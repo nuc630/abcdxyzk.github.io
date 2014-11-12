@@ -94,7 +94,7 @@ def initialize(name, params, tokens)
 	weighted.each_with_index do |tag, i|
 	name, weight_orig = tag
         if min == max
-		weight = 1
+		weight = 0.5
 	else
 		weight = (Math.log(weight_orig) - Math.log(min))/(Math.log(max) - Math.log(min))
 	end
