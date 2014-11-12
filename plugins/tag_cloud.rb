@@ -54,7 +54,7 @@ def initialize(name, params, tokens)
 # map: [[tag name, tag count]] -> [[tag name, tag weight]]
 	weighted = count.map do |name, count|
 # logarithmic distribution
-	weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))
+	weight = count
 	[name, weight]
 	end
 # get the top @limit tag pairs when a limit is given, unless the sort method is random
@@ -92,12 +92,17 @@ def initialize(name, params, tokens)
 	html = ""
 # iterate over the weighted tag Array and create the tag items
 	weighted.each_with_index do |tag, i|
-	name, weight = tag
+	name, weight_orig = tag
+        if min == max
+		weight = 1
+	else
+		weight = (Math.log(weight_orig) - Math.log(min))/(Math.log(max) - Math.log(min))
+	end
 	size = size_min + ((size_max - size_min) * weight).to_f
 	size = sprintf("%.#{@precision}f", size)
 	slug = name.to_url
 	@separator = "" if i == (weighted.size - 1)
-	html << "#{@tag_before}<a style=\"font-size: #{size}#{unit}\" href=\"/#{dir}/#{slug}/\">#{name}</a>#{@separator}#{@tag_after}\n"
+	html << "#{@tag_before}<a style=\"font-size: #{size}#{unit}\" href=\"/#{dir}/#{slug}/\">#{name}(#{weight_orig})</a>#{@separator}#{@tag_after}\n"
 	end
 	html
 	end
