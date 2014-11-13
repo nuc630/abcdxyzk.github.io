@@ -1,0 +1,120 @@
+---
+layout: post
+title: "octopress分类中使用二级目录"
+date: 2014-11-13 23:49:25 +0800
+comments: true
+categories: 
+- 2014
+- 2014~11
+- blog
+- blog~octopress
+tags:
+- blog
+- octopress
+---
+
+<h2>1.修改plugins/category_list_tag.rb为</h2>
+```
+	# encoding: UTF-8
+	module Jekyll
+		class CategoryListTag < Liquid::Tag
+			def render(context)
+				html = ""
+				pre = ""
+				divout = 0
+				categories = context.registers[:site].categories.keys
+				categories.sort.each do |category|
+					posts_in_category = context.registers[:site].categories[category].size
+					category_dir = context.registers[:site].config['category_dir']
+					cats = category.split(/~/)
+					if cats.size > 1 and cats[0] == pre
+						if divout == 0
+							html << "<div id='#{pre}' class='divclass'>"
+							divout = 1
+						end
+						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre}'>#{cats[1]} (#{posts_in_category})</a></li>\n"
+					else
+						pre = cats[0]
+						if divout > 0
+							html << "</div>"
+							divout = 0
+						end
+						html << "<li class='category'><a href='##' onmousedown=showDiv('#{pre}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'>(#{posts_in_category})</a></li>\n"
+					end
+				end
+				if divout > 0
+					html << "</div>"
+					divout = 0
+				end
+				html
+			end
+		end
+	end
+
+	Liquid::Template.register_tag('category_list', Jekyll::CategoryListTag)
+```
+
+<h2>2.修改source/_includes/custom/asides/category_list.html为：注意去掉’\‘</h2>
+```
+	<section>
+	<h1>Categories</h1>
+	<head>
+	<style type="text/css">
+
+	.divclass
+	{
+		display:none;
+		font-size:12px;
+		position:relative;
+		left:0px;
+		top:0px;
+		padding:0px 30px 0px 30px;
+	}
+	</style>
+	<script language="javascript" type="text/javascript">
+
+	function showDiv(divName)
+	{
+		if (document.getElementById(divName).style.display == "block")
+			document.getElementById(divName).style.display = "none"; //隐藏层
+		else
+			document.getElementById(divName).style.display = "block"; //显示层
+	}
+
+	function GetRequest(name) {
+		var url = location.search; //获取url中"?"符后的字串
+	   	if (url.indexOf("?") != -1) {
+			var str = url.substr(1);
+			strs = str.split("&");
+			for(var i = 0; i < strs.length; i ++) {
+				if (name == strs[i].split("=")[0])
+				return unescape(strs[i].split("=")[1]);
+		  	}
+	   	}
+	   	return null;
+	}
+	</script>
+	</head>
+	<body>
+	<div id="menu">
+	<ul>
+	{\% category_list \%}
+	</ul>
+	</div>
+	</body>
+	</html>
+
+	<script language="javascript" type="text/javascript">
+	var divname = GetRequest("opendiv");
+	if (divname != null)
+		showDiv(divname)
+	</script>
+	</section>
+```
+
+<h2>3.使用二级标签的时候先写一个一级标签，写一个一级~二级标签，例如：</h2>
+```
+ categories:
+ - hello
+ - hello~hi
+```
