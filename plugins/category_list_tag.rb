@@ -15,14 +15,14 @@
 							html << "<div id='#{pre}' class='divclass'>"
 							divout = 1
 						end
-						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre}'>#{cats[1]} (#{posts_in_category})</a></li>\n"
+						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre}'>#{cats[1]}<span>(#{posts_in_category})</span></a></li>\n"
 					else
 						pre = cats[0]
 						if divout > 0
 							html << "</div>"
 							divout = 0
 						end
-						html << "<li class='category'><a href='##' onmousedown=showDiv('#{pre}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'>(#{posts_in_category})</a></li>\n"
+						html << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pre}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'><span>[#{posts_in_category}]</span></a></li>\n"
 					end
 				end
 				if divout > 0
