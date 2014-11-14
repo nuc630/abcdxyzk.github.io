@@ -173,3 +173,10 @@ default_asides: [... custom/asides/recent_comments.html, ...]
  source/_includes/custom/head.html</br>
  source/_includes/head.html</br>
 中googleapis</br>
+
+<h4>8.BUG，最新octopress的已经修复</h4>
+除了根目录，其他目录无法将右侧缩到底部。</br>
+可以修改一下source/_includes/head.html文件，去掉src中的'.'，改成如下：</br>
+```
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+```
