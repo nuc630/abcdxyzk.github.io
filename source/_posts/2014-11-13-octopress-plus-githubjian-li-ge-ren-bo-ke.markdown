@@ -103,10 +103,14 @@ rake deploy
 	bundle install
 	rake install
 	rake setup_github_pages
+	mkdir _deploy
+	cd _deploy
+	git init
+	git remote add origin git@github.com:abcdxyzk/abcdxyzk.github.io.git
+	git pull origin master
+	cd ..
 ```
-输入项目的地址。</br>
-然后到_deploy目录git pull才能运行rake deploy。</br>
-_deploy目录就是对应master分支</br>
+_deploy目录就是对应master分支，所以必须要先保持一致</br>
 不然先运行rake deploy会在_deploy目录先commit，再push，这就会导致其他和另外机子上提交的冲突。</br>
 如果先rake deploy的话，可以在_deploy目录reset回去，然后pull。</br>
 
