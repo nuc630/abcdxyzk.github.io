@@ -13,13 +13,12 @@ tags:
 - octopress
 ---
 
-<h2>1.添加about页面</h2></br>
+<h4>1.添加about页面</h4>
 rake new_page[about]</br>
 会生成 source/about/index.markdown 文件。</br>
 编辑该文件的内容。</br>
 然后在头部导航菜单中添加页面的超链接。具体做法是编辑 /source/_includes/custom/navigation.html 文件。</br>
-</br>
-<h2>2.增加链接</h2></br>
+<h4>2.增加链接</h4>
 在source/_includes/custom/asides创建blog_link.html，代码如下：</br>
 ```
 <section>
@@ -32,8 +31,7 @@ rake new_page[about]</br>
 </section>
 ```
 然后修改_config.yml文件在default_asides中加入custom/asides/blog_link.html。</br>
-</br>
-<h2>3.支持评论</h2></br>
+<h4>3.支持评论</h4>
 Octopress自身不支持评论功能，不过我们可以使用第三方的评论系统，国外的有Disqus。下面介绍怎样在Octopress中使用Disqus。</br>
 首先需要在Disqus注册一个账号，登录后点击Add Disqus to your site，然后添加站点信息site name和url，记下右侧的name</br>
 然后在_config.yml文件中进行下面设置</br>
@@ -42,8 +40,7 @@ Octopress自身不支持评论功能，不过我们可以使用第三方的评�
 	disqus_short_name: 为添加站点信息时的name
 	disqus_show_comment_count: true
 ```
-</br>
-<h2>4.添加Categories侧边栏</h2></br>
+<h4>4.添加Categories侧边栏</h4>
 增加category_list插件</br>
 保存到 plugins/category_list_tag.rb：</br>
 ```
@@ -84,7 +81,7 @@ Octopress自身不支持评论功能，不过我们可以使用第三方的评�
     http://aiku.me/bar/10393365</br>
     http://blog.sprabbit.com/blog/2012/03/23/octopress/</br>
 </br>
-<h2>5.添加tag</h2></br>
+<h4>5.添加tag</h4>
 首先到https://github.com/robbyedwards/octopress-tag-pages</br>
 和https://github.com/robbyedwards/octopress-tag-cloudclone</br>
 这两个项目的代码。这两个项目分别用于产生tag page和tag cloud。 针对这两个插件，需要手工复制一些文件到你的octopress目录。</br>
@@ -111,8 +108,7 @@ tag_cloud的参数中，style :para指定不使用li来分割，limit限定100�
 ```
 default_asides: [... custom/asides/tags.html, ...]
 ```
-</br>
-bug:</br>
+<h5>bug:</h5>
 除0错误，tag_cloud.rb中</br>
 weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))</br>
 当max==min时出错</br>
@@ -150,16 +146,14 @@ weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))</br>
         html
         end
 ```
-</br>
---- 如果会出现---</br>
+<h6>如果会出现:</h6>
 添加超过一个tags之后，rake generate就会开始报错了： Error :Liquid Exception: comparison of Array with Array failed in page</br>
 只需要将1个tag重复2次以上使用就可以解决。</br>
 1.第1个post加的tag是：tag1，第2个post加的tag是：tag1</br>
 2.rake generate</br>
 3.第2个post的tag随便改：tagXXX</br>
 ---</br>
-</br>
-<h2>6.近期评论</h2></br>
+<h4>6.近期评论</h4>
 复制以下代码到source/_includes/custom/asides/recent_comments.html，名字改成自己的</br>
 ```
 <section id="comment_sidebar">
@@ -173,3 +167,9 @@ weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))</br>
 default_asides: [... custom/asides/recent_comments.html, ...]
 ```
 
+<h4>7.优化</h4>
+
+删除</br>
+ source/_includes/custom/head.html</br>
+ source/_includes/head.html</br>
+中googleapis</br>

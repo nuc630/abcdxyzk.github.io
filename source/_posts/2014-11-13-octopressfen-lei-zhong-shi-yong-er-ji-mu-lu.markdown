@@ -13,7 +13,7 @@ tags:
 - octopress
 ---
 
-<h2>1.修改plugins/category_list_tag.rb为</h2>
+<h4>1.修改plugins/category_list_tag.rb为</h4>
 ```
 	# encoding: UTF-8
 	module Jekyll
@@ -54,7 +54,7 @@ tags:
 	Liquid::Template.register_tag('category_list', Jekyll::CategoryListTag)
 ```
 
-<h2>2.修改source/_includes/custom/asides/category_list.html为：注意去掉’\‘</h2>
+<h4>2.修改source/_includes/custom/asides/category_list.html为：注意去掉’\‘</h4>
 ```
 	<section>
 	<h1>Categories</h1>
@@ -112,7 +112,7 @@ tags:
 	</section>
 ```
 
-<h2>3.使用二级标签的时候先写一个一级标签，写一个一级~二级标签，例如：</h2>
+<h4>3.使用二级标签的时候先写一个一级标签，写一个一级~二级标签，例如：</h4>
 ```
  categories:
  - hello
