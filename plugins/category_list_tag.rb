@@ -22,7 +22,7 @@
 							html << "</div>"
 							divout = 0
 						end
-						html << "<li class='category'><a href='#' onmousedown=showDiv('#{pre}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'>(#{posts_in_category})</a></li>\n"
+						html << "<li class='category'><a href='##' onmousedown=showDiv('#{pre}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'>(#{posts_in_category})</a></li>\n"
 					end
 				end
 				if divout > 0
