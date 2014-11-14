@@ -114,6 +114,8 @@ _deploy目录就是对应master分支</br>
 
 记住多台机子操作的时候一开始先
 ```
+	保持根目录.git/config只有source分支，如果根目录有master分支就要和_deploy的master同步，每次要push source时都要先pull master，很不好。
+	保持_deploy/.git/config只有master分支
 	git pull
 	cd _deploy
 	git pull
