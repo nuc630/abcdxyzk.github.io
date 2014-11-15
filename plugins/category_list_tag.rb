@@ -14,27 +14,27 @@
 					posts_in_category = context.registers[:site].categories[category].size
 					category_dir = context.registers[:site].config['category_dir']
 					cats = category.split(/~/)
-					if cats[0] > "0000" and cats[0] < "3000"
+					if cats[0] > "0000" and cats[0] < "3000" # 如果是年，则单列
 						if cats.size == 2
 							if lt1 == 0
 								htmltime << "<div id='#{pre1}' class='divclasssub'>"
 								lt1 = 1
 							end
-							htmltime << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[0]}-#{cats[1]}<span>(#{posts_in_category})</span></a></li>\n"
+							htmltime << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[0]}-#{cats[1]}<span class='right_span'>(#{posts_in_category})</span></a></li>\n"
 						else
 							pre1 = cats[0]
 							if lt1 > 0
 								htmltime << "</div>"
 								lt1 = 0
 							end
-							htmltime << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pre1}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'><span>[#{posts_in_category}]</span></a></li>\n"
+							htmltime << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pre1}')><span class='exp_style' id='exp_#{pre1}'>[+] </span></a><a href='/#{category_dir}/#{category.to_url}/'>#{category}<span class='right_span'>[#{posts_in_category}]</span></a></li>\n"
 						end
 					elsif cats.size == 3
 						if l2 == 0
 							html << "<div id='#{pre1}~#{pre2}' class='divclasssub'>"
 							l2 = 1
 						end
-						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}~#{pre2}'>#{cats[2]}<span>#{posts_in_category}</span></a></li>\n"
+						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}~#{pre2}'>#{cats[2]}<span class='right_span'><#{posts_in_category}></span></a></li>\n"
 					elsif cats.size == 2
 						pre2 = cats[1]
 						if l2 > 0
@@ -45,9 +45,8 @@
 							html << "<div id='#{pre1}' class='divclass'>"
 							l1 = 1
 						end
-						html << "<li><a href='##' onmousedown=showDiv('#{pre1}~#{pre2}')>+ </a><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[1]}<span>(#{posts_in_category})</span></a></li>\n"
+						html << "<li><a href='##' onmousedown=showDiv('#{pre1}~#{pre2}')><span class='exp_style' id='exp_#{pre1}~#{pre2}'>[+] </span></a><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[1]}<span class='right_span'>(#{posts_in_category})</span></a></li>\n"
 					else
-						pre1 = cats[0]
 						if l2 > 0
 							html << "</div>"
 							l2 = 0
@@ -55,8 +54,10 @@
 						if l1 > 0
 							html << "</div>"
 							l1 = 0
+							html << "<script language='javascript' type='text/javascript'>\nif (!document.getElementById('#{pre1}~#{pre2}')) document.getElementById('exp_#{pre1}~#{pre2}').style.visibility = 'hidden';\n</script>\n"
 						end
-						html << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pre1}')>#{category} </a><a href='/#{category_dir}/#{category.to_url}/'><span>[#{posts_in_category}]</span></a></li>\n"
+						pre1 = cats[0]
+						html << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pre1}')><span class='exp_style' id='exp_#{pre1}'>[+] </span></a><a href='/#{category_dir}/#{category.to_url}/'>#{category}<span class='right_span'>[#{posts_in_category}]</span></a></li>\n"
 					end
 				end
 				if l2 > 0
@@ -71,7 +72,7 @@
 					htmltime << "</div>"
 					lt1 = 0
 				end
-				html << "<h1>Time Categories</h1>"
+				html << "<h1>Date Categories</h1>"
 				html << htmltime
 				html
 			end
