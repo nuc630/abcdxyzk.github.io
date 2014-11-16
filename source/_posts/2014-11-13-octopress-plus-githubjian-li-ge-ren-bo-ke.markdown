@@ -13,12 +13,12 @@ tags:
 - octopress
 ---
 
-<h4>Step 1 安装git ruby nodejs</h4>
+#### Step 1 安装git ruby nodejs
 ```
 	sudo apt-get install git zlib1g-dev libyaml-dev openssl libssl-dev tcl-dev tk-dev node/nodejs
 	sudo apt-get install ruby ruby-dev 安装的版本偏低不行，要1.9.3以上https://www.ruby-lang.org/en/downloads/
 ```
-<h4>Step 2 准备octopress</h4>
+#### Step 2 准备octopress
 ```
 	git clone git://github.com/imathis/octopress.git octopress
 	cd octopress    # 如果你使用RVM, 你会被询问你是否信任 .rvmrc 文件 (选择 yes).
@@ -30,7 +30,7 @@ tags:
 	最后安装默认主题
 	rake install
 ```
-<h4>Step 3 部署到github上</h4>
+#### Step 3 部署到github上
 (1)以 用户名/用户名.github.io 的格式建立一个新项目。  
 (2)部署  
 首先运行  
@@ -58,7 +58,7 @@ rake generate可能报错：
 	git commit -m 'your message'
 	git push origin source # 记住只push source，要push master就得先pull一下，因为_deploy目录也对应master，而他一运行rake deploy就会push
 ```
-<h4>Step 4 发布博客</h4>
+#### Step 4 发布博客
 你发布的文章被放在source/_posts目录下，并按照Jekyll的命名规则命名：YYYY-MM-DD-post- title.markdown。这个名字会被用于生成url且日期会被用于为文章按时间排序。 但这样比较麻烦，于是Octopress提供了一个rake task来自动按照正确的命名规则建立博文，并生成基本内容。  
 格式是：rake new_post["title"]  
 样例：  
@@ -77,12 +77,12 @@ rake generate可能报错：
 ```
 你可以在这里设置评论功能开关，设置分类。如果你的博客有多个作者共用，你可以在文件中添加【author:Your Name】。如果你在编辑一个草稿，你可以添加【published： false】以使其在生成博客内容时被自动忽略。  
 
-<h4>Step 5 生成 & 预览</h4>
+#### Step 5 生成 & 预览
 rake generate # 在公开目录中生成博文和页面
 rake watch # 查看 source/ and sass/ 的改动
 rake preview # 在浏览器中输入 http://localhost:4000 即可预览。
 
-<h4>Step 6 推送到github</h4>
+#### Step 6 推送到github
 rake deploy
 然后过几分钟，github就会自动更新你的博客了。  
 注意：执行rake deploy前一定要先rake generate一下  
@@ -94,7 +94,7 @@ rake deploy
 ```
 -----------------------------------
 
-<h4>另一台机子的时候</h4>
+#### 另一台机子的时候
 安装需要软件，然后clone自己的代码库  
 
 ```

@@ -13,12 +13,12 @@ tags:
 - octopress
 ---
 
-<h4>1.添加about页面</h4>
+#### 1.添加about页面
 rake new_page[about]  
 会生成 source/about/index.markdown 文件。  
 编辑该文件的内容。  
 然后在头部导航菜单中添加页面的超链接。具体做法是编辑 /source/_includes/custom/navigation.html 文件。  
-<h4>2.增加链接</h4>
+#### 2.增加链接
 在source/_includes/custom/asides创建blog_link.html，代码如下：  
 ```
 <section>
@@ -31,7 +31,7 @@ rake new_page[about]
 </section>
 ```
 然后修改_config.yml文件在default_asides中加入custom/asides/blog_link.html。  
-<h4>3.支持评论</h4>
+#### 3.支持评论
 Octopress自身不支持评论功能，不过我们可以使用第三方的评论系统，国外的有Disqus。下面介绍怎样在Octopress中使用Disqus。  
 首先需要在Disqus注册一个账号，登录后点击Add Disqus to your site，然后添加站点信息site name和url，记下右侧的name  
 然后在_config.yml文件中进行下面设置  
@@ -40,7 +40,7 @@ Octopress自身不支持评论功能，不过我们可以使用第三方的评�
 	disqus_short_name: 为添加站点信息时的name
 	disqus_show_comment_count: true
 ```
-<h4>4.添加Categories侧边栏</h4>
+#### 4.添加Categories侧边栏
 增加category_list插件  
 保存到 plugins/category_list_tag.rb：  
 ```
@@ -81,7 +81,7 @@ Octopress自身不支持评论功能，不过我们可以使用第三方的评�
     http://aiku.me/bar/10393365  
     http://blog.sprabbit.com/blog/2012/03/23/octopress/  
   
-<h4>5.添加tag</h4>
+#### 5.添加tag
 首先到https://github.com/robbyedwards/octopress-tag-pages  
 和https://github.com/robbyedwards/octopress-tag-cloudclone  
 这两个项目的代码。这两个项目分别用于产生tag page和tag cloud。 针对这两个插件，需要手工复制一些文件到你的octopress目录。  
@@ -108,7 +108,7 @@ tag_cloud的参数中，style :para指定不使用li来分割，limit限定100�
 ```
 default_asides: [... custom/asides/tags.html, ...]
 ```
-<h5>bug:</h5>
+##### bug:
 除0错误，tag_cloud.rb中  
 weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))  
 当max==min时出错  
@@ -146,14 +146,14 @@ weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))
         html
         end
 ```
-<h6>如果会出现:</h6>
+###### 如果会出现:
 添加超过一个tags之后，rake generate就会开始报错了： Error :Liquid Exception: comparison of Array with Array failed in page  
 只需要将1个tag重复2次以上使用就可以解决。  
 1.第1个post加的tag是：tag1，第2个post加的tag是：tag1  
 2.rake generate  
 3.第2个post的tag随便改：tagXXX  
----  
-<h4>6.近期评论</h4>
+
+#### 6.近期评论
 复制以下代码到source/_includes/custom/asides/recent_comments.html，名字改成自己的  
 ```
 <section id="comment_sidebar">
@@ -167,14 +167,14 @@ weight = (Math.log(count) - Math.log(min))/(Math.log(max) - Math.log(min))
 default_asides: [... custom/asides/recent_comments.html, ...]
 ```
 
-<h4>7.优化</h4>
+#### 7.优化
 
 删除  
  source/_includes/custom/head.html  
  source/_includes/head.html  
 中googleapis  
 
-<h4>8.BUG，最新octopress的已经修复</h4>
+#### 8.BUG，最新octopress的已经修复
 除了根目录，其他目录无法将右侧缩到底部。  
 可以修改一下source/_includes/head.html文件，去掉src中的'.'，改成如下：  
 ```
