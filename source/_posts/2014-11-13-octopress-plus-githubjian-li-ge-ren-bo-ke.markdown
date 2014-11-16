@@ -31,40 +31,40 @@ tags:
 	rake install
 ```
 <h4>Step 3 部署到github上</h4>
-(1)以 用户名/用户名.github.io 的格式建立一个新项目。</br>
-(2)部署</br>
-首先运行</br>
-rake setup_github_pages</br>
-这条命令会询问你刚才建立的项目的地址，按提示输入，然后就会生成一些用于部署的文件和_deploy目录，_deploy目录就是对应master分支。 接着执行</br>
+(1)以 用户名/用户名.github.io 的格式建立一个新项目。  
+(2)部署  
+首先运行  
+rake setup_github_pages  
+这条命令会询问你刚才建立的项目的地址，按提示输入，然后就会生成一些用于部署的文件和_deploy目录，_deploy目录就是对应master分支。 接着执行  
 ```
 	rake generate
 	rake deploy  # 会cd到_deploy目录运行 commit 和 push
 ```
-这两条命令会生成博客内容，然后添加到git中，自动执行git commit然后推送到主分支(master branch)。几分钟后，你会收到github通知你你的提交已经被接受并发布了你的网站的email。</br>
+这两条命令会生成博客内容，然后添加到git中，自动执行git commit然后推送到主分支(master branch)。几分钟后，你会收到github通知你你的提交已经被接受并发布了你的网站的email。  
 
-rake generate可能报错：</br>
+rake generate可能报错：  
 ```
 	Error reading file /var/lib/gems/1.9.1/gems/jekyll-sitemap-0.6.1/lib/sitemap.xml: No such file or directory - /home/kk/kk/github/octopress/source/var/lib/gems/1.9.1/gems/jekyll-sitemap-0.6.1/lib/sitemap.xml
 ```
-是jekyll-sitemap-0.6.1的bug，修改Gemfile.lock, jekyll-sitemap (0.6.1) 改成 jekyll-sitemap (0.6.3), 再</br>
+是jekyll-sitemap-0.6.1的bug，修改Gemfile.lock, jekyll-sitemap (0.6.1) 改成 jekyll-sitemap (0.6.3), 再  
 ```
 	bundle install
 ```
 
 
-不要忘记把为你的博客提交source（Don’t forget to commit the source for your blog）</br>
+不要忘记把为你的博客提交source（Don’t forget to commit the source for your blog）  
 ```
 	git add .
 	git commit -m 'your message'
 	git push origin source # 记住只push source，要push master就得先pull一下，因为_deploy目录也对应master，而他一运行rake deploy就会push
 ```
 <h4>Step 4 发布博客</h4>
-你发布的文章被放在source/_posts目录下，并按照Jekyll的命名规则命名：YYYY-MM-DD-post- title.markdown。这个名字会被用于生成url且日期会被用于为文章按时间排序。 但这样比较麻烦，于是Octopress提供了一个rake task来自动按照正确的命名规则建立博文，并生成基本内容。</br>
-格式是：rake new_post["title"]</br>
-样例：</br>
-    rake new_post["tt"]</br>
-    # 这条命令会创建 source/_posts/2011-07-03-tt.markdown文件</br>
-会生成如下内容的文件：</br>
+你发布的文章被放在source/_posts目录下，并按照Jekyll的命名规则命名：YYYY-MM-DD-post- title.markdown。这个名字会被用于生成url且日期会被用于为文章按时间排序。 但这样比较麻烦，于是Octopress提供了一个rake task来自动按照正确的命名规则建立博文，并生成基本内容。  
+格式是：rake new_post["title"]  
+样例：  
+    rake new_post["tt"]  
+    # 这条命令会创建 source/_posts/2011-07-03-tt.markdown文件  
+会生成如下内容的文件：  
 ```
 	---
 	layout: post
@@ -75,7 +75,7 @@ rake generate可能报错：</br>
 	categories:
 	---
 ```
-你可以在这里设置评论功能开关，设置分类。如果你的博客有多个作者共用，你可以在文件中添加【author:Your Name】。如果你在编辑一个草稿，你可以添加【published： false】以使其在生成博客内容时被自动忽略。</br>
+你可以在这里设置评论功能开关，设置分类。如果你的博客有多个作者共用，你可以在文件中添加【author:Your Name】。如果你在编辑一个草稿，你可以添加【published： false】以使其在生成博客内容时被自动忽略。  
 
 <h4>Step 5 生成 & 预览</h4>
 rake generate # 在公开目录中生成博文和页面
@@ -84,9 +84,9 @@ rake preview # 在浏览器中输入 http://localhost:4000 即可预览。
 
 <h4>Step 6 推送到github</h4>
 rake deploy
-然后过几分钟，github就会自动更新你的博客了。</br>
-注意：执行rake deploy前一定要先rake generate一下</br>
-不要忘记把为你的博客提交source（Don’t forget to commit the source for your blog）</br>
+然后过几分钟，github就会自动更新你的博客了。  
+注意：执行rake deploy前一定要先rake generate一下  
+不要忘记把为你的博客提交source（Don’t forget to commit the source for your blog）  
 ```
 	git add .
 	git commit -m 'your message'
@@ -95,7 +95,7 @@ rake deploy
 -----------------------------------
 
 <h4>另一台机子的时候</h4>
-安装需要软件，然后clone自己的代码库</br>
+安装需要软件，然后clone自己的代码库  
 
 ```
 	git checkout -b source origin/source
@@ -110,9 +110,9 @@ rake deploy
 	git pull origin master
 	cd ..
 ```
-_deploy目录就是对应master分支，所以必须要先保持一致</br>
-不然先运行rake deploy会在_deploy目录先commit，再push，这就会导致其他和另外机子上提交的冲突。</br>
-如果先rake deploy的话，可以在_deploy目录reset回去，然后pull。</br>
+_deploy目录就是对应master分支，所以必须要先保持一致  
+不然先运行rake deploy会在_deploy目录先commit，再push，这就会导致其他和另外机子上提交的冲突。  
+如果先rake deploy的话，可以在_deploy目录reset回去，然后pull。  
 
 记住多台机子操作的时候一开始先
 ```
