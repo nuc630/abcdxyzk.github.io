@@ -153,7 +153,14 @@ ERR
     # Returns string
     #
     def category_links(categories)
-      categories = categories.sort!.map { |c| category_link c }
+	tmp = []
+	categories.each do |tt|
+		cats = tt.split('~');
+		if cats[0] < "0000" or cats[0] > "9999"
+			tmp += [tt]
+		end
+	end
+      categories = tmp.sort!.map { |c| category_link c }
 
       case categories.length
       when 0
