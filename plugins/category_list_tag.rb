@@ -39,7 +39,7 @@
 								lt1 = 0
 							end
 							pret1 = cats[0]
-							htmltime << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pret1}')><span class='exp_style' id='exp_#{pret1}'>[+]</span></a><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a>"
+							htmltime << "<li class='categoryclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pret1}')><span class='exp_style' id='exp_#{pret1}'>[+]</span></a>"
 
 							if showArticle
 								htmltime << "<a href='##' onmousedown=showDiv('list_#{pret1}')><span class='right_span' id='exp_list_#{pret1}'>+#{posts_in_category}</span></a></li>\n"
@@ -80,7 +80,7 @@
 						end
 						l2 = 0
 						pre2 = cats[1]
-						html << "<li><a href='##' onmousedown=showDiv('#{pre1}~#{pre2}') id='aexp_#{pre1}~#{pre2}'><span class='exp_style' id='exp_#{pre1}~#{pre2}'>[+]</span></a><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[1]}</a>"
+						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[1]}</a><a href='##' onmousedown=showDiv('#{pre1}~#{pre2}') id='aexp_#{pre1}~#{pre2}'><span class='exp_style' id='exp_#{pre1}~#{pre2}'>[+]</span></a>"
 						if showArticle
 							html << "<a href='##' onmousedown=showDiv('#{pre1}~list_#{pre2}')><span class='right_span' id='exp_#{pre1}~list_#{pre2}'>+#{posts_in_category}</span></a></li>\n"
 							html << "<div id='#{pre1}~list_#{pre2}' class='div_list_2'>"
@@ -110,7 +110,7 @@
 						l2 = 0
 						pre1 = cats[0]
 						pre2 = ""
-						html << "<li class='categoryclass'><a href='##' onmousedown=showDiv('#{pre1}') id='aexp_#{pre1}'><span class='exp_style' id='exp_#{pre1}'>[+]</span></a><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a>"
+						html << "<li class='categoryclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pre1}') id='aexp_#{pre1}'><span class='exp_style' id='exp_#{pre1}'>[+]</span></a>"
 
 						if showArticle
 							html << "<a href='##' onmousedown=showDiv('list_#{pre1}')><span class='right_span' id='exp_list_#{pre1}'>+#{posts_in_category}</span></a></li>\n"
