@@ -1,0 +1,197 @@
+---
+layout: post
+title: "linux ptrace函数"
+date: 2011-11-29 19:05:00 +0800
+comments: true
+categories:
+- 2011
+- 2011~11
+- oj
+- oj~judge
+tags:
+- oj
+- judge
+---
+```
+	#include <sys/ptrace.h>
+	int ptrace(int request, int pid, int addr, int data);
+```
+##### 描述
+Ptrace提供了一种父进程可以控制子进程运行，并可以检查和改变它的核心image。它主要用于实现断点调试。一个被跟踪的进程运行中，直到发生一个信号。则进程被中止，并且通知其父进程。在进程中止的状态下，进程的内存空间可以被读写。父进程还可以使子进程继续执行，并选择是否是否忽略引起中止的信号。
+
+<!--more-->
+
+Request参数决定了系统调用的功能：
+
+PTRACE_TRACEME  
+本进程被其父进程所跟踪。其父进程应该希望跟踪子进程。
+
+PTRACE_PEEKTEXT, PTRACE_PEEKDATA  
+从内存地址中读取一个字节，内存地址由addr给出。
+
+PTRACE_PEEKUSR  
+从USER区域中读取一个字节，偏移量为addr。
+
+PTRACE_POKETEXT, PTRACE_POKEDATA  
+往内存地址中写入一个字节。内存地址由addr给出。
+
+PTRACE_POKEUSR  
+往USER区域中写入一个字节。偏移量为addr。
+
+PTRACE_SYSCALL, PTRACE_CONT  
+重新运行。
+
+PTRACE_KILL  
+杀掉子进程，使它退出。
+
+PTRACE_SINGLESTEP  
+设置单步执行标志
+
+PTRACE_ATTACH  
+跟踪指定pid 进程。
+
+PTRACE_DETACH  
+结束跟踪
+
+Intel386特有：
+PTRACE_GETREGS  
+读取寄存器
+
+PTRACE_SETREGS  
+设置寄存器
+
+PTRACE_GETFPREGS  
+读取浮点寄存器
+
+PTRACE_SETFPREGS  
+设置浮点寄存器
+init进程不可以使用此函数
+ 
+##### 返回值
+成功返回0。错误返回-1。errno被设置。
+ 
+##### 错误
+EPERM  
+特殊进程不可以被跟踪或进程已经被跟踪。
+
+ESRCH  
+指定的进程不存在
+
+EIO  
+请求非法ptrace系统函数。
+
+ptrace提供了一种使父进程得以监视和控制其它进程的方式，它还能够改变子进程中的寄存器和内核映像，因而可以实现断点调试和系统调用的跟踪。使用ptrace，你可以在用户层拦截和修改系统调用(syscall).
+
+##### 功能详细描述
+
+1)   PTRACE_TRACEME  
+形式：ptrace(PTRACE_TRACEME,0 ,0 ,0)  
+描述：本进程被其父进程所跟踪。其父进程应该希望跟踪子进程。
+ 
+2)  PTRACE_PEEKTEXT,PTRACE_PEEKDATA  
+形式：ptrace(PTRACE_PEEKTEXT, pid, addr, data)  
+描述：从内存地址中读取一个字节，pid表示被跟踪的子进程，内存地址由addr给出，data为用户变量地址用于返回读到的数据。在Linux（i386）中用户代码段与用户数据段重合所以读取代码段和数据段数据处理是一样的。
+ 
+3)  PTRACE_POKETEXT,PTRACE_POKEDATA  
+形式：ptrace(PTRACE_POKETEXT, pid, addr, data)  
+描述：往内存地址中写入一个字节。pid表示被跟踪的子进程，内存地址由addr给出，data为所要写入的数据。
+ 
+4)  TRACE_PEEKUSR  
+形式：ptrace(PTRACE_PEEKUSR, pid, addr, data)  
+描述：从USER区域中读取一个字节，pid表示被跟踪的子进程，USER区域地址由addr给出，data为用户变量地址用于返回读到的数据。USER结构为core文件的前面一部分，它描述了进程中止时的一些状态，如：寄存器值，代码、数据段大小，代码、数据段开始地址等。在Linux（i386）中通过PTRACE_PEEKUSER和PTRACE_POKEUSR可以访问USER结构的数据有寄存器和调试寄存器。
+ 
+5)  PTRACE_POKEUSR  
+形式：ptrace(PTRACE_POKEUSR, pid, addr, data)  
+描述：往USER区域中写入一个字节，pid表示被跟踪的子进程，USER区域地址由addr给出，data为需写入的数据。
+ 
+6)   PTRACE_CONT  
+形式：ptrace(PTRACE_CONT, pid, 0, signal)  
+描述：继续执行。pid表示被跟踪的子进程，signal为0则忽略引起调试进程中止的信号，若不为0则继续处理信号signal。
+ 
+7)  PTRACE_SYSCALL  
+形式：ptrace(PTRACE_SYS, pid, 0, signal)  
+描述：继续执行。pid表示被跟踪的子进程，signal为0则忽略引起调试进程中止的信号，若不为0则继续处理信号signal。与PTRACE_CONT不同的是进行系统调用跟踪。在被跟踪进程继续运行直到调用系统调用开始或结束时，被跟踪进程被中止，并通知父进程。
+ 
+8)   PTRACE_KILL  
+形式：ptrace(PTRACE_KILL,pid)  
+描述：杀掉子进程，使它退出。pid表示被跟踪的子进程。
+ 
+9)   PTRACE_SINGLESTEP  
+形式：ptrace(PTRACE_KILL, pid, 0, signle)  
+描述：设置单步执行标志，单步执行一条指令。pid表示被跟踪的子进程。signal为0则忽略引起调试进程中止的信号，若不为0则继续处理信号signal。当被跟踪进程单步执行完一个指令后，被跟踪进程被中止，并通知父进程。
+ 
+10)  PTRACE_ATTACH  
+形式：ptrace(PTRACE_ATTACH,pid)  
+描述：跟踪指定pid 进程。pid表示被跟踪进程。被跟踪进程将成为当前进程的子进程，并进入中止状态。
+ 
+11)  PTRACE_DETACH 
+形式：ptrace(PTRACE_DETACH,pid) 
+描述：结束跟踪。 pid表示被跟踪的子进程。结束跟踪后被跟踪进程将继续执行。
+ 
+12)  PTRACE_GETREGS  
+形式：ptrace(PTRACE_GETREGS, pid, 0, data)  
+描述：读取寄存器值，pid表示被跟踪的子进程，data为用户变量地址用于返回读到的数据。此功能将读取所有17个基本寄存器的值。
+ 
+13)  PTRACE_SETREGS  
+形式：ptrace(PTRACE_SETREGS, pid, 0, data)  
+描述：设置寄存器值，pid表示被跟踪的子进程，data为用户数据地址。此功能将设置所有17个基本寄存器的值。
+ 
+14)  PTRACE_GETFPREGS 
+形式：ptrace(PTRACE_GETFPREGS, pid, 0, data)  
+描述：读取浮点寄存器值，pid表示被跟踪的子进程，data为用户变量地址用于返回读到的数据。此功能将读取所有浮点协处理器387的所有寄存器的值。
+ 
+15)  PTRACE_SETFPREGS  
+形式：ptrace(PTRACE_SETREGS, pid, 0, data)  
+描述：设置浮点寄存器值，pid表示被跟踪的子进程，data为用户数据地址。此功能将设置所有浮点协处理器387的所有寄存器的值。
+ 
+-----
+ 
+在用户模式中，虽然只有一个函数可用，即ptrace(int _request, pid_t _pid, caddr_t _addr, int _data)，
+但是这个函数能做所有的事情！如果你愿意，也可以花费几个小时来编写自己的小调试器，以解决特定的问题。
+
+ptrace函数的_request参数是最重要的一个参数，因为它确定你将做什么。BSD和Linux的头文件使用不同的定义，这使得将ptrace应用从一个平台移植到另一个平台变得很复杂。默认地，我们使用BSD头文件中的定义。
+
+r  PT_TRACE_ME（PTRACE_TRACEME）  
+将当前进程切换到停止状态。它通常总是与fork/exec一起使用，虽然也能遇到自我追踪的应用程序。
+对于每一个进程，PT_TRACE_ME只能被调用一次。
+追踪一个正被追踪的进程是会失败的（另一个较不重要的结果是进程不能追踪它自己。
+如果要这样做，应该首先从自身派生一个进程）。大量的反调试技术都是以这一事实为基础的。
+为了克服这类技术，必须使用绕过ptrace的调试器。
+一个信号被发送到正被调试的进程，并将该进程切换到停止状态，
+该进程可以使用从父进程上下文中调用的PT_CONTINUE和PT_STEP命令从停止状态退出。
+wait函数会延迟父进程的执行，直到被调试的进程切换为停止状态或者终止为止（终止时，返回值为1407）。
+其他的所有参数都被忽略。
+
+r  PT_ATTACH（PTRACE_ATTACH）  
+将进程标志为pid的运行进程切换为停止状态，在这种情形下，
+调试器进程成为“父进程”。其他的所有参数都被忽略。进程必须具有与调试进程相同的用户标志（UID），
+并且不能是setuid/setduid进程（否则就要用root来调试）。
+
+r  PT_DETACH（PTRACE_DETACH） 
+停止进程标志为pid进程（由PT_ATTACH和PT_TRACE_ME指定）的调试，
+并继续其常态运行。其他的所有参数都被忽略。
+
+r  PT_CONTINUE（PTRACE_CONT）  
+继续进程标志为pid的被调试进程的执行，而不中断与调试器进程的通信。
+如果addr ＝＝ 1（在Linux中为0），从上次停止的地址继续执行；否则，从指定的地址继续执行。
+参数_data指定发送到被调试进程的信号数量（零说明没有信号）。
+
+r  PT_STEP（PTRACE_SINGLESTEP）  
+进行进程标志为pid的进程的单步执行，即执行下一条机器指令并切换为停止状态（在i386中，这是根据设置追踪标志来实现的，虽然有些“黑客”函数库使用硬件断点）。BSD要求将参数addr置为1，而Linux要求将该参数置为0。其他的所有参数都被忽略。
+
+r  PT_READ_I和PT_READ_D（PTRACE_PEEKTEXT和PTRACE_PEEKDATA）  
+分别从代码区和正被调试进程的地址空间区读取机器字。在许多当代的平台中，这两个指令是等价的。
+ptrace函数接收目标地址addr，并返回读到的结果。
+
+r  PT_WRITE_I和PR_READ_D（PTRACE_POKETEXT和PTRACE_POKEDATA）  
+将由_data传入的机器字写入addr所指定的地址。
+
+r  PT_GETREGS，PT_GETFPREGS和PT_GETDBREGS（PTRACE_GETREGS，PTRACE_ FPREGS和PT_GETFPXREGS）  
+将一般用途寄存器、段寄存器和调试寄存器的值读入到地址由_addr指针所指定的调试器进程的内存区中。
+只有i386平台接收这些与系统相关的命令。寄存器结构的描述放在头文件machine/reg.h文件中。
+
+r  PT_SETREGS，PT_SETFPREGS和PT_SETDBREGS（PTRACE_SETREGS，PTRACE_ SETFPREGS和PT_SETFPXREGS）  
+通过拷贝由_addr指针所指定的内存区域的内容来设置被调试进程的寄存器的值。
+
+r  PT_KILL（PTRACE_KILL）  
+将sigkill发送到被调试进程，以终止其执行。
