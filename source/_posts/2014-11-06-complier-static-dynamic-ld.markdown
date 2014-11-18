@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~11
 - compiler
-- ld
+- compiler~ld
 tags:
 - compiler
 - ld

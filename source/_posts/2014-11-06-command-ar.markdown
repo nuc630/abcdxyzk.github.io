@@ -6,10 +6,9 @@ comments: true
 categories:
 - 2014
 - 2014~11
-- command
-- command~ar
+- system
+- system~command
 tags:
-- command
 - ar
 ---
 #### 1.ar基本用法

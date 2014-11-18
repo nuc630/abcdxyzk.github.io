@@ -6,10 +6,9 @@ comments: true
 categories:
 - 2012
 - 2012~02
-- tools
-- tools~screen-tmux
+- system
+- system~tools
 tags: 
-- tools
 - screen
 ---
 
