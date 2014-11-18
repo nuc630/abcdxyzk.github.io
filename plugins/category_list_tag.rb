@@ -74,6 +74,9 @@
 						if l2 > 0
 							html << "</div>"
 						end
+						if pre2 != ""
+							html << "<script language='javascript' type='text/javascript'>\nif (!document.getElementById('#{pre1}~#{pre2}')) document.getElementById('aexp_#{pre1}~#{pre2}').style.visibility = 'hidden';\n</script>\n"
+						end
 						if l1 == 0
 							html << "<div id='#{pre1}' class='divclass'>"
 							l1 = 1
