@@ -6,10 +6,9 @@ comments: true
 categories:
 - 2014
 - 2014~11
-- kernel
-- kernel~kdump、crash
+- debug
+- debug~kdump、crash
 tags:
-- kernel
 - crash
 - gdb
 ---

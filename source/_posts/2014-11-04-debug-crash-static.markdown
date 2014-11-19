@@ -6,10 +6,9 @@ comments: true
 categories:
 - 2014
 - 2014~11
-- kernel
-- kernel~kdump、crash
+- debug
+- debug~kdump、crash
 tags: 
-- kernel
 - crash
 ---
 ##### 要在centos6上编译，为了能在centos5用，用静态编译

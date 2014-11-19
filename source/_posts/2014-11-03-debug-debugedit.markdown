@@ -6,10 +6,10 @@ comments: true
 categories:
 - 2014
 - 2014~11
-- system
-- system~tools
+- debug
+- debug~debugedit
 tags:
-- tools
+- debugedit
 ---
 ```
 	yum install rpm-build
