@@ -154,13 +154,13 @@ ERR
     #
     def category_links(categories)
 	tmp = []
-	categories.sort!.map do |tt|
+	categories.each do |tt|
 		cats = tt.split('~');
-		if (cats[0] < "0000" or cats[0] > "9999") and cats.length > 0
-			tmp += [cats[cats.length-1]]
+		if cats[0] < "0000" or cats[0] > "9999"
+			tmp += [tt]
 		end
 	end
-      categories = tmp.each { |c| category_link c }
+      categories = tmp.sort!.map { |c| category_link c }
 
       case categories.length
       when 0
@@ -179,8 +179,9 @@ ERR
     # Returns string
     #
     def category_link(category)
+      cats = category.split('~');
       dir = @context.registers[:site].config['category_dir']
-      "<a class='category' href='/#{dir}/#{category.to_url}/'>#{category}</a>"
+      "<a class='category' href='/#{dir}/#{category.to_url}/'>#{cats[cats.length-1]}</a>"
     end
 
     # Outputs the post.date as formatted html, with hooks for CSS styling.
