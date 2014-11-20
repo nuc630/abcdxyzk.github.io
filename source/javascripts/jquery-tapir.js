@@ -19,6 +19,11 @@
         return this;
       }
 
+      // 搜索超时
+	setTimeout(function(){
+		settings.complete();
+	},10000);
+
       $.getJSON(
         'http://tapirgo.com/api/1/search.json?token=' + settings.token + '&query=' + paramValue(settings.query_param) + '&callback=?', function(data){
           if(settings['complete']) { settings.complete() }
@@ -27,12 +32,9 @@
           document.getElementById('search_results').style.height="100%";
           document.getElementById('search_results').style.overflow="hidden";
               var str1 = val.content;
-              var str2 = str1.substr(1, 250);
+              var str2 = str1.substr(1, 300);
               str2 = str2.substr(0, Math.min(str2.length, str2.lastIndexOf(" ")));
-            el.append('<div id="content" class="inner"><article class="post"><h2 class="title"><a href="' + val.link + '">' + val.title + '</a></h2><div class="entry-content"><div class="date">Published on: ' + (val.published_on).substr(0,10) + '</div></div><br><p>' + str2 + '...</p><br><a href="' + val.link +'">Read on &rarr;</a></article></div>');
-            if(key >= (data.length-1)){
-                el.append('<div id="content" class="inner"><center><h2 style="border-bottom: 1px solid #ddd;">Result ends</h2></center><br><br></div>');
-            }
+            el.append('<div><a href="' + val.link + '"><span style="font-size:1.3em">' + val.title + '</span></a><div style="font-size:0.8em">Published on : ' + (val.published_on).substr(0,10) + '</div><p style="font-size:0.8em; line-height:1em;">' + str2 + '...</p></div>');
           });
         }
       );
