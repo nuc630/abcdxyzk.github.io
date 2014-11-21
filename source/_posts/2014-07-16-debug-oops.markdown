@@ -1,0 +1,42 @@
+---
+layout: post
+title: "Oops打印Tainted信息"
+date: 2014-07-16 15:58:00 +0800
+comments: true
+categories:
+- 2014
+- 2014~07
+- debug
+- debug~base
+tags:
+- Oops
+---
+检查一下上面的Oops，看看Linux内核还有没有给我们留下其他的有用信息。
+```
+Oops: 0002 [#1]
+```
+* 这里面，0002表示Oops的错误代码（写错误，发生在内核空间），#1表示这个错误发生一次。
+
+Oops的错误代码根据错误的原因会有不同的定义，本文中的例子可以参考下面的定义（如果发现自己遇到的Oops和下面无法对应的话，最好去内核代码里查找）：
+```
+ * error_code:
+ *      bit 0 == 0 means no page found, 1 means protection fault
+ *      bit 1 == 0 means read, 1 means write
+ *      bit 2 == 0 means kernel, 1 means user-mode
+ *      bit 3 == 0 means data, 1 means instruction
+```
+有时候，Oops还会打印出Tainted信息。这个信息用来指出内核是因何种原因被tainted（直译为“玷污”）。具体的定义如下：
+```
+  1: 'G' if all modules loaded have a GPL or compatible license, 'P' if any proprietary module has been loaded.  Modules without a MODULE_LICENSE or with a MODULE_LICENSE that is not recognised by insmod as GPL compatible are assumed to be proprietary.
+  2: 'F' if any module was force loaded by "insmod -f", ' ' if all modules were loaded normally.
+  3: 'S' if the oops occurred on an SMP kernel running on hardware that hasn't been certified as safe to run multiprocessor. Currently this occurs only on various Athlons that are not SMP capable.
+  4: 'R' if a module was force unloaded by "rmmod -f", ' ' if all modules were unloaded normally.
+  5: 'M' if any processor has reported a Machine Check Exception, ' ' if no Machine Check Exceptions have occurred.
+  6: 'B' if a page-release function has found a bad page reference or some unexpected page flags.
+  7: 'U' if a user or user application specifically requested that the Tainted flag be set, ' ' otherwise.
+  8: 'D' if the kernel has died recently, i.e. there was an OOPS or BUG.
+  9: 'A' if the ACPI table has been overridden.
+ 10: 'W' if a warning has previously been issued by the kernel. (Though some warnings may set more specific taint flags.)
+ 11: 'C' if a staging driver has been loaded.
+ 12: 'I' if the kernel is working around a severe bug in the platform firmware (BIOS or similar).
+```
