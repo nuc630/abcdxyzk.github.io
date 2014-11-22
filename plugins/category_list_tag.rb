@@ -2,7 +2,6 @@
 	module Jekyll
 		class CategoryListTag < Liquid::Tag
 			def render(context)
-				showArticle = context.registers[:site].config['showArticle']
 				htmltime = ""
 				html = ""
 				pre1 = ""
@@ -23,16 +22,7 @@
 								lt1 = 1
 							end
 							htmltime << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pret1}'>#{cats[0]}-#{cats[1]}</a>"
-							if showArticle
-								htmltime << "<a href='##' onmousedown=showDiv('#{pret1}~list_#{cats[1]}')><span class='right_span' id='exp_#{pret1}~list_#{cats[1]}'>+#{posts_in_category}</span></a></li>\n"
-								htmltime << "<div id='#{pret1}~list_#{cats[1]}' class='div_list_2'>"
-								for post in context.registers[:site].categories[category]
-									htmltime << "<li><a href=#{post.url}?opendiv=#{pret1}~list_#{cats[1]}><span class='div_list_123'>#{post.title}</span></a></li>"
-								end
-								htmltime << "</div>"
-							else
-								htmltime << "<span class='right_span' id='exp_#{pret1}~list_#{cats[1]}'>#{posts_in_category}</span></li>\n"
-							end
+							htmltime << "<span class='right_span'>#{posts_in_category}</span></li>\n"
 						else
 							if lt1 > 0
 								htmltime << "</div>"
@@ -41,16 +31,7 @@
 							pret1 = cats[0]
 							htmltime << "<li class='categoryclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pret1}')><span class='exp_style' id='exp_#{pret1}'>[+]</span></a>"
 
-							if showArticle
-								htmltime << "<a href='##' onmousedown=showDiv('list_#{pret1}')><span class='right_span' id='exp_list_#{pret1}'>+#{posts_in_category}</span></a></li>\n"
-								htmltime << "<div id='list_#{pret1}' class='div_list_1'>"
-								for post in context.registers[:site].categories[category]
-									htmltime << "<li><a href=#{post.url}?opendiv=list_#{pret1}><span class='div_list_123'>#{post.title}</span></a></li>"
-								end
-								htmltime << "</div>"
-							else
-								htmltime << "<span class='right_span' id='exp_list_#{pret1}'>(#{posts_in_category})</span></li>\n"
-							end
+							htmltime << "<span class='right_span'>(#{posts_in_category})</span></li>\n"
 						end
 					elsif cats.size == 3
 						if l2 == 0
@@ -59,17 +40,7 @@
 						end
 						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}~#{pre2}'>#{cats[2]}</a>"
 
-						if showArticle
-							html << "<a href='##' onmousedown=showDiv('#{pre1}~#{pre2}~list_#{cats[2]}')><span class='right_span' id='exp_#{pre1}~#{pre2}~list_#{cats[2]}'>+#{posts_in_category}</span></a></li>\n"
-
-							html << "<div id='#{pre1}~#{pre2}~list_#{cats[2]}' class='div_list_3'>"
-							for post in context.registers[:site].categories[category]
-								html << "<li><a href=#{post.url}?opendiv=#{pre1}~#{pre2}~list_#{cats[2]}><span class='div_list_123'>#{post.title}</span></a></li>"
-							end
-							html << "</div>"
-						else
-							html << "<span class='right_span' id='exp_#{pre1}~#{pre2}~list_#{cats[2]}'>#{posts_in_category}</span></li>\n"
-						end
+						html << "<span class='right_span'>#{posts_in_category}</span></li>\n"
 					elsif cats.size == 2
 						if l2 > 0
 							html << "</div>"
@@ -84,16 +55,7 @@
 						l2 = 0
 						pre2 = cats[1]
 						html << "<li><a href='/#{category_dir}/#{category.to_url}/?opendiv=#{pre1}'>#{cats[1]}</a><a href='##' onmousedown=showDiv('#{pre1}~#{pre2}') id='aexp_#{pre1}~#{pre2}'><span class='exp_style' id='exp_#{pre1}~#{pre2}'>[+]</span></a>"
-						if showArticle
-							html << "<a href='##' onmousedown=showDiv('#{pre1}~list_#{pre2}')><span class='right_span' id='exp_#{pre1}~list_#{pre2}'>+#{posts_in_category}</span></a></li>\n"
-							html << "<div id='#{pre1}~list_#{pre2}' class='div_list_2'>"
-							for post in context.registers[:site].categories[category]
-								html << "<li><a href=#{post.url}?opendiv=#{pre1}~list_#{pre2}><span class='div_list_123'>#{post.title}</span></a></li>"
-							end
-							html << "</div>"
-						else
-							html << "<span class='right_span' id='exp_#{pre1}~list_#{pre2}'>#{posts_in_category}</span></li>\n"
-						end
+						html << "<span class='right_span'>#{posts_in_category}</span></li>\n"
 					else
 						if l2 > 0
 							html << "</div>"
@@ -115,16 +77,7 @@
 						pre2 = ""
 						html << "<li class='categoryclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pre1}') id='aexp_#{pre1}'><span class='exp_style' id='exp_#{pre1}'>[+]</span></a>"
 
-						if showArticle
-							html << "<a href='##' onmousedown=showDiv('list_#{pre1}')><span class='right_span' id='exp_list_#{pre1}'>+#{posts_in_category}</span></a></li>\n"
-							html << "<div id='list_#{pre1}' class='div_list_1'>"
-							for post in context.registers[:site].categories[category]
-								html << "<li><a href=#{post.url}?opendiv=list_#{pre1}><span class='div_list_123'>#{post.title}</span></a></li>"
-							end
-							html << "</div>"
-						else
-							html << "<span class='right_span' id='exp_list_#{pre1}'>(#{posts_in_category})</span></li>\n"
-						end
+						html << "<span class='right_span'>(#{posts_in_category})</span></li>\n"
 					end
 				end
 				if l2 > 0
