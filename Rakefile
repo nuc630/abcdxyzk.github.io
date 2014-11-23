@@ -58,7 +58,7 @@ task :generate do
   puts "## Generating Site with Jekyll"
   system "compass compile --css-dir #{source_dir}/stylesheets"
   system "jekyll build"
-  system "mv #{source_dir}/sidebar.html #{public_dir}"
+  system "cp #{source_dir}/sidebar.html #{public_dir}"
 end
 
 desc "Watch the site and regenerate when it changes"
@@ -71,12 +71,12 @@ task :watch do
 
   trap("INT") {
     [jekyllPid, compassPid].each { |pid| Process.kill(9, pid) rescue Errno::ESRCH }
-    system "mv #{source_dir}/sidebar.html #{public_dir}"
+    system "cp #{source_dir}/sidebar.html #{public_dir}"
     exit 0
   }
 
   [jekyllPid, compassPid].each { |pid| Process.wait(pid) }
-  system "mv #{source_dir}/sidebar.html #{public_dir}"
+  system "cp #{source_dir}/sidebar.html #{public_dir}"
 end
 
 desc "preview the site in a web browser"
@@ -90,12 +90,12 @@ task :preview do
 
   trap("INT") {
     [jekyllPid, compassPid, rackupPid].each { |pid| Process.kill(9, pid) rescue Errno::ESRCH }
-    system "mv #{source_dir}/sidebar.html #{public_dir}"
+    system "cp #{source_dir}/sidebar.html #{public_dir}"
     exit 0
   }
 
   [jekyllPid, compassPid, rackupPid].each { |pid| Process.wait(pid) }
-  system "mv #{source_dir}/sidebar.html #{public_dir}"
+  system "cp #{source_dir}/sidebar.html #{public_dir}"
 end
 
 # usage rake new_post[my-new-post] or rake new_post['my new post'] or rake new_post (defaults to "new-post")
