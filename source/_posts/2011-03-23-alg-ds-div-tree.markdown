@@ -1,0 +1,55 @@
+---
+layout: post
+title: "划分树--查询区间k-th number"
+date: 2011-03-23 23:10:00 +0800
+comments: false
+categories:
+- 2011
+- 2011~03
+- algorithm
+- algorithm~ds
+tags:
+- ds
+---
+#### 划分树 -- 查询区间 k-th number
+[http://poj.org/problem?id=2104](http://poj.org/problem?id=2104)  
+[http://acm.hdu.edu.cn/showproblem.php?pid=2665](http://acm.hdu.edu.cn/showproblem.php?pid=2665)  
+[http://acm.hdu.edu.cn/showproblem.php?pid=3727](http://acm.hdu.edu.cn/showproblem.php?pid=3727)  
+[http://acm.hdu.edu.cn/showproblem.php?pid=3473](http://acm.hdu.edu.cn/showproblem.php?pid=3473)
+
+```
+tr[ log(N) ][ N ]
+1. 先对原来的数 稳定排序 ，tr[0][i] = 原先的数 a[i] 在排序后的位置。
+2. dep = 0; s = 1; t = n;
+3. 递归建树 
+build_tree(dep, s, t)
+{
+    if(s >= t) return;
+    mid = (s+t)/2;  j = s;  k = mid+1;
+    for(i=s;i<=t;i++) if( tr[dep][i] <= mid )  tr[dep+1][j++] = tr[dep][i]; else tr[dep+1][k++] = tr[dep][i];
+    //  把s 到 t 一分为二， s 到 t 的每个数 如果排序后它排在该区间的前半部分就移到下一层的前半部。
+    //  如果要计算小于和大于 k-th number 的数的和要多算 sum[dep][x] 即 dep+1 层中 s 到 x(x<=mid) 的和 或 mid+1 到 x(x>mid) 的和。
+    tr[dep][i] = j-1;  // s 到 t 区间， tr[dep][i] 记录 s 到 i 分到前半部分的最后位置
+    build_tree(dep+1, s, mid);  build_tree(dep+1, mid+1, t);
+}
+4. 查找区间 [i,j] 中的 k-th number ，其中 1<=k<=j-i+1;
+find_tree(dep, s, t, i, j, k)
+{
+    if(s == t) return s;
+    v = i 到 j 中分到左边的数
+    if(v >= k) return find_tree(dep+1, s, mid, ci, cj, k); // ci, cj 对应 i, j 分到前半部分的位置。 分到右半部分的和加到大于k-th number 上
+    else    return find_tree(dep+1, mid+1, t, ci, cj, k-v); // 分到左半部分的和加到小于k-th number 上
+ }
+ 
+时间复杂度 O( n*log(n) 预处理， log(n) 查询 ) ，空间大小 n*log(n)
+ 
+序列 ： 2 5 9 8 4 3 1
+排序后  1 2 3 4 5 8 9
+所以 原序列对应的最终位置为 2 5 7 6 4 3 1
+ 
+        按最终位置分                                   指向分到前半部分的最后位置
+tr[0][] = 2 5 7 6 4 3 1                        处理后 tr[0][] = 1 1 1 1 2 3 4
+tr[1][] = 2 4 3 1 || 5 7 6                            tr[1][] = 1 1 1 2 || 5 5 6
+tr[2][] = 2 1 || 4 3 || 5 6 || 7                      tr[2][] = 0 1 || 2 3 || 5 5 || 7
+tr[3][] = 1 || 2 || 3 || 4 || 5 || 6   
+```       
