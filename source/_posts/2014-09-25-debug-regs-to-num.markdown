@@ -2,7 +2,7 @@
 layout: post
 title: "通用寄存器编码表"
 date: 2014-09-25 18:14:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~09

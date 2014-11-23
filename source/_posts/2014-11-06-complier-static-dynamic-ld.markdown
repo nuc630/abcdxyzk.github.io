@@ -2,7 +2,7 @@
 layout: post
 title: "gcc同时使用动态和静态链接"
 date: 2014-11-06 14:51:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

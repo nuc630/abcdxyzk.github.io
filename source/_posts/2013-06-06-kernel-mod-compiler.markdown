@@ -2,7 +2,7 @@
 layout: post
 title: "内核编译模块"
 date: 2013-06-06 14:28:00 +0800
-comments: true
+comments: false
 categories:
 - 2013
 - 2013~06

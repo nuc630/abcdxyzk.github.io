@@ -2,7 +2,7 @@
 layout: post
 title: "修改elf文件标记的源码路径debugedit，find-debuginfo"
 date: 2014-11-03 18:10:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

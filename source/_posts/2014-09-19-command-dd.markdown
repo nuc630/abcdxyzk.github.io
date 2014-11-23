@@ -2,7 +2,7 @@
 layout: post
 title: "dd 命令"
 date: 2014-09-19 15:13:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~09

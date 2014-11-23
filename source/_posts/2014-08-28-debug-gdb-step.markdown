@@ -2,7 +2,7 @@
 layout: post
 title: "gdb 没有debug信息step单步调试"
 date: 2014-08-28 16:21:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

@@ -2,7 +2,7 @@
 layout: post
 title: "Oops打印Tainted信息"
 date: 2014-07-16 15:58:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~07

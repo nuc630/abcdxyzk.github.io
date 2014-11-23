@@ -2,7 +2,7 @@
 layout: post
 title: "\\r\\n,\\n,\\r简介"
 date: 2014-10-21 10:06:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~10

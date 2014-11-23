@@ -2,7 +2,7 @@
 layout: post
 title: "修改、重新生成和安装src.rpm源码包"
 date: 2014-10-30 09:50:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~10

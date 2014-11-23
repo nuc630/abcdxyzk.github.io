@@ -2,7 +2,7 @@
 layout: post
 title: "offsetof宏 container_of宏"
 date: 2014-09-15 15:57:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~09

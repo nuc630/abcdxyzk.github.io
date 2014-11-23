@@ -2,7 +2,7 @@
 layout: post
 title: "使用BBSwitch禁用独显(Nvidia)"
 date: 2014-10-08 00:52:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~10

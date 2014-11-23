@@ -2,7 +2,7 @@
 layout: post
 title: "abrt 应用程序core dump"
 date: 2014-06-18 16:26:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~06

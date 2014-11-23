@@ -2,7 +2,7 @@
 layout: post
 title: "libdwarf 安装使用"
 date: 2014-10-15 18:16:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~10

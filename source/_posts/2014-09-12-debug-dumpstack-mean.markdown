@@ -2,7 +2,7 @@
 layout: post
 title: "The meaning of '?' in Linux kernel panic call trace"
 date: 2014-06-12 09:42:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~06

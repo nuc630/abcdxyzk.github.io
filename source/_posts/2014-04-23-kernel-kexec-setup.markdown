@@ -2,7 +2,7 @@
 layout: post
 title: "利用kexec快速切换内核"
 date: 2014-04-23 15:35:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~04

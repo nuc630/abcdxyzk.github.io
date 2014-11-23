@@ -2,7 +2,7 @@
 layout: post
 title: "gdb print 语法"
 date: 2014-08-28 16:13:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

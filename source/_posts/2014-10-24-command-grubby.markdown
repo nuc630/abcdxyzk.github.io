@@ -2,7 +2,7 @@
 layout: post
 title: "grubby edit centos grub args"
 date: 2014-10-24 15:57:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~10

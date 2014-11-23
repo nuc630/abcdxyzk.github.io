@@ -2,7 +2,7 @@
 layout: post
 title: "screen"
 date: 2012-02-18 12:53:00 +0800
-comments: true
+comments: false
 categories:
 - 2012
 - 2012~02

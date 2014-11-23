@@ -2,7 +2,7 @@
 layout: post
 title: "css 二级菜单"
 date: 2014-11-13 14:52:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

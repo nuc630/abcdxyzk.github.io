@@ -2,7 +2,7 @@
 layout: post
 title: "linux ptrace函数"
 date: 2011-11-29 19:05:00 +0800
-comments: true
+comments: false
 categories:
 - 2011
 - 2011~11

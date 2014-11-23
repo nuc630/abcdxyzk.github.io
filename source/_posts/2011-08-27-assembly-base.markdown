@@ -2,7 +2,7 @@
 layout: post
 title: "Linux 汇编基础"
 date: 2011-08-27 16:07:00 +0800
-comments: true
+comments: false
 categories:
 - 2011
 - 2011~08

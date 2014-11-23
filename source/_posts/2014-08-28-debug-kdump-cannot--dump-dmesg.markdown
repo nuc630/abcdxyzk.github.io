@@ -2,7 +2,7 @@
 layout: post
 title: "kdump el5 --dump-dmesg 错误"
 date: 2014-08-28 16:35:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

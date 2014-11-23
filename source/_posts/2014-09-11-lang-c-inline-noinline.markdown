@@ -2,7 +2,7 @@
 layout: post
 title: "强制内联和强制不内联"
 date: 2014-09-11 09:34:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~09

@@ -2,7 +2,7 @@
 layout: post
 title: "Linux 即时修改 启动级别 启动参数 磁盘满无法进系统 忘记密码"
 date: 2014-08-14 17:20:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

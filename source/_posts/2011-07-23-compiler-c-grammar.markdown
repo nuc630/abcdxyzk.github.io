@@ -2,7 +2,7 @@
 layout: post
 title: "C 语言文法 ( C Language Grammar )"
 date: 2011-07-23 13:43:00 +0800
-comments: true
+comments: false
 categories:
 - 2011
 - 2011~07

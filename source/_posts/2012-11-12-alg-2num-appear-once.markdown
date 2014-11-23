@@ -2,7 +2,7 @@
 layout: post
 title: "两个数只出现一次"
 date: 2012-11-12 16:51:00 +0800
-comments: true
+comments: false
 categories:
 - 2012
 - 2012~11

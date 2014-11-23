@@ -2,7 +2,7 @@
 layout: post
 title: "gdb的脚本使用"
 date: 2014-08-28 15:47:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

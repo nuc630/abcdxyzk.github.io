@@ -2,7 +2,7 @@
 layout: post
 title: "字节序和比特序"
 date: 2013-06-20 18:23:00 +0800
-comments: true
+comments: false
 categories:
 - 2013
 - 2013~06

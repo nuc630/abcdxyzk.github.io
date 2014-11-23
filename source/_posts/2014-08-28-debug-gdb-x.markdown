@@ -2,7 +2,7 @@
 layout: post
 title: "gdb x命令语法"
 date: 2014-08-28 16:17:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

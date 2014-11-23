@@ -2,7 +2,7 @@
 layout: post
 title: "数A到数B之间的统计"
 date: 2014-11-03 18:18:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

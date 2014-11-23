@@ -2,7 +2,7 @@
 layout: post
 title: "crash vs gdb work"
 date: 2014-11-06 10:51:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

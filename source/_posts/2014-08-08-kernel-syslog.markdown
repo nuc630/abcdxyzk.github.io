@@ -2,7 +2,7 @@
 layout: post
 title: "log_buf(ring buffer)(syslog)(printk)"
 date: 2014-08-08 09:43:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

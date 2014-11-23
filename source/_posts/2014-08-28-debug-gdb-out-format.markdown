@@ -2,7 +2,7 @@
 layout: post
 title: "gdb 输出控制"
 date: 2014-08-28 16:09:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~08

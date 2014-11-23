@@ -2,7 +2,7 @@
 layout: post
 title: "GCC制作Library--shared部分相当不错"
 date: 2014-11-06 14:49:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

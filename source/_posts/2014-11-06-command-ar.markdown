@@ -2,7 +2,7 @@
 layout: post
 title: "ar ranlib nm 命令--制作.a文件"
 date: 2014-11-06 23:08:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11

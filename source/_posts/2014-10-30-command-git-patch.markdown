@@ -2,7 +2,7 @@
 layout: post
 title: "patch / git patch"
 date: 2014-10-30 10:44:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~10

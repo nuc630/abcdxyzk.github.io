@@ -2,7 +2,7 @@
 layout: post
 title: "静态编译crash + xbt + bt -H"
 date: 2014-11-04 18:23:00 +0800
-comments: true
+comments: false
 categories:
 - 2014
 - 2014~11
