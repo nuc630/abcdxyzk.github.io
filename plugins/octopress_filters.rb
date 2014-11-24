@@ -15,12 +15,20 @@ module OctopressFilters
       end
     end
   end
+# add by kk : 缓存优化，除非两篇文章md5和sha1都冲突
+  @@cache = Hash.new()
   def self.post_filter(page)
+    key = Digest::MD5.hexdigest(page.output)+Digest::SHA1.hexdigest(page.output)
+    if @@cache[key]
+        page.output = @@cache[key]
+	return
+    end
     if page.ext.match('html|textile|markdown|md|haml|slim|xml')
       page.output = TemplateWrapper::unwrap(page.output)
     end
 
     page.output = RubyPants.new(page.output).to_html
+    @@cache[key] = page.output
   end
 
   class PageFilters < Octopress::Hooks::Page
