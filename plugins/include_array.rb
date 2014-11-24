@@ -13,12 +13,7 @@ module Jekyll
 
   class IncludeArrayTag < Liquid::Tag
     Syntax = /(#{Liquid::QuotedFragment}+)/
-    @@caltimes = -1
-    @@retstore = ""
     def initialize(tag_name, markup, tokens)
-	if @@caltimes == 0
-		return
-	end
       if markup =~ Syntax
         @array_name = $1
       else
@@ -28,13 +23,13 @@ module Jekyll
       super
     end
 
+    @@caltime = 0
+    @@retstore = ""
     def render(context)
-	if @@caltimes == -1
-		@@caltimes = context.registers[:site].config['caltimes']
-	end
-	if @@caltimes == 0
+	if Time.now.to_f - @@caltime < context.registers[:site].config['recaltime']
 		return @@retstore;
 	end
+	@@caltime = Time.now.to_f
       includes_dir = File.join(context.registers[:site].source, '_includes')
 
       if File.symlink?(includes_dir)
@@ -60,12 +55,9 @@ module Jekyll
           end
         end
       end
-      if @@caltimes >= 0
-	@@retstore = rtn
-      end
-      puts 'My adjust: ' + __FILE__ + ": rtn.length=#{rtn.length}, caltimes=#{@@caltimes}"
-      @@caltimes = @@caltimes - 1
-      fp = File.new('source/sidebar.html', 'w');
+      @@retstore = rtn
+      puts 'My adjust: ' + __FILE__ + ": rtn.length=#{rtn.length}"
+      fp = File.new('sidebar.html', 'w');
       fp.puts(rtn);
       fp.puts('<script src="/javascripts/category.js" type="text/javascript"></script>');
       fp.puts('<script type="text/javascript"> hadOpenDiv();</script>');

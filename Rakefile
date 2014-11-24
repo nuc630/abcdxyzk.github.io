@@ -54,11 +54,13 @@ end
 
 desc "Generate jekyll site"
 task :generate do
+  system('>`pwd`/sidebar.html')
+  system('ln -f -s `pwd`/sidebar.html `pwd`/source/sidebar.html')
   raise "### You haven't set anything up yet. First run `rake install` to set up an Octopress theme." unless File.directory?(source_dir)
   puts "## Generating Site with Jekyll"
   system "compass compile --css-dir #{source_dir}/stylesheets"
   system "jekyll build"
-  system "cp #{source_dir}/sidebar.html #{public_dir}"
+  system "cp sidebar.html #{public_dir}"
 end
 
 desc "Watch the site and regenerate when it changes"
@@ -71,16 +73,18 @@ task :watch do
 
   trap("INT") {
     [jekyllPid, compassPid].each { |pid| Process.kill(9, pid) rescue Errno::ESRCH }
-    system "cp #{source_dir}/sidebar.html #{public_dir}"
+    system "cp sidebar.html #{public_dir}"
     exit 0
   }
 
   [jekyllPid, compassPid].each { |pid| Process.wait(pid) }
-  system "cp #{source_dir}/sidebar.html #{public_dir}"
+  system "cp sidebar.html #{public_dir}"
 end
 
 desc "preview the site in a web browser"
 task :preview do
+  system('>`pwd`/sidebar.html')
+  system('ln -f -s `pwd`/sidebar.html `pwd`/source/sidebar.html')
   raise "### You haven't set anything up yet. First run `rake install` to set up an Octopress theme." unless File.directory?(source_dir)
   puts "Starting to watch source with Jekyll and Compass. Starting Rack on port #{server_port}"
   system "compass compile --css-dir #{source_dir}/stylesheets" unless File.exist?("#{source_dir}/stylesheets/screen.css")
@@ -90,12 +94,12 @@ task :preview do
 
   trap("INT") {
     [jekyllPid, compassPid, rackupPid].each { |pid| Process.kill(9, pid) rescue Errno::ESRCH }
-    system "cp #{source_dir}/sidebar.html #{public_dir}"
+    system "cp sidebar.html #{public_dir}"
     exit 0
   }
 
   [jekyllPid, compassPid, rackupPid].each { |pid| Process.wait(pid) }
-  system "cp #{source_dir}/sidebar.html #{public_dir}"
+  system "cp sidebar.html #{public_dir}"
 end
 
 # usage rake new_post[my-new-post] or rake new_post['my new post'] or rake new_post (defaults to "new-post")
