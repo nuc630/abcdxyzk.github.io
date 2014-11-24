@@ -56,7 +56,6 @@ module Jekyll
         end
       end
       @@retstore = rtn
-      puts 'My adjust: ' + __FILE__ + ": rtn.length=#{rtn.length}"
       fp = File.new('sidebar.html', 'w');
       fp.puts(rtn);
       fp.puts('<script src="/javascripts/category.js" type="text/javascript"></script>');
