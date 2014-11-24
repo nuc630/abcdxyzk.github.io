@@ -15,10 +15,10 @@ module OctopressFilters
       end
     end
   end
-# add by kk : 缓存优化，除非两篇文章md5和sha1都冲突
+# add by kk : 缓存优化，改用全文做键值保证没问题。
   @@cache = Hash.new()
   def self.post_filter(page)
-    key = Digest::MD5.hexdigest(page.output)+Digest::SHA1.hexdigest(page.output)
+    key = page.output #Digest::MD5.hexdigest(page.output)+Digest::SHA1.hexdigest(page.output)
     if @@cache[key]
         page.output = @@cache[key]
 	return
