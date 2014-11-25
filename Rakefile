@@ -58,8 +58,14 @@ task :generate do
   system('ln -f -s `pwd`/sidebar.html `pwd`/source/sidebar.html')
   raise "### You haven't set anything up yet. First run `rake install` to set up an Octopress theme." unless File.directory?(source_dir)
   puts "## Generating Site with Jekyll"
+  tt = Time.now.to_f
+	p "#{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
   system "compass compile --css-dir #{source_dir}/stylesheets"
+	p "#{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
   system "jekyll build"
+	p "#{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
+	p "total = #{Time.now.to_f-tt}"
+#最好再加一个到/usr/local/lib/ruby/gems/2.1.0/gems/jekyll-2.5.1/lib/jekyll/site.rb:297的render函数中
   system "cp sidebar.html #{public_dir}"
 end
 

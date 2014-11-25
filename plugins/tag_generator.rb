@@ -90,9 +90,11 @@ module Jekyll
 		def write_tag_indexes
 			if self.layouts.key? 'tag_index'
 				dir = self.config['tag_dir'] || 'tags'
+	p "    #{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
 				self.tags.keys.each do |tag|
 					self.write_tag_index(File.join(dir, tag.to_url), tag)
 				end
+	p "    #{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
 			# Throw an exception if the layout couldn't be found.
 			else
 				throw "No 'tag_index' layout found."

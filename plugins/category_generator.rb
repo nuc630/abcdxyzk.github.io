@@ -107,9 +107,11 @@ module Jekyll
     def write_category_indexes
       if self.layouts.key? 'category_index'
         dir = self.config['category_dir'] || 'categories'
+	p "    #{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
         self.categories.keys.each do |category|
           self.write_category_index(File.join(dir, category.to_url), category)
         end
+	p "    #{ __FILE__} line:#{__LINE__} time:#{Time.now.to_f}"
 
       # Throw an exception if the layout couldn't be found.
       else
