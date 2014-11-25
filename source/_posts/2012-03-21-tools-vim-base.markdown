@@ -19,6 +19,13 @@ set autoindent
 set cindent
 set nu
 ```
+恢复文件关闭之前光标的位置  
+Vim的全局配置/etc/vim/vimrc，被注释的这么几行：取消注释，g后面的'改成`，改好如下
+```
+if has("autocmd")
+ au BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
+endif
+```
 #### 1. Vim的几种模式
 Vim提供了诸多模式可供使用，不同模式带有不同的命令功能。  
 ##### 普通模式
