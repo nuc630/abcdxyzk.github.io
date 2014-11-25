@@ -18,15 +18,17 @@ module OctopressFilters
 # add by kk : 缓存优化，改用全文做键值保证没问题。
   @@cache = Hash.new()
   def self.post_filter(page)
+    if page.ext.match('html|textile|markdown|md|haml|slim|xml')
+      page.output = TemplateWrapper::unwrap(page.output)
+    end
+# add by kk: 我觉得不用to_html，这样速度极快
+    return
+
     key = page.output #Digest::MD5.hexdigest(page.output)+Digest::SHA1.hexdigest(page.output)
     if @@cache[key]
         page.output = @@cache[key]
 	return
     end
-    if page.ext.match('html|textile|markdown|md|haml|slim|xml')
-      page.output = TemplateWrapper::unwrap(page.output)
-    end
-
     page.output = RubyPants.new(page.output).to_html
     @@cache[key] = page.output
   end
