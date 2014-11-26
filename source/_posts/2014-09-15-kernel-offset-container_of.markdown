@@ -9,7 +9,6 @@ categories:
 - kernel
 - kernel~base
 tags:
-- kernel
 ---
 Linux内核中，用两个非常巧妙地宏实现了，一个是offsetof宏，另一个是container_of宏，下面讲解一下这两个宏。
 #### 1.  offsetof宏

@@ -9,7 +9,6 @@ categories:
 - language
 - language~c
 tags:
-- c
 ---
 #### 1.强制不内联
 一个函数，如果代码量比较少的话，用 -O3优化开关的话，gcc有可能将这个函数强制内联(inline)即使，你在函数前没有写inline助记符。  

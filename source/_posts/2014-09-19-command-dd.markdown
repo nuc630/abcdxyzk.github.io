@@ -9,7 +9,6 @@ categories:
 - system
 - system~command
 tags:
-- dd
 ---
 贴自[http://www.chinaunix.net/old_jh/4/1025448.html](http://www.chinaunix.net/old_jh/4/1025448.html)
 dd 是 Linux/UNIX 下的一个非常有用的命令，作用是用指定大小的块拷贝一个文件，并在拷贝的同时进行指定的转换。

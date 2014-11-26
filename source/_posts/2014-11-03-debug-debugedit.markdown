@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~debugedit
 tags:
-- debugedit
 ---
 ```
 	yum install rpm-build

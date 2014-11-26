@@ -9,7 +9,6 @@ categories:
 - kernel
 - kernel~base
 tags:
-- kernel
 ---
 #### 1、修改启动级别错误配置的方法
 如果你不小心把级别设成0或6，用下边的方法补救：  

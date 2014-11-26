@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~dwarf
 tags:
-- debug
 - dwarf
 ---
 下载[http://www.prevanders.net/dwarf.html](http://www.prevanders.net/dwarf.html)

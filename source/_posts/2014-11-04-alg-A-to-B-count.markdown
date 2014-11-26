@@ -9,7 +9,6 @@ categories:
 - algorithm
 - algorithm~top
 tags:
-- algorithm
 ---
 [Problem 1896 神奇的魔法数](http://acm.fzu.edu.cn/problem.php?pid=1896)
 ```

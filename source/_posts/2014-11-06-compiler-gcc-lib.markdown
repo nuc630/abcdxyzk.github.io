@@ -8,9 +8,7 @@ categories:
 - 2014~11
 - compiler
 - compiler~lib
-tags: 
-- compiler
-- lib
+tags:
 ---
 [贴自http://blog.csdn.net/alex_ww/article/details/4544207](http://blog.csdn.net/alex_ww/article/details/4544207)
 ### Library可分成三种，static、shared与dynamically loaded。

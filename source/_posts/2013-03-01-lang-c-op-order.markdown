@@ -9,7 +9,6 @@ categories:
 - language
 - language~c
 tags:
-- c
 ---
 一共有十五个优先级：
 ``` 

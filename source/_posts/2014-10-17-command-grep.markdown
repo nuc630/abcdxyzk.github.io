@@ -9,7 +9,6 @@ categories:
 - system
 - system~command
 tags:
-- grep
 ---
 * ^：匹配正则表达式的开始行。
 * $: 匹配正则表达式的结束行。

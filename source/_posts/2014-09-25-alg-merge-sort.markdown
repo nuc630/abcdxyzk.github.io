@@ -9,7 +9,6 @@ categories:
 - algorithm
 - algorithm~base
 tags:
-- sort
 ---
 divide-and-conquer algorithm, in the style
 suggested by Knuth volume 3 (2nd edition),

@@ -9,7 +9,6 @@ categories:
 - blog
 - blog~markdown
 tags:
-- blog
 - markdown
 ---
 [贴自http://wowubuntu.com/markdown/index.html](http://wowubuntu.com/markdown/index.html)

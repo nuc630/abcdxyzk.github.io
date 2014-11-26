@@ -9,8 +9,6 @@ categories:
 - language
 - language~c
 tags:
-- language
-- c
 ---
 
 字节序和比特序，因为比特序对所有代码（包括汇编）是透明的，所以对于小端系统，有说是用大端比特序，也有说是用小端比特序。  

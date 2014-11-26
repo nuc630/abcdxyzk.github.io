@@ -9,7 +9,6 @@ categories:
 - algorithm
 - algorithm~tree
 tags:
-- avltree
 ---
 ```
 /**

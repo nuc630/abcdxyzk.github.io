@@ -6,10 +6,10 @@ comments: false
 categories:
 - 2011
 - 2011~11
-- oj
-- oj~judge
+- language
+- language~c
 tags:
-- oj
+- koj
 - judge
 ---
 ```

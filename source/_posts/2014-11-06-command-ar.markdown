@@ -9,7 +9,6 @@ categories:
 - system
 - system~command
 tags:
-- ar
 ---
 #### 1.ar基本用法
 ##### 功能说明：建立或修改备存文件，或是从备存文件中抽取文件。

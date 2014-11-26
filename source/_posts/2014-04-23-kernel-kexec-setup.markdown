@@ -9,7 +9,6 @@ categories:
 - kernel
 - kernel~kexec
 tags:
-- kexec
 ---
 kexec是一个用于在当前系统下快速切换到另一个内核的一种办法，它采用了一定的机制略过了硬件的初始化，所以切换速度会很快。
 

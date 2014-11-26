@@ -9,7 +9,6 @@ categories:
 - algorithm
 - algorithm~ds
 tags:
-- ds
 ---
 #### 划分树 -- 查询区间 k-th number
 [http://poj.org/problem?id=2104](http://poj.org/problem?id=2104)  

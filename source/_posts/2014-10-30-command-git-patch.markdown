@@ -9,7 +9,6 @@ categories:
 - system
 - system~command
 tags:
-- command
 - patch
 - git
 ---

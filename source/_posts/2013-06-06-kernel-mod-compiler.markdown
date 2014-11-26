@@ -9,7 +9,6 @@ categories:
 - kernel
 - kernel~base
 tags:
-- kernel
 ---
 ```
 	/*filename: test.c*/

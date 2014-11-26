@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~base
 tags:
-- Oops
 ---
 检查一下上面的Oops，看看Linux内核还有没有给我们留下其他的有用信息。
 ```

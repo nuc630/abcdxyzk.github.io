@@ -9,7 +9,6 @@ categories:
 - language
 - language~c
 tags:
-- c
 ---
 * 后缀为.c的，gcc把它当作是C程序，而g++当作是c++程序；
 * 后缀为.cpp的，两者都会认为是c++程序

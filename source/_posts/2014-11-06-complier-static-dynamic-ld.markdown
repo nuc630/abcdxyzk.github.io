@@ -9,8 +9,6 @@ categories:
 - compiler
 - compiler~ld
 tags:
-- compiler
-- ld
 ---
 gcc --static a.c -Wl,-Bstatic -lm -Wl,-Bdynamic -lc  
 

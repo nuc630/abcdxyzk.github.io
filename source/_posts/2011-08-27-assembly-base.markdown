@@ -7,8 +7,8 @@ categories:
 - 2011
 - 2011~08
 - assembly
+- assembly~base
 tags:
-- assembly
 ---
 
 绝顶好书[Professional_Assembly_Language](/download/assembly/Professional_Assembly_Language.pdf)

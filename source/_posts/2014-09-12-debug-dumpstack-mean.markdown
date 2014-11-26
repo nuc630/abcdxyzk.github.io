@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~base
 tags:
-- debug
 ---
 
 * '?' means that the information about this stack entry is probably not reliable.

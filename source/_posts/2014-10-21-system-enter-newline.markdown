@@ -9,7 +9,6 @@ categories:
 - system
 - system~base
 tags:
-- system
 ---
 '\r'是回车，前者使光标到行首，（carriage return）  
 '\n'是换行，后者使光标下移一格，（line feed）

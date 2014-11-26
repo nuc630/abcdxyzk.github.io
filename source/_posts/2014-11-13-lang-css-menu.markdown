@@ -9,8 +9,6 @@ categories:
 - language
 - language~css
 tags:
-- language
-- css
 ---
 ```
 	<style type="text/css">

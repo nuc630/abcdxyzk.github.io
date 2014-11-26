@@ -9,7 +9,6 @@ categories:
 - language
 - language~c
 tags:
-- const
 ---
 #### 1、定义常量
 ##### (1)const修饰变量

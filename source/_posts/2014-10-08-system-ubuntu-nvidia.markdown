@@ -9,7 +9,6 @@ categories:
 - system
 - system~ubuntu
 tags:
-- ubuntu
 - nvidia
 ---
 #### 1-安装编译环境、内核源码和内核头文件 (假设你刚刚装完系统）
