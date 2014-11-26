@@ -57,14 +57,14 @@ Source福州大学第七届程序设计竞赛
 		if (dep == 0) return 1;
 		for (i=0;i<da[dep];i++)
 		{
-		        if (all > 0 || i > 0) {
-		                if (all == 0 || i-da[dep+1]>=d || i-da[dep+1]<=-d)
-		                        ret += dp[dep][i];
-		        } else
-		                ret += sum[dep-1];
+			if (all > 0 || i > 0) {
+				if (all == 0 || i-da[dep+1]>=d || i-da[dep+1]<=-d)
+					ret += dp[dep][i];
+			} else
+				ret += sum[dep-1];
 		}
 		if (all == 0 || da[dep]-da[dep+1]>=d || da[dep]-da[dep+1]<=-d)
-		        ret += dfs(da, dep-1, all+da[dep]);
+			ret += dfs(da, dep-1, all+da[dep]);
 		return ret;
 	}
 
@@ -74,39 +74,39 @@ Source福州大学第七届程序设计竞赛
 		scanf("%d", &T);
 		while (T--)
 		{
-		        scanf("%d %d %d", &m, &n, &d);
-		        for (i=0;i<13;i++)
-		                for (j=0;j<13;j++) dp[i][j] = 0;
-		        sum[0] = 0; sum[1] = 9;
-		        for (i=0;i<10;i++) dp[1][i] = 1;
-		        for (i=2;i<13;i++) {
-		                sum[i] = sum[i-1];
-		                for (j=0;j<10;j++) {
-		                        for (k=0;k<10;k++)
-		                                if (j-k>=d || j-k<=-d)
-		                                        dp[i][j] += dp[i-1][k];
-		                        if (j > 0)
-		                                sum[i] += dp[i][j];
-		                }
-		        }
-	//                for (i=0;i<=2;i++)
-	//                        for (j=0;j<10;j++) printf("%d %d %d\n", i, j, dp[i][j]);
-		        i = 1; k = n;
-		        while (i < 13) {
-		                dn[i] = k % 10; k /= 10;
-		                i++;
-		        }
-		        i = 1; k = m-1;
-		        while (i < 13) {
-		                dm[i] = k % 10; k /= 10;
-		                i++;
-		        }
-		        n = dfs(dn, 11, 0);
-		        if (m == 1)
-		                m = 0;
-		        else
-		                m = dfs(dm, 11, 0);
-		        printf("%d\n", n-m);
+			scanf("%d %d %d", &m, &n, &d);
+			for (i=0;i<13;i++)
+				for (j=0;j<13;j++) dp[i][j] = 0;
+			sum[0] = 0; sum[1] = 9;
+			for (i=0;i<10;i++) dp[1][i] = 1;
+			for (i=2;i<13;i++) {
+				sum[i] = sum[i-1];
+				for (j=0;j<10;j++) {
+					for (k=0;k<10;k++)
+						if (j-k>=d || j-k<=-d)
+							dp[i][j] += dp[i-1][k];
+					if (j > 0)
+						sum[i] += dp[i][j];
+				}
+			}
+	//		for (i=0;i<=2;i++)
+	//			for (j=0;j<10;j++) printf("%d %d %d\n", i, j, dp[i][j]);
+			i = 1; k = n;
+			while (i < 13) {
+				dn[i] = k % 10; k /= 10;
+				i++;
+			}
+			i = 1; k = m-1;
+			while (i < 13) {
+				dm[i] = k % 10; k /= 10;
+				i++;
+			}
+			n = dfs(dn, 11, 0);
+			if (m == 1)
+				m = 0;
+			else
+				m = dfs(dm, 11, 0);
+			printf("%d\n", n-m);
 		}
 		return 0;
 	}
