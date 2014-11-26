@@ -23,6 +23,17 @@ module BacktickCodeBlock
 
       if str.match(/\A( {4}|\t)/)
         str = str.gsub(/^( {4}|\t)/, '')
+# add by kk
+# TODO: code的第一个tab只显示2空格，不知道哪改，先这里改了
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
+        str = str.gsub(/^( *)\t/, '\1    ')
       end
       if @lang.nil? || @lang == 'plain'
         code = HighlightCode::tableize_code(str.gsub('<','&lt;').gsub('>','&gt;'))
