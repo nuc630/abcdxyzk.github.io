@@ -1,0 +1,293 @@
+---
+layout: post
+title: "jekyll的一些全局变量"
+date: 2014-11-27 13:30:00 +0800
+comments: false
+categories:
+- 2014
+- 2014~11
+- blog
+- blog~jekyll
+tags:
+---
+[http://jekyllrb.com/docs/variables/](http://jekyllrb.com/docs/variables/)  
+octopress是基于jekyll，所以也可以用这些内容
+#### Variables
+Jekyll traverses your site looking for files to process. Any files with YAML front matter are subject to processing. For each of these files, Jekyll makes a variety of data available via the Liquid templating system. The following is a reference of the available data.
+##### Global Variables
+<table>
+  <thead>
+    <tr>
+      <th>Variable</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><p>site</p></td>
+      <td><p>
+          Sitewide information + configuration settings from
+          _config.yml. See below for details.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page</p></td>
+      <td><p>
+        Page specific information + the <a href="../frontmatter/">YAML front
+        matter</a>. Custom variables set via the YAML Front Matter will be
+        available here. See below for details.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>content</p></td>
+      <td><p>
+        In layout files, the rendered content of the Post or Page being wrapped.
+        Not defined in Post or Page files.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>paginator</p></td>
+      <td><p>
+        When the paginate configuration option is set, this
+        variable becomes available for use. 
+      </p></td>
+    </tr>
+  </tbody>
+</table>
+##### Site Variables
+<table>
+  <thead>
+    <tr>
+      <th>Variable</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><p>site.time</p></td>
+      <td><p>
+        The current time (when you run the jekyll command).
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.pages</p></td>
+      <td><p>
+        A list of all Pages.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.posts</p></td>
+      <td><p>
+        A reverse chronological list of all Posts.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.related_posts</p></td>
+      <td><p>
+        If the page being processed is a Post, this contains a list of up to ten
+        related Posts. By default, these are low quality but fast to compute.
+        For high quality but slow to compute results, run the
+        jekyll command with the --lsi (latent semantic
+        indexing) option.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.static_files</p></td>
+      <td><p>
+        A list of all static files (i.e. files not processed by Jekyll's
+        converters or the Liquid renderer). Each file has three properties:
+        path, modified_time and extname.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.html_pages</p></td>
+      <td><p>
+        A list of all HTML Pages.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.collections</p></td>
+      <td><p>
+        A list of all the collections.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.data</p></td>
+      <td><p>
+        A list containing the data loaded from the YAML files located in the _data directory.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.documents</p></td>
+      <td><p>
+        A list of all the documents in every collection.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.categories.CATEGORY</p></td>
+      <td><p>
+        The list of all Posts in category CATEGORY.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.tags.TAG</p></td>
+      <td><p>
+        The list of all Posts with tag TAG.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>site.[CONFIGURATION_DATA]</p></td>
+      <td><p>
+        All the variables set via the command line and your
+        _config.yml are available through the site
+        variable. For example, if you have url: http://mysite.com
+        in your configuration file, then in your Posts and Pages it will be
+        stored in site.url. Jekyll does not parse changes to
+        _config.yml in watch mode, you must restart
+        Jekyll to see changes to variables.
+      </p></td>
+    </tr>
+  </tbody>
+</table>
+##### Page Variables
+<table>
+  <thead>
+    <tr>
+      <th>Variable</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><p>page.content</p></td>
+      <td><p>
+        The content of the Page, rendered or un-rendered depending upon
+        what Liquid is being processed and what page is.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.title</p></td>
+      <td><p>
+        The title of the Page.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.excerpt</p></td>
+      <td><p>
+        The un-rendered excerpt of the Page.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.url</p></td>
+      <td><p>
+        The URL of the Post without the domain, but
+        with a leading slash, e.g.
+        /2008/12/14/my-post.html
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.date</p></td>
+      <td><p>
+        The Date assigned to the Post. This can be overridden in a Post’s front
+        matter by specifying a new date/time in the format
+        YYYY-MM-DD HH:MM:SS (assuming UTC), or
+        YYYY-MM-DD HH:MM:SS +/-TTTT (to specify a time zone using
+        an offset from UTC. e.g. 2008-12-14 10:30:00 +0900).
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.id</p></td>
+      <td><p>
+        An identifier unique to the Post (useful in RSS feeds). e.g.
+        /2008/12/14/my-post
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.categories</p></td>
+      <td><p>
+        The list of categories to which this post belongs. Categories are
+        derived from the directory structure above the _posts
+        directory. For example, a post at
+        /work/code/_posts/2008-12-24-closures.md would have this
+        field set to ['work', 'code']. These can also be specified
+        in the <a href="../frontmatter/">YAML Front Matter</a>.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.tags</p></td>
+      <td><p>
+        The list of tags to which this post belongs. These can be specified in
+        the <a href="../frontmatter/">YAML Front Matter</a>.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.path</p></td>
+      <td><p>
+        The path to the raw post or page. Example usage: Linking back to the
+        page or post’s source on GitHub. This can be overridden in the
+        <a href="../frontmatter/">YAML Front Matter</a>.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.next</p></td>
+      <td><p>
+        The next post relative to the position of the current post in
+        site.posts. Returns nil for the last entry.
+      </p></td>
+    </tr>
+    <tr>
+      <td><p>page.previous</p></td>
+      <td><p>
+        The previous post relative to the position of the current post in
+        site.posts. Returns nil for the first entry.
+      </p></td>
+    </tr>
+  </tbody>
+</table>
+##### Paginator
+<table>
+  <thead>
+    <tr>
+      <th>Variable</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><p>paginator.per_page</p></td>
+      <td><p>Number of Posts per page.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.posts</p></td>
+      <td><p>Posts available for that page.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.total_posts</p></td>
+      <td><p>Total number of Posts.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.total_pages</p></td>
+      <td><p>Total number of Pages.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.page</p></td>
+      <td><p>The number of the current page.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.previous_page</p></td>
+      <td><p>The number of the previous page.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.previous_page_path</p></td>
+      <td><p>The path to the previous page.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.next_page</p></td>
+      <td><p>The number of the next page.</p></td>
+    </tr>
+    <tr>
+      <td><p>paginator.next_page_path</p></td>
+      <td><p>The path to the next page.</p></td>
+    </tr>
+  </tbody>
+</table>
