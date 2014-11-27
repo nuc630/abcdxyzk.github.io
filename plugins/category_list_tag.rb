@@ -8,7 +8,24 @@
 				l1 = 0
 				l2 = 0
 				categories = context.registers[:site].categories.keys
-				categories.sort.each do |category|
+				tmp = categories.sort
+				sortby = ['language', 'compiler', 'assembly', 'system', 'kernel', 'debug', '---', 'algorithm', 'blog']
+				categories = []
+				pre = ""
+				sortby.each do |key|
+					pre = ""
+					categories = categories + [key]
+					tmp.each do |category|
+						cats = category.split(/~/)
+						if cats[0] != key or cats.length == 1 or (cats[0] > "0000" and cats[0] < "3000")
+							next
+						end
+						categories = categories + [category]
+					end
+				end
+				tmp = tmp - categories
+				categories = categories + tmp
+				categories.each do |category|
 					posts_in_category = context.registers[:site].categories[category].size
 					category_dir = context.registers[:site].config['category_dir']
 					cats = category.split(/~/)
@@ -57,6 +74,11 @@
 						l2 = 0
 						pre1 = cats[0]
 						pre2 = ""
+						if cats[0] == '---'
+							html << '<li><div style="background:#DDD; height:0.3em;"></div></li>'
+							pre1 = ""
+							next
+						end
 						html << "<li class='catclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pre1}') id='aexp_#{pre1}'><span class='exp_style' id='exp_#{pre1}'>[+]</span></a>"
 
 						html << "<span class='right_span'>(#{posts_in_category})</span></li>\n"
