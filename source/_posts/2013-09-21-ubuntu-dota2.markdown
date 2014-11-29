@@ -44,7 +44,7 @@ ubuntu 装独显 [ubuntu 12.04 N卡双显卡](/blog/2013/03/26/ubuntu-use-nvidia
 
 primus默认是有垂直同步的，帧数当然会低，加个vblank_mode=0绝对秒杀virtualgl
 
-不能用vblank_mode=0 opritun -b primus programme做桥接启动程序，这样会拉低许多显卡性能，
+不能用vblank_mode=0 optirun -b primus programme做桥接启动程序，这样会拉低许多显卡性能，
 使用vblank_mode=0 primusrun programme，性能就上来了，我这里确实比optirun提高30%左右
 
 
@@ -54,7 +54,6 @@ primus默认是有垂直同步的，帧数当然会低，加个vblank_mode=0绝�
 
 ##### 2 输入所选命令（使用多个命令是中间用空格隔开，例如 -novid -international -console  ）
 -novid （去除开始动画）  
--international （蓝色载入画面）  
 -console（命令面板）  
 -high （使dota2 的cpu和内存使用级为最高,也就是说让dota2 可以优先其他程序使用内存）  
 -windowed （窗口模式）  
