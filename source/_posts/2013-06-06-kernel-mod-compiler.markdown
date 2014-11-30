@@ -106,3 +106,13 @@ insmod: error inserting 'test.o': -1 Invalid module format
 ```
 可见，test.mod.o只是产生了几个ELF的节，分别是modinfo,  .gun.linkonce.this_module(用于重定位，引进了rel.gnu.linkonce.this_module),  __versions。而test.ko是test.o和test.mod.o合并的结果。
 
+通常我们安装一个新的模块,先是编译出相应的ko文件，然后移动
+```
+/lib/modules/`uname -r`/
+```
+目录或者某个子目录下，locate xxx.ko确定该模块确实在上面提到的目录下面，执行depmod -a，depmod将会检查
+```
+/lib/modules/`uname -r`/
+```
+目录及其子目录中的所有模块文件，并根据相依性生成新的modules.dep文件，这时我们执行modprobe xxx.ko，该模块就会被正常加载了。
+
