@@ -23,6 +23,14 @@ sudo apt-get install xserver-xorg-core
 sudo apt-get install xserver-xorg
 ```
 
+#### 修改屏幕亮度
+挂起时是独显，恢复时是集显的话，屏幕亮度设置指向独显，导致不能设置。  
+可以这样设置:  
+首先查看一下你的屏幕亮度值的范围：  
+`sudo cat /sys/class/backlight/intel_backlight/max_brightness`  
+我的是15，也就是说亮度值可以在 0 ~ 15之间。  
+`echo 3 > /sys/class/backlight/intel_backlight/brightness`  
+
 #### Ubuntu 10.04 窗口关闭最大化最小化按钮位置调整
 使用图形界面“gconf-editor”修改这个配置文件。  
 我们要修改的项目在“apps/metacity/general”这里。依次点击“+”号展开按钮，导航到“general”项。  
@@ -67,6 +75,8 @@ smb://192.168.XX.XX/
 或注销再登录即要使用
 
 #### 更改工作区数量：
+compiz->常规选项->桌面尺寸  
+或者  
 要更改行的数量，请键入以下命令，将最终数量更改成您希望的数字。按回车。  
 `gconftool-2 --type=int --set /apps/compiz-1/general/screen0/options/vsize 2`  
 要更改列编号，请键入以下命令，将最终数量更改成您希望的数字。按回车。  
