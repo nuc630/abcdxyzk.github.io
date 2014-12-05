@@ -22,7 +22,7 @@
       // 搜索超时
 	setTimeout(function(){
 		settings.complete();
-	},10000);
+	},3000);
 
       $.getJSON(
         'http://tapirgo.com/api/1/search.json?token=' + settings.token + '&query=' + paramValue(settings.query_param) + '&callback=?', function(data){
