@@ -55,7 +55,7 @@
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/10/10/debug-stap-inodewatch/">如何知道文件被那个进程写</a></h2>
+      <h2 class="entry-title"><a href="/blog/2013/11/29/debug-debuger-1/">调试器工作原理之一——基础篇</a></h2>
     
     
       <p class="meta">
@@ -64,189 +64,37 @@
 
 
 
-<time class='entry-date' datetime='2013-10-10T16:27:00+08:00'><span class='date'>2013-10-10</span> <span class='time'>16:27:00</span></time>
+<time class='entry-date' datetime='2013-11-29T09:33:00+08:00'><span class='date'>2013-11-29</span> <span class='time'>09:33:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>一个文件正在被进程写 我想查看这个进程 文件一直在增大 找不到谁在写 使用lsof也没找到</p>
+  <div class="entry-content"><p>英文原文：<a href="http://eli.thegreenplace.net/2011/01/23/how-debuggers-work-part-1/">Eli Bendersky</a>  编译：<a href="http://blog.jobbole.com/23463/">陈舸</a><br/>
+调试器工作原理之一——基础篇<br/>
+<a href="/blog/2013/11/29/debug-debuger-2/">调试器工作原理之二——实现断点</a><br/>
+<a href="/blog/2013/11/29/debug-debuger-3/">调试器工作原理之三——调试信息</a></p>
 
-<p>这个问题挺有普遍性的，解决方法应该很多，这里我给大家提个比较直观的方法。</p>
+<p>  本文是一系列探究调试器工作原理的文章的第一篇。我还不确定这个系列需要包括多少篇文章以及它们所涵盖的主题，但我打算从基础知识开始说起。</p>
 
-<p>linux下每个文件都会在某个块设备上存放，当然也都有相应的inode, 那么透过vfs.write我们就可以知道谁在不停的写入特定的设备上的inode。</p>
+<h4>关于本文</h4>
 
-<p>幸运的是systemtap的安装包里带了inodewatch.stp，位于/usr/local/share/doc/systemtap/examples/io目录下，就是用来这个用途的。</p>
+<p>  我打算在这篇文章中介绍关于Linux下的调试器实现的主要组成部分——ptrace系统调用。本文中出现的代码都在32位的Ubuntu系统上开发。请注意，这里出现的代码是同平台紧密相关的，但移植到别的平台上应该不会太难。</p>
 
-<p>我们来看下代码：</p>
+<h4>动机</h4>
 
-<p>$ cat inodewatch.stp</p>
+<p> 要想理解我们究竟要做什么，试着想象一下调试器是如何工作的。调试器可以启动某些进程，然后对其进行调试，或者 将自己本身关联到一个已存在的进程之上。它可以单步运行代码，设置断点然后运行程序，检查变量的值以及跟踪调用栈。许多调试器已经拥有了一些高级特性，比 如执行表达式并在被调试进程的地址空间中调用函数，甚至可以直接修改进程的代码并观察修改后的程序行为。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#! /usr/bin/env stap
-</span><span class='line'> 
-</span><span class='line'>probe vfs.write, vfs.read
-</span><span class='line'>{
-</span><span class='line'>    # dev and ino are defined by vfs.write and vfs.read
-</span><span class='line'>    if (dev == MKDEV($1,$2) # major/minor device
-</span><span class='line'>        && ino == $3)
-</span><span class='line'>    printf ("%s(%d) %s 0x%x/%u\n",
-</span><span class='line'>        execname(), pid(), probefunc(), dev, ino)
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<p>  尽管现代的调试器都是复杂的大型程序，但令人惊讶的是构建调试器的基础确是如此的简单。调试器只用到了几个由操作系统以及编译器/链接器提供的基础服务，剩下的仅仅就是简单的编程问题了。（可查阅维基百科中关于这个词条的解释，作者是在反讽）</p>
 
+<h4>Linux下的调试——ptrace</h4>
 
-<p>这个脚本的使用方法如下： stap  inodewatch.stp major minor ino</p>
+<p>  Linux下调试器拥有一个瑞士军刀般的工具，这就是ptrace系统调用。这是一个功能众多且相当复杂的工 具，能允许一个进程控制另一个进程的运行，而且可以监视和渗入到进程内部。ptrace本身需要一本中等篇幅的书才能对其进行完整的解释，这就是为什么我 只打算通过例子把重点放在它的实际用途上。让我们继续深入探寻。</p>
 
-<p>下面我们构造个场景： dd不停的写入一个文件，查出这个文件的ino, 以及它所在设备的major, minor, 运行stap脚本就可以得到答案。</p>
+<h4>遍历进程的代码</h4>
 
-<p>场景交代好了，我们来演示下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ pwd
-</span><span class='line'>/home/chuba
-</span><span class='line'>$ df
-</span><span class='line'>Filesystem           1K-blocks      Used Available Use% Mounted on
-</span><span class='line'>...
-</span><span class='line'>/dev/sdb1            1621245336 825209568 713681236  54% /home
-</span><span class='line'>...
-</span><span class='line'>$ ls -al /dev/sdb1
-</span><span class='line'>brw-rw---- 1 root disk 8, 17 Oct 24 11:22 /dev/sdb1 
-</span><span class='line'>$ rm -f test.dat && dd if=/dev/zero of=test.dat
-</span><span class='line'>^C9912890+0 records in
-</span><span class='line'>9912890+0 records out
-</span><span class='line'>5075399680 bytes (5.1 GB) copied, 26.8189 s, 189 MB/s</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个终端模拟文件的不停写入，同时在另外一个终端查验谁干的。这里我们已经知道设备的major/minor为8/17</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ stat -c '%i' test.dat
-</span><span class='line'>25337884
-</span><span class='line'>$ sudo stap /usr/local/share/doc/systemtap/examples/io/inodewatch.stp 8 17 25337884
-</span><span class='line'>dd(740) vfs_write 0x800011/25337884
-</span><span class='line'>dd(740) vfs_write 0x800011/25337884
-</span><span class='line'>dd(740) vfs_write 0x800011/25337884
-</span><span class='line'>dd(740) vfs_write 0x800011/25337884
-</span><span class='line'>dd(740) vfs_write 0x800011/25337884
-</span><span class='line'>dd(740) vfs_write 0x800011/25337884
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>看到了吧，dd是罪魁祸首，pid是740</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/09/21/ubuntu-dota2/">ubuntu dota2</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-09-21T23:51:00+08:00'><span class='date'>2013-09-21</span> <span class='time'>23:51:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>ERROR- You are missing the following 32-bit libraries, and Steam may not run:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo ln -s /usr/lib/i386-linux-gnu/mesa/libGL.so.1 /usr/lib</span></code></pre></td></tr></table></div></figure>
-
-
-<p>无法输入：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>export LC_CTYPE="en_US.UTF-8" && steam</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>一、集显</h4>
-
-<p>  ubuntu下，如果是intel的核心显卡，mesa低于9.2版本的话，会出现看不见树和看不见英雄的情况
-  这时候就要更新mesa到9.2，mesa9.2支持3.6之后的内核版本，如果内核低于3.6，就要先更新内核
-  ubuntu的解决办法:
-  查看当前mesa版本：glxinfo |grep -i opengl
-  查看当前内核版本：uname -a</p>
-
-<p>  sudo add-apt-repository ppa:xorg-edgers/ppa
-  sudo apt-get update
-  sudo apt-get install linux-generic-lts-raring  (更新内核)
-  sudo apt-get dist-upgrade mesa                 (更新mesa)
-  然后就是重启系统</p>
-
-<h4>二、独显</h4>
-
-<p>ubuntu 装独显 <a href="/blog/2013/03/26/ubuntu-use-nvidia/">ubuntu 12.04 N卡双显卡</a></p>
-
-<p>如果你想用独显玩dota2, 那么你需要用optirun steam来启动steam客户端，然后再启动游戏，这样游戏就是通过独显来渲染的。你也可以用普通的steam命令来启动steam，然后在dota2 游戏的属性中，加入启动方式optirun %command。 这样只有在启动游戏之后独显才会工作。</p>
-
-<p>用optirun -b primus %command%(记得要装primus)，效果更好。 // 用%command%在启动时画面会显示不全，但是好像用%command好像又不会用独显了</p>
-
-<p>primus默认是有垂直同步的，帧数当然会低，加个vblank_mode=0绝对秒杀virtualgl</p>
-
-<p>不能用vblank_mode=0 optirun -b primus programme做桥接启动程序，这样会拉低许多显卡性能，
-使用vblank_mode=0 primusrun programme，性能就上来了，我这里确实比optirun提高30%左右</p>
-
-<hr />
-
-<h5>1打开启动选项输入框</h5>
-
-<h5>2 输入所选命令（使用多个命令是中间用空格隔开，例如 -novid -international -console  ）</h5>
-
-<p>-novid （去除开始动画）<br/>
--console（命令面板）<br/>
--high （使dota2 的cpu和内存使用级为最高,也就是说让dota2 可以优先其他程序使用内存）<br/>
--windowed （窗口模式）</p>
-
-<h5>dota 2 console 命令</h5>
-
-<h6>1首先开启命令面板</h6>
-
-<h6>2输入常用命令</h6>
+<p>  我现在要写一个在“跟踪”模式下运行的进程的例子，这里我们要单步遍历这个进程的代码——由CPU所执行的机器 码（汇编指令）。我会在这里给出例子代码，解释每个部分，本文结尾处你可以通过链接下载一份完整的C程序文件，可以自行编译执行并研究。从高层设计来说， 我们要写一个程序，它产生一个子进程用来执行一个用户指定的命令，而父进程跟踪这个子进程。首先，main函数是这样的：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -267,37 +115,72 @@
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>net_graph 1 （ 网络状况显示）
-</span><span class='line'>    再来就是改变位置，有些人不喜欢显示在左边，这个时候可以输入：
-</span><span class='line'>　　net_graphpos 1
-</span><span class='line'>　　这样显示的数据就会变到右边
-</span><span class='line'>　　
-</span><span class='line'>　　net_graphpos 2
-</span><span class='line'>　　这样会变成中间
-</span><span class='line'>　　
-</span><span class='line'>　　net_graphpos 3
-</span><span class='line'>　　这样会变成左边
-</span><span class='line'>
-</span><span class='line'>dota_minimap_hero_size 650 （英雄在小地图上的大小 650 为正常值，可自行更改）
-</span><span class='line'>dota_force_right_click_attack 1 (英雄可以右键直接反补）
-</span><span class='line'>dota_hud_healthbars 1 （去掉生命条上的分隔）
-</span><span class='line'>dota_health_per_vertical_marker 250 （更改每一个分隔代表的血量 默认为250）
-</span><span class='line'>dota_disable_range_finder 0  （随时显示你的施法距离）（很有用）
-</span><span class='line'>dota_camera_accelerate 49 （任意调整观看视角）（没用过）
-</span><span class='line'>
-</span><span class='line'>dota2 一共有数百种命令，包括血的颜色，屏蔽某种声音等等，但是比较实际的就是这几种，其他的就不列举了。
-</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int main(int argc, char** argv)
+</span><span class='line'>{
+</span><span class='line'>    pid_t child_pid;
+</span><span class='line'> 
+</span><span class='line'>    if (argc &lt; 2) {
+</span><span class='line'>        fprintf(stderr, "Expected a program name as argument\n");
+</span><span class='line'>        return -1;
+</span><span class='line'>    }
+</span><span class='line'> 
+</span><span class='line'>    child_pid = fork();
+</span><span class='line'>    if (child_pid == 0)
+</span><span class='line'>        run_target(argv[1]);
+</span><span class='line'>    else if (child_pid &gt; 0)
+</span><span class='line'>        run_debugger(child_pid);
+</span><span class='line'>    else {
+</span><span class='line'>        perror("fork");
+</span><span class='line'>        return -1;
+</span><span class='line'>    }
+</span><span class='line'> 
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<p>  代码相当简单，我们通过fork产生一个新的子进程。随后的if语句块处理子进程（这里称为“目标进程”），而else if语句块处理父进程（这里称为“调试器”）。下面是目标进程：</p>
 
-<h4>Dota2 录像下载失败</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_target(const char* programname)
+</span><span class='line'>{
+</span><span class='line'>    procmsg("target started. will run '%s'\n", programname);
+</span><span class='line'> 
+</span><span class='line'>    /* Allow tracing of this process */
+</span><span class='line'>    if (ptrace(PTRACE_TRACEME, 0, 0, 0) &lt; 0) {
+</span><span class='line'>        perror("ptrace");
+</span><span class='line'>        return;
+</span><span class='line'>    }
+</span><span class='line'> 
+</span><span class='line'>    /* Replace this process's image with the given program */
+</span><span class='line'>    execl(programname, programname, 0);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
-<p>无法打开录像文件,请确保没有其他进程已打开此文件。</p>
 
-<p>在XXX\Steam\SteamApps\common\dota 2 beta\dota目录下新建一个名为replays的文件夹即可</p>
+<p>这部分最有意思的地方在ptrace调用。ptrace的原型是（在sys/ptrace.h）：</p>
 
-<hr />
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>long ptrace(enum __ptrace_request request,  pid_t pid, void *addr,  void *data);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  第一个参数是request，可以是预定义的以PTRACE_打头的常量值。第二个参数指定了进程id，第三以及第四个参数是地址和指向数据的指 针，用来对内存做操作。上面代码段中的ptrace调用使用了PTRACE_TRACEME请求，这表示这个子进程要求操作系统内核允许它的父进程对其跟 踪。这个请求在man手册中解释的非常清楚：<br/>
+  “表明这个进程由它的父进程来跟踪。任何发给这个进程的信号（除了SIGKILL）将导致该进程停止运行，而它的父进程会通过wait()获得通知。另外，该进程之后所有对exec()的调用都将使操作系统产生一个SIGTRAP信号发送给它，这让父进程有机会在新程序开始执行之前获得对子进程的控制权。如果不希望由父进程来跟踪的话，那就不应该使用这个请求。（pid、addr、data被忽略）”</p>
+
+<p>  我已经把这个例子中我们感兴趣的地方高亮显示了。注意，run_target在ptrace调用之后紧接着做的是通过execl来调用我们指定的程 序。这里就会像我们高亮显示的部分所解释的那样，操作系统内核会在子进程开始执行execl中指定的程序之前停止该进程，并发送一个信号给父进程。
+因此，是时候看看父进程需要做些什么了：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -317,167 +200,45 @@
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>net_graphheight "64"
-</span><span class='line'>这个等于是设置高度位置 大家如果分屏率不同 可以修改数字来决定位置 数字越小 会往下移动 
-</span><span class='line'>
-</span><span class='line'>net_graphinsetbottom "437"
-</span><span class='line'>这个等于是设置地步位置 大家如果分屏率不同 可以修改数字来决定位置 数字越小 会往上移动 
-</span><span class='line'>
-</span><span class='line'>net_graphinsetleft "0"
-</span><span class='line'>因为已经设置右边 这个保持0就OK 但是也记得输入一次 以防万一 
-</span><span class='line'>
-</span><span class='line'>net_graphinsetright "-83"
-</span><span class='line'>设置右边距离 记住这里是"-83" 不是83 负数越高 越往右 大家可以根据自己的需要改变数字 
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>net_graphproportionalfont "0"
-</span><span class='line'>这个是关键 字体比例问题 默认是1 设定为0以后 就会变成我图中那样的小字 
-</span><span class='line'>
-</span><span class='line'>net_graphtext "1"
-</span><span class='line'>这个没什么大问题 字体样式</span></code></pre></td></tr></table></div></figure>
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/08/29/tools-git-svn-base/">git-svn</a></h2>
-    
-    
-      <p class="meta">
-        
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_debugger(pid_t child_pid)
+</span><span class='line'>{
+</span><span class='line'>    int wait_status;
+</span><span class='line'>    unsigned icounter = 0;
+</span><span class='line'>    procmsg("debugger started\n");
+</span><span class='line'> 
+</span><span class='line'>    /* Wait for child to stop on its first instruction */
+</span><span class='line'>    wait(&wait_status);
+</span><span class='line'> 
+</span><span class='line'>    while (WIFSTOPPED(wait_status)) {
+</span><span class='line'>        icounter++;
+</span><span class='line'>        /* Make the child execute another instruction */
+</span><span class='line'>        if (ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0) &lt; 0) {
+</span><span class='line'>            perror("ptrace");
+</span><span class='line'>            return;
+</span><span class='line'>        }
+</span><span class='line'> 
+</span><span class='line'>        /* Wait for child to stop on its next instruction */
+</span><span class='line'>        wait(&wait_status);
+</span><span class='line'>    }
+</span><span class='line'> 
+</span><span class='line'>    procmsg("the child executed %u instructions\n", icounter);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
+<p>  通过上面的代码我们可以回顾一下，一旦子进程开始执行exec调用，它就会停止然后接收到一个SIGTRAP信号。父进程通过第一个wait调用正 在等待这个事件发生。一旦子进程停止（如果子进程由于发送的信号而停止运行，WIFSTOPPED就返回true），父进程就去检查这个事件。</p>
 
+<p>  父进程接下来要做的是本文中最有意思的地方。父进程通过PTRACE_SINGLESTEP以及子进程的id号来调用ptrace。这么做是告诉操 作系统——请重新启动子进程，但当子进程执行了下一条指令后再将其停止。然后父进程再次等待子进程的停止，整个循环继续得以执行。当从wait中得到的不 是关于子进程停止的信号时，循环结束。在正常运行这个跟踪程序时，会得到子进程正常退出（WIFEXITED会返回true）的信号。</p>
 
-<time class='entry-date' datetime='2013-08-29T14:37:00+08:00'><span class='date'>2013-08-29</span> <span class='time'>14:37:00</span></time>
-        
-      </p>
-    
-  </header>
+<p>  icounter会统计子进程执行的指令数量。因此我们这个简单的例子实际上还是做了点有用的事情——通过在命令行上指定一个程序名，我们的例子会执行这个指定的程序，然后统计出从开始到结束该程序执行过的CPU指令总数。让我们看看实际运行的情况。</p>
 
+<h4>实际测试</h4>
 
-  <div class="entry-content"><h4>常用</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1、git-svn clone your_svn_repository
-</span><span class='line'>2、git add/commit
-</span><span class='line'>3、git-svn rebase    获取中心svn repository的更新；
-</span><span class='line'>4、git-svn dcommit   将本地git库的修改同步到中心svn库。</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>git-svn默认包含在Git的安装包中，不过在Ubuntu中，git-svn是作为一个独立的Package需要额外安装的(sudo apt-get install git-svn)。安装后你就可以使用git svn xxx命令来操作中心SVN代码库了。当然如果你要使用与git svn等价的git-svn命令的话，你还需要将/usr/lib/git-core配置到你的PATH环境变量中，否则Shell会提示你无法找到 git-svn这个命令。</p>
-
-<ul>
-<li><p>检出一个已存在svn repository(类似于svn checkout)<br/>
-我们可以通过git-svn clone命令完成这个操作： git-svn clone your_svn_repository_url</p></li>
-<li><p>从中心服务器的svn repository获取最新更新<br/>
-这个操作可以通过"git-svn rebase"完成。注意这里用的是rebase，而不是update。update命令对于通过git-svn检出的svn repostory的git版本库是不可用的。</p></li>
-<li><p>查看提交历史日志<br/>
-这个简单，使用"git-svn log"，加上-v选项，还可以提供每次commit操作涉及的相关文件的详细信息。</p></li>
-<li><p>将本地代码同步到Svn服务器<br/>
-完成这一操作需要通过"git-svn dcommit"命令。这个命令会将你在本地使用git commit提交到本地代码库的所有更改逐一提交到svn库中。加上-n选项，则该命令不会真正执行commit到svn的操作，而是会显示会有哪些本地 变动将被commit到svn服务器。git-svn dcommit似乎不能单独提交某个本地版本的修改，而是一次批量提交所有与svn中心版本库的差异。</p></li>
-</ul>
-
-
-<h5>下面是一个git-svn的一般使用流程：</h5>
-
-<p>1、git-svn clone your_svn_repository；<br/>
-2、修改本地代码，使用git add/commit将修改提交到本地git库；<br/>
-3、定期使用git-svn rebase获取中心svn repository的更新；<br/>
-4、使用git-svn dcommit命令将本地git库的修改同步到中心svn库。</p>
-
-<h5>冲突</h5>
-
-<p>使用git-svn处理代码冲突的步骤有些繁琐，不过瑕不掩瑜吧。这里用一个小例子来说明一下。</p>
-
-<p>假设某svn中心库上的某个项目foo中只有一个源码文件foo.c：<br/>
-* 我在使用git-svn clone检出版本时，foo.c当时只有一个commit版本信息："svn v1"；<br/>
-* clone出来后，我在本地git库中修改foo.c，并通过git commit提交到本地git库中，版本为"git v1"；<br/>
-* 不过与此同时另外一个同事也在修改foo.c这个文件，并已经将他的修改提交到了svn库中，版本为"svn v2"；<br/>
-* 此时我使用git-svn dcommit尝试提交我的改动，git-svn提示我：<br/>
-  Committing to svn://10.10.1.1:80/foo &hellip;<br/>
-  M foo.c<br/>
-  事务过时: 过期: ”foo/foo.c“在事务“260-1” at /usr/lib/git-core/git-svn line 570<br/>
-* 使用git-svn rebase获取svn服务器上的最新foo.c，导致与foo.c冲突，不过此时svn版本信息已经添加到本地git库中(通过git log可以查看)，git-svn rebase提示你在解决foo.c的冲突后，运行git rebase &ndash;continue完成rebase操作；<br/>
-* 打开foo.c，修改代码，解决冲突；<br/>
-* 执行git rebase &ndash;continue，git提示我：<br/>
-    You must edit all merge conflicts and then<br/>
-    mark them as resolved using git add<br/>
-* 执行git add foo.c，告知git已完成冲突解决；<br/>
-* 再次执行git rebase &ndash;continue，提示"Applying: git v1"，此时"git v1"版本又一次成功加入本地版本库，你可通过git log查看；<br/>
-* 执行git-svn dcommit将foo.c的改动同步到svn中心库，到此算是完成一次冲突解决。</p>
-
-<ul>
-<li>设置忽略文件<br/>
-要忽略某些文件, 需要首先执行如下命令:<br/>
-git config &ndash;global core.excludesfile ~/.gitignore<br/>
-然后编辑 vi ~/.gitignore.<br/>
-例如: 需要忽略vim的临时文件，就写:<br/>
-.*.swp</li>
-</ul>
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/08/21/debug-kdump-base/">linux内核调试转储工具kdump crash</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-08-21T17:21:00+08:00'><span class='date'>2013-08-21</span> <span class='time'>17:21:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.ibm.com/developerworks/cn/linux/l-cn-kdump4/index.html">http://www.ibm.com/developerworks/cn/linux/l-cn-kdump4/index.html</a></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ crash vmlinux vmcore 
-</span><span class='line'>crash&gt; bt
-</span><span class='line'>crash&gt; dis -l ffffffff80081000
-</span><span class='line'>crash&gt; gdb x/8ub ffffffff90091000
-</span><span class='line'>......</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果是未完成文件可以尝试以最小方式调试</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ crash --minimal vmlinux vmcore
-</span><span class='line'>crash&gt; log</span></code></pre></td></tr></table></div></figure>
-
+<p>我编译了下面这个简单的程序，然后在我们的跟踪程序下执行：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -485,133 +246,19 @@ git config &ndash;global core.excludesfile ~/.gitignore<br/>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_H_args_xbt&gt; mod -S
-</span><span class='line'> MODULE   NAME         SIZE  OBJECT FILE
-</span><span class='line'>c8019000  soundcore   2788  /lib/modules/2.2.5-15/misc/soundcore.o
-</span><span class='line'>。。。
-</span><span class='line'>crash_H_args_xbt&gt; mod -s soundcore
-</span><span class='line'> MODULE   NAME         SIZE  OBJECT FILE
-</span><span class='line'>c8019000  soundcore   2788  /lib/modules/2.2.5-15/misc/soundcore.o
-</span><span class='line'>crash_H_args_xbt&gt; mod -d soundcore
-</span><span class='line'>crash_H_args_xbt&gt; mod -s soundcore /tmp/soundcore.o
-</span><span class='line'> MODULE   NAME         SIZE  OBJECT FILE
-</span><span class='line'>c8019000  soundcore   2788  /tmp/soundcore.o</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    printf(“Hello, world!\n”);
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<p>  令我惊讶的是，我们的跟踪程序运行了很长的时间然后报告显示一共有超过100000条指令得到了执行。仅仅只是一个简单的printf调用，为什么 会这样？答案非常有意思。默认情况下，Linux中的gcc编译器会动态链接到C运行时库。这意味着任何程序在运行时首先要做的事情是加载动态库。这需要 很多代码实现——记住，我们这个简单的跟踪程序会针对每一条被执行的指令计数，不仅仅是main函数，而是整个进程。</p>
 
-<h4>1、kdump介绍与设置</h4>
+<p>  因此，当我采用-static标志静态链接这个测试程序时（注意到可执行文件因此增加了500KB的大小，因为它静态链接了C运行时库），我们的跟 踪程序报告显示只有7000条左右的指令被执行了。这还是非常多，但如果你了解到libc的初始化工作仍然先于main的执行，而清理工作会在main之 后执行，那么这就完全说得通了。而且，printf也是一个复杂的函数。</p>
 
-<h5>1）介绍：</h5>
-
-<p>Kdump 是一种基于 kexec 的内存转储工具，目前它已经被内核主线接收，成为了内核的一部分，它也由此获得了绝大多数 Linux 发行版的支持。与传统的内存转储机制不同不同，基于 Kdump 的系统工作的时候需要两个内核，一个称为系统内核，即系统正常工作时运行的内核；另外一个称为捕获内核，即正常内核崩溃时，用来进行内存转储的内核。</p>
-
-<p>安装crash，kexec-tools</p>
-
-<h5>2）设置</h5>
-
-<p>查看/boot/grub/grub.conf文件中kernel一行最后是否有crashkernel=128M@64M，如果没有，添加上去，重启<br/>
-如何设定 crashkernel 参数<br/>
-在 kdump 的配置中，往往困惑于 crashkernel 的设置。“crashkernel=X@Y”，X 应该多大？ Y 又应该设在哪里呢？实际我们 可以完全省略“@Y”这一部分，这样，kernel 会为我们自动选择一个起始地址。而对于 X 的大小，般对 i386/x86_64 的系统， 设为 128M 即可；对于 powerpc 的系统，则要设为 256M。rhel6 引入的“auto”已经要被放弃了，代之以原来就有的如下语法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crashkernel=&lt;range1&gt;:&lt;size1&gt;[,&lt;range2&gt;:&lt;size2&gt;,...][@offset] 
-</span><span class='line'>          range=start-[end] 
-</span><span class='line'>          'start' is inclusive and 'end' is exclusive. 
-</span><span class='line'>
-</span><span class='line'>          For example: 
-</span><span class='line'>          crashkernel=512M-2G:64M,2G-:128M</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如何判断捕获内核是否加载<br/>
-可通过查看 /sys/kernel/kexec_crash_loaded 的值。“1”为已经加载，“0”为还未加载。<br/>
-缩小 crashkernel<br/>
-可以通过向 /sys/kernel/kexec_crash_size 中输入一个比其原值小的数来缩小甚至完全释放 crashkernel。</p>
-
-<h5>3）测试kdump是否可用</h5>
-
-<p>执行</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>echo 1 &gt; /proc/sys/kernel/sysrq
-</span><span class='line'>echo c &gt; /proc/sysrq-trigger</span></code></pre></td></tr></table></div></figure>
-
-
-<p>经过两次自动重启后，查看/var/crash/目录下是否有vmcore文件生成,如果有表示kdump可用</p>
-
-<h4>2、生成带调试信息的vmlinux文件</h4>
-
-<h5>1）</h5>
-
-<p>centos: debuginfo.centos.org</p>
-
-<h5>2）按顺序安装</h5>
-
-<p>kernel-debuginfo-common-2.6.18-194.3.1.el5.i686.rpm和kernel-debuginfo-2.6.18-194.3.1.el5.i686.rpm，
-之后会在/usr/lib/debug/lib/modules/2.6.18-194.3.1.el5/下生产vmlinux文件<br/>
-或在源码里make binrpm-pkg -j8，然后该目录下会生成一个vmlinux<br/>
-在编译内核之前，需要确认.config中，以下编译选项是否打开：</p>
-
-<blockquote><p>（1）CONFIG_DEBUG_INFO ，必须打开该选项，否则crash会出现以下错误：<br/>
-  crash no debugging data available<br/>
-（2）CONFIG_STRICT_DEVMEM,必须打开该选项，否则crash会出现以下错误：<br/>
-  crash: read error: kernel virtual address: c0670680  type: &ldquo;kernel_config_data&rdquo;<br/>
-  WARNING: cannot read kernel_config_data<br/>
-  crash: read error: kernel virtual address: c066bb68  type: &ldquo;cpu_possible_mask&rdquo;</p></blockquote>
-
-<h4>3、进入vmlinux所在目录，</h4>
-
-<p>执行crash /var/crash/2012-03-13-21:05/vmcore vmlinux <br/>
-mod -S XXX  &ndash;导入XXX目录下所有符号<br/>
-log &ndash;查看日志文件，找到最后一条，如EIP: [<f8ee53f5>] bshtej_interrupt+0x103f/0x11cb [tej21] SS:ESP 0068:c0768f38<br/>
-l* bshtej_interrupt+0x103f 出现如下内容</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>0xf8ee53f5 is in bshtej_interrupt (/opt/dahdi-linux-complete-2.2.1+2.2.1/linux/drivers/dahdi/tej21/tej21.c:2910).
-</span><span class='line'>2904          int c, x;
-</span><span class='line'>2905
-</span><span class='line'>2906
-</span><span class='line'>2907          for(c = 0; c &lt; MAX_CARDS; c++)
-</span><span class='line'>2908          {
-</span><span class='line'>2909              if (!cards[c]) break;
-</span><span class='line'>2910              for (x=0;x&lt;cards[c]-&gt;numspans;x++) {
-</span><span class='line'>2911                  if (cards[c]-&gt;tspans[x]-&gt;sync)
-</span><span class='line'>2912                  {
-</span><span class='line'>2913</span></code></pre></td></tr></table></div></figure>
-
-
-<p>到此可确定死机问题出现在2910行。</p>
-
-<h4>4、设置过滤等级：</h4>
-
-<p>vmcore文件一般会收集内核崩溃时的各种信息，所以生成时间会较长，文件比较大，如果不需要某些信息的话，可对kdump.conf文件进行配置</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>vim  /etc/kdump.conf</span></code></pre></td></tr></table></div></figure>
-
-
-<p>将core_collector makedumpfile -c 这行打开，并加上-d 31，参数说明如下：</p>
+<p>  我们还是不满足于此，我希望能看到一些可检测的东西，例如我可以从整体上看到每一条需要被执行的指令是什么。这一点我们可以通过汇编代码来得到。因此我把这个“Hello，world”程序汇编（gcc -S）为如下的汇编码：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -628,31 +275,371 @@ l* bshtej_interrupt+0x103f 出现如下内容</p>
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>-c: Compress dump data by each page.
-</span><span class='line'>-d: Specify the type of unnecessary page for analysis.
-</span><span class='line'>  Dump  | zero    cache   cache   user    free
-</span><span class='line'>  Level | page    page    private data    page
-</span><span class='line'>  -------+---------------------------------------
-</span><span class='line'>  0  |
-</span><span class='line'>  1  |    X
-</span><span class='line'>  2  |        X
-</span><span class='line'>  4  |        X   X
-</span><span class='line'>  8  |                X
-</span><span class='line'>  16  |                   X
-</span><span class='line'>  31  |   X   X   X   X   X
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>section  .text
+</span><span class='line'>    ; The _start symbol must be declared for the linker (ld)
+</span><span class='line'>    global _start
+</span><span class='line'> 
+</span><span class='line'>_start:
+</span><span class='line'> 
+</span><span class='line'>    ; Prepare arguments for the sys_write system call:
+</span><span class='line'>    ;   - eax: system call number (sys_write)
+</span><span class='line'>    ;   - ebx: file descriptor (stdout)
+</span><span class='line'>    ;   - ecx: pointer to string
+</span><span class='line'>    ;   - edx: string length
+</span><span class='line'>    mov   edx, len
+</span><span class='line'>    mov   ecx, msg
+</span><span class='line'>    mov   ebx, 1
+</span><span class='line'>    mov   eax, 4
+</span><span class='line'> 
+</span><span class='line'>    ; Execute the sys_write system call
+</span><span class='line'>    int   0x80
+</span><span class='line'> 
+</span><span class='line'>    ; Execute sys_exit
+</span><span class='line'>    mov   eax, 1
+</span><span class='line'>    int   0x80
+</span><span class='line'> 
+</span><span class='line'>section   .data
+</span><span class='line'>msg db    'Hello, world!', 0xa
+</span><span class='line'>len equ   $ - msg</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这就足够了。现在跟踪程序会报告有7条指令得到了执行，我可以很容易地从汇编代码来验证这一点。</p>
+
+<h4>深入指令流</h4>
+
+<p>汇编码程序得以让我为大家介绍ptrace的另一个强大的功能——详细检查被跟踪进程的状态。下面是run_debugger函数的另一个版本：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_debugger(pid_t child_pid)
+</span><span class='line'>{
+</span><span class='line'>    int wait_status;
+</span><span class='line'>    unsigned icounter = 0;
+</span><span class='line'>    procmsg("debugger started\n");
+</span><span class='line'> 
+</span><span class='line'>    /* Wait for child to stop on its first instruction */
+</span><span class='line'>    wait(&wait_status);
+</span><span class='line'> 
+</span><span class='line'>    while (WIFSTOPPED(wait_status)) {
+</span><span class='line'>        icounter++;
+</span><span class='line'>        struct user_regs_struct regs;
+</span><span class='line'>        ptrace(PTRACE_GETREGS, child_pid, 0, ®s);
+</span><span class='line'>        unsigned instr = ptrace(PTRACE_PEEKTEXT, child_pid, regs.eip, 0);
+</span><span class='line'> 
+</span><span class='line'>        procmsg("icounter = %u.  EIP = 0x%08x.  instr = 0x%08x\n",
+</span><span class='line'>                    icounter, regs.eip, instr);
+</span><span class='line'> 
+</span><span class='line'>        /* Make the child execute another instruction */
+</span><span class='line'>        if (ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0) &lt; 0) {
+</span><span class='line'>            perror("ptrace");
+</span><span class='line'>            return;
+</span><span class='line'>        }
+</span><span class='line'> 
+</span><span class='line'>        /* Wait for child to stop on its next instruction */
+</span><span class='line'>        wait(&wait_status);
+</span><span class='line'>    }
+</span><span class='line'> 
+</span><span class='line'>    procmsg("the child executed %u instructions\n", icounter);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  同前个版本相比，唯一的不同之处在于while循环的开始几行。这里有两个新的ptrace调用。第一个读取进程的寄存器值到一个结构体中。结构体 user_regs_struct定义在sys/user.h中。这儿有个有趣的地方——如果你打开这个头文件看看，靠近文件顶端的地方有一条这样的注 释：<br/>
+1<br/>
+/<em> 本文件的唯一目的是为GDB，且只为GDB所用。对于这个文件，不要看的太多。除了GDB以外不要用于任何其他目的，除非你知道你正在做什么。</em>/<br/>
+现在，我不知道你是怎么想的，但我感觉我们正处于正确的跑道上。无论如何，回到我们的例子上来。一旦我们将所有的寄存器值获取到regs中，我们就 可以通过PTRACE_PEEKTEXT标志以及将regs.eip（x86架构上的扩展指令指针）做参数传入ptrace来调用。我们所得到的就是指 令。让我们在汇编代码上运行这个新版的跟踪程序。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ simple_tracer traced_helloworld
+</span><span class='line'>[5700] debugger started
+</span><span class='line'>[5701] target started. will run 'traced_helloworld'
+</span><span class='line'>[5700] icounter = 1.  EIP = 0x08048080.  instr = 0x00000eba
+</span><span class='line'>[5700] icounter = 2.  EIP = 0x08048085.  instr = 0x0490a0b9
+</span><span class='line'>[5700] icounter = 3.  EIP = 0x0804808a.  instr = 0x000001bb
+</span><span class='line'>[5700] icounter = 4.  EIP = 0x0804808f.  instr = 0x000004b8
+</span><span class='line'>[5700] icounter = 5.  EIP = 0x08048094.  instr = 0x01b880cd
+</span><span class='line'>Hello, world!
+</span><span class='line'>[5700] icounter = 6.  EIP = 0x08048096.  instr = 0x000001b8
+</span><span class='line'>[5700] icounter = 7.  EIP = 0x0804809b.  instr = 0x000080cd
+</span><span class='line'>[5700] the child executed 7 instructions</span></code></pre></td></tr></table></div></figure>
+
+
+<p>OK，所以现在除了icounter以外，我们还能看到指令指针以及每一步的指令。如何验证这是否正确呢？可以通过在可执行文件上执行objdump –d来实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ objdump -d traced_helloworld
+</span><span class='line'> 
+</span><span class='line'>traced_helloworld:    file format elf32-i386
+</span><span class='line'> 
+</span><span class='line'>Disassembly of section .text:
+</span><span class='line'> 
+</span><span class='line'>08048080 &lt;.text&gt;:
+</span><span class='line'> 8048080: ba 0e 00 00 00      mov    $0xe,%edx
+</span><span class='line'> 8048085: b9 a0 90 04 08      mov    $0x80490a0,%ecx
+</span><span class='line'> 804808a: bb 01 00 00 00      mov    $0x1,%ebx
+</span><span class='line'> 804808f: b8 04 00 00 00      mov    $0x4,%eax
+</span><span class='line'> 8048094: cd 80               int    $0x80
+</span><span class='line'> 8048096: b8 01 00 00 00      mov    $0x1,%eax
+</span><span class='line'> 804809b: cd 80               int    $0x80</span></code></pre></td></tr></table></div></figure>
+
+
+<p>用这份输出对比我们的跟踪程序输出，应该很容易观察到相同的地方。</p>
+
+<h4>关联到运行中的进程上</h4>
+
+<p>你已经知道了调试器也可以关联到已经处于运行状态的进程上。看到这里，你应该不会感到惊讶，这也是通过ptrace来实现的。这需要通过 PTRACE_ATTACH请求。这里我不会给出一段样例代码，因为通过我们已经看到的代码，这应该很容易实现。基于教学的目的，这里采用的方法更为便捷 （因为我们可以在子进程刚启动时立刻将它停止）。</p>
+
+<h4>代码</h4>
+
+<p>本文给出的这个简单的跟踪程序的完整代码（更高级一点，可以将具体指令打印出来）可以在这里找到。程序通过-Wall –pedantic –std=c99编译选项在4.4版的gcc上编译。</p>
+
+<h4>结论及下一步要做的</h4>
+
+<p>诚然，本文并没有涵盖太多的内容——我们离一个真正可用的调试器还差的很远。但是，我希望这篇文章至少已经揭开了调试过程的神秘面纱。ptrace是一个拥有许多功能的系统调用，目前我们只展示了其中少数几种功能。
+能够单步执行代码是很有用处的，但作用有限。以“Hello， world”为例，要到达main函数，需要先遍历好几千条初始化C运行时库的指令。这就不太方便了。我们所希望的理想方案是可以在main函数入口处设 置一个断点，从断点处开始单步执行。下一篇文章中我将向您展示该如何实现断点机制。</p>
+
+<h4>参考文献</h4>
+
+<p>写作本文时我发现下面这些文章很有帮助：<br/>
+<a href="http://www.linuxjournal.com/article/6100?page=0,1">Playing with ptrace, Part I</a><br/>
+<a href="http://linuxgazette.net/81/sandeep.html">Process tracing using ptrace</a><br/>
+<a href="http://www.alexonlinux.com/how-debugger-works">How debugger works</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/11/21/freebsd/">freeBSD9.2 安装 && 允许root用户用SSH登录</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-11-21T16:15:00+08:00'><span class='date'>2013-11-21</span> <span class='time'>16:15:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>一</h4>
+
+<p><a href="http://forums.freebsd.org/showthread.php?t=36579">http://forums.freebsd.org/showthread.php?t=36579</a></p>
+
+<p>Issue:<br/>
+Here is the error message that I&rsquo;ve got:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Code:
 </span><span class='line'>
-</span><span class='line'>##### 5、根据Oops值大致判断错误：
-</span><span class='line'>Oops的错误代码根据错误的原因会有不同的定义如果发现自己遇到的Oops和下面无法对应的话，最好去内核代码里查找：</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>cd0 at umass-sim0 bus 0 scbus3 target 0 lun 0
+</span><span class='line'>cd0: &lt;ASUS SDRW-08D2S-U B302&gt; Removable CD-ROM SCSI-0 device
+</span><span class='line'>cd0: 40.000MB/s transfers
+</span><span class='line'>cd0: cd present [1166275 x 2048 byte records]Mounting from cd9660:/dev/iso9660/FREEBSD_INSTALL failed with error 19.
+</span><span class='line'>
+</span><span class='line'>Loader variables:
+</span><span class='line'>    vfs.root.mountfrom=cd9660:/dev/iso9660/FREEBSD_INSTALL
+</span><span class='line'>    vfs.root.mountfrom.option=ro
+</span><span class='line'>
+</span><span class='line'>Manual root filesystem specification:
+</span><span class='line'>    &lt;fstype&gt;:&lt;device&gt; [option]
+</span><span class='line'>        Mount &lt;device&gt; using filesystem &lt;fstype&gt;
+</span><span class='line'>        and with the specified (optional) option list.
+</span><span class='line'>
+</span><span class='line'>    eg. ufs:/dev/da0s1a
+</span><span class='line'>        zf:tank
+</span></code></pre></td></tr></table></div></figure>
 
 
-<ul>
-<li>error_code:</li>
-<li>  bit 0 == 0 means no page found, 1 means protection fault</li>
-<li>  bit 1 == 0 means read, 1 means write</li>
-<li>  bit 2 == 0 means kernel, 1 means user-mode</li>
-<li>  bit 3 == 0 means data, 1 means instruction
-```</li>
-</ul>
+<p>The system seems to recognize the DVD drive but is unable to mount the media correctly.</p>
+
+<p>You need to get a boot prompt and disable ACPI support before booting:<br/>
+这两句好像没效果</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># set debug.acpi.disabled ="hostres"
+</span><span class='line'># boot</span></code></pre></td></tr></table></div></figure>
+
+
+<p>The solution is actually in the FreeBSD 9 errata (section 3)</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mountroot&gt; cd9660:/dev/cd0  用这句通过</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这句不只道可不可以：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mountroot&gt; cd9660:/iso9660/FREEBSD_INSTALL</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>二 FreeBSD 允许root用户用SSH登录</h4>
+
+<p>修改freebsd可以用sshd权限用户登录ssh<br/>
+在/etc/ssh/sshd_config最后中加入</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>PermitRootLogin yes #允许root登录
+</span><span class='line'>PermitEmptyPasswords no #不允许空密码登录
+</span><span class='line'>PasswordAuthentication yes # 设置是否使用口令验证。</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>FreeBSD SSH配置详解
+首先vi编辑/etc/inetd.conf,去掉ssh前的#，保存退出 (开启监听ssh服务)<br/>
+编辑/etc/rc.conf<br/>
+最后加入:sshd_enable=&ldquo;yes"即可</p>
+
+<p>激活sshd服务：<br/>
+    #/etc/rc.d/sshd start</p>
+
+<p>用下面命令检查服务是否启动，在22端口应该有监听。<br/>
+    #netstat -an ## check port number 22<br/>
+最后<br/>
+vi /etc/ssh/sshd_config</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>...
+</span><span class='line'>Subsystem sftp /usr/libexec/sftp-server
+</span><span class='line'>IgnoreRhosts yes
+</span><span class='line'>IgnoreUserKnownHosts yes
+</span><span class='line'>PrintMotd yes
+</span><span class='line'>StrictModes no
+</span><span class='line'>RSAAuthentication yes
+</span><span class='line'>PermitRootLogin yes #允许root登录
+</span><span class='line'>PermitEmptyPasswords no #不允许空密码登录
+</span><span class='line'>PasswordAuthentication yes # 设置是否使用口令验证。</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>记得修改完配置文件后，重新启动sshd服务器(/etc/rc.d/sshd restart)即可。<br/>
+几点补充说明</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1,如果重启后还是不行请重新载入sshd_config 文件
+</span><span class='line'>/etc/rc.d/sshd reload
+</span><span class='line'>2,如果出现using keyboard-interactive authentication
+</span><span class='line'>password:
+</span><span class='line'>请确认PasswordAuthentication是否已经改成yes
+</span><span class='line'>另外如果客户端是putty那么请确认"尝试'智能键盘'认证（SSH-2）"的勾是否有去掉
+</span><span class='line'>3,如果是使用root帐号登陆
+</span><span class='line'>请确认密码是否为空
+</span><span class='line'>空密码无法登陆
+</span><span class='line'>4请确认是否有安装SSH
+</span><span class='line'>sysinstall&gt;&gt;&gt;configure&gt;&gt;&gt;networking&gt;&gt;&gt;sshd是否的勾是否有打上</span></code></pre></td></tr></table></div></figure>
 
 </div>
   
@@ -666,7 +653,7 @@ l* bshtej_interrupt+0x103f 出现如下内容</p>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/06/21/compiler-makefile-shell/">Makefile与Shell的问题</a></h2>
+      <h2 class="entry-title"><a href="/blog/2013/11/20/lang-c-buildin-addr/">__builtin_return_address获得程序运行栈</a></h2>
     
     
       <p class="meta">
@@ -675,34 +662,14 @@ l* bshtej_interrupt+0x103f 出现如下内容</p>
 
 
 
-<time class='entry-date' datetime='2013-06-21T18:28:00+08:00'><span class='date'>2013-06-21</span> <span class='time'>18:28:00</span></time>
+<time class='entry-date' datetime='2013-11-20T18:34:00+08:00'><span class='date'>2013-11-20</span> <span class='time'>18:34:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>  大概只要知 道Makefile的人，都知道Makefile可以调用Shell脚本。但是在实际使用时，并不那么简单，一些模棱两可的地方可能会让你抓狂。你若不信，可以先看几个例子，想象一下这些这些例子会打印什么内容，记下你想象的结果，然后在计算机上运行这些例子，对照看一下。</p>
-
-<p>示例一：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if [ "$(BUILD)" = "debug" ]; then
-</span><span class='line'>    echo "build debug"; 
-</span><span class='line'>else
-</span><span class='line'>    echo "build release";
-</span><span class='line'>fi
-</span><span class='line'>all:
-</span><span class='line'>    echo "done"</span></code></pre></td></tr></table></div></figure>
-
-
-<p>示例二：</p>
+  <div class="entry-content"><p>  gcc的编译特性使用<code>__builtin_return_address(level)</code>打印出一个函数的堆栈地址。其中 level代表是堆栈中第几层调用地址，<code>__builtin_return_address(0)</code>表示第一层调用地址，即当前函数，<code>__builtin_return_address(1)</code>表示第二层。如代码</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -713,40 +680,65 @@ l* bshtej_interrupt+0x103f 出现如下内容</p>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>all:
-</span><span class='line'>    @CC=arm-linux-gcc
-</span><span class='line'>    @echo $(CC)
-</span><span class='line'>```
-</span><span class='line'>示例三：  
-</span><span class='line'>```
-</span><span class='line'>CC=arm-linux-gcc
-</span><span class='line'>all:
-</span><span class='line'>    @echo $(CC)</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>
+</span><span class='line'>void f()
+</span><span class='line'>{
+</span><span class='line'>    printf("%p,%p" , __builtin_return_address(0), __builtin_return_address(1));
+</span><span class='line'>    //printk("Caller is %pS\n", __builtin_return_address(0));
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>void g()
+</span><span class='line'>{
+</span><span class='line'>    f();
+</span><span class='line'>}
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    g();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>示例四：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>SUBDIR=src example
-</span><span class='line'>all:
-</span><span class='line'>    @for subdir in $(SUBDIR);
-</span><span class='line'>    do
-</span><span class='line'>        echo "building " $(subdir);
-</span><span class='line'>    done</span></code></pre></td></tr></table></div></figure>
+<p>分别打印出函数f()和g() 的函数地址，我们通过objdump 出来的文件去查找打印出来的函数地址，这样就能看到调用的函数名了。</p>
+</div>
+  
+  
 
 
-<h4>说明：</h4>
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/11/05/compiler-cal/">编译期间求值</a></h2>
+    
+    
+      <p class="meta">
+        
 
-<ol>
-<li>Shell脚本在target里才有效，其它地方都被忽略掉了。所以示例一中，”build debug”之类的字符串根本打印不出来。示例一的正确写法是：
-示例一：</li>
-</ol>
 
+
+
+<time class='entry-date' datetime='2013-11-05T14:26:00+08:00'><span class='date'>2013-11-05</span> <span class='time'>14:26:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>编译期求阶乘</p>
+
+<h4>c++ 中的模板可以用来计算一些值，在编译的时候就是实现计算，而不是运行的时候。</h4>
+
+<p>求阶乘 n!，一般 me 们会写个这样的程序：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -755,41 +747,28 @@ l* bshtej_interrupt+0x103f 出现如下内容</p>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>all:
-</span><span class='line'>    if [ "$(BUILD)" = "debug" ]; then
-</span><span class='line'>        echo "build debug";
-</span><span class='line'>    else
-</span><span class='line'>        echo "build release";
-</span><span class='line'>    fi
-</span><span class='line'>    echo "done"</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;iostream&gt;
+</span><span class='line'>long Factorial(long n)
+</span><span class='line'>{
+</span><span class='line'>    return n == 0 ? 1 : n*Factorial(n-1);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    long fac=1, n=20;
+</span><span class='line'>    for(int i=1; i&lt;=n; ++i)fac *= i;
+</span><span class='line'>    std::cout &lt;&lt; "20! = " &lt;&lt; fac &lt;&lt; " " &lt;&lt; Factorial(20) &lt;&lt; std::endl;
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<ol>
-<li>make把每一行Shell脚本当作一个独立的单元，它们在单独的进程中运行。示例二中，两行Shell脚本在两个莫不相干的进程里运行，第一个进程把 CC设置为arm-linux-gcc，第二个进程是不知道的，所以打印的结果自然不是arm-linux-gcc了。示例二的正确写法是：<br/>
-示例二：</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>all:
-</span><span class='line'>    @CC=arm-linux-gcc; echo $(CC)
-</span><span class='line'>或者：
-</span><span class='line'>all:
-</span><span class='line'>    @CC=arm-linux-gcc;
-</span><span class='line'>    echo $(CC)</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li><p>make在调用Shell之前先进行预处理，即展开所有Makefile的变量和函数。这些变量和函数都以$开头。示例三中，Shell拿的脚本实际上是echo arm-linux-gcc，所以打印结果正确。</p></li>
-<li><p>make预处理时，所有以$开头的，它都不会放过。要想引用Shell自己的变量，应该以$$开头。另外要注意，Shell自己的变量是不需要括号的。示例四的正确写法是：<br/>
-示例四：</p></li>
-</ol>
-
+<p>现在使用模板技术，类似于递归的方法求 20 !。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -797,15 +776,258 @@ l* bshtej_interrupt+0x103f 出现如下内容</p>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>SUBDIR=src example
-</span><span class='line'>all:
-</span><span class='line'>    @for subdir in $(SUBDIR);
-</span><span class='line'>    do
-</span><span class='line'>        echo "building " $$subdir;
-</span><span class='line'>    done</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;iostream&gt;
+</span><span class='line'>
+</span><span class='line'>template&lt;int N&gt;
+</span><span class='line'>class Factorial{
+</span><span class='line'>public:
+</span><span class='line'>    static const long value = N*Factorial&lt;N-1&gt;::value;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>template&lt;&gt;
+</span><span class='line'>class Factorial&lt;0&gt;{
+</span><span class='line'>public:
+</span><span class='line'>    static const long value = 1;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    std::cout &lt;&lt; "20! = " &lt;&lt; Factorial&lt;20&gt;::value &lt;&lt; std::endl;
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>说明：<br/>
+  template 通常用来参数化类型，通常 class T 或是 typename T(T 用来代替一个类型的名字)，不过也可以带一个整型参数 N (貌似规定只能是整型)。<br/>
+  template &lt;> 是用来特殊指定一些情形，比如上面给的 Factorial<0> 指定 N = 0 时的情形，这有点像递归中的 if(n==0) return 1;<br/>
+  class 类中可以带有 static const 变量，这种变量可以在类内初始化(只能是整型)；当然既是 const 变量，又是 static 变量；<br/>
+  Factorila<20> 实际是一个类，而 ::value 是其 static 变量；在生成Factorila<20> 的时候同时生成了众多的Factorila<N> ( N >0 &amp;&amp; N &lt; 20)类；</p>
+
+<p>更多例子<br/>
+模板类，或是模版函数，或是模板成员函数，都是编译器根据程序的实际情况而生成的，需要什么就生成什么，不需要就不生成。上面的例子中， 程序中使用 Factorial<20> 这个类，就生成这个类，因为 Factorial<20> 依赖 Factorial<19> 所以又生成 Factorial<19> ，这样一直依赖下去，直到 Factorial<0>( me 们已经指定了)。因为是编译期生成，也是编译器求值，所以实际程序中只能使用 static const 类似的 —— 常量，而不能使用普通的 int n。所以，模板元编程中，么发使用循环，只能类似递归的技术。<br/>
+通常 me 们会将递归程序转换为循环程序，实际上循环程序基本也都可以递归解决。(是不是一定呢？O__O"…)<br/>
+求斐波那契数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;iostream&gt;
+</span><span class='line'>
+</span><span class='line'>template &lt;long N&gt;
+</span><span class='line'>struct Fibonacci{
+</span><span class='line'>    static const long value = Fibonacci&lt;N-1&gt;::value + Fibonacci&lt;N-2&gt;::value;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>template&lt;&gt;
+</span><span class='line'>struct Fibonacci&lt;0&gt;{
+</span><span class='line'>    static const long value = 0;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>template&lt;&gt;
+</span><span class='line'>struct Fibonacci&lt;1&gt;{
+</span><span class='line'>    static const long value = 1;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    std::cout &lt;&lt; Fibonacci&lt;12&gt;::value &lt;&lt; std::endl;
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第 12 个斐波那契数是 144，这是唯一一个 Fib(n) = n*n 的数。
+求 1+2+3+&hellip;+n</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;iostream&gt;
+</span><span class='line'>
+</span><span class='line'>template &lt;long N&gt;
+</span><span class='line'>struct Sum{
+</span><span class='line'>    static const long value = N+Sum&lt;N-1&gt;::value;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>template&lt;&gt;
+</span><span class='line'>struct Sum&lt;1&gt;{
+</span><span class='line'>    static const long value = 1;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    std::cout &lt;&lt; Sum&lt;100&gt;::value &lt;&lt; std::endl;
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个和 n! 的用法基本一样。</p>
+
+<h4>constexpr编译期求值</h4>
+
+<p>  模板只是在编译的时候完成工作的一种方法，实际上上面的模板元编程也只是在编译期求了一些常量而已；为了简化使用模板进行元编程的难度，c++11 引入了 constexpr 关键字 —— 声明常量或是函数，实现在编译期求值。上面的三个程序都可以大大简化：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;iostream&gt;
+</span><span class='line'>
+</span><span class='line'>constexpr long factorial(long n)
+</span><span class='line'>{
+</span><span class='line'>    return n&lt;=1 ? 1 : n*factorial(n-1);
+</span><span class='line'>}
+</span><span class='line'>constexpr long fibonacci(long n)
+</span><span class='line'>{
+</span><span class='line'>    return n&lt;=1 ? n : fibonacci(n-1)+fibonacci(n-2);
+</span><span class='line'>}
+</span><span class='line'>constexpr long sum(long n)
+</span><span class='line'>{
+</span><span class='line'>    return n&lt;=1 ? n : n+sum(n-1);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    std::cout &lt;&lt; "10! F(12) 1+2+...+100 =&gt; " &lt;&lt; factorial(10) &lt;&lt; " " &lt;&lt; fibonacci(12) &lt;&lt; " " &lt;&lt; sum(100) &lt;&lt; std::endl;
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>不用多数，看应该看得懂神马意思，要提的就是 constexpr 都是编译的时候求值。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/10/31/compiler-binutil-static/">binutils(含as、ld等)静态编译</a></h2>
+    
+    
+      <p class="meta">
+        
 
 
 
+
+<time class='entry-date' datetime='2013-10-31T14:47:00+08:00'><span class='date'>2013-10-31</span> <span class='time'>14:47:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>静态编译</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>./configure 后加   CFLAGS=-static --enable-static LDFLAGS=-static --disable-shared
+</span><span class='line'>./configure 后加   CFLAGS=-static LDFLAGS=-static</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>binutils-2.23.2 中gas、ld静态编译：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>./configure
+</span><span class='line'>make
+</span><span class='line'>cd gas
+</span><span class='line'>make clean
+</span><span class='line'>make LDFLAGS=-all-static</span></code></pre></td></tr></table></div></figure>
+
+
+<p>或者</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>./configure
+</span><span class='line'>vim gas/Makefile
+</span><span class='line'>     搜 --mode=link，找到 LINK = $(LIBTOOL) --tag=CC ...
+</span><span class='line'>     在CC后面加个参数 -all-static
+</span><span class='line'>make</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>原因：</h5>
+
+<p>他们链接的时候是通过 ./libtool 完成的，在libtool里有一行提示（./libtool &ndash;help没有显示这个提示)：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>-all-static       do not do any dynamic linking at all</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以就是要libtool增加-all-static参数</p>
 </div>
   
   
@@ -846,8 +1068,8 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/compiler/'>compiler</a><a href='##' onmousedown=showDiv('compiler') id='aexp_compiler'><span class='exp_style' id='exp_compiler'>[+]</span></a><span class='right_span'>(13)</span></li>
-<div id='compiler' class='catsub'><li><a href='/blog/cats/compiler~base/?opendiv=compiler'>base</a><a href='##' onmousedown=showDiv('compiler~base') id='aexp_compiler~base'><span class='exp_style' id='exp_compiler~base'>[+]</span></a><span class='right_span'>7</span></li>
+<li class='catclass'><a href='/blog/cats/compiler/'>compiler</a><a href='##' onmousedown=showDiv('compiler') id='aexp_compiler'><span class='exp_style' id='exp_compiler'>[+]</span></a><span class='right_span'>(15)</span></li>
+<div id='compiler' class='catsub'><li><a href='/blog/cats/compiler~base/?opendiv=compiler'>base</a><a href='##' onmousedown=showDiv('compiler~base') id='aexp_compiler~base'><span class='exp_style' id='exp_compiler~base'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('compiler~base')) document.getElementById('aexp_compiler~base').style.visibility = 'hidden';
 </script>
@@ -864,8 +1086,8 @@ if (!document.getElementById('compiler~lib')) document.getElementById('aexp_comp
 if (!document.getElementById('compiler')) document.getElementById('aexp_compiler').style.visibility = 'hidden';
 if (!document.getElementById('compiler~make')) document.getElementById('aexp_compiler~make').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(2)</span></li>
-<div id='assembly' class='catsub'><li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(12)</span></li>
+<div id='assembly' class='catsub'><li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>12</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
@@ -934,8 +1156,8 @@ if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(32)</span></li>
-<div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>7</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(40)</span></li>
+<div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
 </script>
@@ -947,7 +1169,7 @@ if (!document.getElementById('debug~debugedit')) document.getElementById('aexp_d
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>5</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>6</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -1023,7 +1245,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2014/'>2014</a><a href='##' onmousedown=showDiv('2014')><span class='exp_style' id='exp_2014'>[+]</span></a><span class='right_span'>(76)</span></li>
+<li class='catclass'><a href='/blog/cats/2014/'>2014</a><a href='##' onmousedown=showDiv('2014')><span class='exp_style' id='exp_2014'>[+]</span></a><span class='right_span'>(81)</span></li>
 <div id='2014' class='catsub'><li><a href='/blog/cats/2014~12/?opendiv=2014'>2014-12</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2014~11/?opendiv=2014'>2014-11</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2014~10/?opendiv=2014'>2014-10</a><span class='right_span'>12</span></li>
@@ -1032,33 +1254,34 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 <li><a href='/blog/cats/2014~07/?opendiv=2014'>2014-07</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2014~06/?opendiv=2014'>2014-06</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2014~05/?opendiv=2014'>2014-05</a><span class='right_span'>2</span></li>
-<li><a href='/blog/cats/2014~04/?opendiv=2014'>2014-04</a><span class='right_span'>3</span></li>
-<li><a href='/blog/cats/2014~03/?opendiv=2014'>2014-03</a><span class='right_span'>1</span></li>
-<li><a href='/blog/cats/2014~02/?opendiv=2014'>2014-02</a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/2014~04/?opendiv=2014'>2014-04</a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/2014~03/?opendiv=2014'>2014-03</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2014~02/?opendiv=2014'>2014-02</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2014~01/?opendiv=2014'>2014-01</a><span class='right_span'>1</span></li>
-</div><li class='catclass'><a href='/blog/cats/2013/'>2013</a><a href='##' onmousedown=showDiv('2013')><span class='exp_style' id='exp_2013'>[+]</span></a><span class='right_span'>(39)</span></li>
-<div id='2013' class='catsub'><li><a href='/blog/cats/2013~12/?opendiv=2013'>2013-12</a><span class='right_span'>4</span></li>
-<li><a href='/blog/cats/2013~11/?opendiv=2013'>2013-11</a><span class='right_span'>4</span></li>
+</div><li class='catclass'><a href='/blog/cats/2013/'>2013</a><a href='##' onmousedown=showDiv('2013')><span class='exp_style' id='exp_2013'>[+]</span></a><span class='right_span'>(47)</span></li>
+<div id='2013' class='catsub'><li><a href='/blog/cats/2013~12/?opendiv=2013'>2013-12</a><span class='right_span'>5</span></li>
+<li><a href='/blog/cats/2013~11/?opendiv=2013'>2013-11</a><span class='right_span'>8</span></li>
 <li><a href='/blog/cats/2013~10/?opendiv=2013'>2013-10</a><span class='right_span'>7</span></li>
 <li><a href='/blog/cats/2013~09/?opendiv=2013'>2013-09</a><span class='right_span'>1</span></li>
-<li><a href='/blog/cats/2013~08/?opendiv=2013'>2013-08</a><span class='right_span'>2</span></li>
-<li><a href='/blog/cats/2013~06/?opendiv=2013'>2013-06</a><span class='right_span'>5</span></li>
+<li><a href='/blog/cats/2013~08/?opendiv=2013'>2013-08</a><span class='right_span'>3</span></li>
+<li><a href='/blog/cats/2013~06/?opendiv=2013'>2013-06</a><span class='right_span'>7</span></li>
 <li><a href='/blog/cats/2013~05/?opendiv=2013'>2013-05</a><span class='right_span'>7</span></li>
 <li><a href='/blog/cats/2013~03/?opendiv=2013'>2013-03</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2013~02/?opendiv=2013'>2013-02</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2013~01/?opendiv=2013'>2013-01</a><span class='right_span'>1</span></li>
-</div><li class='catclass'><a href='/blog/cats/2012/'>2012</a><a href='##' onmousedown=showDiv('2012')><span class='exp_style' id='exp_2012'>[+]</span></a><span class='right_span'>(26)</span></li>
-<div id='2012' class='catsub'><li><a href='/blog/cats/2012~11/?opendiv=2012'>2012-11</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2012/'>2012</a><a href='##' onmousedown=showDiv('2012')><span class='exp_style' id='exp_2012'>[+]</span></a><span class='right_span'>(31)</span></li>
+<div id='2012' class='catsub'><li><a href='/blog/cats/2012~12/?opendiv=2012'>2012-12</a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/2012~11/?opendiv=2012'>2012-11</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2012~10/?opendiv=2012'>2012-10</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2012~08/?opendiv=2012'>2012-08</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2012~05/?opendiv=2012'>2012-05</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2012~04/?opendiv=2012'>2012-04</a><span class='right_span'>9</span></li>
 <li><a href='/blog/cats/2012~03/?opendiv=2012'>2012-03</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2012~02/?opendiv=2012'>2012-02</a><span class='right_span'>5</span></li>
-</div><li class='catclass'><a href='/blog/cats/2011/'>2011</a><a href='##' onmousedown=showDiv('2011')><span class='exp_style' id='exp_2011'>[+]</span></a><span class='right_span'>(13)</span></li>
+</div><li class='catclass'><a href='/blog/cats/2011/'>2011</a><a href='##' onmousedown=showDiv('2011')><span class='exp_style' id='exp_2011'>[+]</span></a><span class='right_span'>(15)</span></li>
 <div id='2011' class='catsub'><li><a href='/blog/cats/2011~12/?opendiv=2011'>2011-12</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2011~11/?opendiv=2011'>2011-11</a><span class='right_span'>4</span></li>
-<li><a href='/blog/cats/2011~08/?opendiv=2011'>2011-08</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2011~08/?opendiv=2011'>2011-08</a><span class='right_span'>3</span></li>
 <li><a href='/blog/cats/2011~07/?opendiv=2011'>2011-07</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2011~06/?opendiv=2011'>2011-06</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2011~05/?opendiv=2011'>2011-05</a><span class='right_span'>1</span></li>

@@ -1,0 +1,724 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>调试器工作原理之二——实现断点 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>慢慢搬迁中......</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" type="text" placeholder="search..." x-webkit-speech />
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">调试器工作原理之二——实现断点</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-11-29T09:34:00+08:00'><span class='date'>2013-11-29</span> <span class='time'>09:34:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="/blog/2013/11/29/debug-debuger-1/">调试器工作原理之一——基础篇</a><br/>
+调试器工作原理之二——实现断点<br/>
+<a href="/blog/2013/11/29/debug-debuger-3/">调试器工作原理之三——调试信息</a></p>
+
+<h4>本文的主要内容</h4>
+
+<p>  这里我将说明调试器中的断点机制是如何实现的。断点机制是调试器的两大主要支柱之一 ——另一个是在被调试进程的内存空间中查看变量的值。我们已经在第一篇文章中稍微涉及到了一些监视被调试进程的知识，但断点机制仍然还是个迷。阅读完本文之后，这将不再是什么秘密了。</p>
+
+<h4>软中断</h4>
+
+<p>  要在x86体系结构上实现断点我们要用到软中断（也称为“陷阱”trap）。在我们深入细节之前，我想先大致解释一下中断和陷阱的概念。</p>
+
+<p>  CPU有一个单独的执行序列，会一条指令一条指令的顺序执行。要处理类似IO或者硬件时钟这样的异步事件时CPU就要用到中断。硬件中断通常是一个 专门的电信号，连接到一个特殊的“响应电路”上。这个电路会感知中断的到来，然后会使CPU停止当前的执行流，保存当前的状态，然后跳转到一个预定义的地 址处去执行，这个地址上会有一个中断处理例程。当中断处理例程完成它的工作后，CPU就从之前停止的地方恢复执行。</p>
+
+<p>  软中断的原理类似，但实际上有一点不同。CPU支持特殊的指令允许通过软件来模拟一个中断。当执行到这个指令时，CPU将其当做一个中断——停止当 前正常的执行流，保存状态然后跳转到一个处理例程中执行。这种“陷阱”让许多现代的操作系统得以有效完成很多复杂任务（任务调度、虚拟内存、内存保护、调 试等）。
+一些编程错误（比如除0操作）也被CPU当做一个“陷阱”，通常被认为是“异常”。这里软中断同硬件中断之间的界限就变得模糊了，因为这里很难说这种异常到底是硬件中断还是软中断引起的。我有些偏离主题了，让我们回到关于断点的讨论上来。</p>
+
+<h4>关于int 3指令</h4>
+
+<p>  看过前一节后，现在我可以简单地说断点就是通过CPU的特殊指令——int 3来实现的。int就是x86体系结构中的“陷阱指令”——对预定义的中断处理例程的调用。x86支持int指令带有一个8位的操作数，用来指定所发生的 中断号。因此，理论上可以支持256种“陷阱”。前32个由CPU自己保留，这里第3号就是我们感兴趣的——称为“trap to debugger”。</p>
+
+<p>  不多说了，我这里就引用“圣经”中的原话吧（这里的圣经就是Intel’s Architecture software developer’s manual, volume2A）：<br/>
+  “INT 3指令产生一个特殊的单字节操作码（CC），这是用来调用调试异常处理例程的。（这个单字节形式非常有价值，因为这样可以通过一个断点来替换掉任何指令的第一个字节，包括其它的单字节指令也是一样，而不会覆盖到其它的操作码）。”</p>
+
+<p>上面这段话非常重要，但现在解释它还是太早，我们稍后再来看。</p>
+
+<h4>使用int 3指令</h4>
+
+<p>  是的，懂得事物背后的原理是很棒的，但是这到底意味着什么？我们该如何使用int 3来实现断点机制？套用常见的编程问答中出现的对话——请用代码说话！
+实际上这真的非常简单。一旦你的进程执行到int 3指令时，操作系统就将它暂停。在Linux上（本文关注的是Linux平台），这会给该进程发送一个SIGTRAP信号。</p>
+
+<p>  这就是全部——真的！现在回顾一下本系列文章的第一篇，跟踪（调试器）进程可以获得所有其子进程（或者被关联到的进程）所得到信号的通知，现在你知道我们该做什么了吧？
+  就是这样，再没有什么计算机体系结构方面的东东了，该写代码了。</p>
+
+<h4>手动设定断点</h4>
+
+<p>现在我要展示如何在程序中设定断点。用于这个示例的目标程序如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>section  .text
+</span><span class='line'>  ; The _start symbol must be declared for the linker (ld)
+</span><span class='line'>  global _start
+</span><span class='line'> 
+</span><span class='line'>_start:
+</span><span class='line'> 
+</span><span class='line'>  ; Prepare arguments for the sys_write system call:
+</span><span class='line'>  ;   - eax: system call number (sys_write)
+</span><span class='line'>  ;   - ebx: file descriptor (stdout)
+</span><span class='line'>  ;   - ecx: pointer to string
+</span><span class='line'>  ;   - edx: string length
+</span><span class='line'>  mov edx, len1
+</span><span class='line'>  mov ecx, msg1
+</span><span class='line'>  mov ebx, 1
+</span><span class='line'>  mov eax, 4
+</span><span class='line'> 
+</span><span class='line'>  ; Execute the sys_write system call
+</span><span class='line'>  int 0x80
+</span><span class='line'> 
+</span><span class='line'>  ; Now print the other message
+</span><span class='line'>  mov edx, len2
+</span><span class='line'>  mov ecx, msg2
+</span><span class='line'>  mov ebx, 1
+</span><span class='line'>  mov eax, 4
+</span><span class='line'>  int 0x80
+</span><span class='line'> 
+</span><span class='line'>  ; Execute sys_exit
+</span><span class='line'>  mov eax, 1
+</span><span class='line'>  int 0x80
+</span><span class='line'> 
+</span><span class='line'>section   .data
+</span><span class='line'> 
+</span><span class='line'>msg1  db  'Hello,', 0xa
+</span><span class='line'>len1  equ $ - msg1
+</span><span class='line'>msg2  db  'world!', 0xa
+</span><span class='line'>len2  equ $ - msg2</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  我现在使用的是汇编语言，这是为了避免当使用C语言时涉及到的编译和符号的问题。上面列出的程序功能就是在一行中打印“Hello，”，然后在下一行中打印“world！”。这个例子与上一篇文章中用到的例子很相似。</p>
+
+<p>  我希望设定的断点位置应该在第一条打印之后，但恰好在第二条打印之前。我们就让断点打在第一个int 0×80指令之后吧，也就是mov edx, len2。首先，我需要知道这条指令对应的地址是什么。运行objdump –d：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>traced_printer2: file format elf32-i386
+</span><span class='line'> 
+</span><span class='line'>Sections:
+</span><span class='line'>Idx   Name    Size        VMA         LMA         File off    Algn
+</span><span class='line'>  0   .text   00000033    08048080    08048080    00000080    2**4
+</span><span class='line'>          CONTENTS,ALLOC,LOAD,READONLY,CODE
+</span><span class='line'>  1   .data   0000000e    080490b4    080490b4    000000b4    2**2
+</span><span class='line'>          CONTENTS,ALLOC,LOAD,DATA
+</span><span class='line'> 
+</span><span class='line'>Disassembly of section .text:
+</span><span class='line'> 
+</span><span class='line'>08048080 &lt;.text&gt;:
+</span><span class='line'> 8048080: ba 07 00 00 00      mov     $0x7,%edx
+</span><span class='line'> 8048085: b9 b4 90 04 08      mov     $0x80490b4,%ecx
+</span><span class='line'> 804808a: bb 01 00 00 00      mov     $0x1,%ebx
+</span><span class='line'> 804808f: b8 04 00 00 00      mov     $0x4,%eax
+</span><span class='line'> 8048094: cd 80               int     $0x80
+</span><span class='line'> 8048096: ba 07 00 00 00      mov     $0x7,%edx
+</span><span class='line'> 804809b: b9 bb 90 04 08      mov     $0x80490bb,%ecx
+</span><span class='line'> 80480a0: bb 01 00 00 00      mov     $0x1,%ebx
+</span><span class='line'> 80480a5: b8 04 00 00 00      mov     $0x4,%eax
+</span><span class='line'> 80480aa: cd 80               int     $0x80
+</span><span class='line'> 80480ac: b8 01 00 00 00      mov     $0x1,%eax
+</span><span class='line'> 80480b1: cd 80               int     $0x80</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  通过上面的输出，我们知道要设定的断点地址是0×8048096。等等，真正的调试器不是像这样工作的，对吧？真正的调试器可以根据代码行数或者函 数名称来设定断点，而不是基于什么内存地址吧？非常正确。但是我们离那个标准还差的远——如果要像真正的调试器那样设定断点，我们还需要涵盖符号表以及调 试信息方面的知识，这需要用另一篇文章来说明。至于现在，我们还必须得通过内存地址来设定断点。</p>
+
+<p>看到这里我真的很想再扯一点题外话，所以你有两个选择。如果你真的对于为什么地址是0×8048096，以及这代表什么意思非常感兴趣的话，接着看下一节。如果你对此毫无兴趣，只是想看看怎么设定断点，可以略过这一部分。</p>
+
+<h4>题外话——进程地址空间以及入口点</h4>
+
+<p>  坦白的说，0×8048096本身并没有太大意义，这只不过是相对可执行镜像的代码段（text section）开始处的一个偏移量。如果你仔细看看前面objdump出来的结果，你会发现代码段的起始位置是0×08048080。这告诉了操作系统 要将代码段映射到进程虚拟地址空间的这个位置上。在Linux上，这些地址可以是绝对地址（比如，有的可执行镜像加载到内存中时是不可重定位的），因为在 虚拟内存系统中，每个进程都有自己独立的内存空间，并把整个32位的地址空间都看做是属于自己的（称为线性地址）。</p>
+
+<p>如果我们通过readelf工具来检查可执行文件的ELF头，我们将得到如下输出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ readelf -h traced_printer2
+</span><span class='line'>ELF Header:
+</span><span class='line'>  Magic:   7f 45 4c 46 01 01 01 00 00 00 00 00 00 00 00 00
+</span><span class='line'>  Class:                              ELF32
+</span><span class='line'>  Data:                                   2's complement, little endian
+</span><span class='line'>  Version:                                1 (current)
+</span><span class='line'>  OS/ABI:                             UNIX - System V
+</span><span class='line'>  ABI Version:                            0
+</span><span class='line'>  Type:                                   EXEC (Executable file)
+</span><span class='line'>  Machine:                                Intel 80386
+</span><span class='line'>  Version:                                0x1
+</span><span class='line'>  Entry point address:                    0x8048080
+</span><span class='line'>  Start of program headers:               52 (bytes into file)
+</span><span class='line'>  Start of section headers:               220 (bytes into file)
+</span><span class='line'>  Flags:                              0x0
+</span><span class='line'>  Size of this header:                    52 (bytes)
+</span><span class='line'>  Size of program headers:                32 (bytes)
+</span><span class='line'>  Number of program headers:          2
+</span><span class='line'>  Size of section headers:                40 (bytes)
+</span><span class='line'>  Number of section headers:          4
+</span><span class='line'>  Section header string table index:  3</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  注意，ELF头的“entry point address”同样指向的是0×8048080。因此，如果我们把ELF文件中的这个部分解释给操作系统的话，就表示：<br/>
+1. 将代码段映射到地址0×8048080处<br/>
+2. 从入口点处开始执行——地址0×8048080<br/>
+  但是，为什么是0×8048080呢？它的出现是由于历史原因引起的。每个进程的地址空间的前128MB被保留给栈空间了（注：这一部分原因可参考 Linkers and Loaders）。128MB刚好是0×80000000，可执行镜像中的其他段可以从这里开始。0×8048080是Linux下的链接器ld所使用的 默认入口点。这个入口点可以通过传递参数-Ttext给ld来进行修改。</p>
+
+<p>  因此，得到的结论是这个地址并没有什么特别的，我们可以自由地修改它。只要ELF可执行文件的结构正确且在ELF头中的入口点地址同程序代码段（text section）的实际起始地址相吻合就OK了。</p>
+
+<h4>通过int 3指令在调试器中设定断点</h4>
+
+<p>  要在被调试进程中的某个目标地址上设定一个断点，调试器需要做下面两件事情：<br/>
+1. 保存目标地址上的数据<br/>
+2. 将目标地址上的第一个字节替换为int 3指令<br/>
+  然后，当调试器向操作系统请求开始运行进程时（通过前一篇文章中提到的PTRACE_CONT），进程最终一定会碰到int 3指令。此时进程停止，操作系统将发送一个信号。这时就是调试器再次出马的时候了，接收到一个其子进程（或被跟踪进程）停止的信号，然后调试器要做下面几 件事：<br/>
+1. 在目标地址上用原来的指令替换掉int 3<br/>
+2. 将被跟踪进程中的指令指针向后递减1。这么做是必须的，因为现在指令指针指向的是已经执行过的int 3之后的下一条指令。<br/>
+3. 由于进程此时仍然是停止的，用户可以同被调试进程进行某种形式的交互。这里调试器可以让你查看变量的值，检查调用栈等等。<br/>
+4. 当用户希望进程继续运行时，调试器负责将断点再次加到目标地址上（由于在第一步中断点已经被移除了），除非用户希望取消断点。<br/>
+  让我们看看这些步骤如何转化为实际的代码。我们将沿用第一篇文章中展示过的调试器“模版”（fork一个子进程，然后对其跟踪）。无论如何，本文结尾处会给出完整源码的链接。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Obtain and show child's instruction pointer */
+</span><span class='line'>ptrace(PTRACE_GETREGS, child_pid, 0, ®s);
+</span><span class='line'>procmsg("Child started. EIP = 0x%08x\n", regs.eip);
+</span><span class='line'> 
+</span><span class='line'>/* Look at the word at the address we're interested in */
+</span><span class='line'>unsigned addr = 0x8048096;
+</span><span class='line'>unsigned data = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)addr, 0);
+</span><span class='line'>procmsg("Original data at 0x%08x: 0x%08x\n", addr, data);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里调试器从被跟踪进程中获取到指令指针，然后检查当前位于地址0×8048096处的字长内容。运行本文前面列出的汇编码程序，将打印出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[13028] Child started. EIP = 0x08048080
+</span><span class='line'>[13028] Original data at 0x08048096: 0x000007ba</span></code></pre></td></tr></table></div></figure>
+
+
+<p>目前为止一切顺利，下一步：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Write the trap instruction 'int 3' into the address */
+</span><span class='line'>unsigned data_with_trap = (data & 0xFFFFFF00) | 0xCC;
+</span><span class='line'>ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)data_with_trap);
+</span><span class='line'> 
+</span><span class='line'>/* See what's there again... */
+</span><span class='line'>unsigned readback_data = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)addr, 0);
+</span><span class='line'>procmsg("After trap, data at 0x%08x: 0x%08x\n", addr, readback_data);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>注意看我们是如何将int 3指令插入到目标地址上的。这部分代码将打印出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[13028] After trap, data at 0x08048096: 0x000007cc</span></code></pre></td></tr></table></div></figure>
+
+
+<p>再一次如同预计的那样——0xba被0xcc取代了。调试器现在运行子进程然后等待子进程在断点处停止住。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Let the child run to the breakpoint and wait for it to
+</span><span class='line'>** reach it
+</span><span class='line'>*/
+</span><span class='line'>ptrace(PTRACE_CONT, child_pid, 0, 0);
+</span><span class='line'> 
+</span><span class='line'>wait(&wait_status);
+</span><span class='line'>if (WIFSTOPPED(wait_status)) {
+</span><span class='line'>    procmsg("Child got a signal: %s\n", strsignal(WSTOPSIG(wait_status)));
+</span><span class='line'>}
+</span><span class='line'>else {
+</span><span class='line'>    perror("wait");
+</span><span class='line'>    return;
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>/* See where the child is now */
+</span><span class='line'>ptrace(PTRACE_GETREGS, child_pid, 0, ®s);
+</span><span class='line'>procmsg("Child stopped at EIP = 0x%08x\n", regs.eip);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这段代码打印出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Hello,
+</span><span class='line'>[13028] Child got a signal: Trace/breakpoint trap
+</span><span class='line'>[13028] Child stopped at EIP = 0x08048097</span></code></pre></td></tr></table></div></figure>
+
+
+<p>注意，“Hello,”在断点之前打印出来了——同我们计划的一样。同时我们发现子进程已经停止运行了——就在这个单字节的陷阱指令执行之后。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Remove the breakpoint by restoring the previous data
+</span><span class='line'>** at the target address, and unwind the EIP back by 1 to
+</span><span class='line'>** let the CPU execute the original instruction that was
+</span><span class='line'>** there.
+</span><span class='line'>*/
+</span><span class='line'>ptrace(PTRACE_POKETEXT, child_pid, (void*)addr, (void*)data);
+</span><span class='line'>regs.eip -= 1;
+</span><span class='line'>ptrace(PTRACE_SETREGS, child_pid, 0, ®s);
+</span><span class='line'> 
+</span><span class='line'>/* The child can continue running now */
+</span><span class='line'>ptrace(PTRACE_CONT, child_pid, 0, 0);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这会使子进程打印出“world！”然后退出，同之前计划的一样。<br/>
+注意，我们这里并没有重新加载断点。这可以在单步模式下执行，然后将陷阱指令加回去，再做PTRACE_CONT就可以了。本文稍后介绍的debug库实现了这个功能。</p>
+
+<h4>更多关于int 3指令</h4>
+
+<p>  现在是回过头来说说int 3指令的好机会，以及解释一下Intel手册中对这条指令的奇怪说明。</p>
+
+<p>“这个单字节形式非常有价值，因为这样可以通过一个断点来替换掉任何指令的第一个字节，包括其它的单字节指令也是一样，而不会覆盖到其它的操作码。”</p>
+
+<p>  x86架构上的int指令占用2个字节——0xcd加上中断号。int 3的二进制形式可以被编码为cd 03，但这里有一个特殊的单字节指令0xcc以同样的作用而被保留。为什么要这样做呢？因为这允许我们在插入一个断点时覆盖到的指令不会多于一条。这很重 要，考虑下面的示例代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>.. some code ..
+</span><span class='line'>  jz  foo
+</span><span class='line'>  dec eax
+</span><span class='line'>foo:
+</span><span class='line'>  call    bar
+</span><span class='line'>  .. some code ..</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  假设我们要在dec eax上设定断点。这恰好是条单字节指令（操作码是0×48）。如果替换为断点的指令长度超过1字节，我们就被迫改写了接下来的下一条指令（call）， 这可能会产生一些完全非法的行为。考虑一下条件分支jz foo，这时进程可能不会在dec eax处停止下来（我们在此设定的断点，改写了原来的指令），而是直接执行了后面的非法指令。</p>
+
+<p>  通过对int 3指令采用一个特殊的单字节编码就能解决这个问题。因为x86架构上指令最短的长度就是1字节，这样我们可以保证只有我们希望停止的那条指令被修改。</p>
+
+<h4>封装细节</h4>
+
+<p>  前面几节中的示例代码展示了许多底层的细节，这些可以很容易地通过API进行封装。我已经做了一些封装，使其成为一个小型的调试库——debuglib。代码在本文末尾处可以下载。这里我只想介绍下它的用法，我们要开始调试C程序了。</p>
+
+<h4>跟踪C程序</h4>
+
+<p>目前为止为了简单起见我把重点放在对汇编程序的跟踪上了。现在升一级来看看我们该如何跟踪一个C程序。<br/>
+其实事情并没有很大的不同——只是现在有点难以找到放置断点的位置。考虑如下这个简单的C程序:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'> 
+</span><span class='line'>void do_stuff()
+</span><span class='line'>{
+</span><span class='line'>    printf("Hello, ");
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    for (int i = 0; i &lt; 4; ++i)
+</span><span class='line'>        do_stuff();
+</span><span class='line'>    printf("world!\n");
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>假设我想在do_stuff的入口处设置一个断点。我将请出我们的老朋友objdump来反汇编可执行文件，但得到的输出太多。其实，查看text 段不太管用，因为这里面包含了大量的初始化C运行时库的代码，我目前对此并不感兴趣。所以，我们只需要在dump出来的结果里看do_stuff部分就好 了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>080483e4 &lt;do_stuff&gt;:
+</span><span class='line'> 80483e4: 55                      push    %ebp
+</span><span class='line'> 80483e5: 89 e5                   mov     %esp,%ebp
+</span><span class='line'> 80483e7: 83 ec 18                sub     $0x18,%esp
+</span><span class='line'> 80483ea: c7 04 24 f0 84 04 08    movl    $0x80484f0,(%esp)
+</span><span class='line'> 80483f1: e8 22 ff ff ff          call    8048318 &lt;puts@plt&gt;
+</span><span class='line'> 80483f6: c9                      leave
+</span><span class='line'> 80483f7: c3                      ret</span></code></pre></td></tr></table></div></figure>
+
+
+<p>好的，所以我们应该把断点设定在0x080483e4上，这是do_stuff的第一条指令。另外，由于这个函数是在循环体中调用的，我们希望在循 环全部结束前保留断点，让程序可以在每一轮循环中都在断点处停下。我将使用debuglib来简化代码编写。这里是完整的调试器函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_debugger(pid_t child_pid)
+</span><span class='line'>{
+</span><span class='line'>    procmsg("debugger started\n");
+</span><span class='line'> 
+</span><span class='line'>    /* Wait for child to stop on its first instruction */
+</span><span class='line'>    wait(0);
+</span><span class='line'>    procmsg("child now at EIP = 0x%08x\n", get_child_eip(child_pid));
+</span><span class='line'> 
+</span><span class='line'>    /* Create breakpoint and run to it*/
+</span><span class='line'>    debug_breakpoint* bp = create_breakpoint(child_pid, (void*)0x080483e4);
+</span><span class='line'>    procmsg("breakpoint created\n");
+</span><span class='line'>    ptrace(PTRACE_CONT, child_pid, 0, 0);
+</span><span class='line'>    wait(0);
+</span><span class='line'> 
+</span><span class='line'>    /* Loop as long as the child didn't exit */
+</span><span class='line'>    while (1) {
+</span><span class='line'>        /* The child is stopped at a breakpoint here. Resume its
+</span><span class='line'>        ** execution until it either exits or hits the
+</span><span class='line'>        ** breakpoint again.
+</span><span class='line'>        */
+</span><span class='line'>        procmsg("child stopped at breakpoint. EIP = 0x%08X\n", get_child_eip(child_pid));
+</span><span class='line'>        procmsg("resuming\n");
+</span><span class='line'>        int rc = resume_from_breakpoint(child_pid, bp);
+</span><span class='line'> 
+</span><span class='line'>        if (rc == 0) {
+</span><span class='line'>            procmsg("child exited\n");
+</span><span class='line'>            break;
+</span><span class='line'>        }
+</span><span class='line'>        else if (rc == 1) {
+</span><span class='line'>            continue;
+</span><span class='line'>        }
+</span><span class='line'>        else {
+</span><span class='line'>            procmsg("unexpected: %d\n", rc);
+</span><span class='line'>            break;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'> 
+</span><span class='line'>    cleanup_breakpoint(bp);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们不用手动修改EIP指针以及目标进程的内存空间，我们只需要通过create_breakpoint, resume_from_breakpoint以及cleanup_breakpoint来操作就可以了。我们来看看当跟踪这个简单的C程序后的打印输出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ bp_use_lib traced_c_loop
+</span><span class='line'>[13363] debugger started
+</span><span class='line'>[13364] target started. will run 'traced_c_loop'
+</span><span class='line'>[13363] child now at EIP = 0x00a37850
+</span><span class='line'>[13363] breakpoint created
+</span><span class='line'>[13363] child stopped at breakpoint. EIP = 0x080483E5
+</span><span class='line'>[13363] resuming
+</span><span class='line'>Hello,
+</span><span class='line'>[13363] child stopped at breakpoint. EIP = 0x080483E5
+</span><span class='line'>[13363] resuming
+</span><span class='line'>Hello,
+</span><span class='line'>[13363] child stopped at breakpoint. EIP = 0x080483E5
+</span><span class='line'>[13363] resuming
+</span><span class='line'>Hello,
+</span><span class='line'>[13363] child stopped at breakpoint. EIP = 0x080483E5
+</span><span class='line'>[13363] resuming
+</span><span class='line'>Hello,
+</span><span class='line'>world!
+</span><span class='line'>[13363] child exited</span></code></pre></td></tr></table></div></figure>
+
+
+<p>跟预计的情况一模一样！</p>
+
+<h4>代码</h4>
+
+<p>这里是完整的源码。在文件夹中你会发现：<br/>
+debuglib.h以及debuglib.c——封装了调试器的一些内部工作。<br/>
+bp_manual.c —— 本文一开始介绍的“手动”式设定断点。用到了debuglib库中的一些样板代码。<br/>
+bp_use_lib.c—— 大部分代码用到了debuglib，这就是本文中用于说明跟踪一个C程序中的循环的示例代码。</p>
+
+<h4>结论及下一步要做的</h4>
+
+<p>我们已经涵盖了如何在调试器中实现断点机制。尽管实现细节根据操作系统的不同而有所区别，但只要你使用的是x86架构的处理器，那么一切变化都基于相同的主题——在我们希望停止的指令上将其替换为int 3。<br/>
+我敢肯定，有些读者就像我一样，对于通过指定原始地址来设定断点的做法不会感到很激动。我们更希望说“在do_stuff上停住”，甚至是“在do_stuff的这一行上停住”，然后调试器就能照办。在下一篇文章中，我将向您展示这是如何做到的。</p>
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2013-11-29T09:34:00+08:00'><span class='date'>2013-11-29</span> <span class='time'>09:34:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/debug/'>debug</a>, <a class='category' href='/blog/cats/debug~base/'>base</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2013/11/29/debug-debuger-1/" title="Previous Post: 调试器工作原理之一——基础篇">&laquo; 调试器工作原理之一——基础篇</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2013/11/29/debug-debuger-3/" title="Next Post: 调试器工作原理之三——调试信息">调试器工作原理之三——调试信息 &raquo;</a>
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2014 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 50px; right: 30px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>
