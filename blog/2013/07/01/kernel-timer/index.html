@@ -1,0 +1,571 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>内核定时器的使用 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>慢慢搬迁中......</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" type="text" placeholder="search..." x-webkit-speech />
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">内核定时器的使用</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-07-01T09:46:00+08:00'><span class='date'>2013-07-01</span> <span class='time'>09:46:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p>LINUX内核定时器是内核用来控制在未来某个时间点（基于jiffies）调度执行某个函数的一种机制，其实现位于 &lt;linux/timer.h> 和 kernel/timer.c 文件中。</p>
+
+<p>被调度的函数肯定是异步执行的，它类似于一种“软件中断”，而且是处于非进程的上下文中，所以调度函数必须遵守以下规则：<br/>
+1. 没有 current 指针、不允许访问用户空间。因为没有进程上下文，相关代码和被中断的进程没有任何联系。<br/>
+2. 不能执行休眠（或可能引起休眠的函数）和调度。<br/>
+3. 任何被访问的数据结构都应该针对并发访问进行保护，以防止竞争条件。</p>
+
+<p>内核定时器的调度函数运行过一次后就不会再被运行了（相当于自动注销），但可以通过在被调度的函数中重新调度自己来周期运行。</p>
+
+<p>在SMP系统中，调度函数总是在注册它的同一CPU上运行，以尽可能获得缓存的局域性。</p>
+
+<h4>定时器API</h4>
+
+<p>内核定时器的数据结构</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list {
+</span><span class='line'>  struct list_head entry;
+</span><span class='line'> 
+</span><span class='line'>  unsigned long expires;
+</span><span class='line'>  void (*function)(unsigned long);
+</span><span class='line'>  unsigned long data;
+</span><span class='line'> 
+</span><span class='line'>  struct tvec_base *base;
+</span><span class='line'>  /* ... */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中 expires 字段表示期望定时器执行的 jiffies 值，到达该 jiffies 值时，将调用 function 函数，并传递  data 作为参数。当一个定时器被注册到内核之后，entry 字段用来连接该定时器到一个内核链表中。base 字段是内核内部实现所用的。
+需要注意的是 expires 的值是32位的，因为内核定时器并不适用于长的未来时间点。</p>
+
+<h5>初始化</h5>
+
+<p>在使用 struct timer_list 之前，需要初始化该数据结构，确保所有的字段都被正确地设置。初始化有两种方法。</p>
+
+<h5>方法一：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_TIMER(timer_name, function_name, expires_value, data);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该宏会静态创建一个名叫 timer_name 内核定时器，并初始化其 function, expires, name 和 base 字段。</p>
+
+<h5>方法二：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list mytimer;
+</span><span class='line'>setup_timer(&mytimer, (*function)(unsigned long), unsigned long data);
+</span><span class='line'>mytimer.expires = jiffies + 5*HZ;</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>方法三：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list mytimer;
+</span><span class='line'>init_timer(&mytimer);
+</span><span class='line'>  mytimer -&gt;timer.expires = jiffies + 5*HZ;
+</span><span class='line'>  mytimer -&gt;timer.data = (unsigned long) dev;
+</span><span class='line'>  mytimer -&gt;timer.function = &corkscrew_timer; /* timer handler */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过init_timer()动态地定义一个定时器，此后，将处理函数的地址和参数绑定给一个timer_list，<br/>
+注意，无论用哪种方法初始化，其本质都只是给字段赋值，所以只要在运行 add_timer() 之前，expires, function 和 data 字段都可以直接再修改。<br/>
+关于上面这些宏和函数的定义，参见 include/linux/timer.h。</p>
+
+<h5>注册</h5>
+
+<p>定时器要生效，还必须被连接到内核专门的链表中，这可以通过 add_timer(struct timer_list *timer) 来实现。</p>
+
+<h5>重新注册</h5>
+
+<p>要修改一个定时器的调度时间，可以通过调用 mod_timer(struct timer_list *timer, unsigned long expires)。mod_timer() 会重新注册定时器到内核，而不管定时器函数是否被运行过。</p>
+
+<h5>注销</h5>
+
+<p>注销一个定时器，可以通过 del_timer(struct timer_list <em>timer) 或  del_timer_sync(struct timer_list </em>timer)。其中 del_timer_sync 是用在 SMP  系统上的（在非SMP系统上，它等于del_timer），当要被注销的定时器函数正在另一个 cpu 上运行时，del_timer_sync()  会等待其运行完，所以这个函数会休眠。另外还应避免它和被调度的函数争用同一个锁。对于一个已经被运行过且没有重新注册自己的定时器而言，注销函数其实也 没什么事可做。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int timer_pending(const struct timer_list *timer)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个函数用来判断一个定时器是否被添加到了内核链表中以等待被调度运行。注意，当一个定时器函数即将要被运行前，内核会把相应的定时器从内核链表中删除（相当于注销）</p>
+
+<h5>例子1：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/timer.h&gt;
+</span><span class='line'>#include &lt;linux/jiffies.h&gt;
+</span><span class='line'> 
+</span><span class='line'>struct timer_list mytimer;
+</span><span class='line'>static void myfunc(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>    printk("%s/n", (char *)data);
+</span><span class='line'>    mod_timer(&mytimer, jiffies + 2*HZ);
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>static int __init mytimer_init(void)
+</span><span class='line'>{
+</span><span class='line'>    setup_timer(&mytimer, myfunc, (unsigned long)"Hello, world!");
+</span><span class='line'>    mytimer.expires = jiffies + HZ;
+</span><span class='line'>    add_timer(&mytimer);
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>static void __exit mytimer_exit(void)
+</span><span class='line'>{
+</span><span class='line'>    del_timer(&mytimer);
+</span><span class='line'>}
+</span><span class='line'>module_init(mytimer_init);
+</span><span class='line'>module_exit(mytimer_exit);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>例子2：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct timer_list power_button_poll_timer;
+</span><span class='line'>static void power_button_poll(unsigned long dummy)
+</span><span class='line'>{
+</span><span class='line'>    if (gpio_line_get(N2100_POWER_BUTTON) == 0) {
+</span><span class='line'>        ctrl_alt_del();
+</span><span class='line'>        return;
+</span><span class='line'>    }
+</span><span class='line'>    power_button_poll_timer.expires = jiffies + (HZ / 10);
+</span><span class='line'>    add_timer(&power_button_poll_timer);
+</span><span class='line'>}
+</span><span class='line'>static void __init n2100_init_machine(void)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>    init_timer(&power_button_poll_timer);
+</span><span class='line'>    power_button_poll_timer.function = power_button_poll;
+</span><span class='line'>    power_button_poll_timer.expires = jiffies + (HZ / 10);
+</span><span class='line'>    add_timer(&power_button_poll_timer);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>例子3：</h5>
+
+<p>设备open时初始化和注册定时器</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int corkscrew_open(struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>      init_timer(&vp-&gt;timer);    
+</span><span class='line'>      vp-&gt;timer.expires = jiffies + media_tbl[dev-&gt;if_port].wait;
+</span><span class='line'>      vp-&gt;timer.data = (unsigned long) dev;
+</span><span class='line'>      vp-&gt;timer.function = &corkscrew_timer; /* timer handler */
+</span><span class='line'>      add_timer(&vp-&gt;timer);
+</span><span class='line'>...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定时器超时处理函数，对定时器的超时时间重新赋值</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void corkscrew_timer(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>    vp-&gt;timer.expires = jiffies + media_tbl[dev-&gt;if_port].wait;
+</span><span class='line'>    add_timer(&vp-&gt;timer);
+</span><span class='line'>...
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>设备close时删除定时器
+</span><span class='line'>static int corkscrew_close(struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>    del_timer(&vp-&gt;timer);
+</span><span class='line'>...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>例子4：</h5>
+
+<p>本例子用DEFINE_TIMER静态创建定时器</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/jiffies.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/init.h&gt;
+</span><span class='line'>#include &lt;linux/timer.h&gt;
+</span><span class='line'>#include &lt;linux/leds.h&gt;
+</span><span class='line'>static void ledtrig_ide_timerfunc(unsigned long data);
+</span><span class='line'>DEFINE_LED_TRIGGER(ledtrig_ide);
+</span><span class='line'>static DEFINE_TIMER(ledtrig_ide_timer, ledtrig_ide_timerfunc, 0, 0);
+</span><span class='line'>static int ide_activity;
+</span><span class='line'>static int ide_lastactivity;
+</span><span class='line'>void ledtrig_ide_activity(void)
+</span><span class='line'>{
+</span><span class='line'>    ide_activity++;
+</span><span class='line'>    if (!timer_pending(&ledtrig_ide_timer))
+</span><span class='line'>        mod_timer(&ledtrig_ide_timer, jiffies + msecs_to_jiffies(10));
+</span><span class='line'>}
+</span><span class='line'>EXPORT_SYMBOL(ledtrig_ide_activity);
+</span><span class='line'>static void ledtrig_ide_timerfunc(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>    if (ide_lastactivity != ide_activity) {
+</span><span class='line'>        ide_lastactivity = ide_activity;
+</span><span class='line'>        led_trigger_event(ledtrig_ide, LED_FULL);
+</span><span class='line'>        mod_timer(&ledtrig_ide_timer, jiffies + msecs_to_jiffies(10));
+</span><span class='line'>    } else {
+</span><span class='line'>        led_trigger_event(ledtrig_ide, LED_OFF);
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>static int __init ledtrig_ide_init(void)
+</span><span class='line'>{
+</span><span class='line'>    led_trigger_register_simple("ide-disk", &ledtrig_ide);
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'>static void __exit ledtrig_ide_exit(void)
+</span><span class='line'>{
+</span><span class='line'>    led_trigger_unregister_simple(ledtrig_ide);
+</span><span class='line'>}
+</span><span class='line'>module_init(ledtrig_ide_init);
+</span><span class='line'>module_exit(ledtrig_ide_exit);</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>add_timer() -- 将定时器添加到定时器等待队列中
+</span><span class='line'>用add_timer()函数来看timer_base的作用
+</span><span class='line'>static inline void add_timer(struct timer_list *timer)
+</span><span class='line'>{
+</span><span class='line'>    BUG_ON(timer_pending(timer));
+</span><span class='line'>    __mod_timer(timer, timer-&gt;expires);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int __mod_timer(struct timer_list *timer, unsigned long expires)
+</span><span class='line'>{
+</span><span class='line'>    tvec_base_t *base, *new_base;
+</span><span class='line'>    unsigned long flags;
+</span><span class='line'>    int ret = 0;
+</span><span class='line'>    timer_stats_timer_set_start_info(timer);
+</span><span class='line'>    BUG_ON(!timer-&gt;function);
+</span><span class='line'>    base = lock_timer_base(timer, &flags);
+</span><span class='line'>如果timer已经放到定时链表中,则释放开
+</span><span class='line'>|--------------------------------|
+</span><span class='line'>|   if (timer_pending(timer)) { -|
+</span><span class='line'>|       detach_timer(timer, 0); -|
+</span><span class='line'>|       ret = 1;                 |
+</span><span class='line'>|   }                            |
+</span><span class='line'>|--------------------------------|
+</span><span class='line'>获取当前CPU的timer base
+</span><span class='line'>|-----------------------------------------|
+</span><span class='line'>|   new_base = __get_cpu_var(tvec_bases); |
+</span><span class='line'>|-----------------------------------------|
+</span><span class='line'>如果当前CPU的timer base不是当前timer中的base, 更新timer的base
+</span><span class='line'>|----------------------------------------------------|
+</span><span class='line'>|   if (base != new_base) {                          |
+</span><span class='line'>|       if (likely(base-&gt;running_timer != timer)) { -|
+</span><span class='line'>|           timer-&gt;base = NULL;                      |
+</span><span class='line'>|           spin_unlock(&base-&gt;lock);                |
+</span><span class='line'>|           base = new_base;                         |
+</span><span class='line'>|           spin_lock(&base-&gt;lock);                  |
+</span><span class='line'>|           timer-&gt;base = base;                      |
+</span><span class='line'>|       }                                            |
+</span><span class='line'>|   }                                                |
+</span><span class='line'>|----------------------------------------------------|
+</span><span class='line'>给定时器timer设置超时时间；并添加该时钟
+</span><span class='line'>|-------------------------------------|
+</span><span class='line'>|   timer-&gt;expires = expires;         |
+</span><span class='line'>|   internal_add_timer(base, timer); -|
+</span><span class='line'>|-------------------------------------|
+</span><span class='line'>    spin_unlock_irqrestore(&base-&gt;lock, flags);
+</span><span class='line'>    return ret;
+</span><span class='line'>}
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
+
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2013-07-01T09:46:00+08:00'><span class='date'>2013-07-01</span> <span class='time'>09:46:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~base/'>base</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2013/06/27/kernel-sysctl/" title="Previous Post: 用户空间和内核空间数据交换方式-sysctl">&laquo; 用户空间和内核空间数据交换方式-sysctl</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2013/07/05/kernel-sample/" title="Next Post: 数据交换sysctl + 定时器（code）">数据交换sysctl + 定时器（code） &raquo;</a>
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2014 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 50px; right: 30px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>
