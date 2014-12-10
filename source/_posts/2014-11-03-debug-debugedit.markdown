@@ -32,6 +32,13 @@ base-dir 长度要大等于 dest-dir
 -i 输出build-id  
 -l 输出源编译文件位置，便于有需要的人打包
 
+debugedit 会在.debug_info .debug_abbrev .debug_line .debug_str中将base_dir目录替换为dest_dir目录。  
+* 需要注意，如果base_dir是路径中除文件名的部分，则.debug_line中的The Directory Table的目录不会替换。  
+如：  
+.debug_line中的Table中有一个目录为`/root/Desktop`，如果用 `-b /root/Desktop`则匹配不上这条。  
+* 因为：debugedit在匹配的时候在base_dir后面加了一个'/'  
+其他部分能替换是因为他们存的是文件路径，不是文件夹路径  
+
 --------
 
 .debug_str段保存着所有全局变量的名字，以0x00作为每一个全局变量名的结束。  
@@ -45,7 +52,7 @@ $ objdump --dwarf=str a.out
   0x00000000 474e5520 4320342e 342e3720 32303132 GNU C 4.4.7 2012
   0x00000010 30333133 20285265 64204861 7420342e 0313 (Red Hat 4.
   0x00000020 342e372d 3429006c 6f6e6720 756e7369 4.7-4).long unsi
-  0x00000030 676e6564 20696e74 002f726f 6f742f44 gned int.<span style="color:red">/root/D</span>
+  0x00000030 676e6564 20696e74 002f726f 6f742f44 gned int./root/D
   0x00000040 65736b74 6f702f61 2e630075 6e736967 esktop/a.c.unsig
   0x00000050 6e656420 63686172 006d6169 6e006c6f ned char.main.lo
   0x00000060 6e672069 6e74002f 726f6f74 2f446573 ng int./root/Des
