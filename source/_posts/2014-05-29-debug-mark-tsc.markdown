@@ -52,7 +52,7 @@ Xeon E5 has a bug, it doesn't reset TSC on warm reboot, just keep it instead.
 -------
 
 From 9993bc635d01a6ee7f6b833b4ee65ce7c06350b1 Mon Sep 17 00:00:00 2001  
-From: Salman Qazi <sqazi@google.com>  
+From: Salman Qazi <`sqazi@google.com`>  
 Date: Sat, 10 Mar 2012 00:41:01 +0000  
 Subject: sched/x86: Fix overflow in cyc2ns_offset  
 
@@ -71,13 +71,13 @@ the multiplication separately on the two components.
 Refactor code to share the calculation with the previous
 fix in __cycles_2_ns().
 
-Signed-off-by: Salman Qazi <sqazi@google.com>  
-Acked-by: John Stultz <john.stultz@linaro.org>  
-Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>  
-Cc: Paul Turner <pjt@google.com>  
-Cc: john stultz <johnstul@us.ibm.com>  
+Signed-off-by: Salman Qazi <`sqazi@google.com`>  
+Acked-by: John Stultz <`john.stultz@linaro.org`>  
+Acked-by: Peter Zijlstra <`a.p.zijlstra@chello.nl`>  
+Cc: Paul Turner <`pjt@google.com`>  
+Cc: john stultz <`johnstul@us.ibm.com`>  
 Link: http://lkml.kernel.org/r/20120310004027.19291.88460.stgit@dungbeetle.mtv.corp.google.com  
-Signed-off-by: Ingo Molnar <mingo@elte.hu>  
+Signed-off-by: Ingo Molnar <`mingo@elte.hu`>  
 
 -------
 

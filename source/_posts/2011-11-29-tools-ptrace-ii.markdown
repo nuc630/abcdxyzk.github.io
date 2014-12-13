@@ -17,7 +17,7 @@ tags:
 版权所有 © 转载时必须以链接形式注明作者和原始出处！
  
 Playing with ptrace, Part II  
-by Pradeep Padala p_padala@yahoo.com http://www.cise.ufl.edu/~ppadala  
+by Pradeep Padala `p_padala@yahoo.com` http://www.cise.ufl.edu/~ppadala  
 Created 2002-11-01 02:00
 
 翻译: Magic.D E-mail: adamgic@163.com
