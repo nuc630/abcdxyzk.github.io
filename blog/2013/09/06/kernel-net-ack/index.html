@@ -1,0 +1,1047 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>内核tcp的ack的处理 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>慢慢搬迁中......</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" type="text" placeholder="search..." x-webkit-speech />
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">内核tcp的ack的处理</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-09-06T15:40:00+08:00'><span class='date'>2013-09-06</span> <span class='time'>15:40:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p>我们来看tcp输入对于ack，段的处理。</p>
+
+<ul>
+<li>先是ack的处理，在内核中，处理ack段是通过tcp_ack来进行的。<br/>
+这个函数主要功能是：</li>
+<li>update重传队列，并基于sack来设置skb的相关buf。</li>
+<li>update发送窗口。</li>
+<li>基于sack的信息或者重复ack来决定是否进入拥塞模式。<br/>
+在看之前我们要知道tcp是累积确认的。为了解决带来的缺点，我们才需要sack的。</li>
+</ul>
+
+
+<p>  然后我们来看几个很重要的数据结构，先是tcp_skb_cb，它其实就是表示skb中所保存的tcp的控制信息。而他是保存在skb的cb中的(这个域可以看我前面的blog）。所以这里我们经常会用TCP_SKB_CB来存取这个结构。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TCP_SKB_CB(__skb)   ((struct tcp_skb_cb *)&((__skb)-&gt;cb[0]))</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里还有一个inet_skb_parm，这个结构保存了ipoption的一些信息。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_skb_parm
+</span><span class='line'>{
+</span><span class='line'>    struct ip_options   opt;        /* Compiled IP options      */
+</span><span class='line'>    unsigned char       flags;
+</span><span class='line'>
+</span><span class='line'>    #define IPSKB_FORWARDED           1
+</span><span class='line'>    #define IPSKB_XFRM_TUNNEL_SIZE    2
+</span><span class='line'>    #define IPSKB_XFRM_TRANSFORMED    4
+</span><span class='line'>    #define IPSKB_FRAG_COMPLETE       8
+</span><span class='line'>    #define IPSKB_REROUTED            16
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后来看tcp_skb_cb：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_skb_cb {
+</span><span class='line'>    union {
+</span><span class='line'>        struct inet_skb_parm    h4;
+</span><span class='line'>#if defined(CONFIG_IPV6) || defined (CONFIG_IPV6_MODULE)
+</span><span class='line'>        struct inet6_skb_parm   h6;
+</span><span class='line'>#endif
+</span><span class='line'>    } header;   /* For incoming frames      */
+</span><span class='line'>//这个表示当前tcp包的序列号
+</span><span class='line'>    __u32       seq;
+</span><span class='line'>//这个表示结束序列号，也就是SEQ + FIN + SYN + datalen。
+</span><span class='line'>    __u32       end_seq;
+</span><span class='line'>//主要用来计算rtt
+</span><span class='line'>    __u32       when;
+</span><span class='line'>//tcp头的flag（比如syn，fin等)，它能取的值，我们下面会介绍。
+</span><span class='line'>    __u8        flags;
+</span><span class='line'>
+</span><span class='line'>//SACK/FACK的状态flag或者是sack option的偏移(相对于tcp头的)。我们下面会介绍
+</span><span class='line'>    __u8        sacked;
+</span><span class='line'>//ack的序列号。
+</span><span class='line'>    __u32       ack_seq;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面就是flags所能取的值，可以看到也就是tcp头的控制位。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TCPCB_FLAG_FIN      0x01
+</span><span class='line'>#define TCPCB_FLAG_SYN      0x02
+</span><span class='line'>#define TCPCB_FLAG_RST      0x04
+</span><span class='line'>#define TCPCB_FLAG_PSH      0x08
+</span><span class='line'>#define TCPCB_FLAG_ACK      0x10
+</span><span class='line'>#define TCPCB_FLAG_URG      0x20
+</span><span class='line'>#define TCPCB_FLAG_ECE      0x40
+</span><span class='line'>#define TCPCB_FLAG_CWR      0x80</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是sack/fack的状态标记：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//有这个域说明当前的tcpcb是被sack块确认的。
+</span><span class='line'>#define TCPCB_SACKED_ACKED  0x01
+</span><span class='line'>//表示重传的帧
+</span><span class='line'>#define TCPCB_SACKED_RETRANS    0x02
+</span><span class='line'>//丢失
+</span><span class='line'>#define TCPCB_LOST      0x04
+</span><span class='line'>#define TCPCB_TAGBITS       0x07
+</span><span class='line'>//重传的帧。
+</span><span class='line'>#define TCPCB_EVER_RETRANS  0x80
+</span><span class='line'>#define TCPCB_RETRANS       (TCPCB_SACKED_RETRANS|TCPCB_EVER_RETRANS)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里要注意，当我们接收到正确的SACK后，这个域就会被初始化为sack所在的相对偏移(也就是相对于tcp头的偏移值，这样我们就能很容易得到sack option的位置).
+然后是tcp_sock，这个结构保存了我们整个tcp层所需要得所有必要的信息（也就是从sock中提取出来).我们分两个部分来看这个结构，这里只看我们关注的两部分，第一部分是窗口相关的一些域。第二部分是拥塞控制的一些相关域。
+先来看窗口相关的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//我们期待从另一台设备接收的下一个数据字节的序列号。
+</span><span class='line'>u32 rcv_nxt;
+</span><span class='line'>//还没有被读取的数据的序列号。
+</span><span class='line'>u32 copied_seq;
+</span><span class='line'>//当最后一次窗口update被发送之前我们的rcv_nxt.
+</span><span class='line'>u32 rcv_wup;
+</span><span class='line'>//将要发送给另一台设备的下一个数据字节的序列号。
+</span><span class='line'>u32 snd_nxt;
+</span><span class='line'>//已经发送但尚未被确认的第一个数据字节的序列号。
+</span><span class='line'>u32 snd_una;
+</span><span class='line'>//
+</span><span class='line'>u32 snd_sml;
+</span><span class='line'>//最后一次接收到ack的时间戳，主要用于keepalive
+</span><span class='line'>u32 rcv_tstamp;
+</span><span class='line'>//最后一次发送数据包的时间戳。
+</span><span class='line'>u32 lsndtime;
+</span><span class='line'>//发送窗口长度
+</span><span class='line'>u32 snd_wnd;
+</span><span class='line'>//接收窗口长度。
+</span><span class='line'>u32 rcv_wnd
+</span><span class='line'>//发送未确认的数据包的个数（或者字节数？）
+</span><span class='line'>u32 packets_out;
+</span><span class='line'>//重传的数据包的个数
+</span><span class='line'>u32 retrans_out;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是拥塞部分，看这里之前还是需要取熟悉一下tcp拥塞控制的相关概念。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//慢开始的阀值，也就是超过这个我们就要进入拥塞避免的阶段
+</span><span class='line'>u32  snd_ssthresh;
+</span><span class='line'>//发送的拥塞窗口
+</span><span class='line'>u32 snd_cwnd;
+</span><span class='line'>//这个应该是拥塞状态下所发松的数据字节数
+</span><span class='line'>u32 snd_cwnd_cnt;
+</span><span class='line'>//这里也就是cwnd的最大值
+</span><span class='line'>u32 snd_cwnd_clamp;
+</span><span class='line'>//这两个值不太理解什么意思。
+</span><span class='line'>u32 snd_cwnd_used;
+</span><span class='line'>u32 snd_cwnd_stamp;
+</span><span class='line'>
+</span><span class='line'>//接收窗口打消
+</span><span class='line'>u32 rcv_wnd;
+</span><span class='line'>//tcp的发送buf数据的尾部序列号。
+</span><span class='line'>u32 write_seq;
+</span><span class='line'>//最后一次push的数据的序列号
+</span><span class='line'>u32 pushed_seq;
+</span><span class='line'>//丢失的数据包字节数
+</span><span class='line'>u32 lost_out;
+</span><span class='line'>//sack的数据包的字节数
+</span><span class='line'>u32 sacked_out;
+</span><span class='line'>//fack处理的数据包的字节数
+</span><span class='line'>u32 fackets_out;
+</span><span class='line'>u32 tso_deferred;
+</span><span class='line'>//计数
+</span><span class='line'>u32 bytes_acked;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>分析完相关的数据结构我们来看函数的实现。<br/>
+来看tcp_ack的代码,函数比较大，因此我们分段来看，先来看一开始的一些校验部分。<br/>
+这里有一个tcp_abc也就是proc下面的可以设置的东西，这个主要是看要不要每个ack都要进行拥塞控制。</p>
+
+<blockquote><p>Controls Appropriate Byte Count defined in RFC3465. If set to 0 then does congestion avoid once per ACK. 1 is conservative value, and 2 is more aggressive. The default value is 1.</p></blockquote>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>//等待ack，也就是发送未确认的序列号。
+</span><span class='line'>u32 prior_snd_una = tp-&gt;snd_una;
+</span><span class='line'>u32 ack_seq = TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>//得到ack的序列号。
+</span><span class='line'>u32 ack = TCP_SKB_CB(skb)-&gt;ack_seq;
+</span><span class='line'>u32 prior_in_flight;
+</span><span class='line'>u32 prior_fackets;
+</span><span class='line'>int prior_packets;
+</span><span class='line'>int frto_cwnd = 0;
+</span><span class='line'>
+</span><span class='line'>//如果ack的序列号小于发送未确认的，也就是说可能这个ack只是重传老的ack，因此我们忽略它。
+</span><span class='line'>if (before(ack, prior_snd_una))
+</span><span class='line'>    goto old_ack;
+</span><span class='line'>
+</span><span class='line'>//如果ack大于snd_nxt,也就是它确认了我们还没发送的数据段，因此我们discard这个段。
+</span><span class='line'>if (after(ack, tp-&gt;snd_nxt))
+</span><span class='line'>    goto invalid_ack;
+</span><span class='line'>//如果ack大于发送未确认，则设置flag
+</span><span class='line'>if (after(ack, prior_snd_una))
+</span><span class='line'>    flag |= FLAG_SND_UNA_ADVANCED;
+</span><span class='line'>
+</span><span class='line'>//是否设置tcp_abc，有设置的话，说明我们不需要每个ack都要拥塞避免，因此我们需要计算已经ack的字节数。
+</span><span class='line'>if (sysctl_tcp_abc) {
+</span><span class='line'>    if (icsk-&gt;icsk_ca_state &lt; TCP_CA_CWR)
+</span><span class='line'>        tp-&gt;bytes_acked += ack - prior_snd_una;
+</span><span class='line'>    else if (icsk-&gt;icsk_ca_state == TCP_CA_Loss)
+</span><span class='line'>         tp-&gt;bytes_acked += min(ack - prior_snd_una,qtp-&gt;mss_cache);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>//得到fack的数据包的字节数
+</span><span class='line'>prior_fackets = tp-&gt;fackets_out;
+</span><span class='line'>//计算还在传输的数据段的字节数,下面会详细分析这个函数。
+</span><span class='line'>prior_in_flight = tcp_packets_in_flight(tp);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>packets_out这个表示已经发送还没有ack的数据段的字节数(这个值不会重复加的，比如重传的话不会增加这个值）。<br/>
+sakced_out :sack了的字节数。<br/>
+lost_out:丢失了的字节数。<br/>
+retrans_out:重传的字节数。<br/>
+现在我们就对这个函数的返回值很清楚了，它也就是包含了还没有到达对方的数据段的字节数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline unsigned int tcp_left_out(const struct tcp_sock *tp)
+</span><span class='line'>{
+</span><span class='line'>    return tp-&gt;sacked_out + tp-&gt;lost_out;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline unsigned int tcp_packets_in_flight(const struct tcp_sock *tp)
+</span><span class='line'>{
+</span><span class='line'>    return tp-&gt;packets_out - tcp_left_out(tp) + tp-&gt;retrans_out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>接下来这一段主要是通过判断flag(slow还是fast)来进行一些窗口的操作。有关slow_path和fast_path的区别，可以看我前面的blog。<br/>
+fast_path的话很简单，我们就更新相关的域以及snd_wl1(这个域主要是用于update窗口的时候).它这里会被赋值为我们这次的数据包的序列号。然后进行拥塞控制的操作。<br/>
+snd_wl1是只要我们需要更新发送窗口的话，这个值是都会被更新的。<br/>
+slow_path的话，我们就需要判断要不要update窗口的大小了。以及是否要处理sack等。<br/>
+在看下面的代码之前，我们先来看传递进tcp_ack这个函数中的第三个参数flag，这里我们在函数中也还会修改这个值，这个flag也就是当前的skb的类型信息。看了注释后就清楚了。可疑看到好几个都是ack的类型。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//这个说明当前的输入帧包含有数据。
+</span><span class='line'>#define FLAG_DATA       0x01
+</span><span class='line'>//这个说明当前的ack是一个窗口更新的ack
+</span><span class='line'>#define FLAG_WIN_UPDATE     0x02
+</span><span class='line'>//这个ack确认了一些数据
+</span><span class='line'>#define FLAG_DATA_ACKED     0x04
+</span><span class='line'>//这个表示ack确认了一些我们重传的段。
+</span><span class='line'>#define FLAG_RETRANS_DATA_ACKED 0x08
+</span><span class='line'>//这个表示这个ack是对syn的回复。
+</span><span class='line'>#define FLAG_SYN_ACKED      0x10
+</span><span class='line'>//新的sack
+</span><span class='line'>#define FLAG_DATA_SACKED    0x20
+</span><span class='line'>//ack中包含ECE
+</span><span class='line'>#define FLAG_ECE        0x40
+</span><span class='line'>//sack检测到了数据丢失。
+</span><span class='line'>#define FLAG_DATA_LOST      0x80
+</span><span class='line'>//当更新窗口的时候不跳过RFC的检测。
+</span><span class='line'>#define FLAG_SLOWPATH       0x100
+</span><span class='line'>
+</span><span class='line'>#define FLAG_ONLY_ORIG_SACKED   0x200
+</span><span class='line'>//snd_una被改变了。也就是更新了。
+</span><span class='line'>#define FLAG_SND_UNA_ADVANCED   0x400
+</span><span class='line'>//包含D-sack
+</span><span class='line'>#define FLAG_DSACKING_ACK   0x800
+</span><span class='line'>//这个不太理解什么意思。
+</span><span class='line'>#define FLAG_NONHEAD_RETRANS_ACKED  0x1000
+</span><span class='line'>//
+</span><span class='line'>#define FLAG_SACK_RENEGING  0x2000
+</span><span class='line'>
+</span><span class='line'>//下面也就是一些组合。
+</span><span class='line'>#define FLAG_ACKED  (FLAG_DATA_ACKED|FLAG_SYN_ACKED)
+</span><span class='line'>#define FLAG_NOT_DUP (FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
+</span><span class='line'>#define FLAG_CA_ALERT       (FLAG_DATA_SACKED|FLAG_ECE)
+</span><span class='line'>#define FLAG_FORWARD_PROGRESS   (FLAG_ACKED|FLAG_DATA_SACKED)
+</span><span class='line'>#define FLAG_ANY_PROGRESS   (FLAG_FORWARD_PROGRESS|FLAG_SND_UNA_ADVANCED)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后我们来看代码，下面的代码会设置flag，也就是用上面的宏。<br/>
+这里有一个很大的不同就是slow_path中，我们需要update窗口的大小，而在fast模式中，我们不需要，这个详细去看我前面的blog介绍的fast和slow的区别。fast就是最理想的情况，因此我们不需要update窗口。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//如果不是slowpath并且ack确实是正确的序列号(必须大于snd_una).
+</span><span class='line'>    if (!(flag & FLAG_SLOWPATH) && after(ack, prior_snd_una)) {
+</span><span class='line'>//更新snd_wl1域为ack_seq;
+</span><span class='line'>        tcp_update_wl(tp, ack_seq);
+</span><span class='line'>//snd_una更新为ack也就是确认的序列号
+</span><span class='line'>        tp-&gt;snd_una = ack;
+</span><span class='line'>//更新flag域。
+</span><span class='line'>        flag |= FLAG_WIN_UPDATE;
+</span><span class='line'>//进入拥塞的操作。
+</span><span class='line'>        tcp_ca_event(sk, CA_EVENT_FAST_ACK);
+</span><span class='line'>................................
+</span><span class='line'>    } else {
+</span><span class='line'>//这个判断主要是为了判断是否输入帧包含数据。也就是ack还包含了数据，如果有的话，我们设置标记然后后面会处理。
+</span><span class='line'>        if (ack_seq != TCP_SKB_CB(skb)-&gt;end_seq)
+</span><span class='line'>            flag |= FLAG_DATA;
+</span><span class='line'>        else
+</span><span class='line'>.....................................
+</span><span class='line'>
+</span><span class='line'>//然后进入更新窗口的操作。
+</span><span class='line'>        flag |= tcp_ack_update_window(sk, skb, ack, ack_seq);
+</span><span class='line'>//然后判断是否有sack段，有的话，我们进入sack段的处理。
+</span><span class='line'>        if (TCP_SKB_CB(skb)-&gt;sacked)
+</span><span class='line'>            flag |= tcp_sacktag_write_queue(sk, skb, prior_snd_una);
+</span><span class='line'>//判断是否有ecn标记，如果有的话，设置ecn标记。
+</span><span class='line'>        if (TCP_ECN_rcv_ecn_echo(tp, tcp_hdr(skb)))
+</span><span class='line'>            flag |= FLAG_ECE;
+</span><span class='line'>//进入拥塞的处理。
+</span><span class='line'>        tcp_ca_event(sk, CA_EVENT_SLOW_ACK);
+</span><span class='line'>    }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>接下来这段主要工作是：<br/>
+1 清理重传队列中的已经ack的段。<br/>
+2 处理F-RTO。<br/>
+3 判断是否是零窗口探测的回复ack。<br/>
+4 检测是否要进入拥塞处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sk-&gt;sk_err_soft = 0;
+</span><span class='line'>icsk-&gt;icsk_probes_out = 0;
+</span><span class='line'>tp-&gt;rcv_tstamp = tcp_time_stamp;
+</span><span class='line'>//如果发送并且没有ack的数据段的值为0,则说明这个有可能是0窗口探测的回复，因此我们进入no_queue的处理，这个我们紧接着会详细介绍。
+</span><span class='line'>prior_packets = tp-&gt;packets_out;
+</span><span class='line'>if (!prior_packets)
+</span><span class='line'>    goto no_queue;
+</span><span class='line'>//清理重传队列中的已经ack的数据段。
+</span><span class='line'>flag |= tcp_clean_rtx_queue(sk, prior_fackets, prior_snd_una);
+</span><span class='line'>
+</span><span class='line'>//处理F-RTO
+</span><span class='line'>if (tp-&gt;frto_counter)
+</span><span class='line'>    frto_cwnd = tcp_process_frto(sk, flag);
+</span><span class='line'>
+</span><span class='line'>if (before(tp-&gt;frto_highmark, tp-&gt;snd_una))
+</span><span class='line'>    tp-&gt;frto_highmark = 0;
+</span><span class='line'>//判断ack是否是可疑的。它主要是检测我们是否进入拥塞状态，或者已经处于拥塞状态。
+</span><span class='line'>if (tcp_ack_is_dubious(sk, flag)) {
+</span><span class='line'>//检测flag以及是否需要update拥塞窗口的大小。
+</span><span class='line'>if ((flag & FLAG_DATA_ACKED) && !frto_cwnd &&
+</span><span class='line'>    tcp_may_raise_cwnd(sk, flag))
+</span><span class='line'>//如果都为真，则更新拥塞窗口。
+</span><span class='line'>    tcp_cong_avoid(sk, ack, prior_in_flight);
+</span><span class='line'>//这里进入拥塞状态的处理(这个函数是一个非常关键的函数,等到后面详细分析拥塞的时候，会分析到)。
+</span><span class='line'>    tcp_fastretrans_alert(sk, prior_packets - tp-&gt;packets_out,flag);
+</span><span class='line'>} else {
+</span><span class='line'>//这里可以看到和上面相比，没有tcp_may_raise_cwnd这个，我们紧接着就会分析到。
+</span><span class='line'>    if ((flag & FLAG_DATA_ACKED) && !frto_cwnd)
+</span><span class='line'>        tcp_cong_avoid(sk, ack, prior_in_flight);
+</span><span class='line'>}
+</span><span class='line'>//是否更新neigh子系统。
+</span><span class='line'>if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP))
+</span><span class='line'>    dst_confirm(sk-&gt;sk_dst_cache);
+</span><span class='line'>
+</span><span class='line'>return 1;
+</span><span class='line'>
+</span><span class='line'>no_queue:
+</span><span class='line'>//这里判断发送缓冲区是否为空，如果不为空，则我们进入判断需要重启keepalive定时器还是关闭定时器
+</span><span class='line'>    if (tcp_send_head(sk))
+</span><span class='line'>        tcp_ack_probe(sk);
+</span><span class='line'>    return 1;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>ok，，接着来看上面略过的几个函数，先来看tcp_ack_is_dubious，这里的条件我们一个个来看<br/>
+1 说明flag不能是 FLAG_NOT_DUP的， FLAG_NOT_DUP表示我们的ack不是重复的。<br/>
+2 是flag是CA_ALERT,它的意思是我们是否在我们进入拥塞状态时被alert。<br/>
+3 拥塞状态不能为TCP_CA_OPEN不为这个，就说明我们已经进入了拥塞状态。<br/>
+可以看下面这几个宏的定义，就比较清楚了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define FLAG_ACKED  (FLAG_DATA_ACKED|FLAG_SYN_ACKED)
+</span><span class='line'>#define FLAG_NOT_DUP (FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
+</span><span class='line'>
+</span><span class='line'>//收到sack则说明可能有的段丢失了。而ECE则是路由器提示我们有拥塞了。我们必须处理。
+</span><span class='line'>#define FLAG_CA_ALERT       (FLAG_DATA_SACKED|FLAG_ECE)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的任意一个为真。就说明ack是可疑的。这里起始也可以说我们就必须进入拥塞的处理了(tcp_fastretrans_alert)</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_ack_is_dubious(const struct sock *sk, const int flag)
+</span><span class='line'>{
+</span><span class='line'>    return (!(flag & FLAG_NOT_DUP) || (flag & FLAG_CA_ALERT) ||inet_csk(sk)-&gt;icsk_ca_state != TCP_CA_Open);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是 tcp_may_raise_cwnd，这个函数用来判断是否需要增大拥塞窗口。<br/>
+1 不能有ECE flag或者发送的拥塞窗口不能大于slow start的阀值。<br/>
+3 拥塞状态为RECO或者CWR.</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_may_raise_cwnd(const struct sock *sk, const int flag)
+</span><span class='line'>{
+</span><span class='line'>    const struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    return (!(flag & FLAG_ECE) || tp-&gt;snd_cwnd &lt; tp-&gt;snd_ssthresh) &&!((1 &lt;&lt; inet_csk(sk)-&gt;icsk_ca_state) & (TCPF_CA_Recovery | TCPF_CA_CWR));
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在看tcp_ack_update_window函数之前，我们先来看tcp_may_update_window，这个函数用来判断是否需要更新发送窗口。<br/>
+1 新的数据已经被ack了。<br/>
+2 当前的数据包的序列号大于当窗口更新的时候那个数据包的序列号。<br/>
+3 当前的数据包的序列号等于窗口更新时的序列号并且新的窗口大小大于当前的发送窗口大小。这个说明对端可能已经增加了窗口的大小</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_may_update_window(const struct tcp_sock *tp,const u32 ack, const u32 ack_seq,const u32 nwin)
+</span><span class='line'>{
+</span><span class='line'>    return (after(ack, tp-&gt;snd_una) ||
+</span><span class='line'>        after(ack_seq, tp-&gt;snd_wl1) ||
+</span><span class='line'>        (ack_seq == tp-&gt;snd_wl1 && nwin &gt; tp-&gt;snd_wnd));
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是tcp_ack_update_window函数，这个主要用来更新发送窗口的大小。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_ack_update_window(struct sock *sk, struct sk_buff *skb, u32 ack, u32 ack_seq)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    int flag = 0;
+</span><span class='line'>    //得到窗口的大小。
+</span><span class='line'>    u32 nwin = ntohs(tcp_hdr(skb)-&gt;window);
+</span><span class='line'>
+</span><span class='line'>    if (likely(!tcp_hdr(skb)-&gt;syn))
+</span><span class='line'>        nwin &lt;&lt;= tp-&gt;rx_opt.snd_wscale;
+</span><span class='line'>
+</span><span class='line'>    //判断是否需要update窗口。
+</span><span class='line'>    if (tcp_may_update_window(tp, ack, ack_seq, nwin)) {
+</span><span class='line'>        flag |= FLAG_WIN_UPDATE;
+</span><span class='line'>    //更新snd_wl1
+</span><span class='line'>        tcp_update_wl(tp, ack_seq);
+</span><span class='line'>    //如果不等于，则说明我们需要更新窗口。
+</span><span class='line'>        if (tp-&gt;snd_wnd != nwin) {
+</span><span class='line'>            tp-&gt;snd_wnd = nwin;
+</span><span class='line'>    ...................................
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    tp-&gt;snd_una = ack;
+</span><span class='line'>    return flag;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是tcp_cong_avoid函数，这个函数用来实现慢开始和快重传的拥塞算法。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+</span><span class='line'>{
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>    icsk-&gt;icsk_ca_ops-&gt;cong_avoid(sk, ack, in_flight);
+</span><span class='line'>    tcp_sk(sk)-&gt;snd_cwnd_stamp = tcp_time_stamp;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到它主要是调用cong_avoid回调函数，而这个函数被初始化为tcp_reno_cong_avoid，我们来看这个函数，在看这个函数之前我们要知道一些慢开始和快回复的概念。这些东西随便介绍tcp的书上都有介绍的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    //是否已经到达拥塞窗口的限制。
+</span><span class='line'>    if (!tcp_is_cwnd_limited(sk, in_flight))
+</span><span class='line'>        return;
+</span><span class='line'>    //如果拥塞窗口还没有到达慢开始的阈值，我们就进入慢开始处理。
+</span><span class='line'>    if (tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh)
+</span><span class='line'>        tcp_slow_start(tp);
+</span><span class='line'>
+</span><span class='line'>    //否则我们就要进入拥塞避免阶段。
+</span><span class='line'>    else if (sysctl_tcp_abc) {
+</span><span class='line'>    //RFC3465,只有当当前的拥塞窗口的所有段都被ack了，窗口才被允许增加。
+</span><span class='line'>    if (tp-&gt;bytes_acked &gt;= tp-&gt;snd_cwnd*tp-&gt;mss_cache) {
+</span><span class='line'>        tp-&gt;bytes_acked -= tp-&gt;snd_cwnd*tp-&gt;mss_cache;
+</span><span class='line'>            if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
+</span><span class='line'>                tp-&gt;snd_cwnd++;
+</span><span class='line'>        }
+</span><span class='line'>    } else {
+</span><span class='line'>    //和上面处理方式类似。
+</span><span class='line'>        tcp_cong_avoid_ai(tp, tp-&gt;snd_cwnd);
+</span><span class='line'>    }
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后我们来看tcp_clean_rtx_queue函数，这个函数主要用于清理发送队列中已经被ack的数据段。函数比较大，我们来分段看。<br/>
+这里有使用karn算法，也就是如果重传的段，则计算rto的话，不采样这次的值。<br/>
+还有就是要判断是syn的ack回复，还是数据的ack回复。以及sack的判断。<br/>
+首先是遍历部分：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>while ((skb = tcp_write_queue_head(sk)) && skb != tcp_send_head(sk)) {
+</span><span class='line'>    struct tcp_skb_cb *scb = TCP_SKB_CB(skb);
+</span><span class='line'>    u32 acked_pcount;
+</span><span class='line'>    u8 sacked = scb-&gt;sacked;
+</span><span class='line'>    //这个说明当前的数据已经在发送未确认的段里面了。
+</span><span class='line'>    if (after(scb-&gt;end_seq, tp-&gt;snd_una)) {
+</span><span class='line'>        //这边不是很懂。
+</span><span class='line'>        if (tcp_skb_pcount(skb) == 1 ||
+</span><span class='line'>            !after(tp-&gt;snd_una, scb-&gt;seq))
+</span><span class='line'>            break;
+</span><span class='line'>        acked_pcount = tcp_tso_acked(sk, skb);
+</span><span class='line'>        if (!acked_pcount)
+</span><span class='line'>            break;
+</span><span class='line'>        fully_acked = 0;
+</span><span class='line'>    } else {
+</span><span class='line'>        acked_pcount = tcp_skb_pcount(skb);
+</span><span class='line'>    }
+</span><span class='line'>    //如果sack的状态有被设置重传，则我们会使用karn算法。
+</span><span class='line'>    if (sacked & TCPCB_RETRANS) {
+</span><span class='line'>        //如果标记为sack了重传段，则更新重传的计数。
+</span><span class='line'>        if (sacked & TCPCB_SACKED_RETRANS)
+</span><span class='line'>            tp-&gt;retrans_out -= acked_pcount;
+</span><span class='line'>        flag |= FLAG_RETRANS_DATA_ACKED;
+</span><span class='line'>
+</span><span class='line'>        //都为-1，也就是后面计算rtt，不会采样这次值。
+</span><span class='line'>        ca_seq_rtt = -1;
+</span><span class='line'>        seq_rtt = -1;
+</span><span class='line'>            if ((flag & FLAG_DATA_ACKED) || (acked_pcount &gt; 1))
+</span><span class='line'>        flag |= FLAG_NONHEAD_RETRANS_ACKED;
+</span><span class='line'>    } else {
+</span><span class='line'>        //否则根据时间戳得到对应的rtt
+</span><span class='line'>        ca_seq_rtt = now - scb-&gt;when;
+</span><span class='line'>        last_ackt = skb-&gt;tstamp;
+</span><span class='line'>        if (seq_rtt &lt; 0) {
+</span><span class='line'>            seq_rtt = ca_seq_rtt;
+</span><span class='line'>        }
+</span><span class='line'>        if (!(sacked & TCPCB_SACKED_ACKED))
+</span><span class='line'>            reord = min(pkts_acked, reord);
+</span><span class='line'>    }
+</span><span class='line'>    //如果有sack的数据包被ack确认了，则我们需要减小sack的计数
+</span><span class='line'>    if (sacked & TCPCB_SACKED_ACKED)
+</span><span class='line'>        tp-&gt;sacked_out -= acked_pcount;
+</span><span class='line'>    if (sacked & TCPCB_LOST)
+</span><span class='line'>        tp-&gt;lost_out -= acked_pcount;
+</span><span class='line'>    //总得发送为ack的数据字节计数更新。
+</span><span class='line'>    tp-&gt;packets_out -= acked_pcount;
+</span><span class='line'>    pkts_acked += acked_pcount;
+</span><span class='line'>    //判断是否为syn的ack。
+</span><span class='line'>    if (!(scb-&gt;flags & TCPCB_FLAG_SYN)) {
+</span><span class='line'>        flag |= FLAG_DATA_ACKED;
+</span><span class='line'>    } else {
+</span><span class='line'>        //如果是设置标记
+</span><span class='line'>        flag |= FLAG_SYN_ACKED;
+</span><span class='line'>        tp-&gt;retrans_stamp = 0;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    if (!fully_acked)
+</span><span class='line'>        break;
+</span><span class='line'>    //从写buf，unlink掉。
+</span><span class='line'>    tcp_unlink_write_queue(skb, sk);
+</span><span class='line'>    //释放内存。
+</span><span class='line'>    sk_wmem_free_skb(sk, skb);
+</span><span class='line'>    tp-&gt;scoreboard_skb_hint = NULL;
+</span><span class='line'>    if (skb == tp-&gt;retransmit_skb_hint)
+</span><span class='line'>        tp-&gt;retransmit_skb_hint = NULL;
+</span><span class='line'>    if (skb == tp-&gt;lost_skb_hint)
+</span><span class='line'>        tp-&gt;lost_skb_hint = NULL;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>剩下的部分就是计算rtt的部分，这里就不介绍了。</p>
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2013-09-06T15:40:00+08:00'><span class='date'>2013-09-06</span> <span class='time'>15:40:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~net/'>net</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2013/08/29/tools-git-svn-base/" title="Previous Post: git-svn">&laquo; git-svn</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2013/09/09/kernel-net-rx/" title="Next Post: 接收包的主流程">接收包的主流程 &raquo;</a>
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2014 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 50px; right: 30px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>
