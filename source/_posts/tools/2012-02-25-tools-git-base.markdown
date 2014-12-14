@@ -9,7 +9,6 @@ categories:
 - tools
 - tools~git
 tags:
-- git
 ---
 ####【GIT 基础】
 GIT 使用 SHA-1哈希码（40个字符）来标识提交，同时保证本次提交后整体（一个快照）的完整性。  

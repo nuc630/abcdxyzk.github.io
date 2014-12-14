@@ -10,7 +10,6 @@ categories:
 - language~c
 tags:
 - koj
-- judge
 ---
 pipe我们用中文叫做管道。  
 #### 函数简介

@@ -10,7 +10,6 @@ categories:
 - language~c
 tags:
 - koj
-- judge
 ---
 ```
 	#include <stdio.h>

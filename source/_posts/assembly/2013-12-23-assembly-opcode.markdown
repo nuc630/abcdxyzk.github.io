@@ -9,7 +9,6 @@ categories:
 - assembly
 - assembly~base
 tags:
-- opcode
 ---
 [http://www.pediy.com/kssd/pediy10/77824.html](http://www.pediy.com/kssd/pediy10/77824.html)
 

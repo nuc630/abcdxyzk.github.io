@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~kdump、crash
 tags:
-- kdump
 ---
 #### 原因：
 http://vault.centos.org/5.11/os/SRPMS/kexec-tools-1.102pre-165.el5.src.rpm  

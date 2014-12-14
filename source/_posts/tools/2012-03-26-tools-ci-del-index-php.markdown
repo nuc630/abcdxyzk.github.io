@@ -9,7 +9,7 @@ categories:
 - tools
 - tools~ci
 tags:
-- oj
+- koj
 ---
 #### RewriteEngine命令需要rewrite mod的支持
 `$>cd /etc/apache2/mods-enabled` 切换到apache下的mods-enabled目录   

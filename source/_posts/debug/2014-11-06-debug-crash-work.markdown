@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~kdump、crash
 tags:
-- crash
 - gdb
 ---
 [贴自https://www.redhat.com/archives/crash-utility/2014-October/msg00002.html](https://www.redhat.com/archives/crash-utility/2014-October/msg00002.html)  

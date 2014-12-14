@@ -9,7 +9,6 @@ categories:
 - system
 - system~centos
 tags:
-- rpm
 ---
 RHEL/CentOS/Fedora/Suse等Linux发行版都使用rpm包作为软件包格式。另外还有一个相关的格式srpm包（后缀是.src.rpm），它包含了源代码，可以用它重新生成rpm包。  
 当前最新发行的RHEL/CentOS是6.X版本。目前最新版是RHEL6.5/CentOS6.5。（CentOS是RHEL的免费版本，与RHEL对应版本完全等价，除了去掉了Redhat的LOGO。）  

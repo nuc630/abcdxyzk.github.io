@@ -9,7 +9,6 @@ categories:
 - algorithm
 - algorithm~base
 tags:
-- algorithm
 ---
 #### problem
 一个数组，其中只有两个数只出现一次，其余数皆出现偶数次。  

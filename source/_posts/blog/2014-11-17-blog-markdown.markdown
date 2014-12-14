@@ -9,7 +9,6 @@ categories:
 - blog
 - blog~markdown
 tags:
-- markdown
 ---
 [贴自http://wowubuntu.com/markdown/index.html](http://wowubuntu.com/markdown/index.html)
 #### 段落和换行

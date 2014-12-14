@@ -10,7 +10,6 @@ categories:
 - language~c
 tags:
 - koj
-- judge
 ---
 本文的主要内容如下：
 ```

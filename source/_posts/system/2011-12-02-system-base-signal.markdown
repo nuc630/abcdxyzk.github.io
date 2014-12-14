@@ -10,7 +10,6 @@ categories:
 - system~base
 tags:
 - koj
-- judge
 ---
 [原文](http://blog.sina.com.cn/s/blog_6f92c8fc0100x6i5.html)  
 

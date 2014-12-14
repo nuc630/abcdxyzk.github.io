@@ -9,7 +9,6 @@ categories:
 - system
 - system~ubuntu
 tags:
-- Thunderbird
 ---
 #### Mozilla Thunderbird 最小化附加组建
 在工具->附加组建中  

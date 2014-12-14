@@ -9,7 +9,6 @@ categories:
 - tools
 - tools~base
 tags: 
-- screen
 ---
 
 #### 断开控制台而不结束会话-Screen

@@ -9,7 +9,7 @@ categories:
 - tools
 - tools~ci
 tags:
-- oj
+- koj
 ---
 #### 基于URL权限系统：
   例如游客只能访问音乐模块的index,list,search方法。而注册用户除上述功能之外还能访问create,update,delete方法。那么我们可以在控制器之行之前判断当前用户是否具备访问该控制器的权限。

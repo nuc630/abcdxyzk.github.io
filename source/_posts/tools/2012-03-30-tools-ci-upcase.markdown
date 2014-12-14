@@ -9,7 +9,7 @@ categories:
 - tools
 - tools~ci
 tags:
-- oj
+- koj
 ---
 #### CI 处理 URL 的“大小写敏感”问题
 

@@ -10,7 +10,6 @@ categories:
 - language~c
 tags:
 - koj
-- judge
 ---
 [原文](http://www.kgdb.info/gdb/playing_with_ptrace_part_i/)  
 版权所有 © 转载时必须以链接形式注明作者和原始出处！

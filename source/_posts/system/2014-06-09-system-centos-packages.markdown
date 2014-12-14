@@ -9,7 +9,6 @@ categories:
 - system
 - system~centos
 tags:
-- centos
 ---
 #### 1、系统包
 ```

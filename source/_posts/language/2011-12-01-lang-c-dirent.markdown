@@ -10,7 +10,6 @@ categories:
 - language~c
 tags:
 - koj
-- judge
 ---
 引用头文件#include<dirent.h>  
 结构体说明  

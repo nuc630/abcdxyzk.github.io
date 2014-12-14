@@ -10,7 +10,6 @@ categories:
 - language~java
 tags:
 - koj
-- judge
 ---
 #### jni 编译：
 g++ -L /usr/lib/jvm/default-java/jre/lib/amd64/server -o judge judge.cpp -ljvm

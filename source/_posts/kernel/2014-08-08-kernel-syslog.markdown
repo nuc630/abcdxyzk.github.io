@@ -9,7 +9,6 @@ categories:
 - kernel
 - kernel~base
 tags:
-- syslog
 ---
 ##### printk 的输出都是保存在log_buf里的
 How to read it the ring buffer? Here is a beautiful illustration from IBM Developerworks

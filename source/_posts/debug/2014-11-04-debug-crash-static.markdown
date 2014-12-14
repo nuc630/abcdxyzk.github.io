@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~kdump、crash
 tags: 
-- crash
 ---
 ##### 要在centos6上编译，为了能在centos5用，用静态编译
 ##### 有两个显示函数参数的patch，但是不一定能起作用  

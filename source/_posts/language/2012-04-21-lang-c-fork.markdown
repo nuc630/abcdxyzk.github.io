@@ -10,7 +10,6 @@ categories:
 - language~c
 tags:
 - koj
-- judge
 ---
 #### 一 两次fork避免僵死进程
 如果在一个进程A中启动了一个子进程B，但是B的执行时间可能很长，也可能很短。因此，既不希望A调用wait或者waitpid来等待B的完成（如果B执行时间太长，A的时间就耗费在等待B的完成了，虽然waitpid有WNOHANG选项，但免不了多次调用waitpid来看B是否完成）；也不希望如果B执行时间太短了，然后A又不用wait或waitpid去获取B的退出状态，那么B就一直处于僵死状态直到A终止（这样造成了资源的浪费）。

@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~kdump、crash
 tags:
-- makedumpfile
 ---
 #### makedumpfile.8
 ```

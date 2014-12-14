@@ -9,7 +9,6 @@ categories:
 - compiler
 - compiler~make
 tags:
-- binutils
 ---
 #### 静态编译
 ```

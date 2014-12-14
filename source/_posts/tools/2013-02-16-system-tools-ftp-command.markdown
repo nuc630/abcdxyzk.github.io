@@ -9,7 +9,6 @@ categories:
 - tools
 - tools~base
 tags:
-- ftp
 ---
 * ftp 很快就会自动断开，lftp命令一样，更好用
 

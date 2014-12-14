@@ -9,7 +9,6 @@ categories:
 - debug
 - debug~dwarf
 tags:
-- dwarf
 ---
 * 来源：systemtap-2.4/runtime/loc2c-runtime.h
 #### x86_64

@@ -9,14 +9,14 @@ categories:
 - language
 - language~web
 tags:
-- oj
+- koj
 ---
 #### 1. 
 在 http://ckeditor.com/download 上下载最新版本的CKeditor。将下载的文件解压，然后将4M多的文件减肥：可以删掉_samples、_source、_tests这三个无用的文件夹；打开lang文件夹，删掉除_languages.js、en.js、zh-cn.js以外的所有文件；如果你不用office2003和v2两种皮肤，可以把skin目录下的这两个目录也都删掉。这样就做的了准备工作。  
 将ckeditor压缩包解压放在网站根目录下的“ckeditor”文件夹里：
 引入ckeditor.js文件：
 ```
-<script type="text/javascript" src="ckeditor/ckeditor.js"></script>
+    <script type="text/javascript" src="ckeditor/ckeditor.js"></script>
 ```
 你也可以将这些文件放在你网站的其他任何一个地方，默认为“ckeditor”。
  

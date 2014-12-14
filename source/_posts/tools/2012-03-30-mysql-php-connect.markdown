@@ -9,7 +9,7 @@ categories:
 - tools
 - tools~mysql
 tags:
-- oj
+- koj
 ---
 
 打开“新立得软件包管理器“安装两个东东就好了，
