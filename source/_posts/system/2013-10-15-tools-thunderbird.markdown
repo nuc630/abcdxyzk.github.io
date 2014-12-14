@@ -7,7 +7,7 @@ categories:
 - 2013
 - 2013~10
 - system
-- system~tools
+- system~ubuntu
 tags:
 - Thunderbird
 ---

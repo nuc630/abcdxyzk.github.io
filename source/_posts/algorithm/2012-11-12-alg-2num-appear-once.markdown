@@ -7,7 +7,7 @@ categories:
 - 2012
 - 2012~11
 - algorithm
-- algorithm~top
+- algorithm~base
 tags:
 - algorithm
 ---

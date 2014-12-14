@@ -7,7 +7,7 @@ categories:
 - 2012
 - 2012~10
 - algorithm
-- algorithm~top
+- algorithm~base
 tags:
 ---
 ##### POJ 3692 Kindergarten（二分图匹配）

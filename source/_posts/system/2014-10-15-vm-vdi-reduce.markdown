@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~10
 - system
-- system~vm
+- system~base
 tags:
 ---
 http://blog.csdn.net/zcg1041bolg/article/details/7870170

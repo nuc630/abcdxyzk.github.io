@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~08
 - system
-- system~vm
+- system~base
 tags:
 ---
 #### 一 添加

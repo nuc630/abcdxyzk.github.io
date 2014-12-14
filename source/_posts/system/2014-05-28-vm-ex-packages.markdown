@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~05
 - system
-- system~vm
+- system~base
 tags:
 ---
 #### 1、下载Oracle VM VirtualBox Extension Pack。下载网址如下：

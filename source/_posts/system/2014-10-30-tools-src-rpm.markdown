@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~10
 - system
-- system~rpm
+- system~centos
 tags:
 - rpm
 ---

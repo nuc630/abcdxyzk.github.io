@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~11
 - debug
-- debug~debugedit
+- debug~dwarf
 tags:
 ---
 ```
@@ -33,7 +33,7 @@ base-dir 长度要大等于 dest-dir
 -l 输出源编译文件位置，便于有需要的人打包
 
 debugedit 会在.debug_info .debug_abbrev .debug_line .debug_str中将base_dir目录替换为dest_dir目录。  
-* 需要注意，如果base_dir是路径中除文件名的部分，则.debug_line中的The Directory Table的目录不会替换。  
+* 需要注意，如果base_dir是路径中除文件名的部分，则.debug_line中的The Directory Table的目录和.debug_info中的DW_AT_comp_dir(指向.debug_str的内容)不会替换。  
 如：  
 .debug_line中的Table中有一个目录为`/root/Desktop`，如果用 `-b /root/Desktop`则匹配不上这条。  
 * 因为：debugedit在匹配的时候在base_dir后面加了一个'/'  

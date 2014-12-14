@@ -7,7 +7,7 @@ categories:
 - 2011
 - 2011~04
 - algorithm
-- algorithm~tree
+- algorithm~ds
 tags:
 ---
 ```

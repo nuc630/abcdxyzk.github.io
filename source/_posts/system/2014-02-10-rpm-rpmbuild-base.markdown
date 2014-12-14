@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~02
 - system
-- system~rpm
+- system~centos
 tags:
 ---
 在rpmbuild -ba时，遇到如下错误：  

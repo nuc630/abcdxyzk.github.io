@@ -7,7 +7,7 @@ categories:
 - 2011
 - 2011~03
 - algorithm
-- algorithm~top
+- algorithm~base
 tags:
 ---
 Knuth Dancing_Links 中文版 http://www.docin.com/p-31928825.html

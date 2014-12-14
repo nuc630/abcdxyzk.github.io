@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~11
 - compiler
-- compiler~ld
+- compiler~base
 tags:
 ---
 gcc --static a.c -Wl,-Bstatic -lm -Wl,-Bdynamic -lc  

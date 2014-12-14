@@ -7,7 +7,7 @@ categories:
 - 2011
 - 2011~07
 - algorithm
-- algorithm~top
+- algorithm~base
 tags:
 ---
 #### 分段排序网络 Bitonic Sort

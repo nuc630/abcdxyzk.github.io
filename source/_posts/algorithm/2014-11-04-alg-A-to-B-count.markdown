@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~11
 - algorithm
-- algorithm~top
+- algorithm~base
 tags:
 ---
 [Problem 1896 神奇的魔法数](http://acm.fzu.edu.cn/problem.php?pid=1896)

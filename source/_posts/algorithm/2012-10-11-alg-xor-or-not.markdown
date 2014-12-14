@@ -7,7 +7,7 @@ categories:
 - 2012
 - 2012~10
 - algorithm
-- algorithm~top
+- algorithm~base
 tags:
 ---
 http://acm.hust.edu.cn:8080/judge/problem/viewProblem.action?id=18669
