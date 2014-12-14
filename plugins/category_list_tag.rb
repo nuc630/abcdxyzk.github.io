@@ -9,7 +9,7 @@
 				l2 = 0
 				categories = context.registers[:site].categories.keys
 				tmp = categories.sort
-				sortby = ['language', 'compiler', 'assembly', 'system', 'kernel', 'debug', '---', 'algorithm', 'blog']
+				sortby = ['language', 'compiler', 'assembly', 'tools', 'system', 'kernel', 'debug', '---', 'algorithm', 'blog']
 				categories = []
 				pre = ""
 				sortby.each do |key|
