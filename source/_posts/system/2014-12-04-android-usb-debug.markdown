@@ -9,7 +9,6 @@ categories:
 - system
 - system~android
 tags:
-- android
 ---
 #### 一 下载
 下载 platform-tools 或 adt-bundle-linux-x86_64-XXX.zip（这个很大）  

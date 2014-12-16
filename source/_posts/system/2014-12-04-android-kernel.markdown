@@ -6,10 +6,9 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- compiler
-- compiler~base
+- system
+- system~android
 tags:
-- android
 ---
 #### 一 下载
 0.  下载arm编译器  

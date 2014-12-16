@@ -9,7 +9,6 @@ categories:
 - system
 - system~android
 tags:
-- android
 ---
 
 首先下载Android SDK ，完成安装openjdk-6-jre，还需要安装ia32-libs bison flex libglu1-mesa-dev 。  
