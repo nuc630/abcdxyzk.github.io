@@ -35,7 +35,9 @@ ARCH        ?= $(SUBARCH)
 CROSS_COMPILE    ?=  
 这两个字段成如下内容：  
 ARCH        ?= arm  
-CROSS_COMPILE    ?= arm-none-eabi-
+CROSS_COMPILE    ?= arm-none-eabi-  
+// 但是对于make goldfish_armv7_defconfig这样编译的内核模拟器好像启动不了，应该是默认编译成v5的，需要改成v7。或者可以改成ndk的编译器  
+// CROSS_COMPILE   ?= /home/kk/andr-perf/android-ndk-r10c/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/arm-linux-androideabi-
 
 3.  开始编译,敲入如下命令  
 make goldfish_defconfig  
@@ -60,8 +62,13 @@ Kernel: arch/arm/boot/zImage is ready
   同样，如果你的源代码目录不是android_prj，请注意修改下。另外，如果你已经配置了环境变量。则不必如此。建议最好写到配置文件 ~/.bash_rc配置文件里面去。 免得每次都要配置
 
 3. 启动模拟器  
+一、
 cd ~/android_prj  回到源代码目录  
-sandy@ubuntu:~/android_prj$ emulator -kernel ./kernel/arch/arm/boot/zImage 利用刚才我们编译的kernel内核启动模拟器
+sandy@ubuntu:~/android_prj$ emulator -kernel ./kernel/arch/arm/boot/zImage 利用刚才我们编译的kernel内核启动模拟器  
+二、
+emulator -avd myavd -kernel ~/goldfish/arch/arm/boot/zImage  
+-avd后面的参数 myavd即为模拟器的名字，-kernel后面的参数就找到刚才编译出的内核的路径。  
+若启动模拟器失败，可尝试关闭后再启动。第一次启动模拟器时可能需要等待比较长的时间，3分钟到15分钟不等。  
 
 4. 验证结果  
 待模拟器启动完毕之后，我们敲入adb shell  
