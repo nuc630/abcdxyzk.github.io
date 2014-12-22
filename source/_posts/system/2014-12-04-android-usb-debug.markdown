@@ -40,7 +40,7 @@ $ mount
 
 我用的平台，默认加载sdcard分区是noexec，所以无法执行该分区下的文件。
 
-重新加载该分区mount -o rw,remount /mnt/sdcard
+重新加载该分区mount -o rw,remount /mnt/sdcard /sdcard
 
 然后一切正常，自己的执行程序现在工作正常了。
 
