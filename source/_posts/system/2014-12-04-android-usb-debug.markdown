@@ -32,7 +32,21 @@ adb root
 adb shell  
 不过这种不一定成功
 
-#### 三 不能执行的sdcard分区如下
+#### 三 fastboot 模式
+有些手机有自己的刷机软件，这种的fastboot连不上--大品牌  
+没有自己的刷机软件的，一般都可以用fastboot连接--杂牌、国产。。。
+
+查看设备, 注意fastboot要加-i，其他网上搜到的对我试的三种机子都无效。 http://bbs.nubia.cn/thread-167619-1-1.html  
+
+```
+lsusb
+Bus 002 Device 001: ID 19d2:2286 xxxx机型
+
+
+fastboot -i 0x19D2 devices
+```
+
+#### 四 不能执行的sdcard分区如下
 $ mount  
 ```
 /dev/block/vold/93:80 /mnt/sdcard vfat rw,dirsync,nosuid,nodev,noexec,relatime,uid=1000,gid=1015,fmask=0702,dmask=0702,allow_utime=0020,codepage=cp437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro 0 0
