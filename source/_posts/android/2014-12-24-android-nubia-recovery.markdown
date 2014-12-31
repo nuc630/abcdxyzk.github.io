@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android
+- android
+- android~nx403a
 tags:
 ---
 http://www.onekeyrom.com/rom/zte_130038_10965.html
@@ -36,4 +36,12 @@ pan.baidu.com/s/1c0u18Ik
 步骤7： 在recovery模式界面，请按音量键选择wipe date/factory reset 菜单项，按开关机键进入，进行数据擦除  
 步骤8： 数据擦除结束后，请按音量键选择apply update fromsdcard菜单项，按开关机键进入，再按音量键选择NX403A_4.4_update_xxx.zip文件，按开关机键  确认，执行升级，此过程要1到2分钟  
 步骤9： 步骤8升级完成后如下图所示，此时光标条位于reboot system now菜单项，直接按开关机键重启手机
+
+
+##### 分区（看看就好）
+http://www.miui.com/forum.php?mod=viewthread&tid=1804584&extra=
+
+http://bbs.nubia.cn/thread-120471-1-1.html
+
+http://bbs.nubia.cn/thread-128729-1-1.html
 

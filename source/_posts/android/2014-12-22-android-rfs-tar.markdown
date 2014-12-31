@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android
+- android
+- android~base
 tags:
 ---
 boot.img可以按照 [这里](/blog/2014/12/22/android-img/) 的方式编辑

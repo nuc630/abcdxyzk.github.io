@@ -27,9 +27,9 @@ tags:
 	all:
 		@CC=arm-linux-gcc
 		@echo $(CC)
-	```
-	示例三：  
-	```
+```
+示例三：  
+```
 	CC=arm-linux-gcc
 	all:
 		@echo $(CC)
@@ -44,7 +44,7 @@ tags:
 		done
 ```
 #### 说明：
-1. Shell脚本在target里才有效，其它地方都被忽略掉了。所以示例一中，”build debug”之类的字符串根本打印不出来。示例一的正确写法是：
+1.Shell脚本在target里才有效，其它地方都被忽略掉了。所以示例一中，”build debug”之类的字符串根本打印不出来。示例一的正确写法是：
 示例一：
 ```
 	all:
@@ -55,7 +55,7 @@ tags:
 		fi
 		echo "done"
 ```
-2. make把每一行Shell脚本当作一个独立的单元，它们在单独的进程中运行。示例二中，两行Shell脚本在两个莫不相干的进程里运行，第一个进程把 CC设置为arm-linux-gcc，第二个进程是不知道的，所以打印的结果自然不是arm-linux-gcc了。示例二的正确写法是：  
+2.make把每一行Shell脚本当作一个独立的单元，它们在单独的进程中运行。示例二中，两行Shell脚本在两个莫不相干的进程里运行，第一个进程把 CC设置为arm-linux-gcc，第二个进程是不知道的，所以打印的结果自然不是arm-linux-gcc了。示例二的正确写法是：  
 示例二：
 ```
 	all:
@@ -65,9 +65,9 @@ tags:
 		@CC=arm-linux-gcc;
 		echo $(CC)
 ```
-3. make在调用Shell之前先进行预处理，即展开所有Makefile的变量和函数。这些变量和函数都以$开头。示例三中，Shell拿的脚本实际上是echo arm-linux-gcc，所以打印结果正确。
+3.make在调用Shell之前先进行预处理，即展开所有Makefile的变量和函数。这些变量和函数都以$开头。示例三中，Shell拿的脚本实际上是echo arm-linux-gcc，所以打印结果正确。
 
-4. make预处理时，所有以$开头的，它都不会放过。要想引用Shell自己的变量，应该以$$开头。另外要注意，Shell自己的变量是不需要括号的。示例四的正确写法是：  
+4.make预处理时，所有以$开头的，它都不会放过。要想引用Shell自己的变量，应该以$$开头。另外要注意，Shell自己的变量是不需要括号的。示例四的正确写法是：  
 示例四：
 ```
 	SUBDIR=src example

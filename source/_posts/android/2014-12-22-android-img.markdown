@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android
+- android
+- android~base
 tags:
 ---
 备份系统中img：dd if=/dev/block/mmcblk0p2 of=/sdcard/boot.img，回车，可得boot.img。

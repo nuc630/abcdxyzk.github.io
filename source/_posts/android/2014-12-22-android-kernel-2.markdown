@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android～Moto
+- android
+- android~ME722
 tags:
 ---
 blog.sina.com.cn/s/blog_706845a5010129da.html

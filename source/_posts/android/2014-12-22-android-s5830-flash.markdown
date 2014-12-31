@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android
+- android
+- android~S5830
 tags:
 ---
 

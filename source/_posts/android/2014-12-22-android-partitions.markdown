@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android～Moto
+- android
+- android~base
 tags:
 ---
 blog.chinaunix.net/uid-22731254-id-3222708.html

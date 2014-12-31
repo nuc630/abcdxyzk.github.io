@@ -16,6 +16,13 @@ sudo apt-get install build-essential
 sudo apt-get install ia32-libs
 ```
 
+#### bash
+修改sh默认连接到bash的一种方法：
+```
+sudo dpkg-reconfigure dash
+```
+选择no即可.
+
 #### intel集显驱动
 ```
 sudo apt-get install xserver-xorg-video-intel

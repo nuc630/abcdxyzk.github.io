@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2014
 - 2014~12
-- system
-- system~android
+- android
+- android~ME722
 tags:
 ---
 ##### ROM
