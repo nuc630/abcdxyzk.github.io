@@ -13,40 +13,40 @@ tags:
 
 ##### tsc时钟源初始化
 ```
-//    调用路径：time_init->tsc_init
-//    函数任务：
-//        1.矫正tsc，获取tsc频率，设置cpu频率等于tsc频率
-//        2.初始化基于tsc的延迟函数
-//        3.检查tsc的特性
-//            3.1 tsc之间是否同步
-//                3.1.1 如果tsc之间不同步，标记tsc不稳定，设置rating=0
-//            3.2 tsc是否稳定
-//        4.注册tsc时钟源设备
+	//    调用路径：time_init->tsc_init
+	//    函数任务：
+	//        1.矫正tsc，获取tsc频率，设置cpu频率等于tsc频率
+	//        2.初始化基于tsc的延迟函数
+	//        3.检查tsc的特性
+	//            3.1 tsc之间是否同步
+	//                3.1.1 如果tsc之间不同步，标记tsc不稳定，设置rating=0
+	//            3.2 tsc是否稳定
+	//        4.注册tsc时钟源设备
 ```
 
 ```
-void __init tsc_init(void)
-{
-    u64 lpj;
-    int cpu;
+	void __init tsc_init(void)
+	{
+		u64 lpj;
+		int cpu;
 
-    //矫正tsc，获取tsc频率
-    tsc_khz = x86_platform.calibrate_tsc();
-    //cpu频率等于tsc频率
-    cpu_khz = tsc_khz;
-    //计算辅助cycle到ns转换的辅助参数scale
-    for_each_possible_cpu(cpu)
-        set_cyc2ns_scale(cpu_khz, cpu);
-    //初始化基于tsc的延迟函数，ndely，udelay，mdelay
-    use_tsc_delay();
-    //检查cpu之间tsc是否同步
-    if (unsynchronized_tsc())
-        mark_tsc_unstable("TSCs unsynchronized");
-    //检查tsc是否可靠
-    check_system_tsc_reliable();
-    //注册tsc时钟源设备
-    init_tsc_clocksource();
-}
+		//矫正tsc，获取tsc频率
+		tsc_khz = x86_platform.calibrate_tsc();
+		//cpu频率等于tsc频率
+		cpu_khz = tsc_khz;
+		//计算辅助cycle到ns转换的辅助参数scale
+		for_each_possible_cpu(cpu)
+		    set_cyc2ns_scale(cpu_khz, cpu);
+		//初始化基于tsc的延迟函数，ndely，udelay，mdelay
+		use_tsc_delay();
+		//检查cpu之间tsc是否同步
+		if (unsynchronized_tsc())
+		    mark_tsc_unstable("TSCs unsynchronized");
+		//检查tsc是否可靠
+		check_system_tsc_reliable();
+		//注册tsc时钟源设备
+		init_tsc_clocksource();
+	}
 ```
 
 ##### 延迟函数ndelay，udelay，mdelay
@@ -62,48 +62,48 @@ void __init tsc_init(void)
 ##### tsc延迟函数
 通过rep_nop实现轮询时的短延迟，查询tsc时禁止内核抢占，确保不受不同cpu间影响。
 ```
-static void delay_tsc(unsigned long loops)
-{
-    unsigned long bclock, now;
-    int cpu;
-    //短延迟，禁止内核抢占
-    preempt_disable();
-    //delay_tsc当前运行的cpu
-    cpu = smp_processor_id();
-    rdtsc_barrier();
-    rdtscl(bclock);
-    for (;;) {
-        rdtsc_barrier();
-        rdtscl(now);
-        if ((now - bclock) >= loops)
-            break;
-        //允许rt策略进程运行
-        preempt_enable();
-        //空操作
-        rep_nop();
-        preempt_disable();
+	static void delay_tsc(unsigned long loops)
+	{
+		unsigned long bclock, now;
+		int cpu;
+		//短延迟，禁止内核抢占
+		preempt_disable();
+		//delay_tsc当前运行的cpu
+		cpu = smp_processor_id();
+		rdtsc_barrier();
+		rdtscl(bclock);
+		for (;;) {
+		    rdtsc_barrier();
+		    rdtscl(now);
+		    if ((now - bclock) >= loops)
+		        break;
+		    //允许rt策略进程运行
+		    preempt_enable();
+		    //空操作
+		    rep_nop();
+		    preempt_disable();
 
-        //delay_tsc在运行过程中，可能会迁移到不同的cpu
-        //tsc
-        if (unlikely(cpu != smp_processor_id())) {
-            loops -= (now - bclock);
-            cpu = smp_processor_id();
-            rdtsc_barrier();
-            rdtscl(bclock);
-        }
-    }
-    preempt_enable();
-}
+		    //delay_tsc在运行过程中，可能会迁移到不同的cpu
+		    //tsc
+		    if (unlikely(cpu != smp_processor_id())) {
+		        loops -= (now - bclock);
+		        cpu = smp_processor_id();
+		        rdtsc_barrier();
+		        rdtscl(bclock);
+		    }
+		}
+		preempt_enable();
+	}
 ```
 
 ##### 检查tsc是否同步
 ```
-//    调用路径：tsc_init->unsynchronized_tsc
-//    检查办法：
-//        1.如果apic在多块板卡，则tsc不同步
-//        2.如果cpuid显示具有稳定的tsc，则tsc同步
-//        3.intel cpu的tsc都是同步的
-//        4.默认其他品牌的多核的tsc不同步
+	//    调用路径：tsc_init->unsynchronized_tsc
+	//    检查办法：
+	//        1.如果apic在多块板卡，则tsc不同步
+	//        2.如果cpuid显示具有稳定的tsc，则tsc同步
+	//        3.intel cpu的tsc都是同步的
+	//        4.默认其他品牌的多核的tsc不同步
 ```
 
 ```
@@ -127,11 +127,12 @@ static void delay_tsc(unsigned long loops)
 
 ##### 标记tsc不稳定
 ```
-//    调用路径：tsc_init->mark_tsc_unstable
-//    函数任务：
-//        1.如果tsc时钟已经注册，异步设置tsc的rating=0，标识其不稳定
-//        2.如果tsc时钟还未注册，同步设置tsc的rating=0，标识其不稳定
+	//    调用路径：tsc_init->mark_tsc_unstable
+	//    函数任务：
+	//        1.如果tsc时钟已经注册，异步设置tsc的rating=0，标识其不稳定
+	//        2.如果tsc时钟还未注册，同步设置tsc的rating=0，标识其不稳定
 ```
+
 ```
 	void mark_tsc_unstable(char *reason)
 	{
@@ -161,6 +162,7 @@ static void delay_tsc(unsigned long loops)
 	//        3.向系统注册tsc clocksource
 	//    调用路径：tsc_init->init_tsc_clocksource
 ```
+
 ```
 	static void __init init_tsc_clocksource(void)
 	{

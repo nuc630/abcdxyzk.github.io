@@ -30,4 +30,7 @@ XXX改成和你手机的这部分'-perf-CL382966'一模一样，不一样这些�
 
 编译好后，cp *.ko 到 boot.img-ramdisk/lib/modules/，然后按照 [这里](/blog/2014/12/22/android-img/) 方法重新生成boot.img, 记得zImage用你编译的，在arch/arm/boot/zImage 
 
+```
+mkbootimg --kernel zImage --ramdisk no_ko_ramdisk.cpio.gz --base 13600000 --ramdisk_offset FF8000 --pagesize 4096 -o 3.4_noko_boot.img
+```
 
