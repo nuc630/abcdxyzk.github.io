@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~sched | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~sched/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2014-12-31T11:32:20+08:00</updated>
+  <updated>2015-01-03T23:26:57+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,596 +14,111 @@
 
   
   <entry>
-    <title type="html"><![CDATA[tsc时钟初始化]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/05/29/kernel-sched-tsc/"/>
-    <updated>2014-05-29T14:03:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/05/29/kernel-sched-tsc</id>
-    <content type="html"><![CDATA[<h5>tsc时钟源初始化</h5>
+    <title type="html"><![CDATA[中断，进程]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/01/03/kernel-sched-irq-mark/"/>
+    <updated>2015-01-03T15:45:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/01/03/kernel-sched-irq-mark</id>
+    <content type="html"><![CDATA[<p>blog.chinaunix.net/uid-20806345-id-3203602.html</p>
 
-<pre><code>//    调用路径：time_init-&gt;tsc_init
-//    函数任务：
-//        1.矫正tsc，获取tsc频率，设置cpu频率等于tsc频率
-//        2.初始化基于tsc的延迟函数
-//        3.检查tsc的特性
-//            3.1 tsc之间是否同步
-//                3.1.1 如果tsc之间不同步，标记tsc不稳定，设置rating=0
-//            3.2 tsc是否稳定
-//        4.注册tsc时钟源设备
-</code></pre>
+<p>  中断不是进程，不受内核调度器的管辖。在系统处理进程的过程中，对于某个cpu来说，如果有内部中断或外部中断到来，则切换到中断处理程序，切换首先要将进程由用户态要切到进程的内核态，然后再将cpu切换到中断态，待处理完中断返回进程的内核态，再返回进程的用户态，如果中断时进程刚好处于内核态中不用由用户态切到内核态了。<br/>
+  中断处理时是不分优先级的，处理中断的过程中如果有任意中断到来，都会抢占当前的中断处理过程。所以对于要及时响应的中断，需要通过关中断来屏蔽其他中断。通常所说的中断优先级是指中断控制器端的优先级，当有多个中断触发时，首先选择优先级高的中断发出请求给处理器。中断优先级只是对中断控制器而言的，所有的中断对cpu来说都是一样的，没有优先级高低之分。<br/>
+  关中断是关闭所有的外部可屏蔽中断，和优先级没有关系，如果在某中断处理程序中关中断，则不会被任何可屏蔽中断抢占，但是会被任意的不可屏蔽中断抢占。关中断是中断处理程序可选的。</p>
 
-<pre><code>void __init tsc_init(void)
-{
-    u64 lpj;
-    int cpu;
+<p>bbs.chinaunix.net/thread-2306027-1-8.html</p>
 
-    //矫正tsc，获取tsc频率
-    tsc_khz = x86_platform.calibrate_tsc();
-    //cpu频率等于tsc频率
-    cpu_khz = tsc_khz;
-    //计算辅助cycle到ns转换的辅助参数scale
-    for_each_possible_cpu(cpu)
-        set_cyc2ns_scale(cpu_khz, cpu);
-    //初始化基于tsc的延迟函数，ndely，udelay，mdelay
-    use_tsc_delay();
-    //检查cpu之间tsc是否同步
-    if (unsynchronized_tsc())
-        mark_tsc_unstable("TSCs unsynchronized");
-    //检查tsc是否可靠
-    check_system_tsc_reliable();
-    //注册tsc时钟源设备
-    init_tsc_clocksource();
-}
-</code></pre>
+<p>软中断做的是一些可延迟的费时间的事，当然不能在中断里执行了。<br/>
+  <code>__do_softirq</code>代码，可以看到在执行可延迟函数第一件事就是开中断。但在开始之前，禁用了下半部中断（<code>__local_bh_disable</code>）。这样就算被中断了，返回内核时也不会被抢占，还是执行这里的代码。也不会被调度。<br/>
+  那么这样的后果就是软中断上下文里的会一直执行下去，直到到达了限定次数，然后唤醒守护进程。<br/>
+  因为软中断切换了栈，不再使用进程上下文，那么如果在软中断上下文直接或简洁调用了shedule，那么只有死翘翘了！！因为schedule调度回来的时候是依赖进程内核栈的thread_info。</p>
 
-<h5>延迟函数ndelay，udelay，mdelay</h5>
+<p>  内核抢占点之一就是中断返回的时候检查是否可以抢占，检查的内容之一就是preempt_count是否等于0，因为禁用了下半部中断，那么肯定就不会等于0的，所以不会被抢占。也就是说返回的时候不会发生调度。</p>
 
-<p>通过tsc实现短延迟
-<code>
-    void use_tsc_delay(void)
-    {
-        //通过tsc进行短延迟
-        delay_fn = delay_tsc;
-    }
-</code></p>
+<p>  个人理解 中断上下文 最大的特征 禁掉了某种中断（硬中断和软中断），所以导致 不能阻塞。<br/>
+  softirq 有可能在两种方式下被调用，一是中断处理程序退出时，开放硬件中断之后，会去调用do_softirq()。
+  do_softirq()会禁掉后半部抢占，并且现在执行流使用的是被中断的进程的栈，所以无法阻塞。<br/>
+  softirq的另一种调用方式是ksoftirq内核线程，同样do_softirq()被调用，后半部中断被禁掉，同样禁止阻塞。<br/>
+  工作队列，可以被任何中断或者软中断中断，运行在进程上下文，有自己的栈，可以阻塞。</p>
 
-<h5>tsc延迟函数</h5>
-
-<p>通过rep_nop实现轮询时的短延迟，查询tsc时禁止内核抢占，确保不受不同cpu间影响。
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void delay_tsc(unsigned long loops)
-</span><span class='line'>{
-</span><span class='line'>    unsigned long bclock, now;
-</span><span class='line'>    int cpu;
-</span><span class='line'>    //短延迟，禁止内核抢占
-</span><span class='line'>    preempt_disable();
-</span><span class='line'>    //delay_tsc当前运行的cpu
-</span><span class='line'>    cpu = smp_processor_id();
-</span><span class='line'>    rdtsc_barrier();
-</span><span class='line'>    rdtscl(bclock);
-</span><span class='line'>    for (;;) {
-</span><span class='line'>        rdtsc_barrier();
-</span><span class='line'>        rdtscl(now);
-</span><span class='line'>        if ((now - bclock) &gt;= loops)
-</span><span class='line'>            break;
-</span><span class='line'>        //允许rt策略进程运行
-</span><span class='line'>        preempt_enable();
-</span><span class='line'>        //空操作
-</span><span class='line'>        rep_nop();
-</span><span class='line'>        preempt_disable();&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    //delay_tsc在运行过程中，可能会迁移到不同的cpu
-</span><span class='line'>    //tsc
-</span><span class='line'>    if (unlikely(cpu != smp_processor_id())) {
-</span><span class='line'>        loops -= (now - bclock);
-</span><span class='line'>        cpu = smp_processor_id();
-</span><span class='line'>        rdtsc_barrier();
-</span><span class='line'>        rdtscl(bclock);
-</span><span class='line'>    }
-</span><span class='line'>}
-</span><span class='line'>preempt_enable();
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;}</span></code></pre></td></tr></table></div></figure></p>
-
-<h5>检查tsc是否同步</h5>
-
-<pre><code>//    调用路径：tsc_init-&gt;unsynchronized_tsc
-//    检查办法：
-//        1.如果apic在多块板卡，则tsc不同步
-//        2.如果cpuid显示具有稳定的tsc，则tsc同步
-//        3.intel cpu的tsc都是同步的
-//        4.默认其他品牌的多核的tsc不同步
-</code></pre>
-
-<pre><code>    __cpuinit int unsynchronized_tsc(void)
-    {
-        //如果apic分布在多块板卡上，tsc可能不同步
-        if (apic_is_clustered_box())
-            return 1;
-        //cpu具有稳定的tsc
-        if (boot_cpu_has(X86_FEATURE_CONSTANT_TSC))
-            return 0;
-        //intel cpu的tsc都是同步的
-        if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) {
-            //非intel cpu，如果cpu个数&gt;1,则认为不同步
-            if (num_possible_cpus() &gt; 1)
-                tsc_unstable = 1;
-        }
-        return tsc_unstable;
-    }
-</code></pre>
-
-<h5>标记tsc不稳定</h5>
-
-<pre><code>//    调用路径：tsc_init-&gt;mark_tsc_unstable
-//    函数任务：
-//        1.如果tsc时钟已经注册，异步设置tsc的rating=0，标识其不稳定
-//        2.如果tsc时钟还未注册，同步设置tsc的rating=0，标识其不稳定
-</code></pre>
-
-<pre><code>    void mark_tsc_unstable(char *reason)
-    {
-        if (!tsc_unstable) {
-            tsc_unstable = 1;
-            sched_clock_stable = 0;
-            //tsc已经注册，
-            if (clocksource_tsc.mult)
-            {
-                clocksource_mark_unstable(&amp;clocksource_tsc);
-            }
-            //如果tsc时钟源未注册，修改rating为最低，从而不会被当做最佳的时钟源
-            else {
-                clocksource_tsc.flags |= CLOCK_SOURCE_UNSTABLE;
-                clocksource_tsc.rating = 0;
-            }
-        }
-    }
-</code></pre>
-
-<h5>注册tsc时钟源</h5>
-
-<pre><code>    //    函数任务：
-    //        1.计算tsc的mult
-    //        2.检查tsc是否稳定
-    //            2.1 如果tsc不稳定，降低其rating，清除时钟源连续标志
-    //        3.向系统注册tsc clocksource
-    //    调用路径：tsc_init-&gt;init_tsc_clocksource
-</code></pre>
-
-<pre><code>    static void __init init_tsc_clocksource(void)
-    {
-        // 计算tsc的mult
-        clocksource_tsc.mult = clocksource_khz2mult(tsc_khz,
-                clocksource_tsc.shift);
-        // 如果tsc的可靠性已经验证，则清除 必须验证 标记
-        if (tsc_clocksource_reliable)
-            clocksource_tsc.flags &amp;= ~CLOCK_SOURCE_MUST_VERIFY;
-
-        // 检查tsc是否稳定
-        // 在tsc_init前通过全局变量标记tsc是否稳定，可靠
-        if (check_tsc_unstable()) {
-            // 如果tsc不稳定，则降低rating最低，清除连续标记
-            clocksource_tsc.rating = 0;
-            clocksource_tsc.flags &amp;= ~CLOCK_SOURCE_IS_CONTINUOUS;
-        }
-        // 向系统注册tsc clocksource
-        clocksource_register(&amp;clocksource_tsc);
-    }
-</code></pre>
+<p>看一下__do_softirq()的代码,新的硬中断确实可能触发更高优先级的软中断，但是这个软中断并不会在被中断的软中断之前得到执行，软中断始终是顺序执行的。从代码看来，新一批的软中断，无论优先级多高，也得等到前一批的软中断被处理完成之后才能得到处理。而优先级只能帮助软中断在对应的批次中优先得到处理。</p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[周期性调度器scheduler_tick]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/05/22/kernel-sched-tick/"/>
-    <updated>2014-05-22T16:57:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/05/22/kernel-sched-tick</id>
-    <content type="html"><![CDATA[<p>周期性调度器由中断实现，系统定时产生一个中断，然后启动周期性调度器，周期性调度器执行过程中要关闭中断, 周期性调度器执行完毕后再打开中断(handle_IRQ_event,  IRQF_DISABLED)</p>
+    <title type="html"><![CDATA[硬中断和软中断]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/01/03/kernel-sched-irq/"/>
+    <updated>2015-01-03T15:15:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/01/03/kernel-sched-irq</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/21992933">http://blog.csdn.net/zhangskd/article/details/21992933</a></p>
 
-<p>周期性调度器主要做两个工作：<br/>
-a)更新相关统计量<br/>
-b) 检查进程执行的时间是否超过了它对应的ideal_runtime，如果超过了，则告诉系统，需要启动主调度器(schedule)进行进程切换。(注意 thread_info:preempt_count、thread_info:flags (TIF_NEED_RESCHED))</p>
+<h4>概述</h4>
 
-<h4>周期性调度器</h4>
+<p>从本质上来讲，中断是一种电信号，当设备有某种事件发生时，它就会产生中断，通过总线把电信号发送给中断控制器。
+如果中断的线是激活的，中断控制器就把电信号发送给处理器的某个特定引脚。处理器于是立即停止自己正在做的事，
+跳到中断处理程序的入口点，进行中断处理。</p>
 
-<pre><code>    |----&gt;do_timer()   更新jiffies_64
-    |----&gt;update_process_times()
-          |----&gt;scheduler_tick()
-          |----&gt;update_rq_clock()  更新当前调度队列rq的clock
-          |----&gt;curr-&gt;sched_class-&gt;task_tick() 
-          |         对于普通进程，即task_tick_fair()
-          |         task_struct: struct sched_class *sched_class
+<h5>(1) 硬中断</h5>
 
-update_rq_clock()----delta = sched_clock_cpu(cpu_of(rq)) - rq-&gt;clock
-         |-----两次相邻两次周期性调度器运行的时间差
-         |----rq-&gt;clock += delta; 更新运行队列上的时钟
-               |----&gt;update_rq_clock_task(rq, delta)
-               |     即rq-&gt;clock_task += delta
-</code></pre>
+<p>由与系统相连的外设(比如网卡、硬盘)自动产生的。主要是用来通知操作系统系统外设状态的变化。比如当网卡收到数据包的时候，就会发出一个中断。我们通常所说的中断指的是硬中断(hardirq)。</p>
 
-<h4>普通进程</h4>
+<h5>(2) 软中断</h5>
 
-<pre><code>task_tick_fair()----&gt;entity_tick()   没有考虑组调度
-   |----&gt;update_curr() 更新相关统计量
-   |----&gt;check_preempt_tick()   
-   |        检查进程本次获得CPU使用权的执行时间是否超过了
-   |        它对应的ideal_runtime值，如果超过了，则将当前进
-   |        程的TIF_NEED_RESCHED标志位置位
+<p>为了满足实时系统的要求，中断处理应该是越快越好。linux为了实现这个特点，当中断发生的时候，硬中断处理那些短时间就可以完成的工作，而将那些处理事件比较长的工作，放到中断之后来完成，也就是软中断(softirq)来完成。</p>
 
-update_curr()
-   |----delta_exec = (unsigned long)(now - curr-&gt;exec_start);  
-   |            exec_start当前进程开始获得
-   |            cpu使用权时的时间戳;
-   |            进程本次所获得的CPU执行权的时间;
-   |----&gt;__update_curr(cfs_rq, curr, delta_exec);
-         |----&gt;curr-&gt;sum_exec_runtime += delta_exec; 
-         |     更新该进程获得CPU执行权总时间
-         |
-         |----&gt;curr-&gt;vruntime += delta_exec_weighted;
-         |     更新该进程获得CPU执行权的虚拟时间
-         |
-         |----&gt;update_min_vruntime()
-         |     更新cfs_rq-&gt;min_vruntime
-         |
-   |----&gt;curr-&gt;exec_start = now    
-   |        更新进程下次运行起始时间
-   |        (如果被抢占，下次被调度时将会更新)
+<h5>(3) 中断嵌套</h5>
 
-check_preempt_tick()
-   |----ideal_runtime = sched_slice(cfs_rq, curr);
-   |----delta_exec = curr-&gt;sum_exec_runtime 
-   |                 - curr-&gt;prev_sum_exec_runtime;
-   |----if(delta_exec &gt; ideal_runtime)  
-   |          resched_task(rq_of(cfs_rq)-&gt;curr);
-   |          把当前进程的TIF_NEED_RESCHED标志位置位
-   |----else
-   |    delta = curr-&gt;vruntime - se-&gt;vruntime;  //这是什么？
-   |    if (delta &gt; ideal_runtime)  
-   |        resched_task(rq_of(cfs_rq)-&gt;curr);
-   |        把当前进程的TIF_NEED_RESCHED标志位置位
-</code></pre>
+<p>Linux下硬中断是可以嵌套的，但是没有优先级的概念，也就是说任何一个新的中断都可以打断正在执行的中断，但同种中断除外。软中断不能嵌套，但相同类型的软中断可以在不同CPU上并行执行。</p>
 
-<h4>实时进程</h4>
+<h5>(4) 软中断指令</h5>
 
-<pre><code>task_tick_rt()
-    |----&gt;update_curr_rt();
-    |----&gt;if (p-&gt;policy != SCHED_RR) return;  SCHED_FIFO只有主动放弃CPU使用权
-    |----&gt;rt.timeslice值减一，若没有运行完时间则直接返回，
-    |     否则再次分配时间片，加入队列尾部，设置TIF_NEED_RESCHED
+<p>int是软中断指令。<br/>
+中断向量表是中断号和中断处理函数地址的对应表。<br/>
+int n - 触发软中断n。相应的中断处理函数的地址为：中断向量表地址 + 4 * n。</p>
 
-update_curr_rt()
-    |----delta_exec = rq-&gt;clock - curr-&gt;se.exec_start; //本次运行时间
-    |----curr-&gt;se.sum_exec_runtime += delta_exec; //更新总得运行时间
-    |----curr-&gt;se.exec_start = rq-&gt;clock; //更新下次进程运行的起始时间
-    |----if (sched_rt_runtime(rt_rq) != RUNTIME_INF)
-    |-------{
-    |           rt_rq-&gt;rt_time += delta_exec;
-    |                if (sched_rt_runtime_exceeded(rt_rq))
-    |                   resched_task(curr);
-    |       }
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[内核抢占实现机制分析]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/04/25/kernel-sched-2/"/>
-    <updated>2014-04-25T17:22:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/04/25/kernel-sched-2</id>
-    <content type="html"><![CDATA[<h4>1 内核抢占概述</h4>
+<h5>(5)硬中断和软中断的区别</h5>
 
-<p>2.6新的可抢占式内核是指内核抢占，即当进程位于内核空间时，有一个更高优先级的任务出现时，如果当前内核允许抢占，则可以将当前任务挂起，执行优先级更高的进程。</p>
+<p>软中断是执行中断指令产生的，而硬中断是由外设引发的。<br/>
+硬中断的中断号是由中断控制器提供的，软中断的中断号由指令直接指出，无需使用中断控制器。<br/>
+硬中断是可屏蔽的，软中断不可屏蔽。<br/>
+硬中断处理程序要确保它能快速地完成任务，这样程序执行时才不会等待较长时间，称为上半部。<br/>
+软中断处理硬中断未完成的工作，是一种推后执行的机制，属于下半部。</p>
 
-<p>在2.5.4版本之前，Linux内核是不可抢占的，高优先级的进程不能中止正在内核中运行的低优先级的进程而抢占CPU运行。进程一旦处于核心态(例如 用户进程执行系统调用)，则除非进程自愿放弃CPU，否则该进程将一直运行下去，直至完成或退出内核。与此相反，一个可抢占的Linux内核可以让 Linux内核如同用户空间一样允许被抢占。当一个高优先级的进程到达时，不管当前进程处于用户态还是核心态，如果当前允许抢占，可抢占内核的Linux 都会调度高优先级的进程运行。</p>
+<h4>开关</h4>
 
-<h4>2 用户抢占</h4>
+<h5>(1) 硬中断的开关</h5>
 
-<p>内核即将返回用户空间的时候，如果need resched标志被设置，会导致schedule()被调用，此时就会发生用户抢占。在内核返回用户空间的时候，它知道自己是安全的。所以，内核无论是 在从中断处理程序还是在系统调用后返回，都会检查need resched标志。如果它被设置了，那么，内核会选择一个其他(更合适的)进程投入运行。</p>
-
-<p>简而言之，用户抢占在以下情况时产生：
-从系统调返回用户空间。<br/>
-从中断处理程序返回用户空间。</p>
-
-<h4>3 不可抢占内核的特点</h4>
-
-<p>在不支持内核抢占的内核中，内核代码可以一直执行，到它完成为止。也就是说，调度程序没有办法在一个内核级的任务正在执行的时候重新调度—内核中的各任务是协作方式调度的，不具备抢占性。当然，运行于内核态 的进程可以主动放弃CPU，比如，在系统调用服务例程中，由于内核代码由于等待资源而放弃CPU，这种情况叫做计划性进程切换（planned process switch）。内核代码一直要执行到完成(返回用户空间)或明显的阻塞为止,
-在单CPU情况下，这样的设定大大简化了内核的同步和保护机制。可以分两步对此加以分析：<br/>
-  首先，不考虑进程在内核中自愿放弃CPU的情况(也即在内核中不发生进程的切换)。一个进程一旦进入内核就将一直运行下去，直到完成或退出内核。在其没有 完成或退出内核之前，不会有另外一个进程进入内核，即进程在内核中的执行是串行的，不可能有多个进程同时在内核中运行，这样内核代码设计时就不用考虑多个 进程同时执行所带来的并发问题。Linux的内核开发人员就不用考虑复杂的进程并发执行互斥访问临界资源的问题。当进程在访问、修改内核的数据结构时就不 需要加锁来防止多个进程同时进入临界区。这时只需再考虑一下中断的情况，若有中断处理例程也有可能访问进程正在访问的数据结构，那么进程只要在进入临界区 前先进行关中断操作，退出临界区时进行开中断操作就可以了。<br/>
-  再考虑一下进程自愿放弃CPU的情况。因为对CPU的放弃是自愿的、主动的，也就意味着进程在内核中的切换是预先知道的，不会出现在不知道的情况下发生进 程的切换。这样就只需在发生进程切换的地方考虑一下多个进程同时执行所可能带来的并发问题，而不必在整个内核范围内都要考虑进程并发执行问题。</p>
-
-<h4>4 为什么需要内核抢占？</h4>
-
-<p>实现内核的可抢占对Linux具有重要意义。首先，这是将Linux应用于实时系统所必需的。实时系统对响应时间有严格的限定，当一个实时进程被实时设备 的硬件中断唤醒后，它应在限定的时间内被调度执行。而Linux不能满足这一要求，因为Linux的内核是不可抢占的，不能确定系统在内核中的停留时间。 事实上当内核执行长的系统调用时，实时进程要等到内核中运行的进程退出内核才能被调度，由此产生的响应延迟，在如今的硬件条件下，会长达100ms级。</p>
-
-<p>这对于那些要求高实时响应的系统是不能接受的。而可抢占的内核不仅对Linux的实时应用至关重要，而且能解决Linux对多媒体(video, audio)等要求低延迟的应用支持不够好的缺陷。</p>
-
-<p>由于可抢占内核的重要性，在Linux2.5.4版本发布时，可抢占被并入内核，同SMP一样作为内核的一项标准可选配置。</p>
-
-<h4>5 什么情况不允许内核抢占</h4>
-
-<p>有几种情况Linux内核不应该被抢占，除此之外Linux内核在任意一点都可被抢占。这几种情况是：<br/>
-?  内核正进行中断处理。在Linux内核中进程不能抢占中断(中断只能被其他中断中止、抢占，进程不能中止、抢占中断)，在中断例程中不允许进行进程调度。进程调度函数schedule()会对此作出判断，如果是在中断中调用，会打印出错信息。<br/>
-?  内核正在进行中断上下文的Bottom Half(中断的底半部)处理。硬件中断返回前会执行软中断，此时仍然处于中断上下文中。<br/>
-?  内核的代码段正持有spinlock自旋锁、writelock/readlock读写锁等锁，处干这些锁的保护状态中。内核中的这些锁是为了在SMP系 统中短时间内保证不同CPU上运行的进程并发执行的正确性。当持有这些锁时，内核不应该被抢占，否则由于抢占将导致其他CPU长期不能获得锁而死等。<br/>
-?  内核正在执行调度程序Scheduler。抢占的原因就是为了进行新的调度，没有理由将调度程序抢占掉再运行调度程序。<br/>
-?  内核正在对每个CPU“私有”的数据结构操作(Per-CPU date structures)。在SMP中，对于per-CPU数据结构未用spinlocks保护，因为这些数据结构隐含地被保护了(不同的CPU有不一样的 per-CPU数据，其他CPU上运行的进程不会用到另一个CPU的per-CPU数据)。但是如果允许抢占，但一个进程被抢占后重新调度，有可能调度到 其他的CPU上去，这时定义的Per-CPU变量就会有问题，这时应禁抢占。</p>
-
-<p>为保证Linux内核在以上情况下不会被抢占，抢占式内核使用了一个变量preempt<em> count，称为内核抢占锁。这一变量被设置在进程的PCB结构task_struct中。每当内核要进入以上几种状态时，变量preempt</em> count就加1，指示内核不允许抢占。每当内核从以上几种状态退出时，变量preempt_ count就减1，同时进行可抢占的判断与调度。</p>
-
-<p>从中断返回内核空间的时候，内核会检查need_resched和preempt_count的值。如果need<em> resched被设置，并且preempt count为0的话，这说明可能有一个更为重要的任务需要执行并且可以安全地抢占，此时，调度程序就会被调用。如果preempt-count不为0，则 说明内核现在处干不可抢占状态，不能进行重新调度。这时，就会像通常那样直接从中断返回当前执行进程。如果当前进程持有的所有的锁都被释放了，那么 preempt</em> count就会重新为0。此时，释放锁的代码会检查need_ resched是否被设置。如果是的话，就会调用调度程序。</p>
-
-<h4>6 内核抢占时机</h4>
-
-<p>在2.6版的内核中，内核引入了抢占能力；现在，只要重新调度是安全的，那么内核就可以在任何时间抢占正在执行的任务。<br/>
-那么，什么时候重新调度才是安全的呢？只要premptcount为0，内核就可以进行抢占。通常锁和中断是非抢占区域的标志。由于内核是支持SMP的，所以，如果没有持有锁，那么正在执行的代码就是可重新导人的，也就是可以抢占的。<br/>
-如果内核中的进程被阻塞了，或它显式地调用了schedule()，内核抢占也会显式地发生。这种形式的内核抢占从来都是受支持的(实际上是主动让出 CPU)，因为根本无需额外的逻辑来保证内核可以安全地被抢占。如果代码显式的调用了schedule()，那么它应该清楚自己是可以安全地被抢占的。</p>
-
-<p>内核抢占可能发生在：<br/>
-当从中断处理程序正在执行，且返回内核空间之前。<br/>
-当内核代码再一次具有可抢占性的时候，如解锁及使能软中断(local_bh_enable)等。<br/>
-如果内核中的任务显式的调用schedule()<br/>
-如果内核中的任务阻塞(这同样也会导致调用schedule())</p>
-
-<h4>7 如何支持抢占内核</h4>
-
-<p>抢占式Linux内核的修改主要有两点：一是对中断的入口代码和返回代码进行修改。在中断的入口内核抢占锁preempt_count加1，以禁止内核抢占；在中断的返回处，内核抢占锁preempt_count减1，使内核有可能被抢占。</p>
-
-<p>我们说可抢占Linux内核在内核的任一点可被抢占，主要就是因为在任意一点中断都有可能发生，每当中断发生，Linux可抢占内核在处理完中断返回时都 会进行内核的可抢占判断。若内核当前所处状态允许被抢占，内核都会重新进行调度选取高优先级的进程运行。这一点是与非可抢占的内核不一样的。在非可抢占的 Linux内核中，从硬件中断返回时，只有当前被中断进程是用户态进程时才会重新调度，若当前被中断进程是核心态进程，则不进行调度，而是恢复被中断的进 程继续运行。</p>
-
-<p>另一基本修改是重新定义了自旋锁、读、写锁，在锁操作时增加了对preempt count变量的操作。在对这些锁进行加锁操作时preemptcount变量加1，以禁止内核抢占；在释放锁时preemptcount变量减1，并在 内核的抢占条件满足且需要重新调度时进行抢占调度。下面以spin_lock(), spin_unlock()操作为例说明：
+<p>简单禁止和激活当前处理器上的本地中断：
 <code>
-/////////////////////////////////////////////////////////////////////////
-/linux+v2.6.19/kernel/spinlock.c
- 320void __lockfunc _spin_unlock(spinlock_t *lock)
- 321{
- 322        spin_release(&amp;lock-&gt;dep_map, 1, _RET_IP_);
- 323        _raw_spin_unlock(lock);
- 324        preempt_enable();
- 325}
- 326EXPORT_SYMBOL(_spin_unlock);
- 178void __lockfunc _spin_lock(spinlock_t *lock)
- 179{
- 180        preempt_disable();
- 181        spin_acquire(&amp;lock-&gt;dep_map, 0, 0, _RET_IP_);
- 182        _raw_spin_lock(lock);
- 183}
- 184
- 185EXPORT_SYMBOL(_spin_lock);
-/////////////////////////////////////////////////////////////////////////
-  29#define preempt_disable() /
-  30do { /
-  31        inc_preempt_count(); /
-  32        barrier(); /
-  33} while (0)
-  34
-  35#define preempt_enable_no_resched() /
-  36do { /
-  37        barrier(); /
-  38        dec_preempt_count(); /
-  39} while (0)
-  40
-  41#define preempt_check_resched() /
-  42do { /
-  43        if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) /
-  44                preempt_schedule(); /
-  45} while (0)
-  46
-  47#define preempt_enable() /
-  48do { /
-  49        preempt_enable_no_resched(); /
-  50        barrier(); /
-  51        preempt_check_resched(); /
-  52} while (0)
-  53
+local_irq_disable();
+local_irq_enable();
 </code>
-另外一种可抢占内核实现方案是在内核代码段中插入抢占点(preemption point)的方案。在这一方案中，首先要找出内核中产生长延迟的代码段，然后在这一内核代码段的适当位置插入抢占点，使得系统不必等到这段代码执行完就 可重新调度。这样对于需要快速响应的事件，系统就可以尽快地将服务进程调度到CPU运行。抢占点实际上是对进程调度函数的调用，代码如下:<br/>
-  <code>if (current-&gt;need_ resched) schedule();</code><br/>
-通常这样的代码段是一个循环体，插入抢占点的方案就是在这一循环体中不断检测need_ resched的值，在必要的时候调用schedule()令当前进程强行放弃CPU</p>
-
-<h4>8 何时需要重新调度</h4>
-
-<p>内核必须知道在什么时候调用schedule()。如果仅靠用户程序代码显式地调用schedule()，它们可能就会永远地执行下去。相反，内核提供了 一个need_resched标志来表明是否需要重新执行一次调度。当某个进程耗尽它的时间片时，scheduler tick()就会设置这个标志；当一个优先级高的进程进入可执行状态的时候，try_to_wake_up也会设置这个标志。<br/>
-set<em> tsk_need_resched：设置指定进程中的need</em> resched标志<br/>
-clear tsk need_resched：清除指定进程中的need<em> resched标志<br/>
-need_resched()：检查need</em> resched标志的值;如果被设置就返回真，否则返回假信号量、等到队列、completion等机制唤醒时都是基于waitqueue的，而waitqueue的唤醒函数为default_wake_function，其调用try_to_wake_up将进程更改为可运行状态并置待调度标志。</p>
-
-<p>在返回用户空间以及从中断返回的时候，内核也会检查need_resched标志。如果已被设置，内核会在继续执行之前调用调度程序。<br/>
-每个进程都包含一个need_resched标志，这是因为访问进程描述符内的数值要比访问一个全局变量快(因为current宏速度很快并且描述符通常 都在高速缓存中)。在2.2以前的内核版本中，该标志曾经是一个全局变量。2.2到2.4版内核中它在task_struct中。而在2.6版中，它被移 到thread_info结构体里，用一个特别的标志变量中的一位来表示。可见，内核开发者总是在不断改进。<br/>
+保存本地中断系统状态下的禁止和激活：
 <code>
-/linux+v2.6.19/include/linux/sched.h
-1503static inline void set_tsk_need_resched(struct task_struct *tsk)
-1504{
-1505        set_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
-1506}
-1507
-1508static inline void clear_tsk_need_resched(struct task_struct *tsk)
-1509{
-1510        clear_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
-1511}
-1512
-1513static inline int signal_pending(struct task_struct *p)
-1514{
-1515        return unlikely(test_tsk_thread_flag(p,TIF_SIGPENDING));
-1516}
-1517
-1518static inline int need_resched(void)
-1519{
-1520        return unlikely(test_thread_flag(TIF_NEED_RESCHED));
-1521}
-///////////////////////////////////////////////////////////////////////////////
-/linux+v2.6.19/kernel/sched.c
- 991/*
- 992 * resched_task - mark a task 'to be rescheduled now'.
- 993 *
- 994 * On UP this means the setting of the need_resched flag, on SMP it
- 995 * might also involve a cross-CPU call to trigger the scheduler on
- 996 * the target CPU.
- 997 */
- 998#ifdef CONFIG_SMP
- 999
-1000#ifndef tsk_is_polling
-1001#define tsk_is_polling(t) test_tsk_thread_flag(t, TIF_POLLING_NRFLAG)
-1002#endif
-1003
-1004static void resched_task(struct task_struct *p)
-1005{
-1006        int cpu;
-1007
-1008        assert_spin_locked(&amp;task_rq(p)-&gt;lock);
-1009
-1010        if (unlikely(test_tsk_thread_flag(p, TIF_NEED_RESCHED)))
-1011                return;
-1012
-1013        set_tsk_thread_flag(p, TIF_NEED_RESCHED);
-1014
-1015        cpu = task_cpu(p);
-1016        if (cpu == smp_processor_id())
-1017                return;
-1018
-1019        /* NEED_RESCHED must be visible before we test polling */
-1020        smp_mb();
-1021        if (!tsk_is_polling(p))
-1022                smp_send_reschedule(cpu);
-1023}
-1024#else
-1025static inline void resched_task(struct task_struct *p)
-1026{
-1027        assert_spin_locked(&amp;task_rq(p)-&gt;lock);
-1028        set_tsk_need_resched(p);
-1029}
-1030#endif
-///////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////
-1366/***
-1367 * try_to_wake_up - wake up a thread
-1368 * @p: the to-be-woken-up thread
-1369 * @state: the mask of task states that can be woken
-1370 * @sync: do a synchronous wakeup?
-1371 *
-1372 * Put it on the run-queue if it's not already there. The "current"
-1373 * thread is always on the run-queue (except when the actual
-1374 * re-schedule is in progress), and as such you're allowed to do
-1375 * the simpler "current-&gt;state = TASK_RUNNING" to mark yourself
-1376 * runnable without the overhead of this.
-1377 *
-1378 * returns failure only if the task is already active.
-1379 */
-1380static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync)
-///////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////
-1538int fastcall wake_up_process(struct task_struct *p)
-1539{
-1540        return try_to_wake_up(p, TASK_STOPPED | TASK_TRACED |
-1541                                 TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE, 0);
-1542}
-1543EXPORT_SYMBOL(wake_up_process);
-1545int fastcall wake_up_state(struct task_struct *p, unsigned int state)
-1546{
-1547        return try_to_wake_up(p, state, 0);
-1548}
-1616/*
-1617 * wake_up_new_task - wake up a newly created task for the first time.
-1618 *
-1619 * This function will do some initial scheduler statistics housekeeping
-1620 * that must be done for every newly created context, then puts the task
-1621 * on the runqueue and wakes it.
-1622 */
-1623void fastcall wake_up_new_task(struct task_struct *p, unsigned long clone_flags)
-3571/*
-3572 * The core wakeup function.  Non-exclusive wakeups (nr_exclusive == 0) just
-3573 * wake everything up.  If it's an exclusive wakeup (nr_exclusive == small +ve
-3574 * number) then we wake all the non-exclusive tasks and one exclusive task.
-3575 *
-3576 * There are circumstances in which we can try to wake a task which has already
-3577 * started to run but is not in state TASK_RUNNING.  try_to_wake_up() returns
-3578 * zero in this (rare) case, and we handle it by continuing to scan the queue.
-3579 */
-3580static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
-3581                             int nr_exclusive, int sync, void *key)
-///////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////
-3595/**
-3596 * __wake_up - wake up threads blocked on a waitqueue.
-3597 * @q: the waitqueue
-3598 * @mode: which threads
-3599 * @nr_exclusive: how many wake-one or wake-many threads to wake up
-3600 * @key: is directly passed to the wakeup function
-3601 */
-3602void fastcall __wake_up(wait_queue_head_t *q, unsigned int mode,
-3603                        int nr_exclusive, void *key)
-3604{
-3605        unsigned long flags;
-3606
-3607        spin_lock_irqsave(&amp;q-&gt;lock, flags);
-3608        __wake_up_common(q, mode, nr_exclusive, 0, key);
-3609        spin_unlock_irqrestore(&amp;q-&gt;lock, flags);
-3610}
-3611EXPORT_SYMBOL(__wake_up);
-3564int default_wake_function(wait_queue_t *curr, unsigned mode, int sync,
-3565                          void *key)
-3566{
-3567        return try_to_wake_up(curr-&gt;private, mode, sync);
-3568}
-3569EXPORT_SYMBOL(default_wake_function);
-3652void fastcall complete(struct completion *x)
-3653{
-3654        unsigned long flags;
-3655
-3656        spin_lock_irqsave(&amp;x-&gt;wait.lock, flags);
-3657        x-&gt;done++;
-3658        __wake_up_common(&amp;x-&gt;wait, TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE,
-3659                         1, 0, NULL);
-3660        spin_unlock_irqrestore(&amp;x-&gt;wait.lock, flags);
-3661}
-3662EXPORT_SYMBOL(complete);
+unsigned long flags;
+local_irq_save(flags);
+local_irq_restore(flags);
 </code></p>
 
-<h4>9 参考资料</h4>
+<h5>(2) 软中断的开关</h5>
 
-<p>请解释抢占式内核与非抢占式内核的区别联系，<a href="http://oldlinux.org/oldlinux/viewthread.php?tid=3024">http://oldlinux.org/oldlinux/viewthread.php?tid=3024</a></p>
+<p>禁止下半部，如softirq、tasklet和workqueue等：
+<code>
+local_bh_disable();
+local_bh_enable();
+</code>
+需要注意的是，禁止下半部时仍然可以被硬中断抢占。</p>
 
-<p>抢占式内核中的锁问题，<a href="http://hi.baidu.com/juventus/blog/item/a71c8701960454d2277fb5f0.html">http://hi.baidu.com/juventus/blog/item/a71c8701960454d2277fb5f0.html</a></p>
+<h5>(3) 判断中断状态</h5>
 
-<p><a href="http://www.linuxforum.net/forum/showflat.php?Cat=&amp;Board=linuxK&amp;Number=610932&amp;page=">http://www.linuxforum.net/forum/showflat.php?Cat=&amp;Board=linuxK&amp;Number=610932&amp;page=</a></p>
+<pre><code>    #define in_interrupt() (irq_count()) // 是否处于中断状态(硬中断或软中断)
+    #define in_irq() (hardirq_count()) // 是否处于硬中断
+    #define in_softirq() (softirq_count()) // 是否处于软中断
+</code></pre>
 
-<p><a href="http://linux.chinaunix.net/bbs/viewthread.php?tid=912039">http://linux.chinaunix.net/bbs/viewthread.php?tid=912039</a></p>
+<h4>硬中断</h4>
 
-<p>Linux kernel design and development</p>
+<h5>(1) 注册中断处理函数</h5>
 
-<p>Linux抢占式内核就是由Robert Love修改实现的。在他的书中有如下描述：
+<p>注册中断处理函数：
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -659,84 +174,173 @@ need_resched()：检查need</em> resched标志的值;如果被设置就返回真
 <span class='line-number'>53</span>
 <span class='line-number'>54</span>
 <span class='line-number'>55</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>User Preemption
-</span><span class='line'>User preemption occurs when the kernel is about to return to user-space,
-</span><span class='line'>need_resched is set, and therefore, the scheduler is invoked.
-</span><span class='line'>If the kernel is returning to user-space, it knows it is in a safe quiescent state.
-</span><span class='line'>In other words, if it is safe to continue executing the current task,
-</span><span class='line'>it is also safe to pick a new task to execute. Consequently,
-</span><span class='line'>whenever the kernel is preparing to return to user-space either on return from
-</span><span class='line'>an interrupt or after a system call, the value of need_resched is checked.
-</span><span class='line'>If it is set, the scheduler is invoked to select a new (more fit) process to execute.
-</span><span class='line'>Both the return paths for return from interrupt and return from system call
-</span><span class='line'>are architecture dependent and typically implemented in assembly in entry.S
-</span><span class='line'>(which, aside from kernel entry code, also contains kernel exit code).
-</span><span class='line'>In short, user preemption can occur
-</span><span class='line'>When returning to user-space from a system call
-</span><span class='line'>When returning to user-space from an interrupt handler
-</span><span class='line'>Kernel Preemption&lt;/p&gt;
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/&lt;em&gt;&lt;em&gt;
+</span><span class='line'> * irq: 要分配的中断号
+</span><span class='line'> * handler: 要注册的中断处理函数
+</span><span class='line'> * flags: 标志(一般为0)
+</span><span class='line'> * name: 设备名(dev-&gt;name)
+</span><span class='line'> * dev: 设备(struct net_device &lt;/em&gt;dev)，作为中断处理函数的参数
+</span><span class='line'> * 成功返回0
+</span><span class='line'> &lt;/em&gt;/&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;The Linux kernel, unlike most other Unix variants and many other operating systems,
-</span><span class='line'>is a fully preemptive kernel. In non-preemptive kernels, kernel code runs until completion.
-</span><span class='line'>That is, the scheduler is not capable of rescheduling a task while it is in the kernel.
-</span><span class='line'>kernel code is scheduled cooperatively, not preemptively.&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,   
+</span><span class='line'>const char *name, void *dev);  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;Kernel code runs until it finishes (returns to user-space) or explicitly blocks.
-</span><span class='line'>In the 2.6 kernel, however, the Linux kernel became preemptive:
-</span><span class='line'>It is now possible to preempt a task at any point, so long as the kernel is in a state in which it is safe to reschedule.&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>中断处理函数本身：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;So when is it safe to reschedule? The kernel is capable of preempting a task
-</span><span class='line'>running in the kernel so long as it does not hold a lock. That is, locks are used as
-</span><span class='line'>markers of regions of non-preemptibility. Because the kernel is SMP-safe,
-</span><span class='line'>if a lock is not held, the current code is reentrant and capable of being preempted.&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;typedef irqreturn_t (*irq_handler_t) (int, void *);  
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;The first change in supporting kernel preemption was the addition of a preemption counter,
-</span><span class='line'>preempt_count, to each process&rsquo;s thread_info. This counter begins at zero and increments
-</span><span class='line'>once for each lock that is acquired and decrements once for each lock that is released.
-</span><span class='line'>When the counter is zero, the kernel is preemptible. Upon return from interrupt,
-</span><span class='line'>if returning to kernel-space, the kernel checks the values of need_resched and preempt_count.&lt;/p&gt;
+</span><span class='line'>/** 
+</span><span class='line'> * enum irqreturn 
+</span><span class='line'> * @IRQ_NONE: interrupt was not from this device 
+</span><span class='line'> * @IRQ_HANDLED: interrupt was handled by this device 
+</span><span class='line'> * @IRQ_WAKE_THREAD: handler requests to wake the handler thread 
+</span><span class='line'> */  
+</span><span class='line'>enum irqreturn {  
+</span><span class='line'>IRQ_NONE,  
+</span><span class='line'>IRQ_HANDLED,  
+</span><span class='line'>IRQ_WAKE_THREAD,  
+</span><span class='line'>};  
+</span><span class='line'>typedef enum irqreturn irqreturn_t;  
+</span><span class='line'>#define IRQ_RETVAL(x) ((x) != IRQ_NONE)  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;If need_resched is set and preempt_count is zero, then a more important task is runnable and
-</span><span class='line'>it is safe to preempt. Thus, the scheduler is invoked. If preempt_count is nonzero,
-</span><span class='line'>a lock is held and it is unsafe to reschedule. In that case, the interrupt returns
-</span><span class='line'>as usual to the currently executing task. When all the locks that the current task is holding are released,
-</span><span class='line'>preempt_count returns to zero. At that time, the unlock code checks whether need_resched is set.
-</span><span class='line'>If so, the scheduler is invoked. Enabling and disabling kernel preemption is sometimes
-</span><span class='line'>required in kernel code and is discussed in Chapter 9
-</span><span class='line'>.
-</span><span class='line'>Kernel preemption can also occur explicitly, when a task in the kernel blocks or explicitly calls schedule().
-</span><span class='line'>This form of kernel preemption has always been supported because no additional logic is
-</span><span class='line'>required to ensure that the kernel is in a state that is safe to preempt.
-</span><span class='line'>It is assumed that the code that explicitly calls schedule() knows it is safe to reschedule.&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>##### (2) 注销中断处理函数
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;Kernel preemption can occur
-</span><span class='line'>When an interrupt handler exits, before returning to kernel-space
-</span><span class='line'>When kernel code becomes preemptible again
-</span><span class='line'>If a task in the kernel explicitly calls schedule()
-</span><span class='line'>If a task in the kernel blocks (which results in a call to schedule())</span></code></pre></td></tr></table></div></figure></p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[内核抢占与中断返回]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/04/22/kernel-sched-3/"/>
-    <updated>2014-04-22T11:00:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/04/22/kernel-sched-3</id>
-    <content type="html"><![CDATA[<h4>1、上下文</h4>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/** 
+</span><span class='line'> * free_irq - free an interrupt allocated with request_irq 
+</span><span class='line'> * @irq: Interrupt line to free 
+</span><span class='line'> * @dev_id: Device identity to free 
+</span><span class='line'> * 
+</span><span class='line'> * Remove an interrupt handler. The handler is removed and if the 
+</span><span class='line'> * interrupt line is no longer in use by any driver it is disabled. 
+</span><span class='line'> * On a shared IRQ the caller must ensure the interrupt is disabled 
+</span><span class='line'> * on the card it drives before calling this function. The function does 
+</span><span class='line'> * not return until any executing interrupts for this IRQ have completed. 
+</span><span class='line'> * This function must not be called from interrupt context. 
+</span><span class='line'> */  
+</span><span class='line'>
+</span><span class='line'>void free_irq(unsigned int irq, void *dev_id);  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>#### 软中断
+</span><span class='line'>##### (1) 定义
+</span><span class='line'>软中断是一组静态定义的下半部接口，可以在所有处理器上同时执行，即使两个类型相同也可以。  
+</span><span class='line'>但一个软中断不会抢占另一个软中断，唯一可以抢占软中断的是硬中断。
+</span><span class='line'>
+</span><span class='line'>软中断由softirq_action结构体表示：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct softirq_action {  
+</span><span class='line'>void (*action) (struct softirq_action *); /* 软中断的处理函数 */  
+</span><span class='line'>};  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>目前已注册的软中断有10种，定义为一个全局数组：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static struct softirq_action softirq_vec[NR_SOFTIRQS];  
+</span><span class='line'>
+</span><span class='line'>enum {  
+</span><span class='line'>HI_SOFTIRQ = 0, /* 优先级高的tasklets */  
+</span><span class='line'>TIMER_SOFTIRQ, /* 定时器的下半部 */  
+</span><span class='line'>NET_TX_SOFTIRQ, /* 发送网络数据包 */  
+</span><span class='line'>NET_RX_SOFTIRQ, /* 接收网络数据包 */  
+</span><span class='line'>BLOCK_SOFTIRQ, /* BLOCK装置 */  
+</span><span class='line'>BLOCK_IOPOLL_SOFTIRQ,  
+</span><span class='line'>TASKLET_SOFTIRQ, /* 正常优先级的tasklets */  
+</span><span class='line'>SCHED_SOFTIRQ, /* 调度程序 */  
+</span><span class='line'>HRTIMER_SOFTIRQ, /* 高分辨率定时器 */  
+</span><span class='line'>RCU_SOFTIRQ, /* RCU锁定 */  
+</span><span class='line'>NR_SOFTIRQS /* 10 */  
+</span><span class='line'>};  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>##### (2) 注册软中断处理函数
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/** 
+</span><span class='line'> * @nr: 软中断的索引号 
+</span><span class='line'> * @action: 软中断的处理函数 
+</span><span class='line'> */  
+</span><span class='line'>
+</span><span class='line'>void open_softirq(int nr, void (*action) (struct softirq_action *))  
+</span><span class='line'>{  
+</span><span class='line'>softirq_vec[nr].action = action;  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;例如：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+</span><span class='line'>open_softirq(NET_RX_SOFTIRQ, net_rx_action);</span></code></pre></td></tr></table></div></figure></p>
 
-<p>一般来说，CPU在任何时刻都处于以下三种情况之一：<br/>
-(1)运行于用户空间，执行用户进程；<br/>
-(2)运行于内核空间，处于进程上下文；<br/>
-(3)运行于内核空间，处于中断上下文。<br/>
-应用程序通过系统调用陷入内核，此时处于进程上下文。现代几乎所有的CPU体系结构都支持中断。当外部设备产生中断，向CPU发送一个异步信号，CPU调用相应的中断处理程序来处理该中断，此时CPU处于中断上下文。</p>
+<h5>(3) 触发软中断</h5>
 
-<p>在进程上下文中，可以通过current关联相应的任务。进程以进程上下文的形式运行在内核空间，可以发生睡眠，所以在进程上下文中，可以使作信号量(semaphore)。实际上，内核经常在进程上下文中使用信号量来完成任务之间的同步，当然也可以使用锁。</p>
-
-<p>中断上下文不属于任何进程，它与current没有任何关系(尽管此时current指向被中断的进程)。由于没有进程背景，在中断上下文中不能发生睡眠，否则又如何对它进行调度。所以在中断上下文中只能使用锁进行同步，正是因为这个原因，中断上下文也叫做原子上下文(atomic context)(关于同步以后再详细讨论)。在中断处理程序中，通常会禁止同一中断，甚至会禁止整个本地中断，所以中断处理程序应该尽可能迅速，所以又把中断处理分成上部和下部(关于中断以后再详细讨论)。</p>
-
-<h4>2、上下文切换</h4>
-
-<p>上下文切换，也就是从一个可执行进程切换到另一个可执行进程。上下文切换由函数context_switch()函数完成，该函数位于kernel/sched.c中，它由进程调度函数schedule()调用。
+<p>调用raise_softirq()来触发软中断。
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -876,525 +480,796 @@ need_resched()：检查need</em> resched标志的值;如果被设置就返回真
 <span class='line-number'>137</span>
 <span class='line-number'>138</span>
 <span class='line-number'>139</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline
-</span><span class='line'>task_t * context_switch(runqueue_t &lt;em&gt;rq, task_t &lt;/em&gt;prev, task_t &lt;em&gt;next)
-</span><span class='line'>{
-</span><span class='line'>    struct mm_struct &lt;/em&gt;mm = next-&gt;mm;
-</span><span class='line'>    struct mm_struct *oldmm = prev-&gt;active_mm;&lt;/p&gt;
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void raise_softirq(unsigned int nr)&lt;br/&gt;
+</span><span class='line'>{&lt;br/&gt;
+</span><span class='line'>    unsigned long flags;&lt;br/&gt;
+</span><span class='line'>    local_irq_save(flags);&lt;br/&gt;
+</span><span class='line'>    raise_softirq_irqoff(nr);&lt;br/&gt;
+</span><span class='line'>    local_irq_restore(flags);&lt;br/&gt;
+</span><span class='line'>}&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (unlikely(!mm)) {
-</span><span class='line'>    next-&gt;active_mm = oldmm;
-</span><span class='line'>    atomic_inc(&amp;oldmm-&gt;mm_count);
-</span><span class='line'>    enter_lazy_tlb(oldmm, next);
-</span><span class='line'>} else
-</span><span class='line'>    switch_mm(oldmm, mm, next);
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* This function must run with irqs disabled */  
+</span><span class='line'>inline void rasie_softirq_irqsoff(unsigned int nr)  
+</span><span class='line'>{  
+</span><span class='line'>__raise_softirq_irqoff(nr);  
 </span><span class='line'>
-</span><span class='line'>if (unlikely(!prev-&gt;mm)) {
-</span><span class='line'>    prev-&gt;active_mm = NULL;
-</span><span class='line'>    WARN_ON(rq-&gt;prev_mm);
-</span><span class='line'>    rq-&gt;prev_mm = oldmm;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/* Here we just switch the register state and the stack. */
-</span><span class='line'>switch_to(prev, next, prev);
-</span><span class='line'>
-</span><span class='line'>return prev;
-</span><span class='line'>}
+</span><span class='line'>/* If we're in an interrupt or softirq, we're done 
+</span><span class='line'> * (this also catches softirq-disabled code). We will 
+</span><span class='line'> * actually run the softirq once we return from the irq 
+</span><span class='line'> * or softirq. 
+</span><span class='line'> * Otherwise we wake up ksoftirqd to make sure we 
+</span><span class='line'> * schedule the softirq soon. 
+</span><span class='line'> */  
+</span><span class='line'>if (! in_interrupt()) /* 如果不处于硬中断或软中断 */  
+</span><span class='line'>    wakeup_softirqd(void); /* 唤醒ksoftirqd/n进程 */  
+</span><span class='line'>}  
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>其中，switch_mm()将虚拟内存映射到新的进程；switch_to完成最终的进程切换，它保存原进程的所有寄存器信息，恢复新进程的所有寄存器信息，并执行新的进程。无论何时，内核想要进行任务切换，都通过调用schedule()完成任务切换。
+</span><span class='line'>Percpu变量irq_cpustat_t中的__softirq_pending是等待处理的软中断的位图，通过设置此变量
 </span><span class='line'>
-</span><span class='line'>##### 2.2、用户抢占
-</span><span class='line'>当内核即将返回用户空间时，内核会检查need_resched是否设置，如果设置，则调用schedule()，此时，发生用户抢占。一般来说，用户抢占发生几下情况：  
-</span><span class='line'>(1)从系统调用返回用户空间；  
-</span><span class='line'>(2)从中断(异常)处理程序返回用户空间。  
-</span><span class='line'>
-</span><span class='line'>##### 2.3、内核抢占
-</span><span class='line'>内核从2.6开始就支持内核抢占，对于非内核抢占系统，内核代码可以一直执行，直到完成，也就是说当进程处于内核态时，是不能被抢占的（当然，运行于内核态的进程可以主动放弃CPU，比如，在系统调用服务例程中，由于内核代码由于等待资源而放弃CPU，这种情况叫做计划性进程切换（planned process switch））。但是，对于由异步事件(比如中断)引起的进程切换，抢占式内核与非抢占式是有区别的，对于前者叫做强制性进程切换(forced process switch)。
-</span><span class='line'>
-</span><span class='line'>为了支持内核抢占，内核引入了preempt_count字段，该计数初始值为0，每当使用锁时加1，释放锁时减1。当preempt_count为0时，表示内核可以被安全的抢占，大于0时，则禁止内核抢占。该字段对应三个不同的计数器(见软中断一节)，也就是说在以下三种任何一种情况，该字段的值都会大于0。
-</span><span class='line'>
-</span><span class='line'>(1) 内核执行中断处理程序时，通过irq_enter增加中断计数器的值；  
-</span><span class='line'>`#define irq_enter()        (preempt_count() += HARDIRQ_OFFSET)`  
-</span><span class='line'>(2) 可延迟函数被禁止(执行软中断和tasklet时经常如此，由local_bh_disable完成；  
-</span><span class='line'>(3) 通过把抢占计数器设置为正而显式禁止内核抢占，由preempt_disable完成。  
-</span><span class='line'>
-</span><span class='line'>  当从中断返回内核空间时，内核会检preempt_count和need_resched的值(返回用户空间时只需要检查need_resched)，如查preempt_count为0且need_resched设置，则调用schedule()，完成任务抢占。一般来说，内核抢占发生以下情况：  
-</span><span class='line'>(1) 从中断(异常)返回时，preempt_count为0且need_resched置位(见从中断返回)；  
-</span><span class='line'>(2) 在异常处理程序中(特别是系统调用)调用preempt_enable()来允许内核抢占发生；  
+</span><span class='line'>即可告诉内核该执行哪些软中断。
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;//incude/linux/preempt.h
-</span><span class='line'>#define preempt_enable() \
-</span><span class='line'>do { \
-</span><span class='line'>//抢占计数器值减1
-</span><span class='line'>preempt_enable_no_resched(); \
-</span><span class='line'>//检查是否需要进行内核抢占调度,见(3)
-</span><span class='line'>preempt_check_resched(); \
-</span><span class='line'>} while (0)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void __rasie_softirq_irqoff(unsigned int nr)  
+</span><span class='line'>{  
+</span><span class='line'>trace_softirq_raise(nr);  
+</span><span class='line'>or_softirq_pending(1UL &lt;&lt; nr);  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>typedef struct {  
+</span><span class='line'>unsigned int __softirq_pending;  
+</span><span class='line'>unsigned int __nmi_count; /* arch dependent */  
+</span><span class='line'>} irq_cpustat_t;  
+</span><span class='line'>
+</span><span class='line'>irq_cpustat_t irq_stat[];  
+</span><span class='line'>#define __IRQ_STAT(cpu, member) (irq_stat[cpu].member)  
+</span><span class='line'>#define or_softirq_pending(x) percpu_or(irq_stat.__softirq_pending, (x))  
+</span><span class='line'>#define local_softirq_pending() percpu_read(irq_stat.__softirq_pending)  
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;(3) 启用可延迟函数时，即调用local_bh_enable()时发生；
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>唤醒ksoftirqd内核线程处理软中断。
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;//kernel/softirq.c
-</span><span class='line'>void local_bh_enable(void)
-</span><span class='line'>{
-</span><span class='line'>WARN_ON(irqs_disabled());
-</span><span class='line'>/*
-</span><span class='line'> * Keep preemption disabled until we are done with
-</span><span class='line'> * softirq processing:
-</span><span class='line'> */
-</span><span class='line'>//软中断计数器值减1
-</span><span class='line'>preempt_count() -= SOFTIRQ_OFFSET - 1;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void wakeup_softirqd(void)  
+</span><span class='line'>{  
+</span><span class='line'>/* Interrupts are disabled: no need to stop preemption */  
+</span><span class='line'>struct task_struct *tsk = __get_cpu_var(ksoftirqd);  
 </span><span class='line'>
-</span><span class='line'>if (unlikely(!in_interrupt() &amp;&amp; local_softirq_pending()))
-</span><span class='line'>    do_softirq(); //软中断处理
-</span><span class='line'>//抢占计数据器值减1
-</span><span class='line'>dec_preempt_count();
+</span><span class='line'>if (tsk &amp;&amp; tsk-&gt;state != TASK_RUNNING)  
+</span><span class='line'>    wake_up_process(tsk);  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>//检查是否需要进行内核抢占调度
-</span><span class='line'>preempt_check_resched();
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>在下列地方，待处理的软中断会被检查和执行：  
+</span><span class='line'>1. 从一个硬件中断代码处返回时  
+</span><span class='line'>2. 在ksoftirqd内核线程中  
+</span><span class='line'>3. 在那些显示检查和执行待处理的软中断的代码中，如网络子系统中
+</span><span class='line'>
+</span><span class='line'>而不管是用什么方法唤起，软中断都要在do_softirq()中执行。如果有待处理的软中断，do_softirq()会循环遍历每一个，调用它们的相应的处理程序。在中断处理程序中触发软中断是最常见的形式。中断处理程序执行硬件设备的相关操作，然后触发相应的软中断，最后退出。内核在执行完中断处理程序以后，马上就会调用do_softirq()，于是软中断开始执行中断处理程序完成剩余的任务。
+</span><span class='line'>
+</span><span class='line'>下面来看下do_softirq()的具体实现。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;asmlinkage void do_softirq(void)  
+</span><span class='line'>{  
+</span><span class='line'>__u32 pending;  
+</span><span class='line'>unsigned long flags;  
+</span><span class='line'>
+</span><span class='line'>/* 如果当前已处于硬中断或软中断中，直接返回 */  
+</span><span class='line'>if (in_interrupt())   
+</span><span class='line'>    return;  
+</span><span class='line'>
+</span><span class='line'>local_irq_save(flags);  
+</span><span class='line'>pending = local_softirq_pending();  
+</span><span class='line'>if (pending) /* 如果有激活的软中断 */  
+</span><span class='line'>    __do_softirq(); /* 处理函数 */  
+</span><span class='line'>local_irq_restore(flags);  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;code&gt;
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>/&lt;em&gt; We restart softirq processing MAX_SOFTIRQ_RESTART times,
+</span><span class='line'> * and we fall back to softirqd after that.
+</span><span class='line'> * This number has been established via experimentation.
+</span><span class='line'> * The two things to balance is latency against fairness - we want
+</span><span class='line'> * to handle softirqs as soon as possible, but they should not be
+</span><span class='line'> * able to lock up the box.
+</span><span class='line'> &lt;/em&gt;/&lt;br/&gt;
+</span><span class='line'>asmlinkage void &lt;strong&gt;do_softirq(void)&lt;br/&gt;
+</span><span class='line'>{&lt;br/&gt;
+</span><span class='line'>    struct softirq_action *h;&lt;br/&gt;
+</span><span class='line'>    &lt;/strong&gt;u32 pending;&lt;br/&gt;
+</span><span class='line'>    /&lt;em&gt; 本函数能重复触发执行的次数，防止占用过多的cpu时间 &lt;/em&gt;/&lt;br/&gt;
+</span><span class='line'>    int max_restart = MAX_SOFTIRQ_RESTART;&lt;br/&gt;
+</span><span class='line'>    int cpu;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    pending = local_softirq_pending(); /* 激活的软中断位图 */  
+</span><span class='line'>account_system_vtime(current);  
+</span><span class='line'>/* 本地禁止当前的软中断 */  
+</span><span class='line'>__local_bh_disable((unsigned long)__builtin_return_address(0), SOFTIRQ_OFFSET);  
+</span><span class='line'>lockdep_softirq_enter(); /* current-&gt;softirq_context++ */  
+</span><span class='line'>cpu = smp_processor_id(); /* 当前cpu编号 */  
+</span><span class='line'>
+</span><span class='line'>restart:  
+</span><span class='line'>/* Reset the pending bitmask before enabling irqs */  
+</span><span class='line'>set_softirq_pending(0); /* 重置位图 */  
+</span><span class='line'>local_irq_enable();  
+</span><span class='line'>h = softirq_vec;  
+</span><span class='line'>do {  
+</span><span class='line'>    if (pending &amp; 1) {  
+</span><span class='line'>        unsigned int vec_nr = h - softirq_vec; /* 软中断索引 */  
+</span><span class='line'>        int prev_count = preempt_count();  
+</span><span class='line'>        kstat_incr_softirqs_this_cpu(vec_nr);  
+</span><span class='line'>
+</span><span class='line'>        trace_softirq_entry(vec_nr);  
+</span><span class='line'>        h-&gt;action(h); /* 调用软中断的处理函数 */  
+</span><span class='line'>        trace_softirq_exit(vec_nr);  
+</span><span class='line'>
+</span><span class='line'>        if (unlikely(prev_count != preempt_count())) {  
+</span><span class='line'>            printk(KERN_ERR "huh, entered softirq %u %s %p" "with preempt_count %08x,"  
+</span><span class='line'>                "exited with %08x?\n", vec_nr, softirq_to_name[vec_nr], h-&gt;action, prev_count,  
+</span><span class='line'>                preempt_count());  
+</span><span class='line'>        }  
+</span><span class='line'>        rcu_bh_qs(cpu);  
+</span><span class='line'>    }  
+</span><span class='line'>    h++;  
+</span><span class='line'>    pending &gt;&gt;= 1;  
+</span><span class='line'>} while(pending);  
+</span><span class='line'>
+</span><span class='line'>local_irq_disable();  
+</span><span class='line'>pending = local_softirq_pending();  
+</span><span class='line'>if (pending &amp; --max_restart) /* 重复触发 */  
+</span><span class='line'>    goto restart;  
+</span><span class='line'>
+</span><span class='line'>/* 如果重复触发了10次了，接下来唤醒ksoftirqd/n内核线程来处理 */  
+</span><span class='line'>if (pending)  
+</span><span class='line'>    wakeup_softirqd();   
+</span><span class='line'>
+</span><span class='line'>lockdep_softirq_exit();  
+</span><span class='line'>account_system_vtime(current);  
+</span><span class='line'>__local_bh_enable(SOFTIRQ_OFFSET);  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>##### (4) ksoftirqd内核线程
+</span><span class='line'>内核不会立即处理重新触发的软中断。  
+</span><span class='line'>当大量软中断出现的时候，内核会唤醒一组内核线程来处理。  
+</span><span class='line'>这些线程的优先级最低(nice值为19)，这能避免它们跟其它重要的任务抢夺资源。  
+</span><span class='line'>但它们最终肯定会被执行，所以这个折中的方案能够保证在软中断很多时用户程序不会因为得不到处理时间而处于饥饿状态，同时也保证过量的软中断最终会得到处理。
+</span><span class='line'>
+</span><span class='line'>每个处理器都有一个这样的线程，名字为ksoftirqd/n，n为处理器的编号。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int run_ksoftirqd(void *__bind_cpu)  
+</span><span class='line'>{  
+</span><span class='line'>set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>current-&gt;flags |= PF_KSOFTIRQD; /* I am ksoftirqd */  
+</span><span class='line'>
+</span><span class='line'>while(! kthread_should_stop()) {  
+</span><span class='line'>    preempt_disable();  
+</span><span class='line'>
+</span><span class='line'>    if (! local_softirq_pending()) { /* 如果没有要处理的软中断 */  
+</span><span class='line'>        preempt_enable_no_resched();  
+</span><span class='line'>        schedule();  
+</span><span class='line'>        preempt_disable():  
+</span><span class='line'>    }  
+</span><span class='line'>
+</span><span class='line'>    __set_current_state(TASK_RUNNING);  
+</span><span class='line'>
+</span><span class='line'>    while(local_softirq_pending()) {  
+</span><span class='line'>        /* Preempt disable stops cpu going offline. 
+</span><span class='line'>         * If already offline, we'll be on wrong CPU: don't process. 
+</span><span class='line'>         */  
+</span><span class='line'>         if (cpu_is_offline(long)__bind_cpu))/* 被要求释放cpu */  
+</span><span class='line'>             goto wait_to_die;  
+</span><span class='line'>
+</span><span class='line'>        do_softirq(); /* 软中断的统一处理函数 */  
+</span><span class='line'>
+</span><span class='line'>        preempt_enable_no_resched();  
+</span><span class='line'>        cond_resched();  
+</span><span class='line'>        preempt_disable();  
+</span><span class='line'>        rcu_note_context_switch((long)__bind_cpu);  
+</span><span class='line'>    }  
+</span><span class='line'>
+</span><span class='line'>    preempt_enable();  
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>__set_current_state(TASK_RUNNING);  
+</span><span class='line'>return 0;  
+</span><span class='line'>
+</span><span class='line'>wait_to_die:  
+</span><span class='line'>preempt_enable();  
+</span><span class='line'>/* Wait for kthread_stop */  
+</span><span class='line'>set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>while(! kthread_should_stop()) {  
+</span><span class='line'>    schedule();  
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>__set_current_state(TASK_RUNNING);  
+</span><span class='line'>return 0;  
 </span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>//include/linux/preempt.h
-</span><span class='line'>#define preempt_check_resched() \
-</span><span class='line'>do { \
-</span><span class='line'>//检查need_resched
-</span><span class='line'>if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) \
-</span><span class='line'>    //抢占调度
-</span><span class='line'>    preempt_schedule(); \
-</span><span class='line'>} while (0)
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[关于ksoftirqd进程]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/01/03/kernel-sched-ksoftirqd/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-01-03T15:01:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/01/03/kernel-sched-ksoftirqd&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;blog.chinaunix.net/uid-20737871-id-1881243.html&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>//kernel/sched.c
-</span><span class='line'>asmlinkage void __sched preempt_schedule(void)
+</span><span class='line'>&lt;p&gt;每个处理器都有一组辅助处理器软中断(和tasklet)的内核线程。当内核中出现大量软中断的时候，这些内核进程就会辅助处理它们。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;引入ksoftirq内核线程的原因：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;对于软中断，内核会选择在几个特殊时机进行处理。而在中断处理程序返回时处理是最常见的。软中断被触发的频率有时可能很高，更不利的是，处理函数有时还会 字形重复触发，那么就会导致用户空间进程无法获得足够的处理时间，因而处于饥饿状态。单纯的对重新触发的软中断采取不立即处理的策略，也无法让人接受。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;最初的解决方案：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1）只要还有被触发并等待处理的软中断，本次执行就要负责处理，重新触发的软中断也在本次执行返回前被处理。这样做可以保证对内核的软中断采取即时处理的 方式，关键在于，对重新触发的软中断也会立即处理。当负载很高的时候，此时若有大量被触发的软中断，而它们本身又会重复触发。系统可能会一直处理软中断根 本不能完成其他任务。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2）不处理重新触发的软中断。在从中断返回的时候，内核和平常一样，也会检查所有挂起的软中断并处理他们。但是，任何自行重新触发的软中断不会马上处理， 它们被放到下一个软中断执行时机去处理。而这个时机通常也就是下一次中断返回的时候。可是，在比较空闲的系统中，立即处理软中断才是比较好的做法。尽管它 能保证用户空间不处于饥饿状态，但它却让软中断忍受饥饿的痛苦，而根本没有好好利用闲置的系统资源。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;改进：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最终在内核中实现的方案是不会立即处理处理重新触发的软中断。而作为改进，当大量软中断出现的时候，内核会唤醒一组内核线程来处理这些负载。这些线程在最 低的优先级上运行（nice值是19），这能避免它们跟其他重要的任务抢夺资源。但它们最终肯定会被执行，所以这个折中方案能够保证在软中断负担很中的时 候用户程序不会因为得不到处理时间处于饥饿状态。相应的，也能保证”过量“的软中断终究会得到处理。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;每个处理器都有一个这样的线程。所有线程的名字都叫做ksoftirq/n，区别在于n，它对应的是处理器的编号。在一个双CPU的机器上就有两个这样的 线程，分别叫做ksoftirqd/0和ksoftirqd/1。为了保证只要有空闲的处理器，它们就会处理软中断，所以给每个处理器都分配一个这样的线 程。一旦该线程被初始化，它就会执行类似下面这样的死循环：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在kernel/softirq.c中
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>static int ksoftirqd(void * __bind_cpu)
 </span><span class='line'>{
-</span><span class='line'>struct thread_info *ti = current_thread_info();
+</span><span class='line'>    set_user_nice(current, 19);
+</span><span class='line'>    current-&gt;flags |= PF_NOFREEZE;
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop()) {
+</span><span class='line'>        preempt_disable();
+</span><span class='line'>        if (!local_softirq_pending()) {
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            schedule();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'>        __set_current_state(TASK_RUNNING);
+</span><span class='line'>        while (local_softirq_pending()) {
+</span><span class='line'>            /* Preempt disable stops cpu going offline.
+</span><span class='line'>                If already offline, we'll be on wrong CPU:
+</span><span class='line'>                don't process */
+</span><span class='line'>            if (cpu_is_offline((long)__bind_cpu))
+</span><span class='line'>                goto wait_to_die;
+</span><span class='line'>            do_softirq();
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            cond_resched();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'>        preempt_enable();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>wait_to_die:
+</span><span class='line'>    preempt_enable();
+</span><span class='line'>    /* Wait for kthread_stop */
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop()) {
+</span><span class='line'>        schedule();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'> * If there is a non-zero preempt_count or interrupts are disabled,
-</span><span class='line'> * we do not want to preempt the current task.  Just return..
-</span><span class='line'> */
-</span><span class='line'> //检查是否允许抢占,本地中断关闭,或者抢占计数器值不为0时不允许抢占
-</span><span class='line'>if (unlikely(ti-&gt;preempt_count || irqs_disabled()))
-</span><span class='line'>    return;
+</span><span class='line'>&lt;p&gt;只要有待处理的软中断(由softirq_pending()函数负责发现)，ksoftirq就会调用do_softirq去处理它们。通过重复执行这 样的操作，重新触发的软中断也会被执行。如果有必要，每次迭代后都会调用schedule()以便让更重要的进程得到处理机会。当所有需要执行的操作都完 成以后，该内核线程将自己设置为TASK_INTERRUPTIBLE状态，唤起调度程序选择其他可执行进程投入运行。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>need_resched:
-</span><span class='line'>ti-&gt;preempt_count = PREEMPT_ACTIVE;
-</span><span class='line'>//发生调度
-</span><span class='line'>schedule();
-</span><span class='line'>ti-&gt;preempt_count = 0;
+</span><span class='line'>&lt;p&gt;只要do_softirq()函数发现已经执行过的内核线程重新触发了它自己，软中断内核线程就会被唤醒.&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[tsc时钟初始化]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2014/05/29/kernel-sched-tsc/"/&gt;
+</span><span class='line'>&lt;updated&gt;2014-05-29T14:03:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2014/05/29/kernel-sched-tsc&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;h5&gt;tsc时钟源初始化&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>/* we could miss a preemption opportunity between schedule and now */
-</span><span class='line'>barrier();
-</span><span class='line'>if (unlikely(test_thread_flag(TIF_NEED_RESCHED)))
-</span><span class='line'>    goto need_resched;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    //    调用路径：time_init-&gt;tsc_init
+</span><span class='line'>//    函数任务：
+</span><span class='line'>//        1.矫正tsc，获取tsc频率，设置cpu频率等于tsc频率
+</span><span class='line'>//        2.初始化基于tsc的延迟函数
+</span><span class='line'>//        3.检查tsc的特性
+</span><span class='line'>//            3.1 tsc之间是否同步
+</span><span class='line'>//                3.1.1 如果tsc之间不同步，标记tsc不稳定，设置rating=0
+</span><span class='line'>//            3.2 tsc是否稳定
+</span><span class='line'>//        4.注册tsc时钟源设备
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void __init tsc_init(void)
+</span><span class='line'>{
+</span><span class='line'>    u64 lpj;
+</span><span class='line'>    int cpu;
+</span><span class='line'>
+</span><span class='line'>    //矫正tsc，获取tsc频率
+</span><span class='line'>    tsc_khz = x86_platform.calibrate_tsc();
+</span><span class='line'>    //cpu频率等于tsc频率
+</span><span class='line'>    cpu_khz = tsc_khz;
+</span><span class='line'>    //计算辅助cycle到ns转换的辅助参数scale
+</span><span class='line'>    for_each_possible_cpu(cpu)
+</span><span class='line'>        set_cyc2ns_scale(cpu_khz, cpu);
+</span><span class='line'>    //初始化基于tsc的延迟函数，ndely，udelay，mdelay
+</span><span class='line'>    use_tsc_delay();
+</span><span class='line'>    //检查cpu之间tsc是否同步
+</span><span class='line'>    if (unsynchronized_tsc())
+</span><span class='line'>        mark_tsc_unstable("TSCs unsynchronized");
+</span><span class='line'>    //检查tsc是否可靠
+</span><span class='line'>    check_system_tsc_reliable();
+</span><span class='line'>    //注册tsc时钟源设备
+</span><span class='line'>    init_tsc_clocksource();
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;(4) 内核任务显示调用schedule()，例如内核任务阻塞时，就会显示调用schedule()，该情况属于内核自动放弃CPU。
+</span><span class='line'>&lt;h5&gt;延迟函数ndelay，udelay，mdelay&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>#### 5、从中断返回
-</span><span class='line'>当内核从中断返回时，应当考虑以下几种情况：  
-</span><span class='line'>(1) 内核控制路径并发执行的数量：如果为1，则CPU返回用户态。  
-</span><span class='line'>(2) 挂起进程的切换请求：如果有挂起请求，则进行进程调度；否则，返回被中断的进程。  
-</span><span class='line'>(3) 待处理信号：如果有信号发送给当前进程，则必须进行信号处理。  
-</span><span class='line'>(4) 单步调试模式：如果调试器正在跟踪当前进程，在返回用户态时必须恢复单步模式。  
-</span><span class='line'>(5) Virtual-8086模式：如果中断时CPU处于虚拟8086模式，则进行特殊的处理。  
+</span><span class='line'>&lt;p&gt;通过tsc实现短延迟
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>void use_tsc_delay(void)
+</span><span class='line'>{
+</span><span class='line'>    //通过tsc进行短延迟
+</span><span class='line'>    delay_fn = delay_tsc;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>##### 4.1从中断返回
-</span><span class='line'>中断返回点为ret_from-intr：
-</span><span class='line'>// 从中断返回
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>&lt;h5&gt;tsc延迟函数&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;ret_from_intr:
-</span><span class='line'>GET_THREAD_INFO(%ebp)
-</span><span class='line'>movl EFLAGS(%esp), %eax        # mix EFLAGS and CS
-</span><span class='line'>movb CS(%esp), %al
-</span><span class='line'>testl $(VM_MASK | 3), %eax #是否运行在VM86模式或者用户态
-</span><span class='line'>/&lt;em&gt;中断或异常发生时,处于内核空间,则返回内核空间;否则返回用户空间&lt;/em&gt;/
-</span><span class='line'>jz resume_kernel        # returning to kernel or vm86-space</span></code></pre></td></tr></table></div></figure></p>
+</span><span class='line'>&lt;p&gt;通过rep_nop实现轮询时的短延迟，查询tsc时禁止内核抢占，确保不受不同cpu间影响。</span></code></pre></td></tr></table></div></figure>
+    static void delay_tsc(unsigned long loops)
+    {
+        unsigned long bclock, now;
+        int cpu;
+        //短延迟，禁止内核抢占
+        preempt_disable();
+        //delay_tsc当前运行的cpu
+        cpu = smp_processor_id();
+        rdtsc_barrier();
+        rdtscl(bclock);
+        for (;;) {
+            rdtsc_barrier();
+            rdtscl(now);
+            if ((now - bclock) >= loops)
+                break;
+            //允许rt策略进程运行
+            preempt_enable();
+            //空操作
+            rep_nop();
+            preempt_disable();</p>
 
-<p>从中断返回时，有两种情况，一是返回内核态，二是返回用户态。</p>
-
-<h6>5.1.1、返回内核态</h6>
-
-<pre><code>    #ifdef CONFIG_PREEMPT 
-    /*返回内核空间,先检查preempt_count,再检查need_resched*/
-    ENTRY(resume_kernel)
-        /*是否可以抢占,即preempt_count是否为0*/
-        cmpl $0,TI_preempt_count(%ebp)    # non-zero preempt_count ?
-        jnz restore_all #不能抢占,则恢复被中断时处理器状态
-
-    need_resched:
-        movl TI_flags(%ebp), %ecx    # need_resched set ?
-        testb $_TIF_NEED_RESCHED, %cl #是否需要重新调度
-        jz restore_all #不需要重新调度
-        testl $IF_MASK,EFLAGS(%esp)     # 发生异常则不调度
-        jz restore_all
-        #将最大值赋值给preempt_count，表示不允许再次被抢占
-        movl $PREEMPT_ACTIVE,TI_preempt_count(%ebp)
-        sti
-        call schedule #调度函数
-        cli
-        movl $0,TI_preempt_count(%ebp) #preempt_count还原为0
-        #跳转到need_resched，判断是否又需要发生被调度
-        jmp need_resched
-    #endif
+<pre><code>        //delay_tsc在运行过程中，可能会迁移到不同的cpu
+        //tsc
+        if (unlikely(cpu != smp_processor_id())) {
+            loops -= (now - bclock);
+            cpu = smp_processor_id();
+            rdtsc_barrier();
+            rdtscl(bclock);
+        }
+    }
+    preempt_enable();
+}
 </code></pre>
 
-<h6>5.1.2、返回用户态</h6>
-
-<pre><code>    /*返回用户空间,只需要检查need_resched*/
-    ENTRY(resume_userspace)  #返回用户空间,中断或异常发生时,任务处于用户空间
-         cli                # make sure we don't miss an interrupt
-                        # setting need_resched or sigpending
-                        # between sampling and the iret
-        movl TI_flags(%ebp), %ecx
-        andl $_TIF_WORK_MASK, %ecx    # is there any work to be done on
-                        # int/exception return?
-        jne work_pending #还有其它工作要做
-        jmp restore_all #所有工作都做完,则恢复处理器状态
-
-    #恢复处理器状态
-    restore_all:
-        RESTORE_ALL
-
-        # perform work that needs to be done immediately before resumption
-        ALIGN
-
-        #完成其它工作
-    work_pending:
-        testb $_TIF_NEED_RESCHED, %cl #检查是否需要重新调度
-        jz work_notifysig #不需要重新调度
-     #需要重新调度
-    work_resched:
-        call schedule #调度进程
-        cli                # make sure we don't miss an interrupt
-                        # setting need_resched or sigpending
-                        # between sampling and the iret
-        movl TI_flags(%ebp), %ecx
-        /*检查是否还有其它的事要做*/
-        andl $_TIF_WORK_MASK, %ecx    # is there any work to be done other
-                        # than syscall tracing?
-        jz restore_all #没有其它的事,则恢复处理器状态
-        testb $_TIF_NEED_RESCHED, %cl
-        jnz work_resched #如果need_resched再次置位,则继续调度
-    #VM和信号检测
-    work_notifysig:                # deal with pending signals and
-                        # notify-resume requests
-        testl $VM_MASK, EFLAGS(%esp) #检查是否是VM模式
-        movl %esp, %eax
-        jne work_notifysig_v86        # returning to kernel-space or
-                        # vm86-space
-        xorl %edx, %edx
-        #进行信号处理
-        call do_notify_resume
-        jmp restore_all
-
-        ALIGN
-    work_notifysig_v86:
-        pushl %ecx            # save ti_flags for do_notify_resume
-        call save_v86_state        # %eax contains pt_regs pointer
-        popl %ecx
-        movl %eax, %esp
-        xorl %edx, %edx
-        call do_notify_resume #信号处理
-        jmp restore_all
+<pre><code>
+##### 检查tsc是否同步
 </code></pre>
 
-<h5>5.2、从异常返回</h5>
-
-<p>异常返回点为ret_from_exception：
-    #从异常返回<br/>
-    ALIGN<br/>
-ret_from_exception:<br/>
-    preempt_stop /<em>相当于cli,从中断返回时,在handle_IRQ_event已经关中断,不需要这步</em>/</p>
-
-<h4>6、从系统调用返回</h4>
-
-<pre><code>        #系统调用入口
-    ENTRY(system_call)
-        pushl %eax            # save orig_eax
-        SAVE_ALL
-        GET_THREAD_INFO(%ebp)
-                        # system call tracing in operation
-        testb $(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT),TI_flags(%ebp)
-        jnz syscall_trace_entry
-        cmpl $(nr_syscalls), %eax
-        jae syscall_badsys
-    syscall_call:
-        #调用相应的函数
-        call *sys_call_table(,%eax,4)
-        movl %eax,EAX(%esp)        # store the return value,返回值保存到eax
-    #系统调用返回
-    syscall_exit:
-        cli                # make sure we don't miss an interrupt
-                        # setting need_resched or sigpending
-                        # between sampling and the iret
-        movl TI_flags(%ebp), %ecx
-        testw $_TIF_ALLWORK_MASK, %cx    # current-&gt;work,检查是否还有其它工作要完成
-        jne syscall_exit_work
-    #恢复处理器状态
-    restore_all:
-        RESTORE_ALL
-
-    #做其它工作
-    syscall_exit_work:
-         #检查是否系统调用跟踪,审计,单步执行,不需要则跳到work_pending(进行调度,信号处理)
-        testb $(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT|_TIF_SINGLESTEP), %cl
-        jz work_pending
-        sti                # could let do_syscall_trace() call
-                        # schedule() instead
-        movl %esp, %eax
-        movl $1, %edx
-        #系统调用跟踪
-        call do_syscall_trace
-        #返回用户空间
-        jmp resume_userspace
+<pre><code>//    调用路径：tsc_init-&gt;unsynchronized_tsc
+//    检查办法：
+//        1.如果apic在多块板卡，则tsc不同步
+//        2.如果cpuid显示具有稳定的tsc，则tsc同步
+//        3.intel cpu的tsc都是同步的
+//        4.默认其他品牌的多核的tsc不同步
 </code></pre>
 
-<p>整个中断、异常和系统调用返回流程如下：</p>
+<pre><code></code></pre>
 
-<p><img src="/images/kernel/2014-04-22.jpg" alt="" /></p>
+<pre><code>__cpuinit int unsynchronized_tsc(void)
+{
+    //如果apic分布在多块板卡上，tsc可能不同步
+    if (apic_is_clustered_box())
+        return 1;
+    //cpu具有稳定的tsc
+    if (boot_cpu_has(X86_FEATURE_CONSTANT_TSC))
+        return 0;
+    //intel cpu的tsc都是同步的
+    if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) {
+        //非intel cpu，如果cpu个数&gt;1,则认为不同步
+        if (num_possible_cpus() &gt; 1)
+            tsc_unstable = 1;
+    }
+    return tsc_unstable;
+}
+</code></pre>
+
+<pre><code>
+##### 标记tsc不稳定
+</code></pre>
+
+<pre><code>//    调用路径：tsc_init-&gt;mark_tsc_unstable
+//    函数任务：
+//        1.如果tsc时钟已经注册，异步设置tsc的rating=0，标识其不稳定
+//        2.如果tsc时钟还未注册，同步设置tsc的rating=0，标识其不稳定
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>void mark_tsc_unstable(char *reason)
+{
+    if (!tsc_unstable) {
+        tsc_unstable = 1;
+        sched_clock_stable = 0;
+        //tsc已经注册，
+        if (clocksource_tsc.mult)
+        {
+            clocksource_mark_unstable(&amp;clocksource_tsc);
+        }
+        //如果tsc时钟源未注册，修改rating为最低，从而不会被当做最佳的时钟源
+        else {
+            clocksource_tsc.flags |= CLOCK_SOURCE_UNSTABLE;
+            clocksource_tsc.rating = 0;
+        }
+    }
+}
+</code></pre>
+
+<pre><code>
+##### 注册tsc时钟源
+</code></pre>
+
+<pre><code>//    函数任务：
+//        1.计算tsc的mult
+//        2.检查tsc是否稳定
+//            2.1 如果tsc不稳定，降低其rating，清除时钟源连续标志
+//        3.向系统注册tsc clocksource
+//    调用路径：tsc_init-&gt;init_tsc_clocksource
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>static void __init init_tsc_clocksource(void)
+{
+    // 计算tsc的mult
+    clocksource_tsc.mult = clocksource_khz2mult(tsc_khz,
+            clocksource_tsc.shift);
+    // 如果tsc的可靠性已经验证，则清除 必须验证 标记
+    if (tsc_clocksource_reliable)
+        clocksource_tsc.flags &amp;= ~CLOCK_SOURCE_MUST_VERIFY;
+
+    // 检查tsc是否稳定
+    // 在tsc_init前通过全局变量标记tsc是否稳定，可靠
+    if (check_tsc_unstable()) {
+        // 如果tsc不稳定，则降低rating最低，清除连续标记
+        clocksource_tsc.rating = 0;
+        clocksource_tsc.flags &amp;= ~CLOCK_SOURCE_IS_CONTINUOUS;
+    }
+    // 向系统注册tsc clocksource
+    clocksource_register(&amp;clocksource_tsc);
+}
+</code></pre>
+
+<p>```</p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[内核态抢占机制分析]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/01/09/kernel-sched-1/"/>
-    <updated>2014-01-09T17:31:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/01/09/kernel-sched-1</id>
-    <content type="html"><![CDATA[<h4>1. 非抢占式和可抢占式内核的区别</h4>
+    <title type="html"><![CDATA[周期性调度器scheduler_tick]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2014/05/22/kernel-sched-tick/"/>
+    <updated>2014-05-22T16:57:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2014/05/22/kernel-sched-tick</id>
+    <content type="html"><![CDATA[<p>周期性调度器由中断实现，系统定时产生一个中断，然后启动周期性调度器，周期性调度器执行过程中要关闭中断, 周期性调度器执行完毕后再打开中断(handle_IRQ_event,  IRQF_DISABLED)</p>
 
-<p>为了简化问题，我使用嵌入式实时系统uC/OS作为例子。首先要指出的是，uC/OS只有内核态，没有用户态，这和Linux不一样。<br/>
-多任务系统中，内核负责管理各个任务，或者说为每个任务分配CPU时间，并且负责任务之间的通讯。内核提供的基本服务是任务切换。调度 （Scheduler）,英文还有一词叫dispatcher，也是调度的意思。这是内核的主要职责之一，就是要决定该轮到哪个任务运行了。多数实时内核 是基于优先级调度法的。每个任务根据其重要程度的不同被赋予一定的优先级。基于优先级的调度法指，CPU总是让处在就绪态的优先级最高的任务先运行。然 而，究竟何时让高优先级任务掌握CPU的使用权，有两种不同的情况，这要看用的是什么类型的内核，是不可剥夺型的还是可剥夺型内核。</p>
+<p>周期性调度器主要做两个工作：<br/>
+a)更新相关统计量<br/>
+b) 检查进程执行的时间是否超过了它对应的ideal_runtime，如果超过了，则告诉系统，需要启动主调度器(schedule)进行进程切换。(注意 thread_info:preempt_count、thread_info:flags (TIF_NEED_RESCHED))</p>
 
-<h5>非抢占式内核</h5>
+<h4>周期性调度器</h4>
 
-<p>非抢占式内核是由任务主动放弃CPU的使用权。非抢占式调度法也称作合作型多任务，各个任务彼此合作共享一个CPU。异步事件还是由中断服务来处理。中断 服务可以使一个高优先级的任务由挂起状态变为就绪状态。但中断服务以后控制权还是回到原来被中断了的那个任务，直到该任务主动放弃CPU的使用权时，那个 高优先级的任务才能获得CPU的使用权。非抢占式内核如下图所示。<br/>
-非抢占式内核的优点有：<br/>
-·中断响应快(与抢占式内核比较)；<br/>
-·允许使用不可重入函数；<br/>
-·几乎不需要使用信号量保护共享数据。运行的任务占有CPU，不必担心被别的任务抢占。这不是绝对的，在打印机的使用上，仍需要满足互斥条件。</p>
+<pre><code>    |----&gt;do_timer()   更新jiffies_64
+    |----&gt;update_process_times()
+          |----&gt;scheduler_tick()
+          |----&gt;update_rq_clock()  更新当前调度队列rq的clock
+          |----&gt;curr-&gt;sched_class-&gt;task_tick() 
+          |         对于普通进程，即task_tick_fair()
+          |         task_struct: struct sched_class *sched_class
 
-<p>非抢占式内核的缺点有：<br/>
-·任务响应时间慢。高优先级的任务已经进入就绪态，但还不能运行，要等到当前运行着的任务释放CPU。<br/>
-·非抢占式内核的任务级响应时间是不确定的，不知道什么时候最高优先级的任务才能拿到CPU的控制权，完全取决于应用程序什么时候释放CPU。</p>
-
-<h5>抢占式内核</h5>
-
-<p>使用抢占式内核可以保证系统响应时间。最高优先级的任务一旦就绪，总能得到CPU的使用权。当一个运行着的任务使一个比它优先级高的任务进入了就绪态，当 前任务的CPU使用权就会被剥夺，或者说被挂起了，那个高优先级的任务立刻得到了CPU的控制权。如果是中断服务子程序使一个高优先级的任务进入就绪态， 中断完成时，中断了的任务被挂起，优先级高的那个任务开始运行。抢占式内核如下图所示。<br/>
-抢占式内核的优点有：<br/>
-·使用抢占式内核，最高优先级的任务什么时候可以执行，可以得到CPU的使用权是可知的。使用抢占式内核使得任务级响应时间得以最优化。</p>
-
-<p>抢占式内核的缺点有：<br/>
-·不能直接使用不可重入型函数。调用不可重入函数时，要满足互斥条件，这点可以使用互斥型信号量来实现。如果调用不可重入型函数时，低优先级的任务CPU的使用权被高优先级任务剥夺，不可重入型函数中的数据有可能被破坏。</p>
-
-<h4>2. Linux下的用户态抢占和内核态抢占</h4>
-
-<p>Linux除了内核态外还有用户态。用户程序的上下文属于用户态，系统调用和中断处理例程上下文属于内核态。在2.6 kernel以前，Linux kernel只支持用户态抢占。</p>
-
-<h5>2.1 用户态抢占(User Preemption)</h5>
-
-<p>在kernel返回用户态(user-space)时，并且need_resched标志为1时，scheduler被调用，这就是用户态抢占。当 kernel返回用户态时，系统可以安全的执行当前的任务，或者切换到另外一个任务。当中断处理例程或者系统调用完成后，kernel返回用户态 时，need_resched标志的值会被检查，假如它为1，调度器会选择一个新的任务并执行。中断和系统调用的返回路径(return path)的实现在entry.S中(entry.S不仅包括kernel entry code，也包括kernel exit code)。</p>
-
-<h5>2.2 内核态抢占(Kernel Preemption)</h5>
-
-<p>在2.6 kernel以前，kernel code(中断和系统调用属于kernel code)会一直运行，直到code被完成或者被阻塞(系统调用可以被阻塞)。在 2.6 kernel里，Linux kernel变成可抢占式。当从中断处理例程返回到内核态(kernel-space)时，kernel会检查是否可以抢占和是否需要重新调度。 kernel可以在任何时间点上抢占一个任务(因为中断可以发生在任何时间点上)，只要在这个时间点上kernel的状态是安全的、可重新调度的。</p>
-
-<h4>3.内核态抢占的设计</h4>
-
-<h5>3.1 可抢占的条件</h5>
-
-<p>要满足什么条件，kernel才可以抢占一个任务的内核态呢？<br/>
-·没持有锁。锁是用于保护临界区的，不能被抢占。<br/>
-·Kernel code可重入(reentrant)。因为kernel是SMP-safe的，所以满足可重入性。<br/>
-如何判断当前上下文(中断处理例程、系统调用、内核线程等)是没持有锁的？Linux在每个每个任务的thread_info结构中增加了preempt_count变量作为preemption的计数器。这个变量初始为0，当加锁时计数器增一，当解锁时计数器减一。</p>
-
-<h5>3.2 内核态需要抢占的触发条件</h5>
-
-<p>内核提供了一个need_resched标志(这个标志在任务结构thread_info中)来表明是否需要重新执行调度。</p>
-
-<h5>3.3 何时触发重新调度</h5>
-
-<p>set_tsk_need_resched()：设置指定进程中的need_resched标志<br/>
-clear_tsk need_resched()：清除指定进程中的need_resched标志<br/>
-need_resched()：检查need_ resched标志的值;如果被设置就返回真，否则返回假</p>
-
-<p>什么时候需要重新调度：<br/>
-<code>
-·时钟中断处理例程检查当前任务的时间片，当任务的时间片消耗完时，scheduler_tick()函数就会设置need_resched标志；
-·信号量、等到队列、completion等机制唤醒时都是基于waitqueue的，而waitqueue的唤醒函数为default_wake_function，其调用try_to_wake_up将被唤醒的任务更改为就绪状态并设置need_resched标志。
-·设置用户进程的nice值时，可能会使高优先级的任务进入就绪状态；
-·改变任务的优先级时，可能会使高优先级的任务进入就绪状态；
-·新建一个任务时，可能会使高优先级的任务进入就绪状态；
-·对CPU(SMP)进行负载均衡时，当前任务可能需要放到另外一个CPU上运行；
-</code></p>
-
-<h5>3.4 抢占发生的时机(何时检查可抢占条件)</h5>
-
-<pre><code>·当一个中断处理例程退出，在返回到内核态时(kernel-space)。这是隐式的调用schedule()函数，当前任务没有主动放弃CPU使用权，而是被剥夺了CPU使用权。
-·当kernel code从不可抢占状态变为可抢占状态时(preemptible again)。也就是preempt_count从正整数变为0时。这也是隐式的调用schedule()函数。
-·一个任务在内核态中显式的调用schedule()函数。任务主动放弃CPU使用权。
-·一个任务在内核态中被阻塞，导致需要调用schedule()函数。任务主动放弃CPU使用权。
+update_rq_clock()----delta = sched_clock_cpu(cpu_of(rq)) - rq-&gt;clock
+         |-----两次相邻两次周期性调度器运行的时间差
+         |----rq-&gt;clock += delta; 更新运行队列上的时钟
+               |----&gt;update_rq_clock_task(rq, delta)
+               |     即rq-&gt;clock_task += delta
 </code></pre>
 
-<h5>3.5 禁用/使能可抢占条件的操作</h5>
+<h4>普通进程</h4>
 
-<p>对preempt_count操作的函数有add_preempt_count()、sub_preempt_count()、inc_preempt_count()、dec_preempt_count()。<br/>
-使能可抢占条件的操作是preempt_enable()，它调用dec_preempt_count()函数，然后再调用preempt_check_resched()函数去检查是否需要重新调度。<br/>
-禁用可抢占条件的操作是preempt_disable()，它调用inc_preempt_count()函数。<br/>
-在内核中有很多函数调用了preempt_enable()和preempt_disable()。比如spin_lock()函数调用了preempt_disable()函数，spin_unlock()函数调用了preempt_enable()函数。</p>
+<pre><code>task_tick_fair()----&gt;entity_tick()   没有考虑组调度
+   |----&gt;update_curr() 更新相关统计量
+   |----&gt;check_preempt_tick()   
+   |        检查进程本次获得CPU使用权的执行时间是否超过了
+   |        它对应的ideal_runtime值，如果超过了，则将当前进
+   |        程的TIF_NEED_RESCHED标志位置位
 
-<h5>3.6 什么时候不允许抢占</h5>
+update_curr()
+   |----delta_exec = (unsigned long)(now - curr-&gt;exec_start);  
+   |            exec_start当前进程开始获得
+   |            cpu使用权时的时间戳;
+   |            进程本次所获得的CPU执行权的时间;
+   |----&gt;__update_curr(cfs_rq, curr, delta_exec);
+         |----&gt;curr-&gt;sum_exec_runtime += delta_exec; 
+         |     更新该进程获得CPU执行权总时间
+         |
+         |----&gt;curr-&gt;vruntime += delta_exec_weighted;
+         |     更新该进程获得CPU执行权的虚拟时间
+         |
+         |----&gt;update_min_vruntime()
+         |     更新cfs_rq-&gt;min_vruntime
+         |
+   |----&gt;curr-&gt;exec_start = now    
+   |        更新进程下次运行起始时间
+   |        (如果被抢占，下次被调度时将会更新)
 
-<p>preempt_count()函数用于获取preempt_count的值，preemptible()用于判断内核是否可抢占。<br/>
-有几种情况Linux内核不应该被抢占，除此之外，Linux内核在任意一点都可被抢占。这几种情况是：<br/>
-<code>
-·内核正进行中断处理。在Linux内核中进程不能抢占中断(中断只能被其他中断中止、抢占，进程不能中止、抢占中断)，在中断例程中不允许进行进程调度。进程调度函数schedule()会对此作出判断，如果是在中断中调用，会打印出错信息。
-·内核正在进行中断上下文的Bottom Half(中断的下半部)处理。硬件中断返回前会执行软中断，此时仍然处于中断上下文中。
-·内核的代码段正持有spinlock自旋锁、writelock/readlock读写锁等锁，处干这些锁的保护状态中。内核中的这些锁是为了在SMP 系统中短时间内保证不同CPU上运行的进程并发执行的正确性。当持有这些锁时，内核不应该被抢占，否则由于抢占将导致其他CPU长期不能获得锁而死等。
-·内核正在执行调度程序Scheduler。抢占的原因就是为了进行新的调度，没有理由将调度程序抢占掉再运行调度程序。
-·内核正在对每个CPU“私有”的数据结构操作(Per-CPU date structures)。在SMP中，对于per-CPU数据结构未用spinlocks保护，因为这些数据结构隐含地被保护了(不同的CPU有不一样的 per-CPU数据，其他CPU上运行的进程不会用到另一个CPU的per-CPU数据)。但是如果允许抢占，但一个进程被抢占后重新调度，有可能调度到 其他的CPU上去，这时定义的Per-CPU变量就会有问题，这时应禁抢占。
-</code></p>
+check_preempt_tick()
+   |----ideal_runtime = sched_slice(cfs_rq, curr);
+   |----delta_exec = curr-&gt;sum_exec_runtime 
+   |                 - curr-&gt;prev_sum_exec_runtime;
+   |----if(delta_exec &gt; ideal_runtime)  
+   |          resched_task(rq_of(cfs_rq)-&gt;curr);
+   |          把当前进程的TIF_NEED_RESCHED标志位置位
+   |----else
+   |    delta = curr-&gt;vruntime - se-&gt;vruntime;  //这是什么？
+   |    if (delta &gt; ideal_runtime)  
+   |        resched_task(rq_of(cfs_rq)-&gt;curr);
+   |        把当前进程的TIF_NEED_RESCHED标志位置位
+</code></pre>
 
-<h4>4.Linux内核态抢占的实现</h4>
+<h4>实时进程</h4>
 
-<h5>4.1 数据结构</h5>
+<pre><code>task_tick_rt()
+    |----&gt;update_curr_rt();
+    |----&gt;if (p-&gt;policy != SCHED_RR) return;  SCHED_FIFO只有主动放弃CPU使用权
+    |----&gt;rt.timeslice值减一，若没有运行完时间则直接返回，
+    |     否则再次分配时间片，加入队列尾部，设置TIF_NEED_RESCHED
 
-<p>在thread_info.h中
-<code>
-    struct thread_info {
-        struct task_struct  *task;
-        struct exec_domain  *exec_domain;
-        __u32           flags;
-         __u32           status;
-        __u32           cpu;
-        int         preempt_count;
-        mm_segment_t        addr_limit;
-        struct restart_block    restart_block;
-        void __user     *sysenter_return;
-    #ifdef CONFIG_X86_32
-        unsigned long           previous_esp;
-        __u8            supervisor_stack[0];
-    #endif
-    };
-</code></p>
-
-<h5>4.2 代码流程</h5>
-
-<p>禁用/使能可抢占条件的函数
-<code>
-    #if defined(CONFIG_DEBUG_PREEMPT) || defined(CONFIG_PREEMPT_TRACER)
-        extern void add_preempt_count(int val);
-        extern void sub_preempt_count(int val);
-    #else
-        #define add_preempt_count(val) do { preempt_count() += (val); } while (0)
-        #define sub_preempt_count(val) do { preempt_count() -= (val); } while (0)
-    #endif
-        #define inc_preempt_count() add_preempt_count(1)
-        #define dec_preempt_count() sub_preempt_count(1)
-        #define preempt_count() (current_thread_info()-&gt;preempt_count)
-        #define preempt_disable() \
-        do { \
-            inc_preempt_count(); \
-            barrier(); \
-        } while (0)
-        #define preempt_enable_no_resched() \
-        do { \
-            barrier(); \
-            dec_preempt_count(); \
-        } while (0)
-        #define preempt_check_resched() \
-        do { \
-            if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) \
-            preempt_schedule(); \
-        } while (0)
-        #define preempt_enable() \
-        do { \
-            preempt_enable_no_resched(); \
-            barrier(); \
-            preempt_check_resched(); \
-        } while (0)
-</code>
-检查可抢占条件
-<code>
-    # define preemptible() (preempt_count() == 0 &amp;&amp; !irqs_disabled())
-</code>
-自旋锁的加锁与解锁
-<code>
-    void __lockfunc _spin_lock(spinlock_t *lock)
-    {
-        preempt_disable();
-        spin_acquire(&amp;lock-&gt;dep_map, 0, 0, _RET_IP_);
-        LOCK_CONTENDED(lock, _raw_spin_trylock, _raw_spin_lock);
-    }
-    void __lockfunc _spin_unlock(spinlock_t *lock)
-    {
-        spin_release(&amp;lock-&gt;dep_map, 1, _RET_IP_);
-        _raw_spin_unlock(lock);
-        preempt_enable();
-    }
-</code>
-设置need_resched标志的函数
-<code>
-    static inline void set_tsk_need_resched(struct task_struct *tsk)
-    {
-        set_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
-    }
-    static inline void clear_tsk_need_resched(struct task_struct *tsk)
-    {
-        clear_tsk_thread_flag(tsk,TIF_NEED_RESCHED);
-    }
-    static inline int test_tsk_need_resched(struct task_struct *tsk)
-    {
-        return unlikely(test_tsk_thread_flag(tsk,TIF_NEED_RESCHED));
-    }
-</code>
-时钟中断时调用的task_tick()函数，当时间片消耗完之后，设置need_resched标志
-<code>
-    static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
-    {
-        update_curr_rt(rq);
-        watchdog(rq, p);
-        if (p-&gt;policy != SCHED_RR)
-            return;
-        if (--p-&gt;rt.time_slice)
-            return;
-        p-&gt;rt.time_slice = DEF_TIMESLICE;
-        if (p-&gt;rt.run_list.prev != p-&gt;rt.run_list.next) {
-            requeue_task_rt(rq, p, 0);
-            set_tsk_need_resched(p);
-        }
-    }
-</code>
-设置任务的need_resched标志，并触发任务所在CPU的调度器。
-<code>
-    static void resched_task(struct task_struct *p)
-    {
-        int cpu;
-        assert_spin_locked(&amp;task_rq(p)-&gt;lock);
-        if (unlikely(test_tsk_thread_flag(p, TIF_NEED_RESCHED)))
-            return;
-        set_tsk_thread_flag(p, TIF_NEED_RESCHED);
-        cpu = task_cpu(p);
-        if (cpu == smp_processor_id())
-            return;
-        smp_mb();
-        if (!tsk_is_polling(p))
-            smp_send_reschedule(cpu);
-    }
-</code></p>
-
-<h4>5. 参考资料</h4>
-
-<p><a href="http://blog.csdn.net/sailor_8318/archive/2008/09/03/2870184.aspx">http://blog.csdn.net/sailor_8318/archive/2008/09/03/2870184.aspx</a></p>
-
-<p>《uC/OS-II源码公开的嵌入式实时多任务操作系统内核》</p>
-
-<p>Linux 2.6.29内核源码</p>
+update_curr_rt()
+    |----delta_exec = rq-&gt;clock - curr-&gt;se.exec_start; //本次运行时间
+    |----curr-&gt;se.sum_exec_runtime += delta_exec; //更新总得运行时间
+    |----curr-&gt;se.exec_start = rq-&gt;clock; //更新下次进程运行的起始时间
+    |----if (sched_rt_runtime(rt_rq) != RUNTIME_INF)
+    |-------{
+    |           rt_rq-&gt;rt_time += delta_exec;
+    |                if (sched_rt_runtime_exceeded(rt_rq))
+    |                   resched_task(curr);
+    |       }
+</code></pre>
 ]]></content>
   </entry>
   
