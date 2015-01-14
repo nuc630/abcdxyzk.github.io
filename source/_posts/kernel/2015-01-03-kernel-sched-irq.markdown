@@ -10,6 +10,19 @@ categories:
 - kernel~sched
 tags:
 ---
+
+关闭硬中断： spin_lock_irq和spin_unlock_irq以及spin_lock_irqsave和spin_unlock_irqrestore  
+关闭软中断： spin_lock_bh和spin_unlock_bh
+
+--------------
+netfilter：  
+有些netfilter hooks可以从系统调用的context到达， 比如socket的send_msg()是可以到达LOCAL_OUT/POST_ROUTING的，   
+这样，也就是说，在这些情况下操作conntrack链表的时候，是进程上下文，而不是软中断上下文， 因此，是需要关闭bh的。 
+
+PRE_ROUTING上的按道理说，它只能从软中断到达，因此只需要spin_lock()就可以了。
+
+--------------
+
 http://blog.csdn.net/zhangskd/article/details/21992933
 
 #### 概述
@@ -42,21 +55,21 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 ##### (1) 硬中断的开关
 简单禁止和激活当前处理器上的本地中断：
 ```
-local_irq_disable();
-local_irq_enable();
+	local_irq_disable();
+	local_irq_enable();
 ```
 保存本地中断系统状态下的禁止和激活：
 ```
-unsigned long flags;
-local_irq_save(flags);
-local_irq_restore(flags);
+	unsigned long flags;
+	local_irq_save(flags);
+	local_irq_restore(flags);
 ```
 
 ##### (2) 软中断的开关
 禁止下半部，如softirq、tasklet和workqueue等：
 ```
-local_bh_disable();
-local_bh_enable();
+	local_bh_disable();
+	local_bh_enable();
 ```
 需要注意的是，禁止下半部时仍然可以被硬中断抢占。
 
@@ -167,8 +180,8 @@ local_bh_enable();
 ```
 例如：
 ```
-open_softirq(NET_TX_SOFTIRQ, net_tx_action);
-open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+	open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+	open_softirq(NET_RX_SOFTIRQ, net_rx_action);
 ```
 
 ##### (3) 触发软中断 
