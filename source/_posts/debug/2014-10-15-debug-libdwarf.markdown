@@ -16,6 +16,10 @@ tags:
 
 dwarf格式文档[http://www.dwarfstd.org/Home.php](http://www.dwarfstd.org/Home.php)
 
+编译
+```
+make CFLAGS+="-static -I`pwd`/libdwarf -I`pwd`/dwarfdump" LDFLAGS+="-static -L`pwd`/libdwarf -ldwarf -lelf"
+```
 
 使用
 ```
