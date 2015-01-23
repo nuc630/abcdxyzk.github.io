@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~01
 - kernel
-- kernel~sched
+- kernel~irq
 tags:
 ---
 blog.chinaunix.net/uid-20737871-id-1881243.html

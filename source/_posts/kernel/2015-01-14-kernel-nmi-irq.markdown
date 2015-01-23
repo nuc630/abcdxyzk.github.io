@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~01
 - kernel
-- kernel~sched
+- kernel~irq
 tags:
 ---
 http://blog.csdn.net/arethe/article/details/6153143
