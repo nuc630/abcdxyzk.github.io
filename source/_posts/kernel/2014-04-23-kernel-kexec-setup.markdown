@@ -45,7 +45,7 @@ initrd /initrd.img-2.6.26-1-amd64
 ```
 找到了，对照上面开始用kexec加载了
 ```
-$ kexec -l /boot/vmlinuz-2.6.26-1-amd64 --initrd /boot/initrd.img-2.6.26-1-amd64 --append="root=/dev/sda1 ro"
+$ kexec -l /boot/vmlinuz-2.6.26-1-amd64 --initrd=/boot/initrd.img-2.6.26-1-amd64 --append="root=/dev/sda1 ro"
 ```
 加载以后并不直接执行哦，所以我们要执行一下才会切换
 ```
