@@ -30,6 +30,16 @@ sudo apt-get install xserver-xorg-core
 sudo apt-get install xserver-xorg
 ```
 
+#### 修改MTU值
+其实网卡的MTU值是保存在/sys/class/net/eth0/mtu文件中，所以可以通过查看和修改文件达到修改MTU的目的：  
+以下以查看和修改eth0为例：
+```
+	1. 查看MTU值
+	# cat /sys/class/net/eth0/mtu
+	2.  修改MTU值
+	# echo "1460" > /sys/class/net/eth0/mtu
+```
+
 #### 修改屏幕亮度
 挂起时是独显，恢复时是集显的话，屏幕亮度设置指向独显，导致不能设置。  
 可以这样设置:  
