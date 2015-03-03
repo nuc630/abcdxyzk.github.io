@@ -62,6 +62,535 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/03/03/kernel-mm-slab2/">Linux slab 分配器</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-03T17:32:00+08:00'><span class='date'>2015-03-03</span> <span class='time'>17:32:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2012-06/62965.htm">Linux Slab分配器(一)-概述</a><br/>
+<a href="http://www.linuxidc.com/Linux/2012-06/62966.htm">Linux Slab分配器(二)-初始化</a><br/>
+<a href="http://www.linuxidc.com/Linux/2012-06/63109.htm">Linux Slab分配器(三)-创建缓存</a><br/>
+<a href="http://www.linuxidc.com/Linux/2012-06/63138.htm">Linux Slab分配器(四)-分配对象</a></p>
+
+<h2>一、概述</h2>
+
+<p>  slab分配器是Linux内存管理中非常重要和复杂的一部分，其工作是针对一些经常分配并释放的对象，如进程描述符等，这些对象的大小一般比较小，如果直接采用伙伴系统来进行分配和释放，不仅会造成大量的内碎片，而且处理速度也太慢。而slab分配器是基于对象进行管理的，相同类型的对象归为一类(如进程描述符就是一类)，每当要申请这样一个对象，slab分配器就从一个slab列表中分配一个这样大小的单元出去，而当要释放时，将其重新保存在该列表中，而不是直接返回给伙伴系统。slab分配对象时，会使用最近释放的对象内存块，因此其驻留在CPU高速缓存的概率较高。</p>
+
+<h5>用于描述和管理cache的数据结构是struct kmem_cache</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache {  
+</span><span class='line'>/* 1) per-cpu data, touched during every alloc/free */  
+</span><span class='line'>    /*per-CPU数据，记录了本地高速缓存的信息，也用于跟踪最近释放的对象，每次分配和释放都要直接访问它*/  
+</span><span class='line'>    struct array_cache *array[NR_CPUS];   
+</span><span class='line'>/* 2) Cache tunables. Protected by cache_chain_mutex */  
+</span><span class='line'>    unsigned int batchcount;  /*本地高速缓存转入或转出的大批对象数量*/  
+</span><span class='line'>    unsigned int limit;       /*本地高速缓存中空闲对象的最大数目*/  
+</span><span class='line'>    unsigned int shared;  
+</span><span class='line'>
+</span><span class='line'>    unsigned int buffer_size;/*管理对象的大小*/  
+</span><span class='line'>    u32 reciprocal_buffer_size;/*buffer_size的倒数值*/  
+</span><span class='line'>/* 3) touched by every alloc & free from the backend */  
+</span><span class='line'>
+</span><span class='line'>    unsigned int flags;          /* 高速缓存的永久标识*/  
+</span><span class='line'>    unsigned int num;         /* 一个slab所包含的对象数目 */  
+</span><span class='line'>
+</span><span class='line'>/* 4) cache_grow/shrink */  
+</span><span class='line'>    /* order of pgs per slab (2^n) */  
+</span><span class='line'>    unsigned int gfporder;   /*一个slab包含的连续页框数的对数*/  
+</span><span class='line'>
+</span><span class='line'>    /* force GFP flags, e.g. GFP_DMA */  
+</span><span class='line'>    gfp_t gfpflags;          /*与伙伴系统交互时所提供的分配标识*/  
+</span><span class='line'>
+</span><span class='line'>    size_t colour;         /* 颜色的个数*/  
+</span><span class='line'>    unsigned int colour_off; /* 着色的偏移量 */  
+</span><span class='line'>
+</span><span class='line'>    /*如果将slab描述符存储在外部，该指针指向存储slab描述符的cache, 
+</span><span class='line'>      否则为NULL*/  
+</span><span class='line'>    struct kmem_cache *slabp_cache;  
+</span><span class='line'>    unsigned int slab_size;  /*slab管理区的大小*/  
+</span><span class='line'>    unsigned int dflags;     /*动态标识*/  
+</span><span class='line'>
+</span><span class='line'>    /* constructor func */  
+</span><span class='line'>    void (*ctor)(void *obj); /*创建高速缓存时的构造函数指针*/  
+</span><span class='line'>
+</span><span class='line'>/* 5) cache creation/removal */  
+</span><span class='line'>    const char *name;         /*高速缓存名*/  
+</span><span class='line'>    struct list_head next;    /*用于将高速缓存链入cache chain*/  
+</span><span class='line'>
+</span><span class='line'>/* 6) statistics */  
+</span><span class='line'>#ifdef CONFIG_DEBUG_SLAB /*一些用于调试用的变量*/   
+</span><span class='line'>    unsigned long num_active;  
+</span><span class='line'>    unsigned long num_allocations;  
+</span><span class='line'>    unsigned long high_mark;  
+</span><span class='line'>    unsigned long grown;  
+</span><span class='line'>    unsigned long reaped;  
+</span><span class='line'>    unsigned long errors;  
+</span><span class='line'>    unsigned long max_freeable;  
+</span><span class='line'>    unsigned long node_allocs;  
+</span><span class='line'>    unsigned long node_frees;  
+</span><span class='line'>    unsigned long node_overflow;  
+</span><span class='line'>    atomic_t allochit;  
+</span><span class='line'>    atomic_t allocmiss;  
+</span><span class='line'>    atomic_t freehit;  
+</span><span class='line'>    atomic_t freemiss;  
+</span><span class='line'>
+</span><span class='line'>    /* 
+</span><span class='line'>     * If debugging is enabled, then the allocator can add additional 
+</span><span class='line'>     * fields and/or padding to every object. buffer_size contains the total 
+</span><span class='line'>     * object size including these internal fields, the following two 
+</span><span class='line'>     * variables contain the offset to the user object and its size. 
+</span><span class='line'>     */  
+</span><span class='line'>    int obj_offset;  
+</span><span class='line'>    int obj_size;  
+</span><span class='line'>#endif /* CONFIG_DEBUG_SLAB */   
+</span><span class='line'>
+</span><span class='line'>    /* 
+</span><span class='line'>     * We put nodelists[] at the end of kmem_cache, because we want to size 
+</span><span class='line'>     * this array to nr_node_ids slots instead of MAX_NUMNODES 
+</span><span class='line'>     * (see kmem_cache_init()) 
+</span><span class='line'>     * We still use [MAX_NUMNODES] and not [1] or [0] because cache_cache 
+</span><span class='line'>     * is statically defined, so we reserve the max number of nodes. 
+</span><span class='line'>     */  
+</span><span class='line'>     /*struct kmem_list3用于组织该高速缓存中的slab*/  
+</span><span class='line'>    struct kmem_list3 *nodelists[MAX_NUMNODES];  
+</span><span class='line'>    /* 
+</span><span class='line'>     * Do not add fields after nodelists[] 
+</span><span class='line'>     */  
+</span><span class='line'>}; </span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_list3 {  
+</span><span class='line'>    struct list_head slabs_partial;/*slab链表，包含空闲对象和已分配对象的slab描述符*/  
+</span><span class='line'>    struct list_head slabs_full;   /*slab链表，只包含非空闲的slab描述符*/  
+</span><span class='line'>    struct list_head slabs_free;   /*slab链表，只包含空闲的slab描述符*/  
+</span><span class='line'>    unsigned long free_objects;    /*高速缓存中空闲对象的个数*/  
+</span><span class='line'>    unsigned int free_limit;       /*空闲对象的上限*/  
+</span><span class='line'>    unsigned int colour_next;       /*下一个slab使用的颜色*/  
+</span><span class='line'>    spinlock_t list_lock;  
+</span><span class='line'>    struct array_cache *shared; /* shared per node */  
+</span><span class='line'>    struct array_cache **alien; /* on other nodes */  
+</span><span class='line'>    unsigned long next_reap;    /* updated without locking */  
+</span><span class='line'>    int free_touched;       /* updated without locking */  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>描述和管理单个slab的结构是struct slab</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct slab {  
+</span><span class='line'>    struct list_head list;  /*用于将slab链入kmem_list3的链表*/  
+</span><span class='line'>    unsigned long colouroff;/*该slab的着色偏移*/  
+</span><span class='line'>    void *s_mem;            /*指向slab中的第一个对象*/  
+</span><span class='line'>    unsigned int inuse;     /*已分配出去的对象*/  
+</span><span class='line'>    kmem_bufctl_t free;     /*下一个空闲对象的下标*/  
+</span><span class='line'>    unsigned short nodeid;  /*节点标识号*/  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+</div>
+  
+  
+    <footer>
+      <a rel="full-article" target="_blank" href="/blog/2015/03/03/kernel-mm-slab2/">Read on &rarr;</a>
+    </footer>
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/03/03/kernel-mm-slab1/">Linux slab 分配器剖析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-03T17:15:00+08:00'><span class='date'>2015-03-03</span> <span class='time'>17:15:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.ibm.com/developerworks/cn/linux/l-linux-slab-allocator/">http://www.ibm.com/developerworks/cn/linux/l-linux-slab-allocator/</a></p>
+
+<h4>动态内存管理</h4>
+
+<p>内存管理的目标是提供一种方法，为实现各种目的而在各个用户之间实现内存共享。内存管理方法应该实现以下两个功能：<br/>
+1. 最小化管理内存所需的时间
+2. 最大化用于一般应用的可用内存（最小化管理开销）</p>
+
+<p>  内存管理实际上是一种关于权衡的零和游戏。您可以开发一种使用少量内存进行管理的算法，但是要花费更多时间来管理可用内存。也可以开发一个算法来有效地管理内存，但却要使用更多的内存。最终，特定应用程序的需求将促使对这种权衡作出选择。</p>
+
+<p>  每个内存管理器都使用了一种基于堆的分配策略。在这种方法中，大块内存（称为 堆）用来为用户定义的目的提供内存。当用户需要一块内存时，就请求给自己分配一定大小的内存。堆管理器会查看可用内存的情况（使用特定算法）并返回一块内存。搜索过程中使用的一些算法有 first-fit（在堆中搜索到的第一个满足请求的内存块 ）和 best-fit（使用堆中满足请求的最合适的内存块）。当用户使用完内存后，就将内存返回给堆。</p>
+
+<p>  这种基于堆的分配策略的根本问题是碎片（fragmentation）。当内存块被分配后，它们会以不同的顺序在不同的时间返回。这样会在堆中留下一些洞，需要花一些时间才能有效地管理空闲内存。这种算法通常具有较高的内存使用效率（分配需要的内存），但是却需要花费更多时间来对堆进行管理。</p>
+
+<p>  另外一种方法称为 buddy memory allocation，是一种更快的内存分配技术，它将内存划分为 2 的幂次方个分区，并使用 best-fit 方法来分配内存请求。当用户释放内存时，就会检查 buddy 块，查看其相邻的内存块是否也已经被释放。如果是的话，将合并内存块以最小化内存碎片。这个算法的时间效率更高，但是由于使用 best-fit 方法的缘故，会产生内存浪费。</p>
+
+<p>本文将着重介绍 Linux 内核的内存管理，尤其是 slab 分配提供的机制。</p>
+
+<h4>slab 缓存</h4>
+
+<p>  Linux 所使用的 slab 分配器的基础是 Jeff Bonwick 为 SunOS 操作系统首次引入的一种算法。Jeff 的分配器是围绕对象缓存进行的。在内核中，会为有限的对象集（例如文件描述符和其他常见结构）分配大量内存。Jeff 发现对内核中普通对象进行初始化所需的时间超过了对其进行分配和释放所需的时间。因此他的结论是不应该将内存释放回一个全局的内存池，而是将内存保持为针对特定目而初始化的状态。例如，如果内存被分配给了一个互斥锁，那么只需在为互斥锁首次分配内存时执行一次互斥锁初始化函数（mutex_init）即可。后续的内存分配不需要执行这个初始化函数，因为从上次释放和调用析构之后，它已经处于所需的状态中了。</p>
+
+<p>Linux slab 分配器使用了这种思想和其他一些思想来构建一个在空间和时间上都具有高效性的内存分配器。</p>
+
+<p>图 1 给出了 slab 结构的高层组织结构。在最高层是 cache_chain，这是一个 slab 缓存的链接列表。这对于 best-fit 算法非常有用，可以用来查找最适合所需要的分配大小的缓存（遍历列表）。cache_chain 的每个元素都是一个 kmem_cache 结构的引用（称为一个 cache）。它定义了一个要管理的给定大小的对象池。</p>
+
+<p><img src="/images/kernel/2015-03-03-1.gif" alt="" /></p>
+
+<p>每个缓存都包含了一个 slabs 列表，这是一段连续的内存块（通常都是页面）。存在 3 种 slab：</p>
+
+<p>slabs_full<br/>
+    完全分配的 slab <br/>
+slabs_partial<br/>
+    部分分配的 slab<br/>
+slabs_empty<br/>
+    空 slab，或者没有对象被分配</p>
+
+<p>  注意 slabs_empty 列表中的 slab 是进行回收（reaping）的主要备选对象。正是通过此过程，slab 所使用的内存被返回给操作系统供其他用户使用。</p>
+
+<p>  slab 列表中的每个 slab 都是一个连续的内存块（一个或多个连续页），它们被划分成一个个对象。这些对象是从特定缓存中进行分配和释放的基本元素。注意 slab 是 slab 分配器进行操作的最小分配单位，因此如果需要对 slab 进行扩展，这也就是所扩展的最小值。通常来说，每个 slab 被分配为多个对象。</p>
+
+<p>  由于对象是从 slab 中进行分配和释放的，因此单个 slab 可以在 slab 列表之间进行移动。例如，当一个 slab 中的所有对象都被使用完时，就从 slabs_partial 列表中移动到 slabs_full 列表中。当一个 slab 完全被分配并且有对象被释放后，就从 slabs_full 列表中移动到 slabs_partial 列表中。当所有对象都被释放之后，就从 slabs_partial 列表移动到 slabs_empty 列表中。</p>
+
+<h5>slab 背后的动机</h5>
+
+<p>  与传统的内存管理模式相比， slab 缓存分配器提供了很多优点。首先，内核通常依赖于对小对象的分配，它们会在系统生命周期内进行无数次分配。slab 缓存分配器通过对类似大小的对象进行缓存而提供这种功能，从而避免了常见的碎片问题。slab 分配器还支持通用对象的初始化，从而避免了为同一目而对一个对象重复进行初始化。最后，slab 分配器还可以支持硬件缓存对齐和着色，这允许不同缓存中的对象占用相同的缓存行，从而提高缓存的利用率并获得更好的性能。</p>
+
+<h4>API 函数</h4>
+
+<p>现在来看一下能够创建新 slab 缓存、向缓存中增加内存、销毁缓存的应用程序接口（API）以及 slab 中对对象进行分配和释放操作的函数。</p>
+
+<p>第一个步骤是创建 slab 缓存结构，您可以将其静态创建为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct struct kmem_cache *my_cachep;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后其他 slab 缓存函数将使用该引用进行创建、删除、分配等操作。kmem_cache 结构包含了每个中央处理器单元（CPU）的数据、一组可调整的（可以通过 proc 文件系统访问）参数、统计信息和管理 slab 缓存所必须的元素。</p>
+
+<h5>kmem_cache_create</h5>
+
+<p>内核函数 kmem_cache_create 用来创建一个新缓存。这通常是在内核初始化时执行的，或者在首次加载内核模块时执行。其原型定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache *
+</span><span class='line'>kmem_cache_create( const char *name, size_t size, size_t align,
+</span><span class='line'>                       unsigned long flags;
+</span><span class='line'>                       void (*ctor)(void*, struct kmem_cache *, unsigned long),
+</span><span class='line'>                       void (*dtor)(void*, struct kmem_cache *, unsigned long));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>name 参数定义了缓存名称，proc 文件系统（在 /proc/slabinfo 中）使用它标识这个缓存。 size 参数指定了为这个缓存创建的对象的大小， align 参数定义了每个对象必需的对齐。 flags 参数指定了为缓存启用的选项。这些标志如表 1 所示。</p>
+
+<p>表 1. kmem_cache_create 的部分选项（在 flags 参数中指定）<br/>
+选项                  说明<br/>
+SLAB_RED_ZONE       在对象头、尾插入标志，用来支持对缓冲区溢出的检查。<br/>
+SLAB_POISON         使用一种己知模式填充 slab，允许对缓存中的对象进行监视（对象属对象所有，不过可以在外部进行修改）。<br/>
+SLAB_HWCACHE_ALIGN  指定缓存对象必须与硬件缓存行对齐。</p>
+
+<p>ctor 和 dtor 参数定义了一个可选的对象构造器和析构器。构造器和析构器是用户提供的回调函数。当从缓存中分配新对象时，可以通过构造器进行初始化。</p>
+
+<p>在创建缓存之后， kmem_cache_create 函数会返回对它的引用。注意这个函数并没有向缓存分配任何内存。相反，在试图从缓存（最初为空）分配对象时，refill 操作将内存分配给它。当所有对象都被使用掉时，也可以通过相同的操作向缓存添加内存。</p>
+
+<h5>kmem_cache_destroy</h5>
+
+<p>内核函数 kmem_cache_destroy 用来销毁缓存。这个调用是由内核模块在被卸载时执行的。在调用这个函数时，缓存必须为空。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kmem_cache_destroy( struct kmem_cache *cachep );</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>kmem_cache_alloc</h5>
+
+<p>要从一个命名的缓存中分配一个对象，可以使用 kmem_cache_alloc 函数。调用者提供了从中分配对象的缓存以及一组标志：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kmem_cache_alloc( struct kmem_cache *cachep, gfp_t flags );</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个函数从缓存中返回一个对象。注意如果缓存目前为空，那么这个函数就会调用 cache_alloc_refill 向缓存中增加内存。 kmem_cache_alloc 的 flags 选项与 kmalloc 的 flags 选项相同。表 2 给出了标志选项的部分列表。</p>
+
+<p>表 2. kmem_cache_alloc 和 kmalloc 内核函数的标志选项<br/>
+标志              说明<br/>
+GFP_USER        为用户分配内存（这个调用可能会睡眠）。<br/>
+GFP_KERNEL      从内核 RAM 中分配内存（这个调用可能会睡眠）。<br/>
+GFP_ATOMIC      使该调用强制处于非睡眠状态（对中断处理程序非常有用）。<br/>
+GFP_HIGHUSER    从高端内存中分配内存。</p>
+
+<h5>kmem_cache_zalloc</h5>
+
+<p>内核函数 kmem_cache_zalloc 与 kmem_cache_alloc 类似，只不过它对对象执行 memset 操作，用来在将对象返回调用者之前对其进行清除操作。</p>
+
+<h5>kmem_cache_free</h5>
+
+<p>要将一个对象释放回 slab，可以使用 kmem_cache_free。调用者提供了缓存引用和要释放的对象。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kmem_cache_free( struct kmem_cache *cachep, void *objp );</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>kmalloc 和 kfree</h5>
+
+<p>内核中最常用的内存管理函数是 kmalloc 和 kfree 函数。这两个函数的原型如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void *kmalloc( size_t size, int flags );
+</span><span class='line'>void kfree( const void *objp );</span></code></pre></td></tr></table></div></figure>
+
+
+<p>注意在 kmalloc 中，惟一两个参数是要分配的对象的大小和一组标志（请参看 表 2 中的部分列表）。但是 kmalloc 和 kfree 使用了类似于前面定义的函数的 slab 缓存。kmalloc 没有为要从中分配对象的某个 slab 缓存命名，而是循环遍历可用缓存来查找可以满足大小限制的缓存。找到之后，就（使用 <code>__kmem_cache_alloc</code>）分配一个对象。要使用 kfree 释放对象，从中分配对象的缓存可以通过调用 virt_to_cache 确定。这个函数会返回一个缓存引用，然后在 <code>__cache_free</code> 调用中使用该引用释放对象。</p>
+
+<h5>其他函数</h5>
+
+<p>slab 缓存 API 还提供了其他一些非常有用的函数。 kmem_cache_size 函数会返回这个缓存所管理的对象的大小。您也可以通过调用 kmem_cache_name 来检索给定缓存的名称（在创建缓存时定义）。缓存可以通过释放其中的空闲 slab 进行收缩。这可以通过调用 kmem_cache_shrink 实现。注意这个操作（称为回收）是由内核定期自动执行的（通过 kswapd）。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned int kmem_cache_size( struct kmem_cache *cachep );
+</span><span class='line'>const char *kmem_cache_name( struct kmem_cache *cachep );
+</span><span class='line'>int kmem_cache_shrink( struct kmem_cache *cachep );</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>slab 缓存的示例用法</h4>
+
+<p>下面的代码片断展示了创建新 slab 缓存、从缓存中分配和释放对象然后销毁缓存的过程。首先，必须要定义一个 kmem_cache 对象，然后对其进行初始化（请参看清单 1）。这个特定的缓存包含 32 字节的对象，并且是硬件缓存对齐的（由标志参数 SLAB_HWCACHE_ALIGN 定义）。<br/>
+清单 1. 创建新 slab 缓存</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct kmem_cache *my_cachep;
+</span><span class='line'>
+</span><span class='line'>static void init_my_cache( void )
+</span><span class='line'>{
+</span><span class='line'>
+</span><span class='line'>    my_cachep = kmem_cache_create( 
+</span><span class='line'>                  "my_cache",            /* Name */
+</span><span class='line'>                  32,                    /* Object Size */
+</span><span class='line'>                  0,                     /* Alignment */
+</span><span class='line'>                  SLAB_HWCACHE_ALIGN,    /* Flags */
+</span><span class='line'>                  NULL, NULL );          /* Constructor/Deconstructor */
+</span><span class='line'>
+</span><span class='line'>    return;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>使用所分配的 slab 缓存，您现在可以从中分配一个对象了。清单 2 给出了一个从缓存中分配和释放对象的例子。它还展示了两个其他函数的用法。<br/>
+清单 2. 分配和释放对象</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int slab_test( void )
+</span><span class='line'>{
+</span><span class='line'>    void *object;
+</span><span class='line'>
+</span><span class='line'>    printk( "Cache name is %s\n", kmem_cache_name( my_cachep ) );
+</span><span class='line'>    printk( "Cache object size is %d\n", kmem_cache_size( my_cachep ) );
+</span><span class='line'>
+</span><span class='line'>    object = kmem_cache_alloc( my_cachep, GFP_KERNEL );
+</span><span class='line'>    if (object) {
+</span><span class='line'>        kmem_cache_free( my_cachep, object );
+</span><span class='line'>    }
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后，清单 3 演示了 slab 缓存的销毁。调用者必须确保在执行销毁操作过程中，不要从缓存中分配对象。<br/>
+清单 3. 销毁 slab 缓存</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void remove_my_cache( void )
+</span><span class='line'>{
+</span><span class='line'>    if (my_cachep) kmem_cache_destroy( my_cachep );
+</span><span class='line'>    return;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>slab 的 proc 接口</h3>
+
+<p>  proc 文件系统提供了一种简单的方法来监视系统中所有活动的 slab 缓存。这个文件称为 /proc/slabinfo，它除了提供一些可以从用户空间访问的可调整参数之外，还提供了有关所有 slab 缓存的详细信息。当前版本的 slabinfo 提供了一个标题，这样输出结果就更具可读性。对于系统中的每个 slab 缓存来说，这个文件提供了对象数量、活动对象数量以及对象大小的信息（除了每个 slab 的对象和页面之外）。另外还提供了一组可调整的参数和 slab 数据。</p>
+
+<p>  要调优特定的 slab 缓存，可以简单地向 /proc/slabinfo 文件中以字符串的形式回转 slab 缓存名称和 3 个可调整的参数。下面的例子展示了如何增加 limit 和 batchcount 的值，而保留 shared factor 不变（格式为 “cache name limit batchcount shared factor”）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># echo "my_cache 128 64 8" &gt; /proc/slabinfo</span></code></pre></td></tr></table></div></figure>
+
+
+<p>limit 字段表示每个 CPU 可以缓存的对象的最大数量。 batchcount 字段是当缓存为空时转换到每个 CPU 缓存中全局缓存对象的最大数量。 shared 参数说明了对称多处理器（Symmetric MultiProcessing，SMP）系统的共享行为。</p>
+
+<p>注意您必须具有超级用户的特权才能在 proc 文件系统中为 slab 缓存调优参数。</p>
+
+<h4>SLOB 分配器</h4>
+
+<p>对于小型的嵌入式系统来说，存在一个 slab 模拟层，名为 SLOB。这个 slab 的替代品在小型嵌入式 Linux 系统中具有优势，但是即使它保存了 512KB 内存，依然存在碎片和难于扩展的问题。在禁用 CONFIG_SLAB 时，内核会回到这个 SLOB 分配器中。更多信息请参看 参考资料 一节。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-base-param/">Linux 内核引导参数简介</a></h2>
     
     
@@ -2926,423 +3455,6 @@ TSC(Time Stamp Counter) TSC是位于CPU里面的一个64位寄存器，与传统
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-trywakeup/">try_to_wake_up函数</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-02-11T11:32:00+08:00'><span class='date'>2015-02-11</span> <span class='time'>11:32:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>  try_to_wake_up函数通过把进程状态设置为TASK_RUNNING，并把该进程插入本地CPU运行队列rq来达到唤醒睡眠和停止的进程的目的。<br/>
-例如：调用该函数唤醒等待队列中的进程，或恢复执行等待信号的进程。该函数接受的参数有：<br/>
-- 被唤醒进程的描述符指针（p）<br/>
-- 可以被唤醒的进程状态掩码（state）<br/>
-- 一个标志（sync），用来禁止被唤醒的进程抢占本地CPU上正在运行的进程</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync)
-</span><span class='line'>{
-</span><span class='line'>    int cpu, this_cpu, success = 0;
-</span><span class='line'>    unsigned long flags;
-</span><span class='line'>    long old_state;
-</span><span class='line'>    struct rq *rq;
-</span><span class='line'>#ifdef CONFIG_SMP
-</span><span class='line'>    struct sched_domain *sd, *this_sd = NULL;
-</span><span class='line'>    unsigned long load, this_load;
-</span><span class='line'>    int new_cpu;
-</span><span class='line'>#endif
-</span><span class='line'>    rq = task_rq_lock(p, &flags);
-</span><span class='line'>    old_state = p-&gt;state;
-</span><span class='line'>    if (!(old_state & state))
-</span><span class='line'>        goto out;
-</span><span class='line'>    if (p-&gt;array)
-</span><span class='line'>        goto out_running;
-</span><span class='line'>    cpu = task_cpu(p);
-</span><span class='line'>    this_cpu = smp_processor_id();
-</span><span class='line'>#ifdef CONFIG_SMP
-</span><span class='line'>... // [多处理器负载平衡工作](/blog/2015/02/11/kernel-sched-balance/)
-</span><span class='line'>#endif /* CONFIG_SMP */
-</span><span class='line'>    if (old_state == TASK_UNINTERRUPTIBLE) {
-</span><span class='line'>        rq-&gt;nr_uninterruptible--;
-</span><span class='line'>        /*
-</span><span class='line'>         * Tasks on involuntary sleep don't earn
-</span><span class='line'>         * sleep_avg beyond just interactive state.
-</span><span class='line'>         */
-</span><span class='line'>        p-&gt;sleep_type = SLEEP_NONINTERACTIVE; //简单判断出非交互进程
-</span><span class='line'>    } else
-</span><span class='line'>        if (old_state & TASK_NONINTERACTIVE)
-</span><span class='line'>            p-&gt;sleep_type = SLEEP_NONINTERACTIVE;//同上
-</span><span class='line'>    activate_task(p, rq, cpu == this_cpu);
-</span><span class='line'>    if (!sync || cpu != this_cpu) {
-</span><span class='line'>        if (TASK_PREEMPTS_CURR(p, rq))
-</span><span class='line'>            resched_task(rq-&gt;curr);
-</span><span class='line'>    }
-</span><span class='line'>    success = 1;
-</span><span class='line'>out_running:
-</span><span class='line'>    trace_sched_wakeup(rq, p, success);
-</span><span class='line'>    p-&gt;state = TASK_RUNNING;
-</span><span class='line'>out:
-</span><span class='line'>    task_rq_unlock(rq, &flags);
-</span><span class='line'>    return success;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>代码解释如下：<br/>
-1.首先调用task_rq_lock( )禁止本地中断，并获得最后执行进程的CPU（他可能不同于本地CPU）所拥有的运行队列rq的锁。CPU的逻辑号存储在p->thread_info->cpu字段。</p>
-
-<p>2.检查进程的状态p->state是否属于被当作参数传递给函数的状态掩码state，如果不是，就跳到第9步终止函数。</p>
-
-<p>3.如果p->array字段不等于NULL，那么进程已经属于某个运行队列，因此跳转到第8步。</p>
-
-<p>4.在多处理器系统中，该函数检查要被唤醒的进程是否应该从最近运行的CPU的运行队列迁移到另外一个CPU的运行队列。实际上，函数就是根据一些启发式规则选择一个目标运行队列。</p>
-
-<p>5.如果进程处于TASK_UNINTERRUPTIBLE状态，函数递减目标运行队列的nr_uninterruptible字段，并把进程描述符的p->activated字段设置为-1。</p>
-
-<p>6.调用activate_task( )函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void activate_task(struct task_struct *p, struct rq *rq, int local)
-</span><span class='line'>{
-</span><span class='line'>    unsigned long long now;
-</span><span class='line'>    now = sched_clock();
-</span><span class='line'>#ifdef CONFIG_SMP
-</span><span class='line'>...
-</span><span class='line'>#endif
-</span><span class='line'>    if (!rt_task(p))
-</span><span class='line'>        p-&gt;prio = recalc_task_prio(p, now); //计算平均睡眠时间并返回之后的优先级。
-</span><span class='line'>    if (p-&gt;sleep_type == SLEEP_NORMAL) {
-</span><span class='line'>        if (in_interrupt())
-</span><span class='line'>            p-&gt;sleep_type = SLEEP_INTERRUPTED;
-</span><span class='line'>        else {
-</span><span class='line'>            p-&gt;sleep_type = SLEEP_INTERACTIVE;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>    p-&gt;timestamp = now;
-</span><span class='line'>    __activate_task(p, rq);
-</span><span class='line'>}
-</span><span class='line'>static void __activate_task(struct task_struct *p, struct rq *rq)
-</span><span class='line'>{
-</span><span class='line'>    struct prio_array *target = rq-&gt;active;
-</span><span class='line'>    trace_activate_task(p, rq);
-</span><span class='line'>    if (batch_task(p))
-</span><span class='line'>        target = rq-&gt;expired;
-</span><span class='line'>    enqueue_task(p, target);
-</span><span class='line'>    inc_nr_running(p, rq);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>它依次执行下面的子步骤：<br/>
-  a) 调用sched_clock( )获取以纳秒为单位的当前时间戳。如果目标CPU不是本地CPU，就要补偿本地时钟中断的偏差，这是通过使用本地CPU和目标CPU上最近一次发生时钟中断的相对时间戳来达到的：now = (sched_clock( ) - this_rq( )->timestamp_last_tick)  +  rq->timestamp_last_tick;<br/>
-  b) 调用recalc_task_prio()，把进程描述的指针和上一步计算出的时间戳传递给它。recalc_task_prio()主要更新进程的平均睡眠时间和动态优先级，下一篇博文将详细说明这个函数。<br/>
-  c) 根据下表设置p->activated字段的值，该字段的意义为：<br/>
-        值             说明<br/>
-        0   进程处于TASK_RUNNING 状态。<br/>
-        1   进程处于TASK_INTERRUPTIBLE 或TASK_STOPPED 状态，而且正在被系统调用服务例程或内核线程唤醒。<br/>
-        2   进程处于TASK_INTERRUPTIBLE 或TASK_STOPPED 状态，而且正在被中断处理程序或可延迟函数唤醒。<br/>
-        -1  进程处于TASK_UNINTERRUPTIBLE 状态而且正在被唤醒。
-  d) 使用在第6a步中计算的时间戳设置p->timestamp字段。<br/>
-  e) 把进程描述符插入活动进程集合：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>enqueue_task(p, rq-&gt;active);
-</span><span class='line'>rq-&gt;nr_running++;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>7.如果目标CPU不是本地CPU，或者没有设置sync标志，就检查可运行的新进程的动态优先级是否比rq运行对了中当前进程的动态优先级高（p->prio &lt; rq->curr->prio）；如果是，就调用resched_task()抢占rq->curr。在单处理器系统中，后面的函数只是执行set_tsk_need_resched()来设置rq->curr进程的TIF_NEED_RESCHED标志。在多处理器系统中，resched_task()也检查TIF_NEED_RESCHED的旧值是否为0、目标CPU与本地CPU是否不同、rq->curr进程的TIF_POLLING_NRFLAG标志是否清0（目标CPU没有轮询进程TIF_NEED_RESCHED标志的值）。如果是，resched_task()调用smp_send_reschedule()产生IPI，并强制目标CPU重新调度。</p>
-
-<p>8.把进程的p->state字段设置为TASK_RUNNING状态。</p>
-
-<p>9.调用task_rq_unlock()来打开rq运行队列的锁并打开本地中断。</p>
-
-<p>10.返回1（若成功唤醒进程）或0（如果进程没有被唤醒）</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-kthread/">内核线程使用</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-02-11T11:06:00+08:00'><span class='date'>2015-02-11</span> <span class='time'>11:06:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/newnewman80/article/details/7050090">http://blog.csdn.net/newnewman80/article/details/7050090</a></p>
-
-<h5>kthread_create：创建线程。</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct task_struct *kthread_create(int (*threadfn)(void *data),void *data,const char *namefmt, ...);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>线程创建后，不会马上运行，而是需要将kthread_create() 返回的task_struct指针传给wake_up_process()，然后通过此函数运行线程。</p>
-
-<h5>kthread_run ：创建并启动线程的函数：</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct task_struct *kthread_run(int (*threadfn)(void *data),void *data,const char *namefmt, ...);</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>kthread_stop：通过发送信号给线程，使之退出。</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int kthread_stop(struct task_struct *thread);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>线程一旦启动起来后，会一直运行，除非该线程主动调用do_exit函数，或者其他的进程调用kthread_stop函数，结束线程的运行。<br/>
-但如果线程函数正在处理一个非常重要的任务，它不会被中断的。当然如果线程函数永远不返回并且不检查信号，它将永远都不会停止。</p>
-
-<h4>1. 头文件</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/sched.h&gt;       //wake_up_process()
-</span><span class='line'>#include &lt;linux/kthread.h&gt;      //kthread_create()、kthread_run()   
-</span><span class='line'>#include &lt;err.h&gt;                //IS_ERR()、PTR_ERR()  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. 实现</h4>
-
-<h5>2.1创建线程</h5>
-
-<p>kernel thread可以用kernel_thread创建，但是在执行函数里面必须用daemonize释放资源并挂到init下，还需要用completion等待这一过程的完成。为了简化操作kthread_create闪亮登场。
-在模块初始化时，可以进行线程的创建。使用下面的函数和宏定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct task_struct *kthread_create(int (*threadfn)(void *data),     
-</span><span class='line'>                            void *data,  
-</span><span class='line'>                            const char namefmt[], ...);  </span></code></pre></td></tr></table></div></figure>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define kthread_run(threadfn, data, namefmt, ...)                      \
-</span><span class='line'>({                                                                     \
-</span><span class='line'>    struct task_struct *__k                                            \
-</span><span class='line'>           = kthread_create(threadfn, data, namefmt, ## __VA_ARGS__);  \
-</span><span class='line'>    if (!IS_ERR(__k))                                                  \
-</span><span class='line'>           wake_up_process(__k);                                       \
-</span><span class='line'>    __k;                                                               \
-</span><span class='line'>})  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct task_struct *test_task;  
-</span><span class='line'>static int test_init_module(void)  
-</span><span class='line'>{  
-</span><span class='line'>    int err;  
-</span><span class='line'>    test_task = kthread_create(test_thread, NULL, "test_task");  
-</span><span class='line'>    if (IS_ERR(test_task)) {  
-</span><span class='line'>        printk("Unable to start kernel thread./n");  
-</span><span class='line'>        err = PTR_ERR(test_task);  
-</span><span class='line'>        test_task = NULL;  
-</span><span class='line'>        return err;  
-</span><span class='line'>    }  
-</span><span class='line'>    wake_up_process(test_task);  
-</span><span class='line'>    return 0;  
-</span><span class='line'>}  
-</span><span class='line'>module_init(test_init_module);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2.2线程函数</h5>
-
-<p>在线程函数里，完成所需的业务逻辑工作。主要框架如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int threadfunc(void *data) {
-</span><span class='line'>    ...        
-</span><span class='line'>    while(1) {
-</span><span class='line'>        set_current_state(TASK_UNINTERRUPTIBLE);
-</span><span class='line'>        if (kthread_should_stop()) break;
-</span><span class='line'>        if () { //条件为真
-</span><span class='line'>            //进行业务处理
-</span><span class='line'>        } else { //条件为假
-</span><span class='line'>            //让出CPU运行其他线程，并在指定的时间内重新被调度
-</span><span class='line'>            schedule_timeout(HZ);
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>    ...
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2.3结束线程</h5>
-
-<p>在模块卸载时，可以结束线程的运行。使用下面的函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int kthread_stop(struct task_struct *k);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void test_cleanup_module(void)  
-</span><span class='line'>{  
-</span><span class='line'>    if (test_task) {  
-</span><span class='line'>        kthread_stop(test_task);  
-</span><span class='line'>        test_task = NULL;  
-</span><span class='line'>    }  
-</span><span class='line'>}  
-</span><span class='line'>module_exit(test_cleanup_module);  </span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/2">&larr; Older</a>
@@ -3434,7 +3546,7 @@ if (!document.getElementById('system~centos')) document.getElementById('aexp_sys
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(50)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(52)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -3447,7 +3559,7 @@ if (!document.getElementById('kernel~irq')) document.getElementById('aexp_kernel
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kernel~kexec').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~mm/?opendiv=kernel'>mm</a><a href='##' onmousedown=showDiv('kernel~mm') id='aexp_kernel~mm'><span class='exp_style' id='exp_kernel~mm'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/kernel~mm/?opendiv=kernel'>mm</a><a href='##' onmousedown=showDiv('kernel~mm') id='aexp_kernel~mm'><span class='exp_style' id='exp_kernel~mm'>[+]</span></a><span class='right_span'>10</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
@@ -3571,8 +3683,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(30)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~02/?opendiv=2015'>2015-02</a><span class='right_span'>11</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(32)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2015~02/?opendiv=2015'>2015-02</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2015~01/?opendiv=2015'>2015-01</a><span class='right_span'>19</span></li>
 </div><li class='catclass'><a href='/blog/cats/2014/'>2014</a><a href='##' onmousedown=showDiv('2014')><span class='exp_style' id='exp_2014'>[+]</span></a><span class='right_span'>(112)</span></li>
 <div id='2014' class='catsub'><li><a href='/blog/cats/2014~12/?opendiv=2014'>2014-12</a><span class='right_span'>21</span></li>
@@ -3651,6 +3764,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/03/03/kernel-mm-slab2/">Linux slab 分配器</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/03/03/kernel-mm-slab1/">Linux slab 分配器剖析</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/02/11/kernel-base-param/">Linux 内核引导参数简介</a>
       </li>
     
@@ -3660,14 +3781,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/02/11/kernel-sched-balance/">Linux内核CPU负载均衡机制</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/02/11/kernel-sched-trywakeup/">try_to_wake_up函数</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/02/11/kernel-sched-kthread/">内核线程使用</a>
       </li>
     
   </ul>
