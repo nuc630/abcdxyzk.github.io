@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~net | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~net/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-03-04T10:33:35+08:00</updated>
+  <updated>2015-03-04T18:50:24+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,1058 +14,11 @@
 
   
   <entry>
-    <title type="html"><![CDATA[收包软中断和netif_rx]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/12/16/kernel-net-softirq-rx/"/>
-    <updated>2014-12-16T15:30:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/12/16/kernel-net-softirq-rx</id>
-    <content type="html"><![CDATA[<h5>初始化报文接收软中断</h5>
-
-<pre><code>static int __init net_dev_init(void)
-{
-    ......
-    open_softirq(NET_RX_SOFTIRQ, net_rx_action);
-    ......
-}
-</code></pre>
-
-<h5>报文接收软中断的处理函数net_rx_action详解：</h5>
-
-<pre><code>static void net_rx_action(struct softirq_action *h)
-{
-    /*取得本地cpu 的softnet_data 的poll_list  链表*/
-    struct list_head *list = &amp;__get_cpu_var(softnet_data).poll_list;
-    /*设置软中断处理程序一次允许的最大执行时间为2个jiffies*/
-    unsigned long time_limit = jiffies + 2;
-　　
-    /*设置软中断接收函数一次最多处理的报文个数为 300 */
-    int budget = netdev_budget;
-    /*关闭本地cpu的中断，下面判断list是否为空时防止硬中断抢占*/
-    local_irq_disable();
-    /*循环处理pool_list 链表上的等待处理的napi*/
-    while (!list_empty(list))
-    {
-        struct napi_struct *n;
-        int work, weight;
-
-        /*如果处理报文超出一次处理最大的个数
-          或允许时间超过最大时间就停止执行，
-          跳到softnet_break 处*/
-        if (unlikely(budget &lt;= 0 || time_after(jiffies, time_limit)))
-        {
-            goto softnet_break;
-        }
-        /*使能本地中断，上面判断list为空已完成，下面调用NAPI
-          的轮询函数是在硬中断开启的情况下执行*/
-        local_irq_enable();
-
-        /* 取得softnet_data pool_list 链表上的一个napi,
-           即使现在硬中断抢占软中断，会把一个napi挂到pool_list的尾端
-           软中断只会从pool_list 头部移除一个pool_list，这样不存在临界区*/
-        n = list_entry(list-&gt;next, struct napi_struct, poll_list);
-        /*用weighe 记录napi 一次轮询允许处理的最大报文数*/
-        weight = n-&gt;weight;
-        /* work 记录一个napi总共处理的报文数*/
-        work = 0;
-　　
-        /*如果取得的napi状态是被调度的，就执行napi的轮询处理函数*/
-        if (test_bit(NAPI_STATE_SCHED, &amp;n-&gt;state))
-        {
-            work = n-&gt;poll(n, weight);
-        }
-        WARN_ON_ONCE(work &gt; weight);
-        /*预算减去已经处理的报文数*/
-        budget -= work;
-        /*禁止本地CPU 的中断，下面会有把没执行完的NAPI挂到softnet_data
-          尾部的操作，和硬中断存在临界区。同时while循环时判断list是否
-          为空时也要禁止硬中断抢占*/
-        local_irq_disable();
-　　
-        /*如果napi 一次轮询处理的报文数正好等于允许处理的最大数,
-          说明一次轮询没处理完全部需要处理的报文*/
-        if (unlikely(work == weight))
-        {
-            /*如果napi已经被禁用，就把napi 从 softnet_data 的pool_list 上移除*/
-            if (unlikely(napi_disable_pending(n)))
-            {
-                local_irq_enable();
-                napi_complete(n);
-                local_irq_disable();
-            }
-            else
-            {
-                /*否则，把napi 移到 pool_list 的尾端*/
-                list_move_tail(&amp;n-&gt;poll_list, list);
-            }
-        }
-    }
-out:
-    local_irq_enable();
-    return;
-　　
-    /*如果处理时间超时，或处理的报文数到了最多允许处理的个数，
-      说明还有napi 上有报文需要处理，调度软中断。
-      否则，说明这次软中断处理完全部的napi上的需要处理的报文，不再需要
-      调度软中断了*/
-softnet_break:
-    __get_cpu_var(netdev_rx_stat).time_squeeze++;
-    __raise_softirq_irqoff(NET_RX_SOFTIRQ);
-    goto out;
-}
-</code></pre>
-
-<h5>虚拟NAPI backlog 的轮询函数process_backlog（）:</h5>
-
-<p>参数：<br/>
-napi : 本地cpu上softnet_data 的backlog .<br/>
-quota :  一次轮询可以处理的最多报文数。</p>
-
-<h6>函数详解：</h6>
-
-<pre><code class="">static int process_backlog(struct napi_struct *napi, int quota)
-{
-    int work = 0;
-
-    /*取得本地CPU上的softnet_data  数据*/
-    struct softnet_data *queue = &amp;__get_cpu_var(softnet_data);
-　　
-    /*开始计时，一旦允许时间到，就退出轮询*/
-    unsigned long start_time = jiffies;
-    napi-&gt;weight = weight_p;
-　　
-    /*循环从softnet_data 的输入队列取报文并处理，直到队列中没有报文了,
-     或处理的报文数大于了允许的上限值了，
-     或轮询函数执行时间大于一个jiffies 了
-　　*/
-    do
-    {
-        struct sk_buff *skb;
-        /*禁用本地中断，要存队列中取skb,防止抢占*/
-        local_irq_disable();
-　　
-        /*从softnet_data 的输入队列中取得一个skb*/
-        skb = __skb_dequeue(&amp;queue-&gt;input_pkt_queue);
-　　
-        /*如果队列中没有skb,则使能中断并退出轮询*/
-        if (!skb)
-        {
-            /*把napi 从 softnet_data 的 pool_list 链表上摘除*/
-            __napi_complete(napi);
-            /*使能本地CPU的中断*/
-            local_irq_enable();
-            break;
-        }
-        /*skb 已经摘下来了，使能中断*/
-        local_irq_enable();
-　　
-        /*把skb送到协议栈相关协议模块进行处理,详细处理见后续章节*/
-        netif_receive_skb(skb);
-    } while (++work &lt; quota &amp;&amp; jiffies == start_time);
-    /*返回处理报文个数*/
-    return work;
-}
-</code></pre>
-
-<h5>linux旧的收包方式提供给驱动的接口netif_rx():</h5>
-
-<pre><code class="">int netif_rx(struct sk_buff *skb)
-{
-    struct softnet_data *queue;
-    unsigned long flags;
-　
-    /*如果接收skb的时间戳没设定，设定接收时间戳*/
-    if (!skb-&gt;tstamp.tv64)
-    {
-        net_timestamp(skb);
-    }
-　　
-    /*禁止本地cpu的中断*/
-    local_irq_save(flags);
-　　
-    /*取得本地cpu的softnet_data*/
-    queue = &amp;__get_cpu_var(softnet_data);
-
-    /*每个CPU都有一个统计数据，增加统计数据*/
-    __get_cpu_var(netdev_rx_stat).total++;
-　　
-    /*如果本地CPU的输入队列中的skb 个数小于允许的最多的个数*/
-    if (queue-&gt;input_pkt_queue.qlen &lt;= netdev_max_backlog)
-    {
-        /*如果本地cpu的输入队列长度不为0,表示输入队列已经有skb了，
-        并且特殊的napi backlog 已经挂入了softnet_data  的
-        pool_list上了*/
-        if (queue-&gt;input_pkt_queue.qlen)
-        {
-enqueue:
-            /*把skb 放入CPU的输入队列 input_pkt_queue*/
-            __skb_queue_tail(&amp;queue-&gt;input_pkt_queue, skb);
-
-            /*使能中断 并 返回*/
-            local_irq_restore(flags);
-            return NET_RX_SUCCESS;
-        }
-        /*如果输入队列为空，则把 特殊的napi backlog 挂到softnet_data
-        的 pool_list 上 并返回把skb放入输入队列并返回*/
-        napi_schedule(&amp;queue-&gt;backlog);
-        goto enqueue;
-    }
-    /*如果本地cpu的输入队列已经满了，则丢弃报文，
-      并增加丢包计数并返回*/
-    __get_cpu_var(netdev_rx_stat).dropped++;
-    local_irq_restore(flags);
-　　
-    kfree_skb(skb);
-    return NET_RX_DROP;
-}
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[linux内核网络分层结构]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/08/01/net-struct/"/>
-    <updated>2014-08-01T16:52:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/08/01/net-struct</id>
-    <content type="html"><![CDATA[<p><a href="http://liucw.blog.51cto.com/6751239/1221140">http://liucw.blog.51cto.com/6751239/1221140</a></p>
-
-<h4>内核网络结构</h4>
-
-<p>  在Linux内核中，对网络部分按照网络协议层、网络设备层、设备驱动功能层和网络媒介层的分层体系设计。</p>
-
-<p>  网络驱动功能层主要通过网络驱动程序实现。</p>
-
-<p>  在Linux内核，所有的网络设备都被抽象为一个接口处理，该接口提供了所有的网络操作。</p>
-
-<p>  net_device结构表示网络设备在内核中的情况，也就是网络设备接口。网络设备接口既包括软件虚拟的网络设备接口，如环路设备，也包括了网络硬件设备，如以太网卡。</p>
-
-<p>  Linux内核有一个dev_base的全局指针，指向一个设备链表，包括了系统内的所有网络设备。该设备链表每个节点是一个网络设备。</p>
-
-<p>  在net_device结构中提供了许多供系统访问和协议层调用的设备方法，包括初始化、打开关闭设备、数据包发送和接收等。</p>
-
-<h4>与网络有关的数据结构</h4>
-
-<p>  内核对网络数据包的处理都是基于sk_buff结构的，该结构是内核网络部分最重要的数据结构。</p>
-
-<p>  网络协议栈中各层协议都可以通过对该结构的操作实现本层协议数据的添加或者删除。使用sk_buff结构避免了网络协议栈各层来回复制数据导致的效率低下。</p>
-
-<p><img src="/images/kernel/20140801-1.png" alt="" /></p>
-
-<p>  sk_buff结构可以分为两个部分，一部分是存储数据包缓存，在图中表示为PackertData，另一部分是由一组用于内核管理的指针组成。<br/>
-  sk_buff管理的指针最主要的是下面4个：</p>
-
-<blockquote><p>head指向数据缓冲(PackertData)的内核首地址；<br/>
-data指向当前数据包的首地址；<br/>
-tail指向当前数据包的尾地址；<br/>
-end 指向数据缓冲的内核尾地址。<br/>
-  数据包的大小在内核网络协议栈的处理过程中会发生改变，因此data和tail指针也会不断变化，而head和tail指针是不会发生改变的。</p></blockquote>
-
-<p>  对于一个TCP数据包为例，sk_buff还提供了几个指针直接指向各层协议头。mac指针指向数据的mac头；nh指针指向网络协议头，一般是IP协议头；h指向传输层协议头，在本例中是TCP协议头。</p>
-
-<p>  对各层设置指针的是方便了协议栈对数据包的处理。</p>
-
-<h4>net_device结构</h4>
-
-<p>  Linux内核中网络设备最重要的数据结构就是net_device结构了，它是网络驱动程序最重要的部分。<br/>
-  net_device结构保存在include/linux/netdevices.h头文件，理解该结构对理解网络设备驱动有很大帮助。<br/>
-  内核中所有网络设备的信息和操作都在net_device设备中，无论是注册网络设备，还是设置网络设备参数，都用到该结构。<br/>
-  下面是主要数据成员。</p>
-
-<blockquote><p>设备名称<br/>
-总线参数<br/>
-协议参数<br/>
-链接层变量<br/>
-接口标志</p></blockquote>
-
-<h4>数据包接收流程</h4>
-
-<p>  在Linux内核中，一个网络数据包从网卡接收到用户空间需要经过链路层、传输层和socket的处理，最终到达用户空间。<br/>
-<img src="/images/kernel/20140801-2.png" alt="" /><br/>
-  以DM9000网卡为例，当网卡收到数据包以后，调用中断处理函数 dm9000_interrupt()，该函数检查中断处理类型，如果是接收数据包中断，则调用 dm9000_rx()函数接收数据包到内核空间。</p>
-
-<p>  dm9000_rx()函数收到数据包完成后，内核会继续调用 netif_rx()函数，函数的作用是把网卡接收到数据提交给协议栈处理。</p>
-
-<p>  协议栈使用 net_rx_action()函数处理接收数据包队列，该函数处理数据包后如果是 IP数据包则提交给 ip_recv()函数处理。ip_recv()函数主要是检查一个数据包IP头的合法性，检查通过后交给 ip_local_deliver()和 ip_local_deliver_finish()函数处理，之所以分开处理是因为内核中有防火墙相关的代码需要动态加载到此处。</p>
-
-<p>  IP头处理完毕后，以UDP数据包为例将交由 udp_recv()函数处理，与 ip_recv()函数类亿，该函数检查 UDP头的合法性，然后交给 udp_queue_recv()函数处理，最后提交给 sock_queue_recv()函数处理。</p>
-
-<p>  数据包进入 socket部分的第一个函数是 skb_recv_datagram()，该函数从内核的 socket队列取出数据包，交给 socket部分的 udp_recvmsg()函数，该函数负责处理UDP的数据，sock_recvmsg()处理提交给 sock_read()函数。</p>
-
-<p>  sock_read()函数读取接收到的数据缓冲，把数据返回给 sys_read()系统调用。sys_read()函数调用最终把数据复制到用户空间，供用户使得。</p>
-
-<h4>数据包发送流程</h4>
-
-<p>  以UDP数据包发送流程为例，在DM9000网卡上如何发送一个数据包。</p>
-
-<p><img src="/images/kernel/20140801-3.png" alt="" /></p>
-
-<p>  当用户空间的应用程序通过 socket函数 sento()发送一个UDP数据后，会调用内核空间的 sock_writev()函数，然后通过 sock_sendmsg()函数处理。sock_sendmsg()函数调用 inet_sendmsg()函数处理，inet_sendmsg()函数会把要发送的数据交给传输层的 udp_sendmsg()函数处理。</p>
-
-<p>  udp_sendmsg()函数在数据前加入UDP头，然后把数据交给 ip_build_xmit()函数处理，该函数根据 socket提供的目的 IP和端口信息构造IP头，然后调用 output_maybe_reroute()函数处理。out_maybe_reroute()函数检查数据包是否需要经过路由，最后交给 ip_output()函数写入到发送队列，写入完成后由 ip_finish_output()函数处理后续工作。</p>
-
-<p>  链路层的 dev_queue_xmit()函数处理发送队列，调用 DM9000网卡的发送数据包函数 dm9000_xmit()发送数据包，发送完毕后，调用 dm9000_xmit_done函数处理发送结果。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux 内核发包]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/07/31/net-sendmsg/"/>
-    <updated>2014-07-31T11:28:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/07/31/net-sendmsg</id>
-    <content type="html"><![CDATA[<pre><code>    #include &lt;linux/module.h&gt;
-    #include &lt;linux/kernel.h&gt;
-    #include &lt;linux/init.h&gt;
-    #include &lt;linux/workqueue.h&gt;
-    #include &lt;linux/timer.h&gt;
-    #include &lt;linux/in.h&gt;
-    #include &lt;linux/inet.h&gt;
-    #include &lt;linux/socket.h&gt;
-    #include &lt;net/sock.h&gt;
-
-    struct socket       *sock;
-
-    unsigned char buffer[10]=
-    { 1,2,3,4,5,6,7,8,9,0,};
-
-    static int ker_send_udp(char* ip_addr, unsigned char * data, size_t len )
-    {
-        int ret;
-        u32 remote_ip = in_aton(ip_addr);
-
-        struct sockaddr_in sin = {
-            .sin_family = AF_INET,
-            .sin_port = htons(65530),
-            .sin_addr = {.s_addr = remote_ip}
-        };
-
-        struct kvec iov = {.iov_base = (void *)data, .iov_len = len};
-        struct msghdr udpmsg;
-
-        udpmsg.msg_name = (void *)&amp;sin;
-        udpmsg.msg_namelen = sizeof(sin);
-        udpmsg.msg_control = NULL;
-        udpmsg.msg_controllen = 0;
-        udpmsg.msg_flags=0;
-
-        ret = kernel_sendmsg(sock, &amp;udpmsg, &amp;iov, 1, len);
-        printk("rets = %d\n",ret);
-
-        return 0;
-    }
-
-    static int socket_init (void)
-    {
-        int ret;
-        ret = sock_create_kern (PF_INET, SOCK_DGRAM,IPPROTO_UDP, &amp;sock);
-        printk("retc = %d\n",ret);
-
-        ker_send_udp("192.168.1.253", buffer, 10);
-        return 0;
-    }
-
-    static void socket_exit (void)
-    {   
-        sock_release (sock);
-    }
-
-    module_init (socket_init);
-    module_exit (socket_exit);
-    MODULE_LICENSE ("GPL");
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[内核tcp的定时器管理]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2013/09/27/kernel-net-tcp-timer/"/>
-    <updated>2013-09-27T16:11:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2013/09/27/kernel-net-tcp-timer</id>
-    <content type="html"><![CDATA[<h5>在内核中tcp协议栈有6种类型的定时器：</h5>
-
-<pre><code>1 重传定时器。
-2 delayed ack定时器
-3 零窗口探测定时器
-上面三种定时器都是作为tcp状态机的一部分来实现的。
-4 keep-alive 定时器 主要是管理established状态的连接。
-5 time_wait定时器 主要是用来客户端关闭时的time_wait状态用到。
-6 syn-ack定时器(主要是用在listening socket) 管理新的连接请求时所用到。
-</code></pre>
-
-<h5>而在内核中，tcp协议栈管理定时器主要有下面4个函数：</h5>
-
-<pre><code>inet_csk_reset_xmit_timer   这个函数是用来重启定时器
-inet_csk_clear_xmit_timer   这个函数用来删除定时器。
-上面两个函数都是针对状态机里面的定时器。
-tcp_set_keepalive   这个函数是用来管理keepalive 定时器的接口。
-tcp_synack_timer    这个函数是用来管理syn_ack定时器的接口。
-</code></pre>
-
-<h5>先来看定时器的初始化。</h5>
-
-<p>首先是在tcp_v4_init_sock中对定时器的初始化，它会调用tcp_init_xmit_timers，我们就先来看这个函数：
-<code>
-    void tcp_init_xmit_timers(struct sock *sk)
-    {
-        inet_csk_init_xmit_timers(sk, &amp;tcp_write_timer, &amp;tcp_delack_timer, &amp;tcp_keepalive_timer);
-    }
-</code>
-可以看到这个函数很简单，就是调用inet_csk_init_xmit_timers,然后把3个定时器的回掉函数传递进去，下面我们来看inet_csk_init_xmit_timers。
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-<span class='line-number'>195</span>
-<span class='line-number'>196</span>
-<span class='line-number'>197</span>
-<span class='line-number'>198</span>
-<span class='line-number'>199</span>
-<span class='line-number'>200</span>
-<span class='line-number'>201</span>
-<span class='line-number'>202</span>
-<span class='line-number'>203</span>
-<span class='line-number'>204</span>
-<span class='line-number'>205</span>
-<span class='line-number'>206</span>
-<span class='line-number'>207</span>
-<span class='line-number'>208</span>
-<span class='line-number'>209</span>
-<span class='line-number'>210</span>
-<span class='line-number'>211</span>
-<span class='line-number'>212</span>
-<span class='line-number'>213</span>
-<span class='line-number'>214</span>
-<span class='line-number'>215</span>
-<span class='line-number'>216</span>
-<span class='line-number'>217</span>
-<span class='line-number'>218</span>
-<span class='line-number'>219</span>
-<span class='line-number'>220</span>
-<span class='line-number'>221</span>
-<span class='line-number'>222</span>
-<span class='line-number'>223</span>
-<span class='line-number'>224</span>
-<span class='line-number'>225</span>
-<span class='line-number'>226</span>
-<span class='line-number'>227</span>
-<span class='line-number'>228</span>
-<span class='line-number'>229</span>
-<span class='line-number'>230</span>
-<span class='line-number'>231</span>
-<span class='line-number'>232</span>
-<span class='line-number'>233</span>
-<span class='line-number'>234</span>
-<span class='line-number'>235</span>
-<span class='line-number'>236</span>
-<span class='line-number'>237</span>
-<span class='line-number'>238</span>
-<span class='line-number'>239</span>
-<span class='line-number'>240</span>
-<span class='line-number'>241</span>
-<span class='line-number'>242</span>
-<span class='line-number'>243</span>
-<span class='line-number'>244</span>
-<span class='line-number'>245</span>
-<span class='line-number'>246</span>
-<span class='line-number'>247</span>
-<span class='line-number'>248</span>
-<span class='line-number'>249</span>
-<span class='line-number'>250</span>
-<span class='line-number'>251</span>
-<span class='line-number'>252</span>
-<span class='line-number'>253</span>
-<span class='line-number'>254</span>
-<span class='line-number'>255</span>
-<span class='line-number'>256</span>
-<span class='line-number'>257</span>
-<span class='line-number'>258</span>
-<span class='line-number'>259</span>
-<span class='line-number'>260</span>
-<span class='line-number'>261</span>
-<span class='line-number'>262</span>
-<span class='line-number'>263</span>
-<span class='line-number'>264</span>
-<span class='line-number'>265</span>
-<span class='line-number'>266</span>
-<span class='line-number'>267</span>
-<span class='line-number'>268</span>
-<span class='line-number'>269</span>
-<span class='line-number'>270</span>
-<span class='line-number'>271</span>
-<span class='line-number'>272</span>
-<span class='line-number'>273</span>
-<span class='line-number'>274</span>
-<span class='line-number'>275</span>
-<span class='line-number'>276</span>
-<span class='line-number'>277</span>
-<span class='line-number'>278</span>
-<span class='line-number'>279</span>
-<span class='line-number'>280</span>
-<span class='line-number'>281</span>
-<span class='line-number'>282</span>
-<span class='line-number'>283</span>
-<span class='line-number'>284</span>
-<span class='line-number'>285</span>
-<span class='line-number'>286</span>
-<span class='line-number'>287</span>
-<span class='line-number'>288</span>
-<span class='line-number'>289</span>
-<span class='line-number'>290</span>
-<span class='line-number'>291</span>
-<span class='line-number'>292</span>
-<span class='line-number'>293</span>
-<span class='line-number'>294</span>
-<span class='line-number'>295</span>
-<span class='line-number'>296</span>
-<span class='line-number'>297</span>
-<span class='line-number'>298</span>
-<span class='line-number'>299</span>
-<span class='line-number'>300</span>
-<span class='line-number'>301</span>
-<span class='line-number'>302</span>
-<span class='line-number'>303</span>
-<span class='line-number'>304</span>
-<span class='line-number'>305</span>
-<span class='line-number'>306</span>
-<span class='line-number'>307</span>
-<span class='line-number'>308</span>
-<span class='line-number'>309</span>
-<span class='line-number'>310</span>
-<span class='line-number'>311</span>
-<span class='line-number'>312</span>
-<span class='line-number'>313</span>
-<span class='line-number'>314</span>
-<span class='line-number'>315</span>
-<span class='line-number'>316</span>
-<span class='line-number'>317</span>
-<span class='line-number'>318</span>
-<span class='line-number'>319</span>
-<span class='line-number'>320</span>
-<span class='line-number'>321</span>
-<span class='line-number'>322</span>
-<span class='line-number'>323</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void inet_csk_init_xmit_timers(struct sock &lt;em&gt;sk,
-</span><span class='line'>                    void (&lt;/em&gt;retransmit_handler)(unsigned long),
-</span><span class='line'>                    void (&lt;em&gt;delack_handler)(unsigned long),
-</span><span class='line'>                    void (&lt;/em&gt;keepalive_handler)(unsigned long))
-</span><span class='line'>{
-</span><span class='line'>    struct inet_connection_sock *icsk = inet_csk(sk);&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    //安装定时器，设置定时器的回掉函数。
-</span><span class='line'>setup_timer(&amp;icsk-&gt;icsk_retransmit_timer, retransmit_handler, (unsigned long)sk);
-</span><span class='line'>setup_timer(&amp;icsk-&gt;icsk_delack_timer, delack_handler, (unsigned long)sk);
-</span><span class='line'>setup_timer(&amp;sk-&gt;sk_timer, keepalive_handler, (unsigned long)sk);
-</span><span class='line'>icsk-&gt;icsk_pending = icsk-&gt;icsk_ack.pending = 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;我 们可以看到icsk-&gt;icsk_retransmit_timer定时器，也就是重传定时器的回调函数是tcp_write_timer,而 icsk-&gt;icsk_delack_timer定时器也就是delayed-ack 定时器的回调函数是tcp_delack_timer,最后sk-&gt;sk_timer也就是keepalive定时器的回掉函数是 tcp_keepalive_timer.  
-</span><span class='line'>这里还有一个要注意的，tcp_write_timer还会处理0窗口定时器。  
-</span><span class='line'>这里有关内核定时器的一些基础的东西我就不介绍了，想了解的可以去看下ldd第三版。  
-</span><span class='line'>接下来我们就来一个个的分析这6个定时器，首先是重传定时器。  
-</span><span class='line'>我们知道4层最终调用tcp_xmit_write来讲数据发送到3层，并且tcp是字节流的，因此每次他总是发送一段数据到3层，而每次当它发送完毕(返回正确),则它就会启动重传定时器，我们来看代码：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
-</span><span class='line'>          int push_one, gfp_t gfp)
-</span><span class='line'>{
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>struct sk_buff *skb;
-</span><span class='line'>unsigned int tso_segs, sent_pkts;
-</span><span class='line'>int cwnd_quota;
-</span><span class='line'>int result;
-</span><span class='line'>
-</span><span class='line'>.............................................
-</span><span class='line'>
-</span><span class='line'>while ((skb = tcp_send_head(sk))) {
-</span><span class='line'>..................................................
-</span><span class='line'>
-</span><span class='line'>    //可以看到只有当传输成功，我们才会走到下面的函数。
-</span><span class='line'>    if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
-</span><span class='line'>        break;
-</span><span class='line'>
-</span><span class='line'>    /* Advance the send_head.  This one is sent out.
-</span><span class='line'>     * This call will increment packets_out.
-</span><span class='line'>     */
-</span><span class='line'>    //最终在这个函数中启动重传定时器。
-</span><span class='line'>    tcp_event_new_data_sent(sk, skb);
-</span><span class='line'>
-</span><span class='line'>    tcp_minshall_update(tp, mss_now, skb);
-</span><span class='line'>    sent_pkts++;
-</span><span class='line'>
-</span><span class='line'>    if (push_one)
-</span><span class='line'>        break;
-</span><span class='line'>}
-</span><span class='line'>...........................
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;现在我们来看tcp_event_new_data_sent,如何启动定时器的.
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_event_new_data_sent(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>unsigned int prior_packets = tp-&gt;packets_out;
-</span><span class='line'>
-</span><span class='line'>tcp_advance_send_head(sk, skb);
-</span><span class='line'>tp-&gt;snd_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>
-</span><span class='line'>/* Don't override Nagle indefinately with F-RTO */
-</span><span class='line'>if (tp-&gt;frto_counter == 2)
-</span><span class='line'>    tp-&gt;frto_counter = 3;
-</span><span class='line'>//关键在这里.
-</span><span class='line'>tp-&gt;packets_out += tcp_skb_pcount(skb);
-</span><span class='line'>if (!prior_packets)
-</span><span class='line'>    inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;可以看到只有当prior_packets为0时才会重启定时器,而prior_packets则是发送未确认的段的个数,也就是说如果发送了很多段,如果前面的段没有确认,那么后面发送的时候不会重启这个定时器.  
-</span><span class='line'>我们要知道，定时器的间隔是通过rtt来得到的，具体的算法，可以看下tcp/ip详解。  
-</span><span class='line'>当 启动了重传定时器，我们就会等待ack的到来，如果超时还没到来，那么就调用重传定时器的回调函数，否则最终会调用tcp_rearm_rto来删除或者 重启定时器，这个函数是在tcp_ack()-&gt;tcp_clean_rtx_queue()中被调用的。tcp_ack是专门用来处理ack。  
-</span><span class='line'>这个函数很简单，就是通过判断packets_out，这个值表示当前还未确认的段的个数。然后来进行相关操作。  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_rearm_rto(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>
-</span><span class='line'>//为0说明所有的传输的段都已经acked。此时remove定时器。否则重启定时器。
-</span><span class='line'>if (!tp-&gt;packets_out) {
-</span><span class='line'>    inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);
-</span><span class='line'>} else {
-</span><span class='line'>    inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-</span><span class='line'>                  inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
-</span><span class='line'>}
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;  接下来来看tcp_write_timer的实现。这个函数主要是通过icsk-&gt;icsk_pending来判断是那个定时器导致超时，这里只有两 种，一种是ICSK_TIME_RETRANS，也就是重传定时器，另一种是ICSK_TIME_PROBE0也就是0窗口定时器。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define ICSK_TIME_RETRANS   1   /* Retransmit timer */
-</span><span class='line'>#define ICSK_TIME_PROBE0    3   /* Zero window probe timer */
-</span><span class='line'>static void tcp_write_timer(unsigned long data)
-</span><span class='line'>{
-</span><span class='line'>struct sock *sk = (struct sock *)data;
-</span><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>int event;
-</span><span class='line'>
-</span><span class='line'>//首先加锁。
-</span><span class='line'>bh_lock_sock(sk);
-</span><span class='line'>//如果是进程空间则什么也不做。
-</span><span class='line'>if (sock_owned_by_user(sk)) {
-</span><span class='line'>    /* Try again later */
-</span><span class='line'>    sk_reset_timer(sk, &amp;icsk-&gt;icsk_retransmit_timer, jiffies + (HZ / 20));
-</span><span class='line'>    goto out_unlock;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//如果状态为close或者icsk_pending为空，则什么也不做。
-</span><span class='line'>if (sk-&gt;sk_state == TCP_CLOSE || !icsk-&gt;icsk_pending)
-</span><span class='line'>    goto out;
-</span><span class='line'>//如果超时时间已经过了，则重启定时器。
-</span><span class='line'>
-</span><span class='line'>if (time_after(icsk-&gt;icsk_timeout, jiffies)) {
-</span><span class='line'>    sk_reset_timer(sk, &amp;icsk-&gt;icsk_retransmit_timer, icsk-&gt;icsk_timeout);
-</span><span class='line'>    goto out;
-</span><span class='line'>}
-</span><span class='line'>//取出定时器类型。
-</span><span class='line'>event = icsk-&gt;icsk_pending;
-</span><span class='line'>icsk-&gt;icsk_pending = 0;
-</span><span class='line'>
-</span><span class='line'>//通过判断event来确定进入那个函数进行处理。
-</span><span class='line'>switch (event) {
-</span><span class='line'>case ICSK_TIME_RETRANS:
-</span><span class='line'>    tcp_retransmit_timer(sk);
-</span><span class='line'>    break;
-</span><span class='line'>case ICSK_TIME_PROBE0:
-</span><span class='line'>    tcp_probe_timer(sk);
-</span><span class='line'>    break;
-</span><span class='line'>}
-</span><span class='line'>TCP_CHECK_TIMER(sk);
-</span><span class='line'>
-</span><span class='line'>out:
-</span><span class='line'>sk_mem_reclaim(sk);
-</span><span class='line'>out_unlock:
-</span><span class='line'>bh_unlock_sock(sk);
-</span><span class='line'>sock_put(sk);
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;我们这里只看重传定时器，0窗口定时器后面紧接着会介绍。  
-</span><span class='line'>tcp_retransmit_timer,这个函数用来处理数据段的重传。  
-</span><span class='line'>这里要注意，重传的时候为了防止确认二义性，使用karn算法，也就是定时器退避策略。下面的代码最后部分会修改定时器的值，这里是增加一倍。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_retransmit_timer(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>
-</span><span class='line'>//如果没有需要确认的段，则什么也不做。
-</span><span class='line'>if (!tp-&gt;packets_out)
-</span><span class='line'>    goto out;
-</span><span class='line'>
-</span><span class='line'>WARN_ON(tcp_write_queue_empty(sk));
-</span><span class='line'>
-</span><span class='line'>/**首先进行一些合法性判断，其中:
-</span><span class='line'> * snd_wnd为窗口大小。
-</span><span class='line'> * sock_flag用来判断sock的状态。
-</span><span class='line'> * 最后一个判断是当前的连接状态不能处于syn_sent和syn_recv状态,也就是连接还未建
-</span><span class='line'> * 立状态.
-</span><span class='line'>if (!tp-&gt;snd_wnd &amp;&amp; !sock_flag(sk, SOCK_DEAD) &amp;&amp;
-</span><span class='line'>    !((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_SYN_SENT | TCPF_SYN_RECV))) {
-</span><span class='line'>    //tcp_time_stamp也就是jifes，而rcv_tstamp表示最后一个ack接收的时间，也就是最后一次对端确认的时间。因此这两个时间之差不能大于tcp_rto_max,因为tcp_rto_max为我们重传定时器的间隔时间的最大值。
-</span><span class='line'>    if (tcp_time_stamp - tp-&gt;rcv_tstamp &gt; TCP_RTO_MAX) {
-</span><span class='line'>        tcp_write_err(sk);
-</span><span class='line'>        goto out;
-</span><span class='line'>    }
-</span><span class='line'>    //这个函数用来进入loss状态，也就是进行一些拥塞以及流量的控制。
-</span><span class='line'>    tcp_enter_loss(sk, 0);
-</span><span class='line'>    //现在开始重传skb。
-</span><span class='line'>    tcp_retransmit_skb(sk, tcp_write_queue_head(sk));
-</span><span class='line'>    __sk_dst_reset(sk);
-</span><span class='line'>    //然后重启定时器，继续等待ack的到来。
-</span><span class='line'>    goto out_reset_timer;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//程序到达这里说明上面的校验失败，因此下面这个函数用来判断我们重传需要的次数。如果超过了重传次数，直接跳转到out。
-</span><span class='line'>if (tcp_write_timeout(sk))
-</span><span class='line'>    goto out;
-</span><span class='line'>
-</span><span class='line'>//到达这里说明我们重传的次数还没到。icsk-&gt;icsk_retransmits表示重传的次数。
-</span><span class='line'>if (icsk-&gt;icsk_retransmits == 0) {
-</span><span class='line'>    //这里其实也就是收集一些统计信息。
-</span><span class='line'>    int mib_idx;
-</span><span class='line'>
-</span><span class='line'>    if (icsk-&gt;icsk_ca_state == TCP_CA_Disorder) {
-</span><span class='line'>        if (tcp_is_sack(tp))
-</span><span class='line'>            mib_idx = LINUX_MIB_TCPSACKFAILURES;
-</span><span class='line'>        else
-</span><span class='line'>            mib_idx = LINUX_MIB_TCPRENOFAILURES;
-</span><span class='line'>    } else if (icsk-&gt;icsk_ca_state == TCP_CA_Recovery) {
-</span><span class='line'>        if (tcp_is_sack(tp))
-</span><span class='line'>            mib_idx = LINUX_MIB_TCPSACKRECOVERYFAIL;
-</span><span class='line'>        else
-</span><span class='line'>            mib_idx = LINUX_MIB_TCPRENORECOVERYFAIL;
-</span><span class='line'>    } else if (icsk-&gt;icsk_ca_state == TCP_CA_Loss) {
-</span><span class='line'>        mib_idx = LINUX_MIB_TCPLOSSFAILURES;
-</span><span class='line'>    } else {
-</span><span class='line'>        mib_idx = LINUX_MIB_TCPTIMEOUTS;
-</span><span class='line'>    }
-</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), mib_idx);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//是否使用f-rto算法。
-</span><span class='line'>if (tcp_use_frto(sk)) {
-</span><span class='line'>    tcp_enter_frto(sk);
-</span><span class='line'>} else {
-</span><span class='line'>    //否则处理sack.
-</span><span class='line'>    tcp_enter_loss(sk, 0);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>// 再次尝试重传队列的第一个段。
-</span><span class='line'>if (tcp_retransmit_skb(sk, tcp_write_queue_head(sk)) &gt; 0) {
-</span><span class='line'>    //重传失败。
-</span><span class='line'>    if (!icsk-&gt;icsk_retransmits)
-</span><span class='line'>        icsk-&gt;icsk_retransmits = 1;
-</span><span class='line'>    inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-</span><span class='line'>                  min(icsk-&gt;icsk_rto, TCP_RESOURCE_PROBE_INTERVAL),
-</span><span class='line'>                  TCP_RTO_MAX);
-</span><span class='line'>    goto out;
-</span><span class='line'>}
-</span><span class='line'>//icsk-&gt;icsk_backoff主要用在零窗口定时器。
-</span><span class='line'>icsk-&gt;icsk_backoff++;
-</span><span class='line'>//icsk_retransmits也就是重试次数。
-</span><span class='line'>icsk-&gt;icsk_retransmits++;
-</span><span class='line'>
-</span><span class='line'>out_reset_timer:
-</span><span class='line'>//计算rto，并重启定时器，这里使用karn算法，也就是下次超时时间增加一倍/
-</span><span class='line'>icsk-&gt;icsk_rto = min(icsk-&gt;icsk_rto &lt;&lt; 1, TCP_RTO_MAX);
-</span><span class='line'>//重启定时器，可以看到超时时间就是我们上面的icsk_rto.
-</span><span class='line'>inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk-&gt;icsk_rto, TCP_RTO_MAX);
-</span><span class='line'>if (icsk-&gt;icsk_retransmits &gt; sysctl_tcp_retries1)
-</span><span class='line'>    __sk_dst_reset(sk);
-</span><span class='line'>
-</span><span class='line'>out:;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;下面我们来看tcp_write_timeout，它用来判断重传次数是否已经到了。这里主要分为两个分支，一个是状态为syn_sent或者syn_recv状态，一个是另外的状态。而这里系统设置的重传次数一共有4种。  
-</span><span class='line'>1 sysctl_tcp_syn_retries，它表示syn分节的重传次数。  
-</span><span class='line'>2 sysctl_tcp_retries1 它表示的是最大的重试次数，当超过了这个值，我们就需要检测路由表了。  
-</span><span class='line'>3 sysctl_tcp_retries2 这个值也是表示重试最大次数，只不过这个值一般要比上面的值大。和上面那个不同的是，当重试次数超过这个值，我们就必须放弃重试了。  
-</span><span class='line'>4 sysctl_tcp_orphan_retries 主要是针对孤立的socket(也就是已经从进程上下文中删除了，可是还有一些清理工作没有完成).对于这种socket，我们重试的最大的次数就是它。  
-</span><span class='line'>下面来看代码：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int tcp_write_timeout(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>//retry_untry表示我们需要重传的最大次数。
-</span><span class='line'>int retry_until;
-</span><span class='line'>
-</span><span class='line'>//判断socket状态。
-</span><span class='line'>if ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
-</span><span class='line'>    if (icsk-&gt;icsk_retransmits)
-</span><span class='line'>        dst_negative_advice(&amp;sk-&gt;sk_dst_cache);
-</span><span class='line'>    //设置重传最大值
-</span><span class='line'>    retry_until = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_syn_retries;
-</span><span class='line'>} else {
-</span><span class='line'>    //是否需要检测路由表。
-</span><span class='line'>    if (icsk-&gt;icsk_retransmits &gt;= sysctl_tcp_retries1) {
-</span><span class='line'>        /* Black hole detection */
-</span><span class='line'>        tcp_mtu_probing(icsk, sk);
-</span><span class='line'>
-</span><span class='line'>        dst_negative_advice(&amp;sk-&gt;sk_dst_cache);
-</span><span class='line'>    }
-</span><span class='line'>    //设置重传最大次数为sysctl_tcp_retries2
-</span><span class='line'>    retry_until = sysctl_tcp_retries2;
-</span><span class='line'>    if (sock_flag(sk, SOCK_DEAD)) {
-</span><span class='line'>        //表示是一个孤立的socket。
-</span><span class='line'>        const int alive = (icsk-&gt;icsk_rto &lt; TCP_RTO_MAX);
-</span><span class='line'>
-</span><span class='line'>        //从tcp_orphan_retries(这个函数中会通过sysctl_tcp_orphan_retries来进行计算)中取得重传最大次数。
-</span><span class='line'>        retry_until = tcp_orphan_retries(sk, alive);
-</span><span class='line'>
-</span><span class='line'>        if (tcp_out_of_resources(sk, alive || icsk-&gt;icsk_retransmits &lt; retry_until))
-</span><span class='line'>            return 1;
-</span><span class='line'>    }
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//最终进行判断，如果重传次数已到则返回1,否则为0.
-</span><span class='line'>if (icsk-&gt;icsk_retransmits &gt;= retry_until) {
-</span><span class='line'>    /* Has it gone just too far? */
-</span><span class='line'>    tcp_write_err(sk);
-</span><span class='line'>    return 1;
-</span><span class='line'>}
-</span><span class='line'>return 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;下面来介绍下tcp_enter_loss，这个函数主要用来标记丢失的段(也就是没有acked的段),然后通过执行slow start来降低传输速率.  
-</span><span class='line'>有关slow start以及Congestion avoidance算法描述可以看rfc2001:  
-</span><span class='line'>http://www.faqs.org/rfcs/rfc2001.html
-</span><span class='line'>
-</span><span class='line'>下面4个算法主要是用来对拥塞进行控制的，这四个算法其实都是彼此相连的。slow start和Congestion avoidance使用了相同的机制，他们都涉及到了拥塞窗口的定义。其中拥塞窗口限制着传输的长度，它的大小根据拥塞程度上升或者下降。  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Slow start
-</span><span class='line'>Congestion avoidance
-</span><span class='line'>Fast re-transmit
-</span><span class='line'>Fast recovery
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>然后下面主要是介绍了slow start和Congestion avoidance的一些实现细节。
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>CWND - Sender side limit
-</span><span class='line'>RWND - Receiver side limit
-</span><span class='line'>Slow start threshold ( SSTHRESH ) - Used to determine whether slow start is used or congestion avoidance
-</span><span class='line'>When starting, probe slowly - IW &lt;= 2 * SMSS
-</span><span class='line'>Initial size of SSTHRESH can be arbitrarily high, as high as the RWND
-</span><span class='line'>Use slow start when SSTHRESH &gt; CWND. Else, use Congestion avoidance
-</span><span class='line'>Slow start - CWND is increased by an amount less than or equal to the SMSS for every ACK
-</span><span class='line'>Congestion avoidance - CWND += SMSS&lt;em&gt;SMSS/CWND
-</span><span class='line'>When loss is detected - SSTHRESH = max( FlightSize/2, 2&lt;/em&gt;SMSS )</span></code></pre></td></tr></table></div></figure>
-这里要注意在slow start中，窗口的大小是指数级的增长的。并且当cwnd(拥塞窗口)小于等于ssthresh，就是slow start模式，否则就执行Congestion avoidance。</p>
-
-<h5>现在我们来看tcp_enter_loss的实现。</h5>
-
-<p>首先来介绍下下面要用到的几个关键域的含义。<br/>
-1 icsk->icsk_ca_state 这个域表示拥塞控制的状态。<br/>
-2 tp->snd_una 这个域表示tcp滑动窗口中的发送未确认的第一个字节的序列号。<br/>
-3 tp->prior_ssthresh 这个域表示前一个snd_ssthresh得大小，也就是说每次改变snd_ssthresh前都要保存老的snd_ssthresh到这个域。<br/>
-4 tp->snd_ssthresh  slow start开始时的threshold大小<br/>
-5 tp->snd_cwnd_cnt 这个域表示拥塞窗口的大小。<br/>
-6 TCP_SKB_CB(skb)->sacked tcp数据中的sack标记。<br/>
-7 tp->high_seq 拥塞开始时，snd_nxt的大小。<br/>
+    <title type="html"><![CDATA[TCP拥塞状态机 tcp_fastretrans_alert]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp5/"/>
+    <updated>2015-03-04T17:45:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp5</id>
+    <content type="html"><![CDATA[<p>这里主要说的是TCP拥塞情况下的状态状态处理
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -1469,270 +422,1048 @@ tcp_synack_timer    这个函数是用来管理syn_ack定时器的接口。
 <span class='line-number'>401</span>
 <span class='line-number'>402</span>
 <span class='line-number'>403</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_enter_loss(struct sock &lt;em&gt;sk, int how)
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+<span class='line-number'>412</span>
+<span class='line-number'>413</span>
+<span class='line-number'>414</span>
+<span class='line-number'>415</span>
+<span class='line-number'>416</span>
+<span class='line-number'>417</span>
+<span class='line-number'>418</span>
+<span class='line-number'>419</span>
+<span class='line-number'>420</span>
+<span class='line-number'>421</span>
+<span class='line-number'>422</span>
+<span class='line-number'>423</span>
+<span class='line-number'>424</span>
+<span class='line-number'>425</span>
+<span class='line-number'>426</span>
+<span class='line-number'>427</span>
+<span class='line-number'>428</span>
+<span class='line-number'>429</span>
+<span class='line-number'>430</span>
+<span class='line-number'>431</span>
+<span class='line-number'>432</span>
+<span class='line-number'>433</span>
+<span class='line-number'>434</span>
+<span class='line-number'>435</span>
+<span class='line-number'>436</span>
+<span class='line-number'>437</span>
+<span class='line-number'>438</span>
+<span class='line-number'>439</span>
+<span class='line-number'>440</span>
+<span class='line-number'>441</span>
+<span class='line-number'>442</span>
+<span class='line-number'>443</span>
+<span class='line-number'>444</span>
+<span class='line-number'>445</span>
+<span class='line-number'>446</span>
+<span class='line-number'>447</span>
+<span class='line-number'>448</span>
+<span class='line-number'>449</span>
+<span class='line-number'>450</span>
+<span class='line-number'>451</span>
+<span class='line-number'>452</span>
+<span class='line-number'>453</span>
+<span class='line-number'>454</span>
+<span class='line-number'>455</span>
+<span class='line-number'>456</span>
+<span class='line-number'>457</span>
+<span class='line-number'>458</span>
+<span class='line-number'>459</span>
+<span class='line-number'>460</span>
+<span class='line-number'>461</span>
+<span class='line-number'>462</span>
+<span class='line-number'>463</span>
+<span class='line-number'>464</span>
+<span class='line-number'>465</span>
+<span class='line-number'>466</span>
+<span class='line-number'>467</span>
+<span class='line-number'>468</span>
+<span class='line-number'>469</span>
+<span class='line-number'>470</span>
+<span class='line-number'>471</span>
+<span class='line-number'>472</span>
+<span class='line-number'>473</span>
+<span class='line-number'>474</span>
+<span class='line-number'>475</span>
+<span class='line-number'>476</span>
+<span class='line-number'>477</span>
+<span class='line-number'>478</span>
+<span class='line-number'>479</span>
+<span class='line-number'>480</span>
+<span class='line-number'>481</span>
+<span class='line-number'>482</span>
+<span class='line-number'>483</span>
+<span class='line-number'>484</span>
+<span class='line-number'>485</span>
+<span class='line-number'>486</span>
+<span class='line-number'>487</span>
+<span class='line-number'>488</span>
+<span class='line-number'>489</span>
+<span class='line-number'>490</span>
+<span class='line-number'>491</span>
+<span class='line-number'>492</span>
+<span class='line-number'>493</span>
+<span class='line-number'>494</span>
+<span class='line-number'>495</span>
+<span class='line-number'>496</span>
+<span class='line-number'>497</span>
+<span class='line-number'>498</span>
+<span class='line-number'>499</span>
+<span class='line-number'>500</span>
+<span class='line-number'>501</span>
+<span class='line-number'>502</span>
+<span class='line-number'>503</span>
+<span class='line-number'>504</span>
+<span class='line-number'>505</span>
+<span class='line-number'>506</span>
+<span class='line-number'>507</span>
+<span class='line-number'>508</span>
+<span class='line-number'>509</span>
+<span class='line-number'>510</span>
+<span class='line-number'>511</span>
+<span class='line-number'>512</span>
+<span class='line-number'>513</span>
+<span class='line-number'>514</span>
+<span class='line-number'>515</span>
+<span class='line-number'>516</span>
+<span class='line-number'>517</span>
+<span class='line-number'>518</span>
+<span class='line-number'>519</span>
+<span class='line-number'>520</span>
+<span class='line-number'>521</span>
+<span class='line-number'>522</span>
+<span class='line-number'>523</span>
+<span class='line-number'>524</span>
+<span class='line-number'>525</span>
+<span class='line-number'>526</span>
+<span class='line-number'>527</span>
+<span class='line-number'>528</span>
+<span class='line-number'>529</span>
+<span class='line-number'>530</span>
+<span class='line-number'>531</span>
+<span class='line-number'>532</span>
+<span class='line-number'>533</span>
+<span class='line-number'>534</span>
+<span class='line-number'>535</span>
+<span class='line-number'>536</span>
+<span class='line-number'>537</span>
+<span class='line-number'>538</span>
+<span class='line-number'>539</span>
+<span class='line-number'>540</span>
+<span class='line-number'>541</span>
+<span class='line-number'>542</span>
+<span class='line-number'>543</span>
+<span class='line-number'>544</span>
+<span class='line-number'>545</span>
+<span class='line-number'>546</span>
+<span class='line-number'>547</span>
+<span class='line-number'>548</span>
+<span class='line-number'>549</span>
+<span class='line-number'>550</span>
+<span class='line-number'>551</span>
+<span class='line-number'>552</span>
+<span class='line-number'>553</span>
+<span class='line-number'>554</span>
+<span class='line-number'>555</span>
+<span class='line-number'>556</span>
+<span class='line-number'>557</span>
+<span class='line-number'>558</span>
+<span class='line-number'>559</span>
+<span class='line-number'>560</span>
+<span class='line-number'>561</span>
+<span class='line-number'>562</span>
+<span class='line-number'>563</span>
+<span class='line-number'>564</span>
+<span class='line-number'>565</span>
+<span class='line-number'>566</span>
+<span class='line-number'>567</span>
+<span class='line-number'>568</span>
+<span class='line-number'>569</span>
+<span class='line-number'>570</span>
+<span class='line-number'>571</span>
+<span class='line-number'>572</span>
+<span class='line-number'>573</span>
+<span class='line-number'>574</span>
+<span class='line-number'>575</span>
+<span class='line-number'>576</span>
+<span class='line-number'>577</span>
+<span class='line-number'>578</span>
+<span class='line-number'>579</span>
+<span class='line-number'>580</span>
+<span class='line-number'>581</span>
+<span class='line-number'>582</span>
+<span class='line-number'>583</span>
+<span class='line-number'>584</span>
+<span class='line-number'>585</span>
+<span class='line-number'>586</span>
+<span class='line-number'>587</span>
+<span class='line-number'>588</span>
+<span class='line-number'>589</span>
+<span class='line-number'>590</span>
+<span class='line-number'>591</span>
+<span class='line-number'>592</span>
+<span class='line-number'>593</span>
+<span class='line-number'>594</span>
+<span class='line-number'>595</span>
+<span class='line-number'>596</span>
+<span class='line-number'>597</span>
+<span class='line-number'>598</span>
+<span class='line-number'>599</span>
+<span class='line-number'>600</span>
+<span class='line-number'>601</span>
+<span class='line-number'>602</span>
+<span class='line-number'>603</span>
+<span class='line-number'>604</span>
+<span class='line-number'>605</span>
+<span class='line-number'>606</span>
+<span class='line-number'>607</span>
+<span class='line-number'>608</span>
+<span class='line-number'>609</span>
+<span class='line-number'>610</span>
+<span class='line-number'>611</span>
+<span class='line-number'>612</span>
+<span class='line-number'>613</span>
+<span class='line-number'>614</span>
+<span class='line-number'>615</span>
+<span class='line-number'>616</span>
+<span class='line-number'>617</span>
+<span class='line-number'>618</span>
+<span class='line-number'>619</span>
+<span class='line-number'>620</span>
+<span class='line-number'>621</span>
+<span class='line-number'>622</span>
+<span class='line-number'>623</span>
+<span class='line-number'>624</span>
+<span class='line-number'>625</span>
+<span class='line-number'>626</span>
+<span class='line-number'>627</span>
+<span class='line-number'>628</span>
+<span class='line-number'>629</span>
+<span class='line-number'>630</span>
+<span class='line-number'>631</span>
+<span class='line-number'>632</span>
+<span class='line-number'>633</span>
+<span class='line-number'>634</span>
+<span class='line-number'>635</span>
+<span class='line-number'>636</span>
+<span class='line-number'>637</span>
+<span class='line-number'>638</span>
+<span class='line-number'>639</span>
+<span class='line-number'>640</span>
+<span class='line-number'>641</span>
+<span class='line-number'>642</span>
+<span class='line-number'>643</span>
+<span class='line-number'>644</span>
+<span class='line-number'>645</span>
+<span class='line-number'>646</span>
+<span class='line-number'>647</span>
+<span class='line-number'>648</span>
+<span class='line-number'>649</span>
+<span class='line-number'>650</span>
+<span class='line-number'>651</span>
+<span class='line-number'>652</span>
+<span class='line-number'>653</span>
+<span class='line-number'>654</span>
+<span class='line-number'>655</span>
+<span class='line-number'>656</span>
+<span class='line-number'>657</span>
+<span class='line-number'>658</span>
+<span class='line-number'>659</span>
+<span class='line-number'>660</span>
+<span class='line-number'>661</span>
+<span class='line-number'>662</span>
+<span class='line-number'>663</span>
+<span class='line-number'>664</span>
+<span class='line-number'>665</span>
+<span class='line-number'>666</span>
+<span class='line-number'>667</span>
+<span class='line-number'>668</span>
+<span class='line-number'>669</span>
+<span class='line-number'>670</span>
+<span class='line-number'>671</span>
+<span class='line-number'>672</span>
+<span class='line-number'>673</span>
+<span class='line-number'>674</span>
+<span class='line-number'>675</span>
+<span class='line-number'>676</span>
+<span class='line-number'>677</span>
+<span class='line-number'>678</span>
+<span class='line-number'>679</span>
+<span class='line-number'>680</span>
+<span class='line-number'>681</span>
+<span class='line-number'>682</span>
+<span class='line-number'>683</span>
+<span class='line-number'>684</span>
+<span class='line-number'>685</span>
+<span class='line-number'>686</span>
+<span class='line-number'>687</span>
+<span class='line-number'>688</span>
+<span class='line-number'>689</span>
+<span class='line-number'>690</span>
+<span class='line-number'>691</span>
+<span class='line-number'>692</span>
+<span class='line-number'>693</span>
+<span class='line-number'>694</span>
+<span class='line-number'>695</span>
+<span class='line-number'>696</span>
+<span class='line-number'>697</span>
+<span class='line-number'>698</span>
+<span class='line-number'>699</span>
+<span class='line-number'>700</span>
+<span class='line-number'>701</span>
+<span class='line-number'>702</span>
+<span class='line-number'>703</span>
+<span class='line-number'>704</span>
+<span class='line-number'>705</span>
+<span class='line-number'>706</span>
+<span class='line-number'>707</span>
+<span class='line-number'>708</span>
+<span class='line-number'>709</span>
+<span class='line-number'>710</span>
+<span class='line-number'>711</span>
+<span class='line-number'>712</span>
+<span class='line-number'>713</span>
+<span class='line-number'>714</span>
+<span class='line-number'>715</span>
+<span class='line-number'>716</span>
+<span class='line-number'>717</span>
+<span class='line-number'>718</span>
+<span class='line-number'>719</span>
+<span class='line-number'>720</span>
+<span class='line-number'>721</span>
+<span class='line-number'>722</span>
+<span class='line-number'>723</span>
+<span class='line-number'>724</span>
+<span class='line-number'>725</span>
+<span class='line-number'>726</span>
+<span class='line-number'>727</span>
+<span class='line-number'>728</span>
+<span class='line-number'>729</span>
+<span class='line-number'>730</span>
+<span class='line-number'>731</span>
+<span class='line-number'>732</span>
+<span class='line-number'>733</span>
+<span class='line-number'>734</span>
+<span class='line-number'>735</span>
+<span class='line-number'>736</span>
+<span class='line-number'>737</span>
+<span class='line-number'>738</span>
+<span class='line-number'>739</span>
+<span class='line-number'>740</span>
+<span class='line-number'>741</span>
+<span class='line-number'>742</span>
+<span class='line-number'>743</span>
+<span class='line-number'>744</span>
+<span class='line-number'>745</span>
+<span class='line-number'>746</span>
+<span class='line-number'>747</span>
+<span class='line-number'>748</span>
+<span class='line-number'>749</span>
+<span class='line-number'>750</span>
+<span class='line-number'>751</span>
+<span class='line-number'>752</span>
+<span class='line-number'>753</span>
+<span class='line-number'>754</span>
+<span class='line-number'>755</span>
+<span class='line-number'>756</span>
+<span class='line-number'>757</span>
+<span class='line-number'>758</span>
+<span class='line-number'>759</span>
+<span class='line-number'>760</span>
+<span class='line-number'>761</span>
+<span class='line-number'>762</span>
+<span class='line-number'>763</span>
+<span class='line-number'>764</span>
+<span class='line-number'>765</span>
+<span class='line-number'>766</span>
+<span class='line-number'>767</span>
+<span class='line-number'>768</span>
+<span class='line-number'>769</span>
+<span class='line-number'>770</span>
+<span class='line-number'>771</span>
+<span class='line-number'>772</span>
+<span class='line-number'>773</span>
+<span class='line-number'>774</span>
+<span class='line-number'>775</span>
+<span class='line-number'>776</span>
+<span class='line-number'>777</span>
+<span class='line-number'>778</span>
+<span class='line-number'>779</span>
+<span class='line-number'>780</span>
+<span class='line-number'>781</span>
+<span class='line-number'>782</span>
+<span class='line-number'>783</span>
+<span class='line-number'>784</span>
+<span class='line-number'>785</span>
+<span class='line-number'>786</span>
+<span class='line-number'>787</span>
+<span class='line-number'>788</span>
+<span class='line-number'>789</span>
+<span class='line-number'>790</span>
+<span class='line-number'>791</span>
+<span class='line-number'>792</span>
+<span class='line-number'>793</span>
+<span class='line-number'>794</span>
+<span class='line-number'>795</span>
+<span class='line-number'>796</span>
+<span class='line-number'>797</span>
+<span class='line-number'>798</span>
+<span class='line-number'>799</span>
+<span class='line-number'>800</span>
+<span class='line-number'>801</span>
+<span class='line-number'>802</span>
+<span class='line-number'>803</span>
+<span class='line-number'>804</span>
+<span class='line-number'>805</span>
+<span class='line-number'>806</span>
+<span class='line-number'>807</span>
+<span class='line-number'>808</span>
+<span class='line-number'>809</span>
+<span class='line-number'>810</span>
+<span class='line-number'>811</span>
+<span class='line-number'>812</span>
+<span class='line-number'>813</span>
+<span class='line-number'>814</span>
+<span class='line-number'>815</span>
+<span class='line-number'>816</span>
+<span class='line-number'>817</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/&lt;em&gt; Process an event, which can update packets-in-flight not trivially.
+</span><span class='line'> * Main goal of this function is to calculate new estimate for left_out,
+</span><span class='line'> * taking into account both packets sitting in receiver&rsquo;s buffer and
+</span><span class='line'> * packets lost by network.
+</span><span class='line'> *
+</span><span class='line'> * Besides that it does CWND reduction, when packet loss is detected
+</span><span class='line'> * and changes state of machine.
+</span><span class='line'> *
+</span><span class='line'> * It does &lt;em&gt;not&lt;/em&gt; decide what to send, it is made in function
+</span><span class='line'> * tcp_xmit_retransmit_queue().
+</span><span class='line'> &lt;/em&gt;/
+</span><span class='line'>static void tcp_fastretrans_alert(struct sock &lt;em&gt;sk, int pkts_acked, int flag)
 </span><span class='line'>{
-</span><span class='line'>    const struct inet_connection_sock &lt;/em&gt;icsk = inet_csk(sk);
-</span><span class='line'>    struct tcp_sock &lt;em&gt;tp = tcp_sk(sk);
-</span><span class='line'>    struct sk_buff &lt;/em&gt;skb;&lt;/p&gt;
+</span><span class='line'>    struct inet_connection_sock &lt;/em&gt;icsk = inet_csk(sk);   &lt;br/&gt;
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    int is_dupack = !(flag &amp; (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP));   // 判断是不是重复的ACK
+</span><span class='line'>    int do_lost = is_dupack || ((flag &amp; FLAG_DATA_SACKED) &amp;&amp;            // 判断是不是丢包：若是重复ACK 或者 SACK而且提前确认中没有到的包数量&gt;重拍指标
+</span><span class='line'>                    (tcp_fackets_out(tp) &gt; tp-&gt;reordering));            // 后面会单独说说SACK和FACK内容，觉得总是理解不好
+</span><span class='line'>    int fast_rexmit = 0;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* 1 拥塞控制状态小于TCP_CA_Disorder
-</span><span class='line'> * 2 发送未确认的序列号等于拥塞开始时的下一个将要发送的序列号
-</span><span class='line'> * 3 状态为TCP_CA_Loss，并且还未重新传输过。
-</span><span class='line'> * 如果有一个满足说明有数据丢失,因此降低threshold。
-</span><span class='line'> */
-</span><span class='line'>if (icsk-&gt;icsk_ca_state &lt;= TCP_CA_Disorder || tp-&gt;snd_una == tp-&gt;high_seq ||
-</span><span class='line'>    (icsk-&gt;icsk_ca_state == TCP_CA_Loss &amp;&amp; !icsk-&gt;icsk_retransmits)) {
-</span><span class='line'>    //保存老的snd_ssthresh。
-</span><span class='line'>    tp-&gt;prior_ssthresh = tcp_current_ssthresh(sk);
-</span><span class='line'>    //减小snd_ssthresh
-</span><span class='line'>    tp-&gt;snd_ssthresh = icsk-&gt;icsk_ca_ops-&gt;ssthresh(sk);
-</span><span class='line'>    //设置拥塞状态。
-</span><span class='line'>    tcp_ca_event(sk, CA_EVENT_LOSS);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//设置拥塞窗口大小
-</span><span class='line'>tp-&gt;snd_cwnd    = 1;
-</span><span class='line'>tp-&gt;snd_cwnd_cnt   = 0;
-</span><span class='line'>//设置时间
-</span><span class='line'>tp-&gt;snd_cwnd_stamp = tcp_time_stamp;
-</span><span class='line'>
-</span><span class='line'>tp-&gt;bytes_acked = 0;
-</span><span class='line'>//清空所有相关的计数器。
-</span><span class='line'>tcp_clear_retrans_partial(tp);
-</span><span class='line'>
-</span><span class='line'>if (tcp_is_reno(tp))
-</span><span class='line'>    tcp_reset_reno_sack(tp);
-</span><span class='line'>
-</span><span class='line'>if (!how) {
-</span><span class='line'>    /* Push undo marker, if it was plain RTO and nothing
-</span><span class='line'>     * was retransmitted. */
-</span><span class='line'>    tp-&gt;undo_marker = tp-&gt;snd_una;
-</span><span class='line'>} else {
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (WARN_ON(!tp-&gt;packets_out &amp;&amp; tp-&gt;sacked_out))   // 如果packet_out为0，那么不可能有sacked_out
 </span><span class='line'>    tp-&gt;sacked_out = 0;
+</span><span class='line'>if (WARN_ON(!tp-&gt;sacked_out &amp;&amp; tp-&gt;fackets_out))
 </span><span class='line'>    tp-&gt;fackets_out = 0;
+</span><span class='line'>
+</span><span class='line'>/* Now state machine starts.   // 下面开始状态处理
+</span><span class='line'> * A. ECE, hence prohibit cwnd undoing, the reduction is required. */
+</span><span class='line'>if (flag &amp; FLAG_ECE)           // 如果是ECE
+</span><span class='line'>    tp-&gt;prior_ssthresh = 0;    // 禁止拥塞窗口撤销，并开始减小拥塞窗口
+</span><span class='line'>
+</span><span class='line'>/* B. In all the states check for reneging SACKs. */
+</span><span class='line'>if (tcp_check_sack_reneging(sk, flag))   // 检查ACK是不是确认了已经被SACK选择确认的包了
+</span><span class='line'>    return;
+</span><span class='line'>
+</span><span class='line'>/* C. Process data loss notification, provided it is valid. */
+</span><span class='line'>if (tcp_is_fack(tp) &amp;&amp; (flag &amp; FLAG_DATA_LOST) &amp;&amp;   // 提前确认、数据丢失
+</span><span class='line'>    before(tp-&gt;snd_una, tp-&gt;high_seq) &amp;&amp;            // 我们需要注意high_seq&amp;nbsp;可以标志为LOST的段序号的最大值
+</span><span class='line'>    icsk-&gt;icsk_ca_state != TCP_CA_Open &amp;&amp;           // 状态不是OPEN
+</span><span class='line'>    tp-&gt;fackets_out &gt; tp-&gt;reordering) {             // 同上面说的
+</span><span class='line'>    tcp_mark_head_lost(sk, tp-&gt;fackets_out - tp-&gt;reordering);   // 发现丢包，需要标志出丢失的包。&amp;nbsp;(1) 这个函数后面看
+</span><span class='line'>    NET_INC_STATS_BH(LINUX_MIB_TCPLOSS);
 </span><span class='line'>}
-</span><span class='line'>tcp_clear_all_retrans_hints(tp);
 </span><span class='line'>
-</span><span class='line'>//遍历sock的write队列。
-</span><span class='line'>tcp_for_write_queue(skb, sk) {
-</span><span class='line'>    if (skb == tcp_send_head(sk))
+</span><span class='line'>/* D. Check consistency of the current state. */
+</span><span class='line'>tcp_verify_left_out(tp); // #define tcp_verify_left_out(tp) WARN_ON(tcp_left_out(tp) &gt; tp-&gt;packets_out)
+</span><span class='line'>             // 检查丢失的包应该比发送出去的包小，即确定确定left_out &lt; packets_out
+</span><span class='line'>/* E. Check state exit conditions. State can be terminated
+</span><span class='line'> *    when high_seq is ACKed. */                    // 下面检测状态退出条件！当high_seq&amp;nbsp;被确认的时候，这个状态就可以终止了
+</span><span class='line'>if (icsk-&gt;icsk_ca_state == TCP_CA_Open) {           // 如果是open状态
+</span><span class='line'>    BUG_TRAP(tp-&gt;retrans_out == 0);                 // 重传数量应该=0才是合理的
+</span><span class='line'>    tp-&gt;retrans_stamp = 0;                          // 将重传发送时间置0
+</span><span class='line'>} else if (!before(tp-&gt;snd_una, tp-&gt;high_seq)) {    // 如果high_seq已经被确认
+</span><span class='line'>    switch (icsk-&gt;icsk_ca_state) {
+</span><span class='line'>    case TCP_CA_Loss:
+</span><span class='line'>        icsk-&gt;icsk_retransmits = 0;                 // 超时重传次数归零
+</span><span class='line'>        if (tcp_try_undo_recovery(sk))              // 尝试将前面的拥塞窗口的调整撤销，在这种情况下弄不清楚包的情况（2）
+</span><span class='line'>            return;                                 // 如果使用了SACK，那么不管undo成功与否，都会返回Open态
 </span><span class='line'>        break;
-</span><span class='line'>    //判断sack段。
-</span><span class='line'>    if (TCP_SKB_CB(skb)-&gt;sacked &amp; TCPCB_RETRANS)
-</span><span class='line'>        tp-&gt;undo_marker = 0;
-</span><span class='line'>    TCP_SKB_CB(skb)-&gt;sacked &amp;= (~TCPCB_TAGBITS)|TCPCB_SACKED_ACKED;
 </span><span class='line'>
-</span><span class='line'>    //如果how为1,则说明不管sack段，此时标记所有的段为丢失(sack的意思去看tcp/ip详解).
-</span><span class='line'>    if (!(TCP_SKB_CB(skb)-&gt;sacked&amp;TCPCB_SACKED_ACKED) || how) {
-</span><span class='line'>        //设置sack段。
-</span><span class='line'>        TCP_SKB_CB(skb)-&gt;sacked &amp;= ~TCPCB_SACKED_ACKED;
-</span><span class='line'>        TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_LOST;
-</span><span class='line'>        //update 相关的域。
-</span><span class='line'>        tp-&gt;lost_out += tcp_skb_pcount(skb);
-</span><span class='line'>        tp-&gt;retransmit_high = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>    case TCP_CA_CWR:   // 发生某些道路拥塞，需要减慢发送速度
+</span><span class='line'>        /* CWR is to be held something *above* high_seq
+</span><span class='line'>         * is ACKed for CWR bit to reach receiver. */
+</span><span class='line'>        if (tp-&gt;snd_una != tp-&gt;high_seq) {
+</span><span class='line'>            tcp_complete_cwr(sk);                   // 完成道路拥塞情况处理，就是减小cwnd（3）
+</span><span class='line'>            tcp_set_ca_state(sk, TCP_CA_Open);      // 将状态设置成OPEN
+</span><span class='line'>        }
+</span><span class='line'>        break;
+</span><span class='line'>
+</span><span class='line'>    case TCP_CA_Disorder:
+</span><span class='line'>        tcp_try_undo_dsack(sk);                     // 尝试撤销cwnd的减少，因为DSACK确认了所有的重传数据（4）
+</span><span class='line'>        if (!tp-&gt;undo_marker ||                     // 跟踪了重传数据包？
+</span><span class='line'>            /* For SACK case do not Open to allow to undo
+</span><span class='line'>             * catching for all duplicate ACKs. */
+</span><span class='line'>            tcp_is_reno(tp) || tp-&gt;snd_una != tp-&gt;high_seq) {   // 没有SACK || 两者不同步
+</span><span class='line'>            tp-&gt;undo_marker = 0;
+</span><span class='line'>            tcp_set_ca_state(sk, TCP_CA_Open);      // 将状态转换成OPEN
+</span><span class='line'>        }
+</span><span class='line'>        break;
+</span><span class='line'>
+</span><span class='line'>    case TCP_CA_Recovery:
+</span><span class='line'>        if (tcp_is_reno(tp))                // 没有SACK
+</span><span class='line'>            tcp_reset_reno_sack(tp);        // sacked_out=0
+</span><span class='line'>        if (tcp_try_undo_recovery(sk))      // 尝试撤销
+</span><span class='line'>            return;
+</span><span class='line'>        tcp_complete_cwr(sk);               // 完成处理
+</span><span class='line'>        break;
 </span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>/* F. Process state. */
+</span><span class='line'>switch (icsk-&gt;icsk_ca_state) {
+</span><span class='line'>case TCP_CA_Recovery:
+</span><span class='line'>    if (!(flag &amp; FLAG_SND_UNA_ADVANCED)) {  // snd_una没有改变
+</span><span class='line'>        if (tcp_is_reno(tp) &amp;&amp; is_dupack)   // 不是SACK，而且是重复的ACK
+</span><span class='line'>            tcp_add_reno_sack(sk);          // 接收到重复的ACK，tp-&gt;sacked_out++; 并且检查新的reorder问题（5）
+</span><span class='line'>    } else
+</span><span class='line'>        do_lost = tcp_try_undo_partial(sk, pkts_acked);   // 部分ACK接收并撤销窗口操作（6）注意返回的是是否需要重传表示
+</span><span class='line'>    break;                                  // 1代表重传，0代表不需要重传
+</span><span class='line'>case TCP_CA_Loss:
+</span><span class='line'>    if (flag &amp; FLAG_DATA_ACKED)             // 如果是数据确认
+</span><span class='line'>        icsk-&gt;icsk_retransmits = 0;         // 超时重传置次数0
+</span><span class='line'>    if (tcp_is_reno(tp) &amp;&amp; flag &amp; FLAG_SND_UNA_ADVANCED) // 没有ACK，&amp;&amp; snd_una改变了
+</span><span class='line'>        tcp_reset_reno_sack(tp);            // 重置sacked=0
+</span><span class='line'>    if (!tcp_try_undo_loss(sk)) {           // 尝试撤销拥塞调整，然后进入OPEN状态（7）
+</span><span class='line'>        tcp_moderate_cwnd(tp);              // 调整窗口（8）
+</span><span class='line'>        tcp_xmit_retransmit_queue(sk);      // 重传丢失的包（9）
+</span><span class='line'>        return;
+</span><span class='line'>    }
+</span><span class='line'>    if (icsk-&gt;icsk_ca_state != TCP_CA_Open)
+</span><span class='line'>        return;
+</span><span class='line'>    /* Loss is undone; fall through to processing in Open state. */
+</span><span class='line'>default:
+</span><span class='line'>    if (tcp_is_reno(tp)) {                  // 么有SACK，那么就是RENO算法处理：收到三个dup-ACK(即sacked_out==3)，就开始重传
+</span><span class='line'>        if (flag &amp; FLAG_SND_UNA_ADVANCED)   // 如果收到少于 3 个 dupack 后又收到累计确认，则会重置之前的 sacked_out 计数
+</span><span class='line'>            tcp_reset_reno_sack(tp);        // 重新置0
+</span><span class='line'>        if (is_dupack)                      // 如果收到一个dup-ack，将sacked_out++
+</span><span class='line'>            tcp_add_reno_sack(sk);
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    if (icsk-&gt;icsk_ca_state == TCP_CA_Disorder)
+</span><span class='line'>        tcp_try_undo_dsack(sk);             // DSACK确认了所有重传数据
+</span><span class='line'>
+</span><span class='line'>    if (!tcp_time_to_recover(sk)) {         // 判断是否进入恢复状态
+</span><span class='line'>        tcp_try_to_open(sk, flag);          // 如果不可以，那么会判断是否进入Open、Disorder、CWR等状态
+</span><span class='line'>        return;                             // 只有收到三个dup-ack时候，才进入快速回复，否则都返回
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    /* MTU probe failure: don't reduce cwnd */
+</span><span class='line'>    if (icsk-&gt;icsk_ca_state &lt; TCP_CA_CWR &amp;&amp;
+</span><span class='line'>        icsk-&gt;icsk_mtup.probe_size &amp;&amp;
+</span><span class='line'>        tp-&gt;snd_una == tp-&gt;mtu_probe.probe_seq_start) {
+</span><span class='line'>        tcp_mtup_probe_failed(sk);          // MTU探测失败
+</span><span class='line'>        /* Restores the reduction we did in tcp_mtup_probe() */
+</span><span class='line'>        tp-&gt;snd_cwnd++;
+</span><span class='line'>        tcp_simple_retransmit(sk);          // 做一个简单的转发，而不使用回退机制。用于路径MTU发现。&amp;nbsp;
+</span><span class='line'>        return;
+</span><span class='line'>    }
+</span><span class='line'>    // 说明已经收到第 3 个连续 dupack，此时 sacked_out = 3，进入恢复态
+</span><span class='line'>    /* Otherwise enter Recovery state */
+</span><span class='line'>    // 进入恢复状态
+</span><span class='line'>    if (tcp_is_reno(tp))
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPRENORECOVERY);
+</span><span class='line'>    else
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPSACKRECOVERY);
+</span><span class='line'>
+</span><span class='line'>    tp-&gt;high_seq = tp-&gt;snd_nxt;
+</span><span class='line'>    tp-&gt;prior_ssthresh = 0;
+</span><span class='line'>    tp-&gt;undo_marker = tp-&gt;snd_una;
+</span><span class='line'>    tp-&gt;undo_retrans = tp-&gt;retrans_out;
+</span><span class='line'>
+</span><span class='line'>    if (icsk-&gt;icsk_ca_state &lt; TCP_CA_CWR) {
+</span><span class='line'>        if (!(flag &amp; FLAG_ECE))
+</span><span class='line'>            tp-&gt;prior_ssthresh = tcp_current_ssthresh(sk);   // 根据状态获取当前门限值
+</span><span class='line'>        tp-&gt;snd_ssthresh = icsk-&gt;icsk_ca_ops-&gt;ssthresh(sk);  // 更新
+</span><span class='line'>        TCP_ECN_queue_cwr(tp);
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    tp-&gt;bytes_acked = 0;
+</span><span class='line'>    tp-&gt;snd_cwnd_cnt = 0;
+</span><span class='line'>    tcp_set_ca_state(sk, TCP_CA_Recovery);      // 键入恢复状态
+</span><span class='line'>    fast_rexmit = 1;    // 快速重传
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>if (do_lost || (tcp_is_fack(tp) &amp;&amp; tcp_head_timedout(sk))) // 如果丢失需要重传 || 超时重传
+</span><span class='line'>    tcp_update_scoreboard(sk, fast_rexmit);     // 标志丢失和超时的数据包，增加lost_out(10)
+</span><span class='line'>tcp_cwnd_down(sk, flag);                        // 减小cwnd窗口（11）
+</span><span class='line'>tcp_xmit_retransmit_queue(sk);                  // 重传丢失包
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>下面看一下里面的函数：
+</span><span class='line'>
+</span><span class='line'>先看：tcp_mark_head_lost：通过给丢失的数据包标志TCPCB_LOST，就可以表明哪些数据包需要重传。
+</span><span class='line'>
+</span><span class='line'>注意参数：packets = fackets_out - reordering，其实就是sacked_out + lost_out。被标志为LOST的段数不能超过packets。
+</span><span class='line'>
+</span><span class='line'>那么packets 就是标记丢失的包们数量
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Mark head of queue up as lost. With RFC3517 SACK, the packets is
+</span><span class='line'> * is against sacked "cnt", otherwise it's against facked "cnt"
+</span><span class='line'> */
+</span><span class='line'>static void tcp_mark_head_lost(struct sock *sk, int packets)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>struct sk_buff *skb;
+</span><span class='line'>int cnt, oldcnt;
+</span><span class='line'>int err;
+</span><span class='line'>unsigned int mss;
+</span><span class='line'>
+</span><span class='line'>BUG_TRAP(packets &lt;= tp-&gt;packets_out);   // 丢失的包不可能比所有发出去的包的数量
+</span><span class='line'>if (tp-&gt;lost_skb_hint) {                // 如果已经有标识为丢失的段了 
+</span><span class='line'>    skb = tp-&gt;lost_skb_hint;            // 下一个需要标记的数据段
+</span><span class='line'>    cnt = tp-&gt;lost_cnt_hint;            // 已经标记了多少段
+</span><span class='line'>} else {
+</span><span class='line'>    skb = tcp_write_queue_head(sk);     // 获得链表的第一个结构元素
+</span><span class='line'>    cnt = 0;                            // 初始化标记了0个数据
+</span><span class='line'>}
+</span><span class='line'>// 下面开始遍历
+</span><span class='line'>tcp_for_write_queue_from(skb, sk) {
+</span><span class='line'>    if (skb == tcp_send_head(sk))       // return sk-&gt;sk_send_head; 即snd_nxt，那么还没有发送不需要处理，break；
+</span><span class='line'>        break;
+</span><span class='line'>    /* TODO: do this better */
+</span><span class='line'>    /* this is not the most efficient way to do this... */
+</span><span class='line'>    tp-&gt;lost_skb_hint = skb;            // 更新丢失队列信息
+</span><span class='line'>    tp-&gt;lost_cnt_hint = cnt;
+</span><span class='line'>
+</span><span class='line'>    if (after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;high_seq))   // high_seq是最大的标记为LOST的号，不可以超过这个
+</span><span class='line'>        break;                          // 若这个skb超过，退出
+</span><span class='line'>
+</span><span class='line'>    oldcnt = cnt;                       // 保存cnt
+</span><span class='line'>    if (tcp_is_fack(tp) || tcp_is_reno(tp) ||
+</span><span class='line'>        (TCP_SKB_CB(skb)-&gt;sacked &amp; TCPCB_SACKED_ACKED))
+</span><span class='line'>        cnt += tcp_skb_pcount(skb);     // 表示这个段已经被标记
+</span><span class='line'>
+</span><span class='line'>    if (cnt &gt; packets) {
+</span><span class='line'>        if (tcp_is_sack(tp) || (oldcnt &gt;= packets))   // 已经超过了丢失包数量，break
+</span><span class='line'>            break;
+</span><span class='line'>
+</span><span class='line'>        mss = skb_shinfo(skb)-&gt;gso_size;// 得到MSS
+</span><span class='line'>        err = tcp_fragment(sk, skb, (packets - oldcnt) * mss, mss);   // 下面分配，前面说过了
+</span><span class='line'>        if (err &lt; 0)
+</span><span class='line'>            break;
+</span><span class='line'>        cnt = packets;
+</span><span class='line'>    }
+</span><span class='line'>    // 下面这一段就是做标记动作
+</span><span class='line'>    if (!(TCP_SKB_CB(skb)-&gt;sacked &amp; (TCPCB_SACKED_ACKED|TCPCB_LOST))) {
+</span><span class='line'>        TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_LOST;   // 标识
+</span><span class='line'>        tp-&gt;lost_out += tcp_skb_pcount(skb);     // 丢失包+=
+</span><span class='line'>        tcp_verify_retransmit_hint(tp, skb);     // 其实就是标记这个丢失，加入重传标记队列
+</span><span class='line'>       }
 </span><span class='line'>}
 </span><span class='line'>tcp_verify_left_out(tp);
-</span><span class='line'>//设置当前的reordering的长度
-</span><span class='line'>tp-&gt;reordering = min_t(unsigned int, tp-&gt;reordering,
-</span><span class='line'>               sysctl_tcp_reordering);
-</span><span class='line'>//设置拥塞状态。
-</span><span class='line'>tcp_set_ca_state(sk, TCP_CA_Loss);
-</span><span class='line'>tp-&gt;high_seq = tp-&gt;snd_nxt;
-</span><span class='line'>//由于我们修改了拥塞窗口，因此设置ecn状态。
-</span><span class='line'>TCP_ECN_queue_cwr(tp);
-</span><span class='line'>/* Abort F-RTO algorithm if one is in progress */
-</span><span class='line'>tp-&gt;frto_counter = 0;
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;接 下来来看零窗口探测定时器。至于为什么会出现零窗口，这里就不阐述了，详细的可以去看tcp/ip详解。我们知道当0窗口之后,客户机会等待服务器端的窗 口打开报文，可是由于ip是不可靠的，有可能这个报文会丢失，因此就需要客户机发送一个探测段，用来提醒服务器及时汇报当前的窗口大小。这里我们知道当对 端接收窗口关闭后，我们这边的发送窗口也会关闭，此时不能发送任何一般的数据，除了探测段。  
-</span><span class='line'>在内核中是通过tcp_ack_probe来控制零窗口的定时器的。也就是说接收到对端的窗口报告数据后，会进入这个函数。我们来看实现：  
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>看一下tcp_verify_retransmit_hint函数：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_ack_probe(struct sock *sk)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_verify_retransmit_hint(struct tcp_sock *tp, struct sk_buff *skb)
 </span><span class='line'>{
-</span><span class='line'>const struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>if ((tp-&gt;retransmit_skb_hint == NULL) ||
+</span><span class='line'>    before(TCP_SKB_CB(skb)-&gt;seq,
+</span><span class='line'>       TCP_SKB_CB(tp-&gt;retransmit_skb_hint)-&gt;seq))
+</span><span class='line'>    tp-&gt;retransmit_skb_hint = skb;    // 加入这个队列
 </span><span class='line'>
+</span><span class='line'>if (!tp-&gt;lost_out ||
+</span><span class='line'>    after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;retransmit_high))   // 如果最后一个数据标号比high大，明显更新high
+</span><span class='line'>    tp-&gt;retransmit_high = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>//首先判断是否对端的接收窗口是否已经有空间。
-</span><span class='line'>if (!after(TCP_SKB_CB(tcp_send_head(sk))-&gt;end_seq, tcp_wnd_end(tp))) {
-</span><span class='line'>    //如果有空间则删除零窗口探测定时器。
-</span><span class='line'>    icsk-&gt;icsk_backoff = 0;
-</span><span class='line'>    inet_csk_clear_xmit_timer(sk, ICSK_TIME_PROBE0);
-</span><span class='line'>    /* Socket must be waked up by subsequent tcp_data_snd_check().
-</span><span class='line'>     * This function is not for random using!
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>OK，再看一下这个函数tcp_try_undo_recovery：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int tcp_try_undo_recovery(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>if (tcp_may_undo(tp)) {  // 如果可以undo
+</span><span class='line'>    /* Happy end! We did not retransmit anything
+</span><span class='line'>     * or our original transmission succeeded.
 </span><span class='line'>     */
-</span><span class='line'>} else {
-</span><span class='line'>    //否则启动定时器。
-</span><span class='line'>    inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
-</span><span class='line'>                  min(icsk-&gt;icsk_rto &lt;&lt; icsk-&gt;icsk_backoff, TCP_RTO_MAX),
-</span><span class='line'>                  TCP_RTO_MAX);
+</span><span class='line'>    DBGUNDO(sk, inet_csk(sk)-&gt;icsk_ca_state == TCP_CA_Loss ? "loss" : "retrans");
+</span><span class='line'>    tcp_undo_cwr(sk, 1);   // 具体处理
+</span><span class='line'>    if (inet_csk(sk)-&gt;icsk_ca_state == TCP_CA_Loss)
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPLOSSUNDO);
+</span><span class='line'>    else
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPFULLUNDO);
+</span><span class='line'>    tp-&gt;undo_marker = 0;
 </span><span class='line'>}
+</span><span class='line'>if (tp-&gt;snd_una == tp-&gt;high_seq &amp;&amp; tcp_is_reno(tp)) {
+</span><span class='line'>    /* Hold old state until something *above* high_seq
+</span><span class='line'>     * is ACKed. For Reno it is MUST to prevent false
+</span><span class='line'>     * fast retransmits (RFC2582). SACK TCP is safe. */
+</span><span class='line'>    tcp_moderate_cwnd(tp);   // 更新窗口大小
+</span><span class='line'>    return 1;
+</span><span class='line'>}
+</span><span class='line'>tcp_set_ca_state(sk, TCP_CA_Open);
+</span><span class='line'>return 0;
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;我们知道零窗口定时器和重传的定时器是一个定时器，只不过在回调函数中，进行event判断，从而进入不同的处理。而它调用的是tcp_probe_timer函数。  
-</span><span class='line'>这个函数主要就是用来发送探测包，我们来看它的实现：  
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>OK看一下tcp_may_undo函数：检测能否撤销
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_probe_timer(struct sock *sk)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline bool tcp_may_undo(const struct tcp_sock *tp)
 </span><span class='line'>{
-</span><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>return tp-&gt;undo_marker &amp;&amp; (!tp-&gt;undo_retrans || tcp_packet_delayed(tp));
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>首先得有undo_marker标识才OK！然后undo_retrans的意思是最近的Recovery时间内重传的数据包个数，如果收到一个DSACK那么undo_retrans减一，如果最后等于0，那么说明都被确认了，没有必要重传，所以没有必要调整窗口。或tcp_packet_delayed(tp)条件。如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline int tcp_packet_delayed(struct tcp_sock *tp)
+</span><span class='line'>{
+</span><span class='line'>return !tp-&gt;retrans_stamp ||
+</span><span class='line'>    (tp-&gt;rx_opt.saw_tstamp &amp;&amp; tp-&gt;rx_opt.rcv_tsecr &amp;&amp;
+</span><span class='line'>     (__s32)(tp-&gt;rx_opt.rcv_tsecr - tp-&gt;retrans_stamp) &lt; 0); // 接收ACK时间在重传数据之前
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;下面 看一下这个函数tcp_complete_cwr：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void tcp_complete_cwr(struct sock *sk)
+</span><span class='line'>{
 </span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>int max_probes;
-</span><span class='line'>/* 1 tp-&gt;packets_out不为0说明，当定时器被安装之后，对端的接收窗口已经被打开。这* 时就不需要传输探测包。
-</span><span class='line'> * 2 tcp_send_head用来检测是否有新的段被传输。
-</span><span class='line'> * 如果上面有一个满足，则不需要发送探测包，并直接返回。
+</span><span class='line'>tp-&gt;snd_cwnd = min(tp-&gt;snd_cwnd, tp-&gt;snd_ssthresh);   // 调整窗口
+</span><span class='line'>tp-&gt;snd_cwnd_stamp = tcp_time_stamp;
+</span><span class='line'>tcp_ca_event(sk, CA_EVENT_COMPLETE_CWR); // 出发事件
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* CWND moderation, preventing bursts due to too big ACKs
+</span><span class='line'> * in dubious situations.
 </span><span class='line'> */
-</span><span class='line'>if (tp-&gt;packets_out || !tcp_send_head(sk)) {
-</span><span class='line'>    icsk-&gt;icsk_probes_out = 0;
-</span><span class='line'>    return;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//设置最大的重试次数。
-</span><span class='line'>max_probes = sysctl_tcp_retries2;
-</span><span class='line'>
-</span><span class='line'>//这里的处理和上面的tcp_write_timeout很类似。
-</span><span class='line'>if (sock_flag(sk, SOCK_DEAD)) {
-</span><span class='line'>    const int alive = ((icsk-&gt;icsk_rto &lt;&lt; icsk-&gt;icsk_backoff) &lt; TCP_RTO_MAX);
-</span><span class='line'>
-</span><span class='line'>    max_probes = tcp_orphan_retries(sk, alive);
-</span><span class='line'>
-</span><span class='line'>    if (tcp_out_of_resources(sk, alive || icsk-&gt;icsk_probes_out &lt;= max_probes))
-</span><span class='line'>        return;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//如果重试次数大于最大的重试次数，则报错。
-</span><span class='line'>if (icsk-&gt;icsk_probes_out &gt; max_probes) {
-</span><span class='line'>    tcp_write_err(sk);
-</span><span class='line'>} else {
-</span><span class='line'>    /* Only send another probe if we didn't close things up. */
-</span><span class='line'>//否则发送探测包。这个函数里面会发送探测包，并重启定时器。
-</span><span class='line'>    tcp_send_probe0(sk);
-</span><span class='line'>}
+</span><span class='line'>static inline void tcp_moderate_cwnd(struct tcp_sock *tp)  // 修改窗口值
+</span><span class='line'>{
+</span><span class='line'>tp-&gt;snd_cwnd = min(tp-&gt;snd_cwnd,
+</span><span class='line'>           tcp_packets_in_flight(tp) + tcp_max_burst(tp));  // 防止怀疑的ACK情况，所以取min值
+</span><span class='line'>tp-&gt;snd_cwnd_stamp = tcp_time_stamp;
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;然 后来看delay ack定时器。所谓的delay ack也就是ack不会马上发送，而是等待一段时间和数据一起发送，这样就减少了一个数据包的发送。这里一般是将ack包含在tcp option中发送的。这里的定时器就是用来控制这段时间，如果定时器到期，都没有数据要发送给对端，此时单独发送这个ack。如果在定时器时间内，有数 据要发送，此时这个ack和数据一起发送给对端。  
-</span><span class='line'>前面我们知道delay ack定时器的回调函数是tcp_delack_timer。在分析这个函数之前，我们先来看下这个定时器是什么时候被启动的。  
-</span><span class='line'>首先我们知道内核接收数据都是在tcp_rcv_eastablished实现的，当我们接收完数据后，此时进入是否进行delay ack.  
-</span><span class='line'>在tcp_rcv_eastablished最终会调用__tcp_ack_snd_check进行判断。  
-</span><span class='line'>可以看到这个函数很简单，就是判断是否需要发送delay ack，如果是则tcp_send_delayed_ack，否则直接发送ack恢复给对端。
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;--------
+</span><span class='line'>
+</span><span class='line'>再看看这个函数tcp_try_undo_dsack：当DSACK确认所有的重传数据，那么undo_retrans=0，那么需要回复窗口原来的情况
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Try to undo cwnd reduction, because D-SACKs acked all retransmitted data */
+</span><span class='line'>static void tcp_try_undo_dsack(struct sock *sk)
 </span><span class='line'>{
 </span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
 </span><span class='line'>
-</span><span class='line'>/* 1 第一个判断表示多于一个的段在等待ack，并且我们的receive buf有足够的空间，
-</span><span class='line'> *   这是因为这种情况，表明应用程序读取比较快，而对端的发送速度依赖于ack的到达时间，* 因此我们不希望对端减慢速度。
-</span><span class='line'> * 2 这个sock处在quickack 模式
-</span><span class='line'> * 3 我们有 out-of-order数据,此时必须马上给对端以确认。
-</span><span class='line'> *   当上面的任意一个为真，则立即发送ack。
-</span><span class='line'>**/
-</span><span class='line'>if (((tp-&gt;rcv_nxt - tp-&gt;rcv_wup) &gt; inet_csk(sk)-&gt;icsk_ack.rcv_mss
-</span><span class='line'>     /* ... and right edge of window advances far enough.
-</span><span class='line'>      * (tcp_recvmsg() will send ACK otherwise). Or...
-</span><span class='line'>      */
-</span><span class='line'>     &amp;&amp; __tcp_select_window(sk) &gt;= tp-&gt;rcv_wnd) ||
-</span><span class='line'>    /* We ACK each frame or... */
-</span><span class='line'>    tcp_in_quickack_mode(sk) ||
-</span><span class='line'>    /* We have out of order data. */
-</span><span class='line'>    (ofo_possible &amp;&amp; skb_peek(&amp;tp-&gt;out_of_order_queue))) {
-</span><span class='line'>    /* Then ack it now */
-</span><span class='line'>    tcp_send_ack(sk);
-</span><span class='line'>} else {
-</span><span class='line'>    /* Else, send delayed ack. */
-</span><span class='line'>    //在这里启动定时器。
-</span><span class='line'>    tcp_send_delayed_ack(sk);
+</span><span class='line'>if (tp-&gt;undo_marker &amp;&amp; !tp-&gt;undo_retrans) {  // 所有的段都被确认了
+</span><span class='line'>    DBGUNDO(sk, "D-SACK");
+</span><span class='line'>    tcp_undo_cwr(sk, 1);                     // 撤销（1）
+</span><span class='line'>    tp-&gt;undo_marker = 0;
+</span><span class='line'>    NET_INC_STATS_BH(LINUX_MIB_TCPDSACKUNDO);
 </span><span class='line'>}
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;上面还有一个tcp_in_quickack_mode，这个函数我们说了，它是用来判断是否处在quickack 模式。  
-</span><span class='line'>来看这个函数：
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>撤销函数
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline int tcp_in_quickack_mode(const struct sock *sk)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_undo_cwr(struct sock *sk, const int undo)
 </span><span class='line'>{
-</span><span class='line'>const struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>return icsk-&gt;icsk_ack.quick &amp;&amp; !icsk-&gt;icsk_ack.pingpong;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;其中icsk-&gt;icsk_ack.pingpong域被设置的情况只有当tcp连接是交互式的，比如telnet等等。icsk-&gt;icsk_ack.quick表示能够 quickack的数量。
-</span><span class='line'>然后我们来看tcp_delack_timer的实现。  
-</span><span class='line'>在看之前，我们要知道icsk-&gt;icsk_ack.pending表示的是当前的ack的状态。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_delack_timer(unsigned long data)
-</span><span class='line'>{
-</span><span class='line'>struct sock *sk = (struct sock *)data;
 </span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>struct inet_connection_sock *icsk = inet_csk(sk);
 </span><span class='line'>
-</span><span class='line'>bh_lock_sock(sk);
-</span><span class='line'>//用户进程正在使用，则等会再尝试。
-</span><span class='line'>if (sock_owned_by_user(sk)) {
-</span><span class='line'>    /* Try again later. */
-</span><span class='line'>    icsk-&gt;icsk_ack.blocked = 1;
-</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKLOCKED);
-</span><span class='line'>    sk_reset_timer(sk, &amp;icsk-&gt;icsk_delack_timer, jiffies + TCP_DELACK_MIN);
-</span><span class='line'>    goto out_unlock;
+</span><span class='line'>if (tp-&gt;prior_ssthresh) {  // 如果保存了旧的门限值
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>
+</span><span class='line'>    if (icsk-&gt;icsk_ca_ops-&gt;undo_cwnd)
+</span><span class='line'>        tp-&gt;snd_cwnd = icsk-&gt;icsk_ca_ops-&gt;undo_cwnd(sk);           // 这个函数可以自己添加
+</span><span class='line'>    else
+</span><span class='line'>        tp-&gt;snd_cwnd = max(tp-&gt;snd_cwnd, tp-&gt;snd_ssthresh &lt;&lt; 1);   // 如果没有定义那个函数，那么做简单的处理
+</span><span class='line'>
+</span><span class='line'>    if (undo &amp;&amp; tp-&gt;prior_ssthresh &gt; tp-&gt;snd_ssthresh) {
+</span><span class='line'>        tp-&gt;snd_ssthresh = tp-&gt;prior_ssthresh;
+</span><span class='line'>        TCP_ECN_withdraw_cwr(tp);
+</span><span class='line'>    }
+</span><span class='line'>} else {                 // 没有保存旧的阈值
+</span><span class='line'>    tp-&gt;snd_cwnd = max(tp-&gt;snd_cwnd, tp-&gt;snd_ssthresh);   // 
+</span><span class='line'>}
+</span><span class='line'>tcp_moderate_cwnd(tp);   // 上面已经说了
+</span><span class='line'>tp-&gt;snd_cwnd_stamp = tcp_time_stamp;
+</span><span class='line'>
+</span><span class='line'>/* There is something screwy going on with the retrans hints after
+</span><span class='line'>   an undo */
+</span><span class='line'>tcp_clear_all_retrans_hints(tp);      // 清空所有的重传信息
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>-------
+</span><span class='line'>接收到重复的ACK，那么需要对sacked_out处理，看函数tcp_add_reno_sack：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Emulate SACKs for SACKless connection: account for a new dupack. */
+</span><span class='line'>
+</span><span class='line'>static void tcp_add_reno_sack(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>tp-&gt;sacked_out++;                    // 收到重复的ACK，那么这个值++
+</span><span class='line'>tcp_check_reno_reordering(sk, 0);    // 检查是否有reordering（1）
+</span><span class='line'>tcp_verify_left_out(tp);   // 
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>看看这个检查reordering函数：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* If we receive more dupacks than we expected counting segments
+</span><span class='line'> * in assumption of absent reordering, interpret this as reordering.
+</span><span class='line'> * The only another reason could be bug in receiver TCP.
+</span><span class='line'> */
+</span><span class='line'>static void tcp_check_reno_reordering(struct sock *sk, const int addend)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>if (tcp_limit_reno_sacked(tp))      // 检查sack的数量是否超过限度
+</span><span class='line'>    tcp_update_reordering(sk, tp-&gt;packets_out + addend, 0); // 如果是reordering则更新reordering
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Limits sacked_out so that sum with lost_out isn't ever larger than
+</span><span class='line'> * packets_out. Returns zero if sacked_out adjustement wasn't necessary.
+</span><span class='line'> */
+</span><span class='line'>int tcp_limit_reno_sacked(struct tcp_sock *tp)  // 限制sacked_out目的是使得sacked_out + lost_out &lt;= packeted_out
+</span><span class='line'>{                          
+</span><span class='line'>u32 holes;
+</span><span class='line'>
+</span><span class='line'>holes = max(tp-&gt;lost_out, 1U);              // 获得hole
+</span><span class='line'>holes = min(holes, tp-&gt;packets_out);
+</span><span class='line'>
+</span><span class='line'>if ((tp-&gt;sacked_out + holes) &gt; tp-&gt;packets_out) {   // 如果大于发出的包，那么reordering就需要了
+</span><span class='line'>    tp-&gt;sacked_out = tp-&gt;packets_out - holes;       // 因为此处的dup-ack是reorder造成的
+</span><span class='line'>    return 1;
+</span><span class='line'>}
+</span><span class='line'>return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>下面看看更新reordering函数tcp_update_reordering：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void tcp_update_reordering(struct sock *sk, const int metric,
+</span><span class='line'>              const int ts)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>if (metric &gt; tp-&gt;reordering) {                          // 如果现在的数量 &gt; 之前的reorder
+</span><span class='line'>    tp-&gt;reordering = min(TCP_MAX_REORDERING, metric);   // 获得ordering值(注意不能超过最大设置值)
+</span><span class='line'>
+</span><span class='line'>    /* This exciting event is worth to be remembered. 8) */
+</span><span class='line'>    if (ts)
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPTSREORDER);    // 统计信息
+</span><span class='line'>    else if (tcp_is_reno(tp))
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPRENOREORDER);
+</span><span class='line'>    else if (tcp_is_fack(tp))
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPFACKREORDER);
+</span><span class='line'>    else
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPSACKREORDER);
+</span><span class='line'>#if FASTRETRANS_DEBUG &gt; 1
+</span><span class='line'>    printk(KERN_DEBUG "Disorder%d %d %u f%u s%u rr%d\n",
+</span><span class='line'>           tp-&gt;rx_opt.sack_ok, inet_csk(sk)-&gt;icsk_ca_state,
+</span><span class='line'>           tp-&gt;reordering,
+</span><span class='line'>           tp-&gt;fackets_out,
+</span><span class='line'>           tp-&gt;sacked_out,
+</span><span class='line'>           tp-&gt;undo_marker ? tp-&gt;undo_retrans : 0);
+</span><span class='line'>#endif
+</span><span class='line'>    tcp_disable_fack(tp);       // 禁用fack(fack是基于有序的，因为已经使用order了，所以禁用fack)
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>------
+</span><span class='line'>下面再看一下这个tcp_try_undo_partial函数：在恢复状态，收到部分ACK确认，使用这个函数撤销拥塞调整。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Undo during fast recovery after partial ACK. */
+</span><span class='line'>
+</span><span class='line'>static int tcp_try_undo_partial(struct sock *sk, int acked)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>/* Partial ACK arrived. Force Hoe's retransmit. */ // 收到部分ACK，对于SACK来说不需要重传，对于RENO需要
+</span><span class='line'>int failed = tcp_is_reno(tp) || (tcp_fackets_out(tp) &gt; tp-&gt;reordering);  // 或者facked_out数量比reordering要大
+</span><span class='line'>
+</span><span class='line'>if (tcp_may_undo(tp)) {    // 是否可以调整（上面已说）
+</span><span class='line'>    /* Plain luck! Hole if filled with delayed
+</span><span class='line'>     * packet, rather than with a retransmit.
+</span><span class='line'>     */
+</span><span class='line'>    if (tp-&gt;retrans_out == 0)       // 重传包=0
+</span><span class='line'>        tp-&gt;retrans_stamp = 0;      // 重置重传时间
+</span><span class='line'>
+</span><span class='line'>    tcp_update_reordering(sk, tcp_fackets_out(tp) + acked, 1);   // 需要更新reordering( 上面 )
+</span><span class='line'>
+</span><span class='line'>    DBGUNDO(sk, "Hoe");
+</span><span class='line'>    tcp_undo_cwr(sk, 0);   // 撤销操作( 上面 )
+</span><span class='line'>    NET_INC_STATS_BH(LINUX_MIB_TCPPARTIALUNDO);
+</span><span class='line'>
+</span><span class='line'>    /* So... Do not make Hoe's retransmit yet.
+</span><span class='line'>     * If the first packet was delayed, the rest
+</span><span class='line'>     * ones are most probably delayed as well.
+</span><span class='line'>     */
+</span><span class='line'>    failed = 0;            // 表示不用重传了，可以发送新的数据
+</span><span class='line'>}
+</span><span class='line'>return failed;             // 返回是否需要重传
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>-----
+</span><span class='line'>下面继续看tcp_try_undo_loss函数：收到部分确认之后，从loss状态撤销窗口调整
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Undo during loss recovery after partial ACK. */
+</span><span class='line'>static int tcp_try_undo_loss(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>if (tcp_may_undo(tp)) {                    // 如果可以undo
+</span><span class='line'>    struct sk_buff *skb;
+</span><span class='line'>    tcp_for_write_queue(skb, sk) {         // 遍历整个发送queue
+</span><span class='line'>        if (skb == tcp_send_head(sk))      // 直到还没有发送的数据头之前(前面的都已经发送)
+</span><span class='line'>            break;
+</span><span class='line'>        TCP_SKB_CB(skb)-&gt;sacked &amp;= ~TCPCB_LOST;  // 清除LOST标记
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    tcp_clear_all_retrans_hints(tp);       // 清除所有的重传信息
+</span><span class='line'>
+</span><span class='line'>    DBGUNDO(sk, "partial loss");
+</span><span class='line'>    tp-&gt;lost_out = 0;                      // 重置
+</span><span class='line'>    tcp_undo_cwr(sk, 1);                   // 撤销窗口调整
+</span><span class='line'>    NET_INC_STATS_BH(LINUX_MIB_TCPLOSSUNDO);
+</span><span class='line'>    inet_csk(sk)-&gt;icsk_retransmits = 0;
+</span><span class='line'>    tp-&gt;undo_marker = 0;
+</span><span class='line'>    if (tcp_is_sack(tp))
+</span><span class='line'>        tcp_set_ca_state(sk, TCP_CA_Open);  // 设置状态OPEN
+</span><span class='line'>    return 1;
+</span><span class='line'>}
+</span><span class='line'>return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>----
+</span><span class='line'>下面看一下tcp_update_scoreboard函数：其实就是更新lost包数量，这个涉及到不同的算法不一样的结果，没有SACK(reno)，有SACK，有FACK情况
+</span><span class='line'>
+</span><span class='line'>1) 没有SACK：每次收到重复的ACK或部分ack时，标志一个包为丢失。
+</span><span class='line'>
+</span><span class='line'>2)    有SACK：sacked_out - reordering &gt; 0 时候，标记为这么多丢失，若小于0，标记为1个丢失(前提是有重传标识)
+</span><span class='line'>
+</span><span class='line'>3)    有FACK：fackets_out - reordering  &gt;0 时候，标记为这么多丢失，若小于0，标记为1个丢失
+</span><span class='line'>
+</span><span class='line'>( 注意：小于0的情况是因为考虑到reordering情况 )
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Account newly detected lost packet(s) */
+</span><span class='line'>
+</span><span class='line'>static void tcp_update_scoreboard(struct sock *sk, int fast_rexmit)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>if (tcp_is_reno(tp)) {              // 最普通的，没有SACK情况
+</span><span class='line'>    tcp_mark_head_lost(sk, 1);      // 标记为一个丢失
+</span><span class='line'>} else if (tcp_is_fack(tp)) {       // 如果是fack
+</span><span class='line'>    int lost = tp-&gt;fackets_out - tp-&gt;reordering;  // 判断这个值大小
+</span><span class='line'>    if (lost &lt;= 0)
+</span><span class='line'>        lost = 1;  // 小于0指标记一个
+</span><span class='line'>    tcp_mark_head_lost(sk, lost);   // 否则标记所有的
+</span><span class='line'>} else {   // 仅仅有SACK情况
+</span><span class='line'>    int sacked_upto = tp-&gt;sacked_out - tp-&gt;reordering;
+</span><span class='line'>    if (sacked_upto &lt; fast_rexmit)
+</span><span class='line'>        sacked_upto = fast_rexmit;
+</span><span class='line'>    tcp_mark_head_lost(sk, sacked_upto);   // 同上
 </span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>sk_mem_reclaim_partial(sk);
-</span><span class='line'>
-</span><span class='line'>//判断sock状态 以及ack的状态。如果是close或者已经处在ICSK_ACK_TIMER，则直接跳出。
-</span><span class='line'>if (sk-&gt;sk_state == TCP_CLOSE || !(icsk-&gt;icsk_ack.pending &amp; ICSK_ACK_TIMER))
-</span><span class='line'>    goto out;
-</span><span class='line'>
-</span><span class='line'>//如果已经超时，则重启定时器，并退出。
-</span><span class='line'>if (time_after(icsk-&gt;icsk_ack.timeout, jiffies)) {
-</span><span class='line'>    sk_reset_timer(sk, &amp;icsk-&gt;icsk_delack_timer, icsk-&gt;icsk_ack.timeout);
-</span><span class='line'>    goto out;
-</span><span class='line'>}
-</span><span class='line'>//清除ack状态。
-</span><span class='line'>icsk-&gt;icsk_ack.pending &amp;= ~ICSK_ACK_TIMER;
-</span><span class='line'>
-</span><span class='line'>//开始遍历prequeue。此时主要的目的是为了调用tcp_rcv_eastablished.这里会调用tcp_ack_snd_check来发送ack。
-</span><span class='line'>if (!skb_queue_empty(&amp;tp-&gt;ucopy.prequeue)) {
+</span><span class='line'>/* New heuristics: it is possible only after we switched
+</span><span class='line'> * to restart timer each time when something is ACKed.
+</span><span class='line'> * Hence, we can detect timed out packets during fast
+</span><span class='line'> * retransmit without falling to slow start.
+</span><span class='line'> */
+</span><span class='line'>if (tcp_is_fack(tp) &amp;&amp; tcp_head_timedout(sk)) {   // 下面检查超时包( 先检查第一个数据包是否超时 )
 </span><span class='line'>    struct sk_buff *skb;
 </span><span class='line'>
-</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPSCHEDULERFAILED);
+</span><span class='line'>    skb = tp-&gt;scoreboard_skb_hint ? tp-&gt;scoreboard_skb_hint
+</span><span class='line'>        : tcp_write_queue_head(sk);
 </span><span class='line'>
-</span><span class='line'>    //遍历prequeue队列，发送未发送的ack。
-</span><span class='line'>    while ((skb = __skb_dequeue(&amp;tp-&gt;ucopy.prequeue)) != NULL)
-</span><span class='line'>        sk_backlog_rcv(sk, skb);
+</span><span class='line'>    tcp_for_write_queue_from(skb, sk) {
+</span><span class='line'>        if (skb == tcp_send_head(sk))
+</span><span class='line'>            break;
+</span><span class='line'>        if (!tcp_skb_timedout(sk, skb))  // 检查所有的超时包，没有超时的就break
+</span><span class='line'>            break;
 </span><span class='line'>
-</span><span class='line'>    tp-&gt;ucopy.memory = 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>//检测是否有ack还需要被发送。也就是处于ICSK_ACK_SCHED状态的ack
-</span><span class='line'>if (inet_csk_ack_scheduled(sk)) {
-</span><span class='line'>
-</span><span class='line'>    if (!icsk-&gt;icsk_ack.pingpong) {
-</span><span class='line'>        /* Delayed ACK missed: inflate ATO. */
-</span><span class='line'>        icsk-&gt;icsk_ack.ato = min(icsk-&gt;icsk_ack.ato &lt;&lt; 1, icsk-&gt;icsk_rto);
-</span><span class='line'>    } else {
-</span><span class='line'>        //到这里说明已经长时间没有通信，并且处于交互模式。这个时候我们需要关闭pingpong模式。
-</span><span class='line'>        icsk-&gt;icsk_ack.pingpong = 0;
-</span><span class='line'>        icsk-&gt;icsk_ack.ato      = TCP_ATO_MIN;
+</span><span class='line'>        if (!(TCP_SKB_CB(skb)-&gt;sacked &amp; (TCPCB_SACKED_ACKED|TCPCB_LOST))) {
+</span><span class='line'>            TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_LOST;   // 标记为lost
+</span><span class='line'>            tp-&gt;lost_out += tcp_skb_pcount(skb);     // 增加lost数量
+</span><span class='line'>            tcp_verify_retransmit_hint(tp, skb);     
+</span><span class='line'>        }
 </span><span class='line'>    }
-</span><span class='line'>    //立即发送ack。
-</span><span class='line'>    tcp_send_ack(sk);
-</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKS);
-</span><span class='line'>}
-</span><span class='line'>TCP_CHECK_TIMER(sk);
 </span><span class='line'>
-</span><span class='line'>out:
-</span><span class='line'>if (tcp_memory_pressure)
-</span><span class='line'>    sk_mem_reclaim(sk);
-</span><span class='line'>out_unlock:
-</span><span class='line'>bh_unlock_sock(sk);
-</span><span class='line'>sock_put(sk);
+</span><span class='line'>    tp-&gt;scoreboard_skb_hint = skb;
+</span><span class='line'>
+</span><span class='line'>       tcp_verify_left_out(tp);
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>------
+</span><span class='line'>下面继续看这个减小窗口函数：tcp_cwnd_down，
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Decrease cwnd each second ack. */ // 每收到2个确认将拥塞窗口减1，直到拥塞窗口等于慢启动阈值。
+</span><span class='line'>static void tcp_cwnd_down(struct sock *sk, int flag)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>int decr = tp-&gt;snd_cwnd_cnt + 1; // 计数器
+</span><span class='line'>
+</span><span class='line'>if ((flag &amp; (FLAG_ANY_PROGRESS | FLAG_DSACKING_ACK)) ||
+</span><span class='line'>    (tcp_is_reno(tp) &amp;&amp; !(flag &amp; FLAG_NOT_DUP))) {
+</span><span class='line'>    tp-&gt;snd_cwnd_cnt = decr &amp; 1;// 因为此处只可能是0,1三个值，这样的操作其实就是切换值，
+</span><span class='line'>                                // 例如现在是第一个ACK，即之前的snd_cwnd_cnt=0，decr=1，那么1&amp;1=1，
+</span><span class='line'>                                // 将snd_cwnd_cnt赋值为1；第二个ACK到来，decr=2，则2&amp;1=0，
+</span><span class='line'>                                // 相当于又将snd_cwnd_cnt初始化为0，因为两个ACK就需要处理一次。
+</span><span class='line'>    decr &gt;&gt;= 1;   // 除以2，是判断是第一个ACK，还是第二个；第一个的话值=0，下面不会执行，是2的话=1，下面一句会执行
+</span><span class='line'>
+</span><span class='line'>    if (decr &amp;&amp; tp-&gt;snd_cwnd &gt; tcp_cwnd_min(sk)) // 如果是第二个ACK &amp;&amp; 比最小的门限值还大一点，那么还需要减小cwnd
+</span><span class='line'>        tp-&gt;snd_cwnd -= decr;   // 减小一个，^_^
+</span><span class='line'>
+</span><span class='line'>    tp-&gt;snd_cwnd = min(tp-&gt;snd_cwnd, tcp_packets_in_flight(tp) + 1);  // 用于微调，和外面的数据包数量比较
+</span><span class='line'>    tp-&gt;snd_cwnd_stamp = tcp_time_stamp;    // 改变时间戳
+</span><span class='line'>} 
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
@@ -1741,220 +1472,798 @@ tcp_synack_timer    这个函数是用来管理syn_ack定时器的接口。
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[接收包的主流程]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2013/09/09/kernel-net-rx/"/&gt;
-</span><span class='line'>&lt;updated&gt;2013-09-09T18:10:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2013/09/09/kernel-net-rx&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;pre&gt;&lt;code&gt;    int tcp_v4_rcv(struct sk_buff *skb)    linux/net/ipv4/tcp_ipv4.c #1611
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[tcp重传数据包 tcp_xmit_retransmit_skb]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp4/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-03-04T17:40:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp4&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/shanshanpt/article/details/22202743"&gt;http://blog.csdn.net/shanshanpt/article/details/22202743&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;当知道需要重传数据结的时候执行这个函数：&lt;br/&gt;
+</span><span class='line'>对于函数tcp_xmit_retransmit_queue：需要重传哪些包呢到底？&lt;br/&gt;
+</span><span class='line'>首先是lost、标记的包；&lt;br/&gt;
+</span><span class='line'>然后还需要处理：之前发送过的但是尚未收到确认的包（向前重传），或者新数据，在这两者之间有一个选择&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* This gets called after a retransmit timeout, and the initially
+</span><span class='line'> * retransmitted data is acknowledged.  It tries to continue
+</span><span class='line'> * resending the rest of the retransmit queue, until either
+</span><span class='line'> * we've sent it all or the congestion window limit is reached.
+</span><span class='line'> * If doing SACK, the first ACK which comes back for a timeout
+</span><span class='line'> * based retransmit packet might feed us FACK information again.
+</span><span class='line'> * If so, we use it to avoid unnecessarily retransmissions.
+</span><span class='line'> */
+</span><span class='line'>void tcp_xmit_retransmit_queue(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    struct sk_buff *skb;
+</span><span class='line'>    int packet_cnt;
+</span><span class='line'>
+</span><span class='line'>    if (tp-&gt;retransmit_skb_hint) {                  // 如果有重传信息
+</span><span class='line'>        skb = tp-&gt;retransmit_skb_hint;
+</span><span class='line'>        packet_cnt = tp-&gt;retransmit_cnt_hint;       // 保存cnt值
+</span><span class='line'>    } else {
+</span><span class='line'>        skb = tcp_write_queue_head(sk);             // 发送队列
+</span><span class='line'>        packet_cnt = 0;
+</span><span class='line'>    }
+</span><span class='line'>    // 第一步，如果有丢失的包，那么需要重传
+</span><span class='line'>    /* First pass: retransmit lost packets. */
+</span><span class='line'>    if (tp-&gt;lost_out) {  // lost_out &gt; 0
+</span><span class='line'>        tcp_for_write_queue_from(skb, sk) {         // 遍历
+</span><span class='line'>            __u8 sacked = TCP_SKB_CB(skb)-&gt;sacked;  // 获得sacked标识
+</span><span class='line'>
+</span><span class='line'>            if (skb == tcp_send_head(sk))
+</span><span class='line'>                   break;
+</span><span class='line'>            /* we could do better than to assign each time */
+</span><span class='line'>            tp-&gt;retransmit_skb_hint = skb;          // 更新两个值
+</span><span class='line'>            tp-&gt;retransmit_cnt_hint = packet_cnt;
+</span><span class='line'>
+</span><span class='line'>            /* Assume this retransmit will generate
+</span><span class='line'>             * only one packet for congestion window
+</span><span class='line'>             * calculation purposes.  This works because
+</span><span class='line'>             * tcp_retransmit_skb() will chop up the
+</span><span class='line'>             * packet to be MSS sized and all the
+</span><span class='line'>             * packet counting works out.
+</span><span class='line'>             */
+</span><span class='line'>            if (tcp_packets_in_flight(tp) &gt;= tp-&gt;snd_cwnd)  // 如果传输中的报文数量 &gt; 窗口数量，那么没有必要再发送数据
+</span><span class='line'>                return;
+</span><span class='line'>
+</span><span class='line'>            if (sacked &amp; TCPCB_LOST) {                      // 如果是LOST标识
+</span><span class='line'>                if (!(sacked &amp; (TCPCB_SACKED_ACKED|TCPCB_SACKED_RETRANS))) {  // 如果丢失了 &amp;&amp; 没有被选择确认或者重传
+</span><span class='line'>                    if (tcp_retransmit_skb(sk, skb)) {      // 重传该数据函数！！！最后再看（1）
+</span><span class='line'>                        tp-&gt;retransmit_skb_hint = NULL;     // 重传之后重置这个值
+</span><span class='line'>                        return;                             // 返回
+</span><span class='line'>                    }
+</span><span class='line'>                    if (icsk-&gt;icsk_ca_state != TCP_CA_Loss)
+</span><span class='line'>                        NET_INC_STATS_BH(LINUX_MIB_TCPFASTRETRANS);
+</span><span class='line'>                    else
+</span><span class='line'>                        NET_INC_STATS_BH(LINUX_MIB_TCPSLOWSTARTRETRANS);
+</span><span class='line'>
+</span><span class='line'>                    if (skb == tcp_write_queue_head(sk))    // 如果是第一个重传数据，那么重置重传计数器！！！
+</span><span class='line'>                        inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+</span><span class='line'>                                      inet_csk(sk)-&gt;icsk_rto,
+</span><span class='line'>                                      TCP_RTO_MAX);
+</span><span class='line'>                }
+</span><span class='line'>
+</span><span class='line'>                packet_cnt += tcp_skb_pcount(skb);          // 重传数量
+</span><span class='line'>                if (packet_cnt &gt;= tp-&gt;lost_out)             // 大于lost的数量，那么break；下面就不是lost数据问题了
+</span><span class='line'>                    break;
+</span><span class='line'>            }
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    /* OK, demanded retransmission is finished. */
+</span><span class='line'>    // 上面的是必须要重传的，下面的在前向重传和发送新数据之间进行选择
+</span><span class='line'>    /* Forward retransmissions are possible only during Recovery. */
+</span><span class='line'>    if (icsk-&gt;icsk_ca_state != TCP_CA_Recovery)  // 只有在恢复状态才可以这样做，在丢失状态不可以；
+</span><span class='line'>        return;              // 原因：在丢失状态希望通过可控制的方式进行重传？这一块不是很懂
+</span><span class='line'>
+</span><span class='line'>    /* No forward retransmissions in Reno are possible. */
+</span><span class='line'>    if (tcp_is_reno(tp))    // 前向选择重传只能是SACK下，reno下是不可能的~
+</span><span class='line'>        return;
+</span><span class='line'>
+</span><span class='line'>    /* Yeah, we have to make difficult choice between forward transmission
+</span><span class='line'>     * and retransmission... Both ways have their merits...
+</span><span class='line'>     *
+</span><span class='line'>     * For now we do not retransmit anything, while we have some new
+</span><span class='line'>     * segments to send. In the other cases, follow rule 3 for
+</span><span class='line'>     * NextSeg() specified in RFC3517.
+</span><span class='line'>     */ // 下面还是需要选择考虑传输新数据还是前向重传，优先考虑新数据
+</span><span class='line'>
+</span><span class='line'>    if (tcp_may_send_now(sk))   // 检查是否有新的数据在等待传输（1）
+</span><span class='line'>        return;                 // 以及这些新数据是否可以发送，可以的话返回，不需要做下面事
+</span><span class='line'>
+</span><span class='line'>    /* If nothing is SACKed, highest_sack in the loop won't be valid */
+</span><span class='line'>    if (!tp-&gt;sacked_out)
+</span><span class='line'>        return;
+</span><span class='line'>    // 下面开始就是“前向重传”处理
+</span><span class='line'>    if (tp-&gt;forward_skb_hint)               // 是否已经缓存这个队列
+</span><span class='line'>        skb = tp-&gt;forward_skb_hint;
+</span><span class='line'>    else
+</span><span class='line'>        skb = tcp_write_queue_head(sk);     // 没有
+</span><span class='line'>
+</span><span class='line'>    tcp_for_write_queue_from(skb, sk) {     // 需要遍历
+</span><span class='line'>        if (skb == tcp_send_head(sk))       // 到头了
+</span><span class='line'>            break;
+</span><span class='line'>        tp-&gt;forward_skb_hint = skb;
+</span><span class='line'>
+</span><span class='line'>        if (!before(TCP_SKB_CB(skb)-&gt;seq, tcp_highest_sack_seq(tp)))   // 不可以超过最大的即highest_sack_seq
+</span><span class='line'>            break;
+</span><span class='line'>
+</span><span class='line'>        if (tcp_packets_in_flight(tp) &gt;= tp-&gt;snd_cwnd)   // 如果传输中的包数量 &gt; 窗口大小
+</span><span class='line'>            break;  // 不能再发了
+</span><span class='line'>
+</span><span class='line'>        if (TCP_SKB_CB(skb)-&gt;sacked &amp; TCPCB_TAGBITS)     // ?
+</span><span class='line'>            continue;
+</span><span class='line'>
+</span><span class='line'>        /* Ok, retransmit it. */
+</span><span class='line'>        if (tcp_retransmit_skb(sk, skb)) {     // 下面就是传输这个包
+</span><span class='line'>            tp-&gt;forward_skb_hint = NULL;
+</span><span class='line'>            break;
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        if (skb == tcp_write_queue_head(sk))   // 如果是第一个重传的包，那么启动设置定时器
+</span><span class='line'>            inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+</span><span class='line'>                          inet_csk(sk)-&gt;icsk_rto,
+</span><span class='line'>                          TCP_RTO_MAX);
+</span><span class='line'>
+</span><span class='line'>        NET_INC_STATS_BH(LINUX_MIB_TCPFORWARDRETRANS);
+</span><span class='line'>    }
+</span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  //tcp刚刚收到从ipv4发上来的包&lt;br/&gt;
-</span><span class='line'>  （struct tcphdr: 定义在/include/net/tcp.h中，即包的tcp首部，不包括options部分）&lt;br/&gt;
-</span><span class='line'>  （struct sock ：定义在/include/net/sock.h中，即表示socket）&lt;br/&gt;
-</span><span class='line'>  检查skb-&gt;pkt_type != PACKET_HOST 则丢弃&lt;br/&gt;
-</span><span class='line'>  检查th-&gt;doff &lt; sizeof(struct tcphdr) / 4，即首部大小不合理，则丢弃&lt;br/&gt;
-</span><span class='line'>  检查checksum&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;看一下检查是否有新的数据需要传输的函数：tcp_may_send_now&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  （TCP_SKB_CB(skb)：定义在tcp.h是获取一个实际指向skb-&gt;cb[0]的tcp_skb_cb类型指针；将到达的首部剥离后，从中拷贝一些信息到这个变量，供tcp控制功能使用；tcp_skb_cb是在tcp刚收到时填写在包中的）&lt;br/&gt;
-</span><span class='line'>  注意：&lt;br/&gt;
-</span><span class='line'>    1. tcp_skb_cb-&gt;end_seq = seq + th-&gt;fin + th-&gt;fin + len-doff*4&lt;br/&gt;
-</span><span class='line'>    2. when 和 sacked 没有被赋值&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;因为此处涉及到Nagle算法，所以先简介一下：&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  sk = __inet_lookup(&hellip;) 从一个hash表中获取该收包对应的sock结构，根据源IP地址+端口，目的IP地址+端口，inet_iif检查sk-&gt;sk_state == TCP_TIME_WAIT，TCP在该状态下则丢弃任何接收到的包并转入后续的特殊处理（未看，和关闭连接的状态迁移有关需要后续来看$），马上准备进入CLOSED状态了；&lt;br/&gt;
-</span><span class='line'>  检查sk_filter(sk,skb)，则被过滤器阻拦，丢弃&lt;br/&gt;
-</span><span class='line'>  检查!sock_owned_by_user(sk)，不明白sock-&gt;sk_lock的意义是什么，只有检查满足才能进入接收，否则 sk_add_backlog(sk, skb)将该sk_buff记录进sk_backlog队列；（注意这部操作加锁了！）&lt;br/&gt;
-</span><span class='line'>（struct tcp_sock *tp = tcp_sk(sk)：tcp_sock定义在tcp.h中，通过tcp_sk直接将sock指针转换为tcp_sock型）&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;Nagle算法：如果发送端欲多次发送包含少量字符的数据包（一般情况下，后面统一称长度小于MSS的数据包为小包，称长度等于MSS的数据包为大包），则发送端会先将第一个小包发送出去，而将后面到达的少量字符数据都缓存起来而不立即发送，直到收到接收端对前一个数据包报文段的ACK确认、或当前字符属于紧急数据，或者积攒到了一定数量的数据（比如缓存的字符数据已经达到数据包报文段的最大长度）等多种情况才将其组成一个较大的数据包发送出去。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  ret = tcp_v4_do_rcv(sk, skb) 进入进一步接收处理！&lt;br/&gt;
-</span><span class='line'>（之后的异常操作未看）&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int tcp_may_send_now(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    struct sk_buff *skb = tcp_send_head(sk);            // 获得需要发送的数据头部
 </span><span class='line'>
-</span><span class='line'>&lt;hr /&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)    linux/net/ipv4/tcp_ipv4.c #1542
+</span><span class='line'>    return (skb &amp;&amp;          // 尚有新数据需要传输
+</span><span class='line'>        tcp_snd_test(sk, skb, tcp_current_mss(sk, 1),   // 看下面这个函数：检查是否这些新的数据需要尽快发送出去
+</span><span class='line'>                 (tcp_skb_is_last(sk, skb) ?            // 是否是最后一个包
+</span><span class='line'>                  tp-&gt;nonagle : TCP_NAGLE_PUSH))); 
+</span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  //在正常状态下由tcp_v4_rcv调用，进一步进行针对接收包的处理&lt;br/&gt;
-</span><span class='line'>  检查sk-&gt;sk_state == TCP_ESTABLISHED&lt;br/&gt;
-</span><span class='line'>则tcp_rcv_established(sk, skb, skb-&gt;h.th, skb-&gt;len)，连接已经建立，则进入进一步接收处理！&lt;br/&gt;
-</span><span class='line'>  检查sk-&gt;sk_state == TCP_LISTEN，&lt;br/&gt;
-</span><span class='line'>则struct sock *nsk = tcp_v4_hnd_req(sk, skb);    //该函数中判断能否找到已有的连接请求，如果有则说明接收到的是一个ack并在其中创建一个新的sock即nsk；如果没有则说明接收到的是 syn，nsk即为sk；&lt;br/&gt;
-</span><span class='line'>  if(nsk!=sk) tcp_child_process(sk,nsk,skb)    //当nsk==sk时，接收的是SYN，不进行此步直接进入tcp_rcv_state_process；否则是ack说明已经创建好了的nsk，在 tcp_child_process对nsk进行tcp_rcv_state_process状态转移处理；&lt;br/&gt;
-</span><span class='line'>  tcp_rcv_state_process(sk, skb, skb-&gt;h.th, skb-&gt;len); 非常重要函数！处理tcp的状态转移&lt;br/&gt;
-</span><span class='line'>  reset: tcp_v4_send_reset(rsk, skb);    reset，未看$&lt;br/&gt;
-</span><span class='line'>  discard: kfree_skb(skb);&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* This checks if the data bearing packet SKB (usually tcp_send_head(sk))
+</span><span class='line'> * should be put on the wire right now.  If so, it returns the number of
+</span><span class='line'> * packets allowed by the congestion window.
+</span><span class='line'> */
+</span><span class='line'>static unsigned int tcp_snd_test(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>                 unsigned int cur_mss, int nonagle)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    unsigned int cwnd_quota;
 </span><span class='line'>
-</span><span class='line'>&lt;hr /&gt;
+</span><span class='line'>    tcp_init_tso_segs(sk, skb, cur_mss);             // 看看这个包的tso信息，便于后期和其他包一起处理
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,struct tcphdr *th, unsigned len)    linux/net/ipv4/tcp_input.c #3881
+</span><span class='line'>    if (!tcp_nagle_test(tp, skb, cur_mss, nonagle))  // 使用Nagle测试是不是数据现在就允许被发送，看下面函数（1）
+</span><span class='line'>        return 0;                                    // 如果不可以就返回了
+</span><span class='line'>
+</span><span class='line'>    cwnd_quota = tcp_cwnd_test(tp, skb);             // 返回还可以发送几个窗口的数据
+</span><span class='line'>    if (cwnd_quota &amp;&amp; !tcp_snd_wnd_test(tp, skb, cur_mss))  // 如果有窗口数据可以发送 &amp;&amp; 
+</span><span class='line'>        cwnd_quota = 0;                              // 不可发送，设置=0
+</span><span class='line'>
+</span><span class='line'>    return cwnd_quota;
+</span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;Header Prediction：基于效率的考虑，将包的处理后续阶段分为fast path和slow path两种，前者用于普通的包，后者用于特殊的包；该header prediction即用于区分两种包的流向。&lt;br/&gt;
-</span><span class='line'>1.(tcp_flag_word(th) &amp; TCP_HP_BITS) == tp-&gt;pred_flags 判断标志位是不是正常情况；tcp_flag_word返回指向tcphdr的第三个32位基址（即length前面），而TCP_HP_BITS是把 PSH标志位给屏蔽掉即该位值不影响流向；所以总的来说pred_flag应该等于0xS?10 &lt;&lt; 16 + snd_wnd（那么pred_flag是在tcp_fast_path_check或tcp_fast_path_on中更新值的）&lt;br/&gt;
-</span><span class='line'>2.TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt 判断所收包是否为我们正想要接收的，非乱序包&lt;br/&gt;
-</span><span class='line'>3.*ptr != htonl((TCPOPT_NOP &lt;&lt; 24) | (TCPOPT_NOP &lt;&lt; 16) | (TCPOPT_TIMESTAMP &lt;&lt; 8) | TCPOLEN_TIMESTAMP) 若包中没有正常的timestamp选项则转入slow path
-</span><span class='line'> timestamp选项处理： 从包中的ts选项中获取数据，以此刷新tp-&gt;rx_opt的saw_tstamp,rcv_tsval,rcv_tsecr域；ts选项含三个 32bit，其中后两个分别记录着tsval和tsecr；（注意，ts_recent并不在此处更新，在后面的tcp_store_ts_recent 中更新）&lt;br/&gt;
-</span><span class='line'>  struct tcp_options_received: 定义在tcp.h中，其中saw_tstamp表明timestamp选项是否有效，ts_recent_stamp是我们最近一次更新 ts_recent的时间，ts_recent是下一次回显的时戳一般等于下次发包中的rcv_tsecr；rcv_tsval是该data从发端发出时的时戳值，rcv_tsecr是回显时间戳（即该ack对应的data或者该data对应的上次ack中的ts_tsval值），（注意两端时钟无需同步；当ack被收端推迟时，所回复的ack中的timestamp指向所回复包群中的第一个确认包 “When an incoming segment belongs to the current window, but arrives out of order (which implies that an earlier segment was lost), the timestamp of the earlier segment is returned as soon as it arrives, rather than the timestamp of the segment that arrived out of order.”这条细节未看明白$）从包中的时间戳选项中记录这两个值&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;4.PAWS check：(s32)(tp-&gt;rx_opt.rcv_tsval - tp-&gt;rx_opt.ts_recent) &lt; 0，则转入slow path&lt;br/&gt;
-</span><span class='line'>  （PAWS:Protection Against Wrapped Sequence Numbers, SeqNo有可能会有回环交叠（因为它最大只有32bit），两个相同序号的包实际上是不同的两个包，此时判断tsval是否小于ts_recent即判断该包是否是一个过去时间的一个多余的包，然后将其作为一个重复包丢弃）&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;Fast Path：&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  1.当len == tcp_header_len，即这是一个纯ack（区别于piggyback），注意这是个纯ack，所以它通过长度来进行判断而不是标识！&lt;br/&gt;
-</span><span class='line'>tcp_store_ts_recent(tp): tp-&gt;rx_opt.ts_recent = tp-&gt;rx_opt.rcv_tsval;&lt;br/&gt;
-</span><span class='line'>tcp_ack(sk, skb, 0) 处理ack，进一步处理，未看！&lt;br/&gt;
-</span><span class='line'>&lt;code&gt;__kfree_skb(skb)&lt;/code&gt; 释放该包&lt;br/&gt;
-</span><span class='line'> tcp_data_snd_check(sk,tp) 检查有无更进一步的data包处理&lt;br/&gt;
-</span><span class='line'>  2.当len &lt; tcp_header_len，说明该包的首部太小，清除之；&lt;br/&gt;
-</span><span class='line'>  3.当len &gt; tcp_header_len，它是一个data包，tcp_copy_to_iovec函数未看，它决定该payload是否可以直接拷贝给用户空间：&lt;br/&gt;
-</span><span class='line'>可，tcp_store_ts_recent(tp);&lt;br/&gt;
-</span><span class='line'>  tcp_rcv_rtt_measure_ts(sk,skb); //计算RTT&lt;br/&gt;
-</span><span class='line'>  &lt;code&gt;__skb_pull(skb, tcp_header_len);&lt;/code&gt; //剥tcp首部&lt;br/&gt;
-</span><span class='line'>   tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq; //更新rcv_next&lt;br/&gt;
-</span><span class='line'>($ 那么将data拷贝到用户空间的操作在何处体现？难道是在tcp_copy_to_iovec中？)&lt;br/&gt;
-</span><span class='line'>不可，除了以上的操作之外，还要&lt;br/&gt;
-</span><span class='line'>  &lt;code&gt;__skb_queue_tail(&amp;sk-&gt;sk_receive_queue, skb);&lt;/code&gt; //将该包加入到接收sk_buff队列尾部&lt;br/&gt;
-</span><span class='line'>tcp_event_data_recv()：management tasks处理&lt;br/&gt;
-</span><span class='line'>若TCP_SKB_CB(skb)-&gt;ack_seq != tp-&gt;snd_una，说明这是一个有效的ack包&lt;br/&gt;
-</span><span class='line'>  tcp_ack(sk, skb, FLAG_DATA); //FLAG_DATA说明这是一个背在data上的ack&lt;br/&gt;
-</span><span class='line'>  tcp_data_snd_check(sk, tp); //该函数调用tcp_push_pending_frames函数，如果sk-&gt;sk_send_head存在则最终调用 tcp_write_xmit函数发包&lt;br/&gt;
-</span><span class='line'>  &lt;code&gt;__tcp_ack_snd_check(sk, 0);&lt;/code&gt; //检查基于该收包事件，有无进一步的ack包处理（Delayed ACK，Quick ACK）&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;Slow Path：&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  tcp_checksum_complete_user(sk, skb)：checksum检查&lt;br/&gt;
-</span><span class='line'>  tcp_fast_parse_options(skb, th, tp)：timestamp选项检查；tcp_paws_discard(sk, skb)：PAWS检查&lt;br/&gt;
-</span><span class='line'>  tcp_sequence(tp, TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq)：检查是否乱序，并在其中激活QuickACK模式&lt;br/&gt;
-</span><span class='line'>上面两行中，都会再检查RST标志，若没激活则tcp_send_dupack，作用不明，貌似是针对该错包回复一个冗余的ack&lt;br/&gt;
-</span><span class='line'>  检查RST标志，tcp_reset(sk) 该函数没什么操作，填写一些错误信息后进入tcp_done函数(该函数进行一些关闭tcp连接的收尾操作)&lt;br/&gt;
-</span><span class='line'>  tcp_replace_ts_recent(tp, TCP_SKB_CB(skb)-&gt;seq)：更新timestamp信息&lt;br/&gt;
-</span><span class='line'>  检查SYN标志，在连接已建立的状态下，收到SYN是错误的，因此tcp_reset(sk)&lt;br/&gt;
-</span><span class='line'>  检查ACK标志，tcp_ack(sk, skb, FLAG_SLOWPATH)&lt;br/&gt;
-</span><span class='line'>  tcp_rcv_rtt_measure_ts(sk, skb)：更新RTT&lt;br/&gt;
-</span><span class='line'>  tcp_urg(sk, skb, th)：处理URG标志&lt;br/&gt;
-</span><span class='line'>  tcp_data_queue(sk, skb)：处理接收包所含数据，未看&lt;br/&gt;
-</span><span class='line'>  tcp_data_snd_check(sk, tp) &amp; tcp_ack_snd_check(sk)：检查有无进一步的data或ack发送&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;hr /&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void tcp_event_data_recv(struct sock *sk, struct tcp_sock *tp, struct sk_buff *skb)    linux/net/ipv4/tcp_input.c #502
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  //
-</span><span class='line'>  inet_csk_schedule_ack(sk)：将icsk_pending置为ICSK_ACK_SCHED，但具体意义不明&lt;br/&gt;
-</span><span class='line'>  （struct inet_connection_sock：/linux/include/net/inet_connection_sock，面向INET连接的 socket结构，记录着和tcp连接有关的很多变量，比如本函数要处理的ATO（Acknowledgement timeout）信息；tcp_sock是其上的拓展，它的具体意义尚待发掘）&lt;br/&gt;
-</span><span class='line'>  tcp_measure_rcv_mss(sk, skb)：更新rcv_mss，说是与delayed ACK有关，但是具体是怎么运作的？&lt;br/&gt;
-</span><span class='line'>  tcp_rcv_rtt_measure(tp)：更新RTT，为什么又更新一遍$&lt;br/&gt;
-</span><span class='line'>  接下来的一些列操作是更新inet_connection_sock中的ATO信息，具体操作代码中有注释，但这些信息的运作方式还不明&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;hr /&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int tcp_ack(struct sock *sk, struct sk_buff *skb, int flag)    /linux/net/ipv4/tcp_input.c #2491
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  //处理接受到的ack，内容非常复杂
-</span><span class='line'>  首先介绍一下ack可以携带的各个FLAG：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>FLAG_DATA：              Incoming frame contained data.
-</span><span class='line'>FLAG_WIN_UPDATE：        Incoming ACK was a window update
-</span><span class='line'>FLAG_DATA_ACKED：        This ACK acknowledged new data.
-</span><span class='line'>FLAG_RETRANS_DATA_ACKED：Some of which was retransmitted.
-</span><span class='line'>FLAG_SYN_ACKED：         This ACK acknowledged SYN.
-</span><span class='line'>FLAG_DATA_SACKED：       New SACK.
-</span><span class='line'>FLAG_ECE：               ECE in this ACK.
-</span><span class='line'>FLAG_DATA_LOST：         SACK detected data lossage.
-</span><span class='line'>FLAG_SLOWPATH：          Do not skip RFC checks for window update.
-</span><span class='line'>FLAG_ACKED：             (FLAG_DATA_ACKED|FLAG_SYN_ACKED)
-</span><span class='line'>FLAG_NOT_DUP：           (FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
-</span><span class='line'>FLAG_CA_ALERT：          (FLAG_DATA_SACKED|FLAG_ECE)
-</span><span class='line'>FLAG_FORWARD_PROGRESS： (FLAG_ACKED|FLAG_DATA_SACKED)
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  prior_snd_una = tp-&gt;snd_una;ack_seq = TCP_SKB_CB(skb)-&gt;seq; ack = TCP_SKB_CB(skb)-&gt;ack_seq;&lt;br/&gt;
-</span><span class='line'>  //1记录着上一次被确认的data序号；2记录着所收ack包的序号；3记录着所收ack包确认对象的data序号；&lt;br/&gt;
-</span><span class='line'>  首先判断若ack在tp-&gt;snd_nxt之后或者在prio_snd_una之前，则说明该ack非法或者过时（在过时的情况下，若sacked打开则还需tcp_sacktag_write_queue处理） 24</span></code></pre></td></tr></table></div></figure>
-    if (!(flag&amp;FLAG_SLOWPATH) &amp;&amp; after(ack, prior_snd_una))
-        tcp_update_wl（即tp->snd_wl1 = ack_seq）; tp->snd_una=ack; //为什么此种情况下并不更新窗口？
-    else
-        flag |= tcp_ack_update_window(sk, tp, skb, ack, ack_seq);
-        //nwin = ntohs(skb->h.th->window)从ack中记录通告窗口
-        如果检查需要更新发送窗口，则tp->snd_wl1 = ack_seq; tp->snd_wnd = nwin;
-        tp->snd_una = ack;
-        if (TCP_SKB_CB(skb)->sacked) flag |= tcp_sacktag_write_queue(sk, skb, prior_snd_una); //该函数未看</p>
+</span><span class='line'>&lt;p&gt;看Nagle测试函数tcp_nagle_test：</span></code></pre></td></tr></table></div></figure>
+    /<em> Return non-zero if the Nagle test allows this packet to be
+     * sent now.
+     </em>/
+    static inline int tcp_nagle_test(struct tcp_sock <em>tp, struct sk_buff </em>skb,
+                     unsigned int cur_mss, int nonagle) // 注意：测试返回1就是说明那个数据包现在允许直接发送出去
+    {                                       // 而Nagle对于小包是缓存一起发送的，除了第一个包、最后一个包
+        /<em> Nagle rule does not apply to frames, which sit in the middle of the
+         * write_queue (they have no chances to get new data).
+         *
+         * This is implemented in the callers, where they modify the &lsquo;nonagle&rsquo;
+         * argument based upon the location of SKB in the send queue.
+         </em>/
+        if (nonagle &amp; TCP_NAGLE_PUSH)       // 设置了这个标识是因为说明可能是第一个包或者第二个包，或者其他一些允许的原因呢
+            return 1;                       // Nagle允许直接发送包出去</p>
 
-<pre><code>    tp-&gt;rcv_tstamp = tcp_time_stamp; //rcv_tstamp记录着最近一次收到ack的时戳
-    prior_in_flight = tcp_packets_in_flight(tp);
-    if(!tp-&gt;packets_out) icsk-&gt;icsk_prbes_out = 0;
-    if (sk-&gt;sk_send_head) tcp_ack_probe(sk);    //若此时网络中没有data，直接进入zero-window probe的ack处理;通告窗口的数据已经得到处理，所以tcp_ack_probe中仅仅是重置probe计时器，即 icsk-&gt;icsk_retransmit_timer
+<pre><code>    /* Don't use the nagle rule for urgent data (or for the final FIN).
+     * Nagle can be ignored during F-RTO too (see RFC4138).
+     */
+    if (tp-&gt;urg_mode || (tp-&gt;frto_counter == 2) ||      // 注意对于紧急数据来说不可以使用Nagle规则！上面说过Nagle是缓存处理数据，紧急数据不可以！
+        (TCP_SKB_CB(skb)-&gt;flags &amp; TCPCB_FLAG_FIN))      // 注意结束包(FIN)和F-RTO标识包都需要立马发送出去
+        return 1;
 
-    flag |= tcp_clean_rtx_queue(sk, &amp;seq_rtt);   //从重传队列中移除被确认的data包
+    if (!tcp_nagle_check(tp, skb, cur_mss, nonagle))    // 在Nagle算法下，是否允许发送这个包？返回0则允许立刻发送
+        return 1;
 
-    if (tcp_ack_is_dubious(sk, flag)) { //该函数判断此ack是否可疑，判真情况下具体是flag不为FLAG_NOT_DUP，或flag是FLAG_CA_ALERT，或 icsk_ca_state不为TCP_CA_OPEN状态
-    if ((flag &amp; FLAG_DATA_ACKED) &amp;&amp; tcp_may_raise_cwnd(sk, flag))
-    //如果这个包是一个对新数据包的ack，那么通过tcp_may_raise_cwnd函数来判断是否要进行窗口操作，判真情况下具体是flag不是 FLAG_ECE或snd_cwnd&lt;snd_ssthresh（慢启动？）且icsk_ca_state不为TCP_CA_RECOVERY和 TCP_CA_CWR状态（所以，为什么TCP_CA_LOSS状态可以增窗呢？）
-        tcp_cong_avoid(sk, ack, seq_rtt, prior_in_flight, 0);  
-    //该函数会调用icsk-&gt;icsk_ca_ops-&gt;cong_avoid(sk, ack, rtt, in_flight, good)， 这是个函数指针；另外会更新snd_cwnd_stamp
-    tcp_fastretrans_alert(sk, prior_snd_una, prior_packets, flag); //未看，极其重要的函数
-}else{
-    if ((flag &amp; FLAG_DATA_ACKED)) tcp_cong_avoid(sk, ack, seq_rtt, prior_in_flight, 1);
+    return 0;
 }
 </code></pre>
 
-<pre><code>tcp_ack中有很多新的内容，都还未涉及，要注意！！！！！！
-
----------
+<pre><code>
+tcp_nagle_check函数：
 </code></pre>
 
-<pre><code>static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)    /linux/net/ipv4/tcp_input.c #3139
+<pre><code>/* Return 0, if packet can be sent now without violation Nagle's rules:   Nagle算法允许下面条件的包可以正常发送
+ * 1. It is full sized.                                 // 大小等于MSS，即缓存满，或者是大包
+ * 2. Or it contains FIN. (already checked by caller)   // 是结束包FIN
+ * 3. Or TCP_NODELAY was set.                           // 不允许延迟的包
+ * 4. Or TCP_CORK is not set, and all sent packets are ACKed. // TCP_CORK没有设置
+ *    With Minshall's modification: all sent small packets are ACKed.
+ */
+static inline int tcp_nagle_check(const struct tcp_sock *tp,
+                 const struct sk_buff *skb,
+                  unsigned mss_now, int nonagle)
+{
+    return (skb-&gt;len &lt; mss_now &amp;&amp;           // 检查在Nagle算法情况下，是不是可以发送这个包
+        ((nonagle &amp; TCP_NAGLE_CORK) ||      // 满足上面四个条件就OK
+         (!nonagle &amp;&amp; tp-&gt;packets_out &amp;&amp; tcp_minshall_check(tp))));
+}
 </code></pre>
 
-<p>```
-  //将数据拷贝至用户空间<br/>
-若TCP_SKB_CB(skb)->seq == TCP_SKB_CB(skb)->end_seq 则空包丢弃<br/>
-__skb_pull(skb, th->doff*4) //剥离tcp首部</p>
+<pre><code>
+tcp_cwnd_test函数用于测试在当前的拥塞窗口情况下，最多还可以发送几个新数据
+</code></pre>
 
-<h5>1.若TCP_SKB_CB(skb)->seq == tp->rcv_nxt且tcp_receive_window(tp)!=0，非乱序且处于接受窗口中，正常的情况</h5>
+<pre><code>/* Can at least one segment of SKB be sent right now, according to the
+ * congestion window rules?  If so, return how many segments are allowed.
+ */
+static inline unsigned int tcp_cwnd_test(struct tcp_sock *tp,    // 根据当前的拥塞窗口，返回当前还可以发送几个segs
+                     struct sk_buff *skb)
+{
+    u32 in_flight, cwnd;
 
-<p>若tp->ucopy.task == current, tp->copied_seq == tp->rcv_nxt, tp->ucopy.len等条件满足，则可以拷贝至用户空间<br/>
-  //current是什么不明？ucopy.len貌似是用户最先设定的数据包的量，每次收包之后减小直至零<br/>
-    skb_copy_datagram_iovec(skb, 0, tp->ucopy.iov, chunk) //向ucopy.iov拷贝数据<br/>
-    tcp_rcv_space_adjust(sk) //计算TCP接受buffer空间大小，拷贝完<br/>
-tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;<br/>
-if(th->fin) tcp_fin(skb, sk, th); //原来fin的处理在这里！<br/>
-若!skb_queue_empty(&amp;tp->out_of_order_queue)<br/>
-    tcp_ofo_queue(sk); //看out_of_order_queue中有没有可以移到receive_queue中<br/>
-    tcp_sack_remove(tp) //RCV.NXT advances, some SACKs should be eaten<br/>
-    tcp_fast_path_check(sk,tp)   //tp->pred_flag值的更新<br/>
-  清除skb并return</p>
+    /* Don't be strict about the congestion window for the final FIN.  */
+    if ((TCP_SKB_CB(skb)-&gt;flags &amp; TCPCB_FLAG_FIN) &amp;&amp;    // 如果是最后的FIN包
+        tcp_skb_pcount(skb) == 1)
+        return 1;                           // 返回一个OK
 
-<h5>2.若!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt) 说明这是一个重传的包</h5>
+    in_flight = tcp_packets_in_flight(tp);  // 获得还在传输中的包
+    cwnd = tp-&gt;snd_cwnd;                    // 获得当前窗口大小
+    if (in_flight &lt; cwnd)                   // 
+        return (cwnd - in_flight);          // 剩下的部分都是可以发送的
 
-<p>  tcp_dsack_set(tp, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);   //在其中打开并填写dsack信息,在dyokucate_sack[0]中从seq到end_seq，修改dsack和eff_sacks值<br/>
-  tcp_enter_quickack_mode(sk); //进入quick ack模式<br/>
-  清除skb并return<br/>
-若!before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt + tcp_receive_window(tp))<br/>
-  清除skb并return<br/>
-若before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt) 说明这是一个Partial包，即seq&lt;rcv_next&lt;end_seq<br/>
-  tcp_dsack_set(tp, TCP_SKB_CB(skb)->seq, tp->rcv_nxt); //填写dsack信息，从seq到rcv_nxt</p>
+    return 0;
+}
+</code></pre>
 
-<h5>3. 其他情况，说明收到了一个乱序包</h5>
+<pre><code>
+主要是用于测试最后一个数据是不是在窗口内，在则可以发送，不在则不可以发送
+</code></pre>
 
-<p>若out_of_order_queue为空，则<br/>
-（注：out_of_order_queue是一个sk_buff_head结构，它的prev/next指针分别指向最后一个和第一个sk_buff结构，块的排放顺序对应其序号的大小顺序）<br/>
-  初始化sack相关域，num_sacks/eff_sacks为1，dsack为0，selective_acks[0]从seq到end_seq；<br/>
-  <code>__skb_queue_head(&amp;tp-&gt;out_of_order_queue,skb);</code> //将收包加入out_of_order_queue的头部</p>
+<pre><code>/* Does at least the first segment of SKB fit into the send window? */
+static inline int tcp_snd_wnd_test(struct tcp_sock *tp, struct sk_buff *skb,
+                   unsigned int cur_mss)
+{
+    u32 end_seq = TCP_SKB_CB(skb)-&gt;end_seq;
 
-<p>若out_of_order_queue不为空，则首先获取skb1 = tp->out_of_order_queue.prev即最新的一个乱序块<br/>
-  若seq == TCP_SKB_CB(skb1)->end_seq，说明收包能够接在最新乱序块的右边<br/>
-    <code>__skb_append(skb1, skb, &amp;tp-&gt;out_of_order_queue);</code><br/>
-    tp->selective_acks[0].end_seq = end_seq; //将新收包接在skb1的右边，看来第一个selective_acks块对应的是最新的乱序序列<br/>
-  循环执行skb1=skb1->prev，直到找到!after(TCP_SKB_CB(skb1)->seq, seq)表明需要将收包插在此块之后，或skb1=(struct sk_buff<em>)&amp;tp->out_of_order_queue表明收包比队列中的所与块的序列都要小<br/>
-    循环内需要找到收包与队列已有包中的重复部分，然后tcp_dsack_set设置该部分为dsack内容<br/>
-  <code>__skb_insert(skb, skb1, skb1-&gt;next, &amp;tp-&gt;out_of_order_queue);</code> //将收包对应的块插入到队列中<br/>
-  再次循环执行skb1=skb1->next，直到找到!after(end_seq, TCP_SKB_CB(skb1)->seq)表明需要将从收包到该包之间的所有包全部从队列中移除，或者skb1=(struct sk_buff</em>)&amp;tp->out_of_order_queue表明需要将收包之后的所有包都移出<br/>
-    循环内需要将当前的队列包与收包的交叠部分设置为dsack值（当然随着循环的推进，dsack处于不断更新的状况），还要通过 <code>__skb_unlink(skb1, &amp;tp-&gt;out_of_order_queue)，__kfree_skb(skb1);</code>将当前的队列包移除<br/>
-  （该处的两部循环，旨在通过比较队列中块的序号和所收包的序号范围，将队列中的包连续化，即消除孔洞）</p>
+    if (skb-&gt;len &gt; cur_mss)   // skb数据长度比MSS长
+        end_seq = TCP_SKB_CB(skb)-&gt;seq + cur_mss;   // 最后一个seq
 
-<hr />
+    return !after(end_seq, tcp_wnd_end(tp));        // 最后一个seq是不是在窗口内，不在则不可以发送
+}
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[tcp重传数据包 tcp_retransmit_skb 函数]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp3/"/>
+    <updated>2015-03-04T17:39:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp3</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/shanshanpt/article/details/22202999">http://blog.csdn.net/shanshanpt/article/details/22202999</a></p>
+
+<pre><code>    /* This retransmits one SKB.  Policy decisions and retransmit queue
+     * state updates are done by the caller.  Returns non-zero if an
+     * error occurred which prevented the send.
+     */
+    int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct inet_connection_sock *icsk = inet_csk(sk);
+        unsigned int cur_mss = tcp_current_mss(sk, 0);
+        int err;
+
+        /* Inconslusive MTU probe */
+        if (icsk-&gt;icsk_mtup.probe_size) {
+            icsk-&gt;icsk_mtup.probe_size = 0;
+        }
+
+        /* Do not sent more than we queued. 1/4 is reserved for possible  
+         * copying overhead: fragmentation, tunneling, mangling etc.
+         */ // 如果消耗很多的内存做其他事，那么就没有多余的来做队列的处理了~
+        if (atomic_read(&amp;sk-&gt;sk_wmem_alloc) &gt;                    // sk_wmem_alloc：传输队列大小
+            min(sk-&gt;sk_wmem_queued + (sk-&gt;sk_wmem_queued &gt;&gt; 2), sk-&gt;sk_sndbuf))  // sk_wmem_queud：固定的队列大小
+            return -EAGAIN;
+
+        if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {         // 若这样，说明是有一部分数据才需要重传，形如：seq---snd_una---end_seq，前面一半已收到ACK
+            if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))   // 若这样，说明全部ACK，无需重传，BUG
+                BUG();
+            if (tcp_trim_head(sk, skb, tp-&gt;snd_una - TCP_SKB_CB(skb)-&gt;seq))      // 一些控制信息检查
+                return -ENOMEM;
+        }
+
+        /* If receiver has shrunk his window, and skb is out of
+         * new window, do not retransmit it. The exception is the
+         * case, when window is shrunk to zero. In this case
+         * our retransmit serves as a zero window probe.
+         */
+        if (!before(TCP_SKB_CB(skb)-&gt;seq, tcp_wnd_end(tp))    // 如果数据在窗口后面，不会发送
+            &amp;&amp; TCP_SKB_CB(skb)-&gt;seq != tp-&gt;snd_una)   
+               return -EAGAIN;
+
+        if (skb-&gt;len &gt; cur_mss) {    // 如果skb长度 &gt; MSS
+            if (tcp_fragment(sk, skb, cur_mss, cur_mss))      // 先分片。再传送
+                return -ENOMEM; /* We'll try again later. */
+        }
+
+        /* Collapse two adjacent packets if worthwhile and we can. */   // 我*，这么多条件
+        if (!(TCP_SKB_CB(skb)-&gt;flags &amp; TCPCB_FLAG_SYN) &amp;&amp;               // SYN包
+            (skb-&gt;len &lt; (cur_mss &gt;&gt; 1)) &amp;&amp;                              // 长度&lt;半个MSS
+            (tcp_write_queue_next(sk, skb) != tcp_send_head(sk)) &amp;&amp;     // 不是结尾
+            (!tcp_skb_is_last(sk, skb)) &amp;&amp;                              // 不是最后一个
+            (skb_shinfo(skb)-&gt;nr_frags == 0 &amp;&amp;                          // 没有分页数据
+             skb_shinfo(tcp_write_queue_next(sk, skb))-&gt;nr_frags == 0) &amp;&amp;
+            (tcp_skb_pcount(skb) == 1 &amp;&amp;                                // gso_segs=1
+             tcp_skb_pcount(tcp_write_queue_next(sk, skb)) == 1) &amp;&amp;
+            (sysctl_tcp_retrans_collapse != 0))
+            tcp_retrans_try_collapse(sk, skb, cur_mss);                 // 这个函数不是很明白，待看~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        if (inet_csk(sk)-&gt;icsk_af_ops-&gt;rebuild_header(sk))              // 根据目的地址等条件获取路由，如果获取路由失败就不能发送
+            return -EHOSTUNREACH; /* Routing failure or similar. */
+
+        /* Some Solaris stacks overoptimize and ignore the FIN on a
+         * retransmit when old data is attached.  So strip it off
+         * since it is cheap to do so and saves bytes on the network.
+         *///Solaris系统的协议栈有时候会忽略重传SKB上带有的FIN标志的payload，将payload全部剥离掉，节省网络流量
+        if (skb-&gt;len &gt; 0 &amp;&amp;
+            (TCP_SKB_CB(skb)-&gt;flags &amp; TCPCB_FLAG_FIN) &amp;&amp;
+            tp-&gt;snd_una == (TCP_SKB_CB(skb)-&gt;end_seq - 1)) {
+            if (!pskb_trim(skb, 0)) {
+                /* Reuse, even though it does some unnecessary work */
+                tcp_init_nondata_skb(skb, TCP_SKB_CB(skb)-&gt;end_seq - 1,
+                             TCP_SKB_CB(skb)-&gt;flags);
+                skb-&gt;ip_summed = CHECKSUM_NONE;
+            }
+        }
+
+        /* Make a copy, if the first transmission SKB clone we made
+         * is still in somebody's hands, else make a clone.
+         */
+        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;
+
+        err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);     // 这个才是正在的传输函数~~~~~~~~~~~~~~~~~~~~后面再说~~~~~~~~~~~~~~~
+                                                            // 这个函数就是将数据包发送到下面一层，再慢慢传输出去~~~~~~~~~~~~~~
+        if (err == 0) {    // 发送成功，那么就需要更新TCP统计信息
+            /* Update global TCP statistics. */  
+            TCP_INC_STATS(TCP_MIB_RETRANSSEGS);
+
+            tp-&gt;total_retrans++;   // 整体重传数量++
+
+    #if FASTRETRANS_DEBUG &gt; 0
+            if (TCP_SKB_CB(skb)-&gt;sacked &amp; TCPCB_SACKED_RETRANS) {
+                if (net_ratelimit())
+                    printk(KERN_DEBUG "retrans_out leaked.\n");
+            }
+    #endif
+            if (!tp-&gt;retrans_out)
+                tp-&gt;lost_retrans_low = tp-&gt;snd_nxt;
+            TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_RETRANS;
+            tp-&gt;retrans_out += tcp_skb_pcount(skb);         // 重传出去的数量+=。。。
+
+            /* Save stamp of the first retransmit. */
+            if (!tp-&gt;retrans_stamp)
+                tp-&gt;retrans_stamp = TCP_SKB_CB(skb)-&gt;when;  // 第一次重传时间戳
+
+            tp-&gt;undo_retrans++;
+
+            /* snd_nxt is stored to detect loss of retransmitted segment,
+             * see tcp_input.c tcp_sacktag_write_queue().
+             */
+            TCP_SKB_CB(skb)-&gt;ack_seq = tp-&gt;snd_nxt;
+        }
+        return err;
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[拥塞避免处理函数 tcp_reno_cong_avoid]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp2/"/>
+    <updated>2015-03-04T17:35:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp2</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/shanshanpt/article/details/22201847">http://blog.csdn.net/shanshanpt/article/details/22201847</a></p>
+
+<p>慢启动和快速重传拥塞避免算法，函数tcp_reno_cong_avoid<br/>
+在“慢开始”阶段，每收到一个ACK，cwnd++一次，那么一个RTT之后，cwnd就会加倍<br/>
+拥塞避免阶段，其实就是在一个RTT时间内将cwnd++一次( 注意在不丢包的情况下 )</p>
+
+<pre><code>    /*
+     * TCP Reno congestion control
+     * This is special case used for fallback as well.
+     */
+    /* This is Jacobson's slow start and congestion avoidance.
+     * SIGCOMM '88, p. 328.
+     */
+    void tcp_reno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);         // 获取tcp_sock
+        // 函数返回1说明拥塞窗口被限制，我们需要增加拥塞窗口，否则的话，就不需要增加拥塞窗口。
+        if (!tcp_is_cwnd_limited(sk, in_flight))  // 是否已经达到拥塞窗口的限制值（1）
+            return;
+
+        /* In "safe" area, increase. */
+        if (tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh)     // 如果发送窗口大小还 比 慢开始门限小，那么还是慢开始处理
+            tcp_slow_start(tp);                   // 下面进入慢开始处理 (2)
+        /* In dangerous area, increase slowly. */
+        else if (sysctl_tcp_abc) {                // 否则进入拥塞避免阶段！！每个RTT时间就加1
+            /* RFC3465: Appropriate Byte Count
+             * increase once for each full cwnd acked              // 基本思想就是：经过一个RTT时间就将snd_cwnd增加一个单位！
+             */                                                    // 一个RTT时间可以认为是当前拥塞窗口发送出去的数据的所有ACK都被接收到
+            if (tp-&gt;bytes_acked &gt;= tp-&gt;snd_cwnd*tp-&gt;mss_cache) {   // 当前的拥塞窗口的所有段都被ack了，窗口才被允许增加。
+                tp-&gt;bytes_acked -= tp-&gt;snd_cwnd*tp-&gt;mss_cache;     // ACK处理过的及删除去了
+                if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)             // 不允许发送窗口大小超过snd_cwnd_clamp值
+                    tp-&gt;snd_cwnd++;
+            }
+        } else {                                       // 每接收到一个ACK，窗口增大(1/snd_cwnd)，使用cnt计数
+            /* In theory this is tp-&gt;snd_cwnd += 1 / tp-&gt;snd_cwnd */
+            if (tp-&gt;snd_cwnd_cnt &gt;= tp-&gt;snd_cwnd) {    // 线性增长计数器 &gt;= 阈值 
+                if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp) // 如果窗口还没有达到阈值
+                    tp-&gt;snd_cwnd++;                    // 那么++增大窗口
+                tp-&gt;snd_cwnd_cnt = 0;
+            } else
+                tp-&gt;snd_cwnd_cnt++;                    // 否则仅仅是增大线性递增计数器
+        }
+    }
+</code></pre>
+
+<p>下面看一下“慢开始”算法：
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_slow_start(struct tcp_sock &lt;em&gt;tp)           // 每到达一个ACK，snd_cwnd就加1。这意味着每个RTT，拥塞窗口就会翻倍。
+</span><span class='line'>{
+</span><span class='line'>    int cnt; /&lt;/em&gt; increase in packets */&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* RFC3465: ABC Slow start
+</span><span class='line'> * Increase only after a full MSS of bytes is acked
+</span><span class='line'> *
+</span><span class='line'> * TCP sender SHOULD increase cwnd by the number of
+</span><span class='line'> * previously unacknowledged bytes ACKed by each incoming
+</span><span class='line'> * acknowledgment, provided the increase is not more than L
+</span><span class='line'> */
+</span><span class='line'>if (sysctl_tcp_abc &amp;&amp; tp-&gt;bytes_acked &lt; tp-&gt;mss_cache)                     // 如果ack确认的数据少于一个MSS大小，不需要增大窗口
+</span><span class='line'>    return;
+</span><span class='line'>// 限制cnt的值
+</span><span class='line'>if (sysctl_tcp_max_ssthresh &gt; 0 &amp;&amp; tp-&gt;snd_cwnd &gt; sysctl_tcp_max_ssthresh) // 发送窗口超过最大门限值
+</span><span class='line'>    cnt = sysctl_tcp_max_ssthresh &gt;&gt; 1;     /* limited slow start */       // 窗口减半~~~~~
+</span><span class='line'>else
+</span><span class='line'>    cnt = tp-&gt;snd_cwnd;          /* exponential increase */                // 否则还是原来的窗口
+</span><span class='line'>
+</span><span class='line'>/* RFC3465: ABC
+</span><span class='line'> * We MAY increase by 2 if discovered delayed ack
+</span><span class='line'> */
+</span><span class='line'>if (sysctl_tcp_abc &gt; 1 &amp;&amp; tp-&gt;bytes_acked &gt;= 2*tp-&gt;mss_cache) // 如果启动了延迟确认，那么当接收到的ACK大于等于两个MSS的时候才加倍窗口大小
+</span><span class='line'>    cnt &lt;&lt;= 1;
+</span><span class='line'>tp-&gt;bytes_acked = 0;  // 清空
+</span><span class='line'>
+</span><span class='line'>tp-&gt;snd_cwnd_cnt += cnt;
+</span><span class='line'>while (tp-&gt;snd_cwnd_cnt &gt;= tp-&gt;snd_cwnd) {  // 这里snd_cwnd_cnt是snd_cwnd的几倍，拥塞窗口就增加几。
+</span><span class='line'>    tp-&gt;snd_cwnd_cnt -= tp-&gt;snd_cwnd;       // ok
+</span><span class='line'>    if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)  // 判断窗口大小
+</span><span class='line'>        tp-&gt;snd_cwnd++;  // + +
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>最后看一下这个函数：tcp_is_cwnd_limited，基本的意思就是判断需不需要增大拥塞窗口。
+</span><span class='line'>
+</span><span class='line'>关于gso：主要功能就是尽量的延迟数据包的传输，以便与在最恰当的时机传输数据包。如果支持gso，就有可能是tso 延迟了数据包，因此这里会进行几个相关的判断，来看需不需要增加拥塞窗口。
+</span><span class='line'>
+</span><span class='line'>关于burst：主要用来控制网络流量的突发性增大，也就是说当left数据(还能发送的数据段数)大于burst值的时候，我们需要暂时停止增加窗口，因为此时有可能我们这边数据发送过快。其实就是一个平衡权值。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)  // 第二个参数是正在网络中传输，还没有收到确认的报数量
+</span><span class='line'>{
+</span><span class='line'>const struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>u32 left;
+</span><span class='line'>
+</span><span class='line'>if (in_flight &gt;= tp-&gt;snd_cwnd)    // 比较发送未确认和发送拥塞窗口的大小
+</span><span class='line'>    return 1;                     // 如果未确认的大，那么需要增大拥塞窗口
+</span><span class='line'>
+</span><span class='line'>if (!sk_can_gso(sk))              // 如果没有gso延时处理所有包，不需要增大窗口
+</span><span class='line'>    return 0;
+</span><span class='line'>
+</span><span class='line'>left = tp-&gt;snd_cwnd - in_flight;  // 得到还能发送的数据包的数量
+</span><span class='line'>if (sysctl_tcp_tso_win_divisor)    
+</span><span class='line'>    return left * sysctl_tcp_tso_win_divisor &lt; tp-&gt;snd_cwnd;
+</span><span class='line'>else
+</span><span class='line'>    return left &lt;= tcp_max_burst(tp); // 如果还可以发送的数量&gt;burst，说明发送太快，不需要增大窗口。
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[清理重传队列中函数 tcp_clean_rtx_queue]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp1/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-03-04T17:25:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/03/04/kernel-net-tcp1&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/shanshanpt/article/details/22194029"&gt;http://blog.csdn.net/shanshanpt/article/details/22194029&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果重传队列中的一些数据已经被确认，那么， 需要从重传队列中清除出去，需要使用这个函数：tcp_clean_rtx_queue</span></code></pre></td></tr></table></div></figure>
+    /<em> Remove acknowledged frames from the retransmission queue. If our packet
+     * is before the ack sequence we can discard it as it&rsquo;s confirmed to have
+     * arrived at the other end.
+     </em>/<br/>
+    static int tcp_clean_rtx_queue(struct sock <em>sk, int prior_fackets)<br/>
+    {<br/>
+        struct tcp_sock </em>tp = tcp_sk(sk);   // 获得tcp_sock<br/>
+        const struct inet_connection_sock <em>icsk = inet_csk(sk); // 获得连接sock<br/>
+        struct sk_buff </em>skb;<br/>
+        u32 now = tcp_time_stamp;           // 当前时间，用于计算RTT<br/>
+        int fully_acked = 1;                // 表示数据段是否完全被确认<br/>
+        int flag = 0;<br/>
+        u32 pkts_acked = 0;<br/>
+        u32 reord = tp->packets_out;        // 发送出去，还在网络上跑，但是还没有被确认的数据包们<br/>
+        s32 seq_rtt = -1;<br/>
+        s32 ca_seq_rtt = -1;<br/>
+        ktime_t last_ackt = net_invalid_timestamp();    // 把last_ackt设置位0<br/>
+        // 下面就是遍历sk_write_queue队列，遇到snd_una就停止，如果没有更新过，开始就直接退出了<br/>
+        while ((skb = tcp_write_queue_head(sk)) &amp;&amp; skb != tcp_send_head(sk)) {<br/>
+            struct tcp_skb_cb *scb = TCP_SKB_CB(skb);   // 获得这个重传队列的一个skb的cb字段<br/>
+            u32 end_seq;<br/>
+            u32 acked_pcount;<br/>
+            u8 sacked = scb->sacked;</p>
+
+<pre><code>        /* Determine how many packets and what bytes were acked, tso and else */  
+        if (after(scb-&gt;end_seq, tp-&gt;snd_una)) {     // 注意这个scb是我们发出去的数据的skb中的一个scb哦！，不是接受到的数据！小心  
+            if (tcp_skb_pcount(skb) == 1 ||         // 这里的意思就是发出去的数据最后一个字节在已经确认的snd_una之后，说明还有没有确认的字节  
+            !after(tp-&gt;snd_una, scb-&gt;seq))          // 如果没有设置了TSO 或者 seq不在snd_una之前，即不是 seq---snd_una---end_seq这样情况  
+                break;                              // 那么说明没有必要把重传元素去掉，(如果是seq---snd_una---end_seq)那么前面半部分的就可以  
+                                                    // 冲队列中删除！！！  注意是需要理解cb[]数组中seq和end_seq意义！在分片的情况下也是不变的！  
+            acked_pcount = tcp_tso_acked(sk, skb);  // 如果只确认了TSO段中的一部分，则从skb删除已经确认的segs，并统计确认了多少段( 1 )  
+            if (!acked_pcount)                      // 处理出错  
+                break;  
+
+            fully_acked = 0;                        // 表示TSO只处理了一部分，其他还没处理完  
+            end_seq = tp-&gt;snd_una;   
+        } else {  
+            acked_pcount = tcp_skb_pcount(skb);     // 即 !after(scb-&gt;end_seq, tp-&gt;snd_una)，说明已经完全确认OK！  
+            end_seq = scb-&gt;end_seq;  
+        }  
+
+        /* MTU probing checks */  
+        if (fully_acked &amp;&amp; icsk-&gt;icsk_mtup.probe_size &amp;&amp;      // 探测mtu，暂时不多说  
+        !after(tp-&gt;mtu_probe.probe_seq_end, scb-&gt;end_seq)) {  
+            tcp_mtup_probe_success(sk, skb);  
+        }  
+        // 下面通过sack的信息得到这是一个被重传的过包  
+        if (sacked &amp; TCPCB_RETRANS) {  
+            if (sacked &amp; TCPCB_SACKED_RETRANS)      // 如果之前重传过，&amp;&amp; 之前还没收到回复  
+                tp-&gt;retrans_out -= acked_pcount;    // 现在需要更新重传的且没有收到ACK的包  
+            flag |= FLAG_RETRANS_DATA_ACKED;        // 重传包收到ACK  
+            ca_seq_rtt = -1;  
+            seq_rtt = -1;  
+            if ((flag &amp; FLAG_DATA_ACKED) || (acked_pcount &gt; 1))  
+                flag |= FLAG_NONHEAD_RETRANS_ACKED;  
+        } else { // 如果此数据段没有被重传过  
+            ca_seq_rtt = now - scb-&gt;when;           // 通过ACK确认获得RTT值  
+            last_ackt = skb-&gt;tstamp;                // 获得skb的发送时间  
+            if (seq_rtt &lt; 0) {  
+                seq_rtt = ca_seq_rtt;  
+            }  
+            if (!(sacked &amp; TCPCB_SACKED_ACKED))     // 如果SACK存在一段没有被确认，那么保存其中序号最小号的  
+                reord = min(pkts_acked, reord);  
+        }  
+
+        if (sacked &amp; TCPCB_SACKED_ACKED)            // 如果是有sack标识  
+            tp-&gt;sacked_out -= acked_pcount;         // 那么更新sack的发出没有接受到确认的数量  
+        if (sacked &amp; TCPCB_LOST)                    // 如果是丢包标识，那么更新数量  
+            tp-&gt;lost_out -= acked_pcount;  
+
+        if (unlikely(tp-&gt;urg_mode &amp;&amp; !before(end_seq, tp-&gt;snd_up)))  // 紧急模式  
+            tp-&gt;urg_mode = 0;  
+
+        tp-&gt;packets_out -= acked_pcount;            // 发送的包没有确认的数量-=acked_pcount  
+        pkts_acked += acked_pcount;                 // 接收到确认的包数量+=acked_pcount  
+
+        /* Initial outgoing SYN's get put onto the write_queue 
+         * just like anything else we transmit.  It is not 
+         * true data, and if we misinform our callers that 
+         * this ACK acks real data, we will erroneously exit 
+         * connection startup slow start one packet too 
+         * quickly.  This is severely frowned upon behavior. 
+         */  
+        if (!(scb-&gt;flags &amp; TCPCB_FLAG_SYN)) {       // 如果不是SYN握手包  
+            flag |= FLAG_DATA_ACKED;                // 标识是数据确认  
+        } else {  
+            flag |= FLAG_SYN_ACKED;                 // 标识是SYN包标识  
+            tp-&gt;retrans_stamp = 0;                  // 清除重传戳  
+        }  
+
+        if (!fully_acked)                           // 如果TSO段没被完全确认，则到此为止  
+            break;  
+
+        tcp_unlink_write_queue(skb, sk);            // 从发送队列上移除这个skb！！！这个函数其实很简单，其实就是从链表中移除这个skb而已  
+        sk_wmem_free_skb(sk, skb);                  // 删除skb内存对象  
+        tcp_clear_all_retrans_hints(tp);   //   
+    }    // while循环结束  
+
+    if (skb &amp;&amp; (TCP_SKB_CB(skb)-&gt;sacked &amp; TCPCB_SACKED_ACKED))  // 虚假的SACK  
+        flag |= FLAG_SACK_RENEGING;  
+
+    if (flag &amp; FLAG_ACKED) {  // 如果ACK更新了数据，是的snd_una更新了  
+        const struct tcp_congestion_ops *ca_ops  
+            = inet_csk(sk)-&gt;icsk_ca_ops;            // 拥塞信息  
+
+        tcp_ack_update_rtt(sk, flag, seq_rtt);      // 更新RTT  
+        tcp_rearm_rto(sk);                          // 重置超时重传计时器  
+
+        if (tcp_is_reno(tp)) {                      // 如果没有SACK处理  
+            tcp_remove_reno_sacks(sk, pkts_acked);  // 处理乱序的包  
+        } else {  
+            /* Non-retransmitted hole got filled? That's reordering */  
+            if (reord &lt; prior_fackets)  
+                tcp_update_reordering(sk, tp-&gt;fackets_out - reord, 0);  // 更新乱序队列大小  
+        }  
+
+        tp-&gt;fackets_out -= min(pkts_acked, tp-&gt;fackets_out);    // 更新提前确认算法得出的尚未得到确认的包的数量  
+
+        if (ca_ops-&gt;pkts_acked) {   // 这是一个钩子函数  
+            s32 rtt_us = -1;  
+
+            /* Is the ACK triggering packet unambiguous? */  
+            if (!(flag &amp; FLAG_RETRANS_DATA_ACKED)) {            // 如果是确认了非重传的包  
+                /* High resolution needed and available? */  
+                if (ca_ops-&gt;flags &amp; TCP_CONG_RTT_STAMP &amp;&amp;       // 下面都是测量RTT，精读不同而已  
+                !ktime_equal(last_ackt,  
+                         net_invalid_timestamp()))  
+                    rtt_us = ktime_us_delta(ktime_get_real(),  
+                                last_ackt);  
+                else if (ca_seq_rtt &gt; 0)  
+                    rtt_us = jiffies_to_usecs(ca_seq_rtt);  
+            }  
+
+            ca_ops-&gt;pkts_acked(sk, pkts_acked, rtt_us);  
+        }  
+    }  
+
+#if FASTRETRANS_DEBUG &gt; 0  // 下面用于调试  
+    BUG_TRAP((int)tp-&gt;sacked_out &gt;= 0);  
+    BUG_TRAP((int)tp-&gt;lost_out &gt;= 0);  
+    BUG_TRAP((int)tp-&gt;retrans_out &gt;= 0);  
+    if (!tp-&gt;packets_out &amp;&amp; tcp_is_sack(tp)) {  
+        icsk = inet_csk(sk);  
+        if (tp-&gt;lost_out) {  
+            printk(KERN_DEBUG "Leak l=%u %d\n",  
+                tp-&gt;lost_out, icsk-&gt;icsk_ca_state);  
+            tp-&gt;lost_out = 0;  
+        }  
+        if (tp-&gt;sacked_out) {  
+            printk(KERN_DEBUG "Leak s=%u %d\n",  
+                tp-&gt;sacked_out, icsk-&gt;icsk_ca_state);  
+            tp-&gt;sacked_out = 0;  
+        }  
+        if (tp-&gt;retrans_out) {  
+            printk(KERN_DEBUG "Leak r=%u %d\n",  
+                tp-&gt;retrans_out, icsk-&gt;icsk_ca_state);  
+             tp-&gt;retrans_out = 0;  
+        }  
+    }  
+#endif  
+    return flag;  
+}  
+</code></pre>
+
+<pre><code>
+下面看一下tcp_tso_acked函数：
+</code></pre>
+
+<pre><code>struct inet_frag_queue *inet_frag_find(struct inet_frags *f, void *key,
+        unsigned int hash)
+{
+    struct inet_frag_queue *q;
+    struct hlist_node *n;
+
+    /* f-&gt;lock是读写锁，先搜索是否存在该IP分段所属的队列 */
+    read_lock(&amp;f-&gt;lock);
+    hlist_for_each_entry(q, n, &amp;f-&gt;hash[hash], list) { /* 扫描该HASH槽中所有节点 */
+    /* f-&gt;match中match字段在ipfrag_init中初始化为ip4_frag_match函数。*/
+    /* 对比分片队列中的散列字段和user是否和key相等，key指向的是struct ip4_create_arg
+     * 结构，包含IP头部和user字段。 */
+        if (f-&gt;match(q, key)) {
+            atomic_inc(&amp;q-&gt;refcnt);     /* 若找到，则增加该队列引用计数。 */
+            read_unlock(&amp;f-&gt;lock);
+            return q;                /* 返回该队列 */
+        }
+    }
+    read_unlock(&amp;f-&gt;lock);
+    /* 该分片是第一个IP分片，创建一个新的分片队列并添加到合适的HASH队列 */
+    return inet_frag_create(f, key, hash);
+}
+</code></pre>
+
+<p>```</p>
 ]]></content>
   </entry>
   
