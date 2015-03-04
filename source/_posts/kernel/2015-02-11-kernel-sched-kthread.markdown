@@ -107,3 +107,19 @@ kernel thread可以用kernel_thread创建，但是在执行函数里面必须用
     module_exit(test_cleanup_module);  
 ```
 
+#### 设置普通线程优先级
+```
+	void set_user_nice(struct task_struct *p, long nice);
+	// -20 <= nice < 20
+```
+
+#### 将线程设置为实时线程并设置优先级
+```
+	int sched_setscheduler(struct task_struct *p, int policy, struct sched_param *param);
+	struct sched_param {
+        int sched_priority;
+	};
+```
+CFS 调度模块（在 kernel/sched_fair.c 中实现）用于以下调度策略：SCHED_NORMAL、SCHED_BATCH 和 SCHED_IDLE。  
+对于 SCHED_RR 和 SCHED_FIFO 策略，将使用实时调度模块（该模块在 kernel/sched_rt.c 中实现）。
+
