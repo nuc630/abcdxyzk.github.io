@@ -62,6 +62,658 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/02/09/kernel-mm-numa/">玩转CPU Topology</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-02-09T16:19:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>16:19:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.searchtb.com/2012/12/%E7%8E%A9%E8%BD%ACcpu-topology.html">http://www.searchtb.com/2012/12/%E7%8E%A9%E8%BD%ACcpu-topology.html</a></p>
+
+<h4>先温习几个概念</h4>
+
+<p>请原谅对部分术语笔者直接引用了wikipedia上的英文解释，因为哥实在做不到比wikipedia上更准确描述。我会试着解释部分的术语，并在本节的最后梳理一下这些术语之间的关系。注意，笔者对由于不准确的描述导致的性能下降，进程crash等任何问题不承担任何责任☺</p>
+
+<p>NUMA：Non-Uniform Memory Access (NUMA) is a computer memory design used in multiprocessing, where the memory access time depends on the memory location relative to a processor. Under NUMA, a processor can access its own local memory faster than non-local memory, that is, memory local to another processor or memory shared between processors.NUMA architectures logically follow in scaling from symmetric multiprocessing (SMP) architectures.</p>
+
+<p>提到NUMA就不能不对比SMP，</p>
+
+<p>SMP：Symmetric multiprocessing (SMP) involves a multiprocessor computer hardware architecture where two or more identical processors are connected to a single shared main memory and are controlled by a single OS instance.</p>
+
+<p>说了这么多其实都是为了介绍NUMA Node:</p>
+
+<p>A fairly technically correct and also fairly ugly definition of a node is: a region of memory in which every byte has the same distance from each CPU.<br/>
+A more common definition is: a block of memory and the CPUs, I/O, etc. physically on the same bus as the memory.</p>
+
+<p>CPU：这个不解释，原因你懂得。想当年CPU拼的是频率，频率越高越NB，但是提升频率和制程密切相关。</p>
+
+<p><img src="/images/kernel/2015-02-09-11.jpg" alt="" /></p>
+
+<p>Intel cpu制程<br/>
+但是制程这玩意有一个物理天花板，提升越来越难，有报道指出，现阶段普遍应用的硅晶体管在尺寸上有一个10nm的物理极限。为了提升性能cpu走上了多核的道路，即在一个封装（socket或者processor）里放多个core。这还不够，又发明了超线程技术Hyper-threading</p>
+
+<p>HT：HT Technology is used to improve parallelization of computations (doing multiple tasks at once) performed on PC microprocessors. For each processor core that is physically present, the operating system addresses two virtual or logical cores, and shares the workload between them when possible. They appear to the OS as two processors, thus the OS can schedule two processes at once. 一个core 在HT之后OS看到的就是2个Logical Processor。</p>
+
+<p>下图展示了这些术语之间的逻辑关系：</p>
+
+<p><img src="/images/kernel/2015-02-09-12.jpg" alt="" /></p>
+
+<h4>cpu 概念逻辑关系</h4>
+
+<p>一个NUMA node包括一个或者多个Socket，以及与之相连的local memory。一个多核的Socket有多个Core。如果CPU支持HT，OS还会把这个Core看成 2个Logical Processor。为了避免混淆，在下文中统一用socket指代Processor or Socket;为了偷懒，下文中用Processor指代Logical Processor，击键能省则省不是。</p>
+
+<h4>查看CPU Topology</h4>
+
+<p>本文以笔者能访问的某台Red Hat Enterprise Linux Server release 5.4为例介绍，其他系统请自行google。</p>
+
+<h5>NUMA Node</h5>
+
+<p>第一种方法使用numactl查看</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>numactl --hardware
+</span><span class='line'>available: 2 nodes (0-1)  //当前机器有2个NUMA node,编号0&amp;1
+</span><span class='line'>node 0 size: 12091 MB  //node 0 物理内存大小
+</span><span class='line'>node 0 free: 988 MB    //node 0 当前free内存大小
+</span><span class='line'>node 1 size: 12120 MB
+</span><span class='line'>node 1 free: 1206 MB
+</span><span class='line'>node distances:        //node 距离，可以简单认为是CPU本node内存访问和跨node内存访问的成本。从下表可知跨node的内存访问成本（20）是本地node内存（10）的2倍。
+</span><span class='line'>node   0   1
+</span><span class='line'>  0:  10  20
+</span><span class='line'>  1:  20  10</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第二种方法是通过sysfs查看，这种方式可以查看到更多的信息</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ls /sys/devices/system/node/
+</span><span class='line'>1</span></code></pre></td></tr></table></div></figure>
+
+
+<p>node0  node1 //两个目标表示本机有2个node，每个目录内部有多个文件和子目录描述node内cpu，内存等信息。比如说node0/meminfo描述了node0内存相关信息。</p>
+
+<h5>Socket</h5>
+
+<p>可以直接通过/proc/cpuinfo查看，cpuinfo里的physical id描述的就是Socket的编号，</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep "physical id"
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 0
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 1
+</span><span class='line'>physical id     : 1</span></code></pre></td></tr></table></div></figure>
+
+
+<p>由上可知本机有2个Socket，编号为0和1。
+还可以简单的使用如下命令直接查看Socket个数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo|grep "physical id" | sort -u | wc –l
+</span><span class='line'>2   //本机有2个物理CPU封装</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>Core</h5>
+
+<p>仍然是可以通过/proc/cpuinfo查看，cpuinfo中跟core相关的信息有2行。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cpu cores : 4 //一个socket有4个核，
+</span><span class='line'>core id : 1 //一个core在socket内的编号</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过如下命令可以直接查看core的数量</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep "cpu cores" | uniq | cut -d: -f2
+</span><span class='line'>4  //1个socket有4个core</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>本机有2个socket，每个有4个core，所以一共有8个core</li>
+</ul>
+
+
+<p>还可以查看core在Socket里的编号</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep "core id" | sort -u
+</span><span class='line'>core id         : 0
+</span><span class='line'>core id         : 1
+</span><span class='line'>core id         : 10
+</span><span class='line'>core id         : 9</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一个socket里面4个core的编号为0,1,9,10。是的，core id是不连续的。如果谁知道为啥麻烦通知我，先谢了。</p>
+
+<h5>Logical Processor</h5>
+
+<p>仍然是可以通过/proc/cpuinfo查看在OS的眼里有多少个Logical Processor</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep processor | wc –l
+</span><span class='line'>16</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Ok，8个core变成了16个Logical Processor，所以本机开启了HT。</p>
+
+<p>问题来了，cpuinfo里面16个Processor编号为0-15，Core的id为0,1,9,10，Socket的id为0,1。这些编号是如何对应的呢？</p>
+
+<p>我们查看一个Processor完整的cpuinfo就比较清楚了，我剔除了不相关的行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>processor : 0    processor : 5
+</span><span class='line'>physical id : 0
+</span><span class='line'>siblings : 8
+</span><span class='line'>core id : 0
+</span><span class='line'>cpu cores : 4     physical id : 1
+</span><span class='line'>siblings : 8
+</span><span class='line'>core id : 1
+</span><span class='line'>cpu cores : 4</span></code></pre></td></tr></table></div></figure>
+
+
+<p>明白了？<br/>
+Processor 0:在socket 0的core 0 里。<br/>
+Processor 5：在socket 1的core 1 里。</p>
+
+<h5>Cache</h5>
+
+<p>仍然可以通过/proc/cpuinfo查看，OMG， cpuinfo难道是万能的？</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>processor       : 0
+</span><span class='line'>cache size      : 12288 KB //cpu cache 大小
+</span><span class='line'>cache_alignment : 64 </span></code></pre></td></tr></table></div></figure>
+
+
+<p>问题又来了，我们知道CPU cache分为L1，L2，L3, L1一般还分为独立的指令cache和数据cache。Cpuinfo里这个cache size指的是？</p>
+
+<p>好吧，cpuinfo也不是万能的。详细的cache信息可以通过sysfs查看</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ls /sys/devices/system/cpu/cpu0/cache/
+</span><span class='line'>index0  index1  index2  index3</span></code></pre></td></tr></table></div></figure>
+
+
+<p>4个目录 <br/>
+index0: 1级数据cache<br/>
+index1: 1级指令cache<br/>
+index2: 2级cache<br/>
+index3: 3级cache ,对应cpuinfo里的cache</p>
+
+<p>目录里的文件是cache信息描述，以本机的cpu0/index0为例简单解释一下：</p>
+
+<table border="1">
+<tr>
+<td>文件</td>
+<td>内容</td>
+<td>说明</td>
+</tr>
+<tr>
+<td>type</td>
+<td>Data</td>
+<td>数据cache，如果查看index1就是Instruction</td>
+</tr>
+<tr>
+<td>Level</td>
+<td>1</td>
+<td>L1</td>
+</tr>
+<tr>
+<td>Size</td>
+<td>32K</td>
+<td>大小为32K</td>
+</tr>
+<tr>
+<td>coherency_line_size</td>
+<td>64</td>
+<th rowspan="4">64*4*128=32K</th>
+</tr>
+<tr>
+<td>physical_line_partition</td>
+<td>1</td>
+</tr>
+<tr>
+<td>ways_of_associativity</td>
+<td>4</td>
+</tr>
+<tr>
+<td>number_of_sets</td>
+<td>128</td>
+</tr>
+<tr>
+<td>shared_cpu_map</td>
+<td>00000101</td>
+<td>表示这个cache被CPU0和CPU8 share</td>
+</tr>
+</table>
+
+
+<p>解释一下shared_cpu_map内容的格式：<br />
+表面上看是2进制，其实是16进制表示，每个bit表示一个cpu，1个数字可以表示4个cpu<br />
+截取00000101的后4位，转换为2进制表示</p>
+
+
+<table border="1">
+<tr>
+<td>CPU id</td>
+<td>15</td>
+<td>14</td>
+<td>13</td>
+<td>12</td>
+<td>11</td>
+<td>10</td>
+<td>9</td>
+<td>8</td>
+<td>7</td>
+<td>6</td>
+<td>5</td>
+<td>4</td>
+<td>3</td>
+<td>2</td>
+<td>1</td>
+<td>0</td>
+</tr>
+<tr>
+<td>0&#215;0101的2进制表示</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>1</td>
+</tr>
+</table>
+
+
+<p>0101表示cpu8和cpu0，即cpu0的L1 data cache是和cpu8共享的。<br/>
+验证一下？</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /sys/devices/system/cpu/cpu8/cache/index0/shared_cpu_map
+</span><span class='line'>00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000101</span></code></pre></td></tr></table></div></figure>
+
+
+<p>再看一下index3 shared_cpu_map的例子</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_map
+</span><span class='line'>00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000f0f</span></code></pre></td></tr></table></div></figure>
+
+
+<table border="1">
+<tr>
+<td>CPU id</td>
+<td>15</td>
+<td>14</td>
+<td>13</td>
+<td>12</td>
+<td>11</td>
+<td>10</td>
+<td>9</td>
+<td>8</td>
+<td>7</td>
+<td>6</td>
+<td>5</td>
+<td>4</td>
+<td>3</td>
+<td>2</td>
+<td>1</td>
+<td>0</td>
+</tr>
+<tr>
+<td>0x0f0f的2进制表示</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+</table>
+
+
+<p>cpu0,1,2,3和cpu8,9,10,11共享L3 cache</p>
+
+<h4>小结</h4>
+
+<p>综合以上信息可以绘制出以下的cpu topology图:</p>
+
+<p><img src="/images/kernel/2015-02-09-13.jpg" alt="" /></p>
+
+<p>抱歉，图比较大，网页上看不清楚，下面放大单node图，另一个node基本上可以类推。</p>
+
+<p><img src="/images/kernel/2015-02-09-14.jpg" alt="" /></p>
+
+<h5>使用CPU Topology</h5>
+
+<p>好吧，现在我们知道了如何查看CPU topology。那么这与各位攻城狮的工作有什么关系呢？</p>
+
+<p>以淘宝搜索常见的服务模型为例，服务端把离线处理的数据load到内存中，开始监听某个服务端口，接收到客户端请求后从线程池中分配一个工作线程，该线程解析请求，读取内存中对应的数据，进行一些计算，然后把结果返回给客户端。</p>
+
+<p>把这个过程简化简化再简化，抽象抽象再抽象，可以得到一个简单的测试程序，程序流程为：<br/>
+1. 主线程申请2块256M的内存，使用memset初始化这两块内存的每个byte<br/>
+2. 启动2个子线程，每个线程内循环16M次，在每次循环中随机读取2块内存中的各1K数据，对每个byte进行简单加和，返回。<br/>
+3. 主线程等待子线程结束，打印每个线程的结果，结束。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;pthread.h&gt;
+</span><span class='line'>#include &lt;stdlib.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>
+</span><span class='line'>char *p1, *p2;
+</span><span class='line'>
+</span><span class='line'>int run(unsigned r)
+</span><span class='line'>{
+</span><span class='line'>        int i,j,k,ret=0;
+</span><span class='line'>        unsigned r1,r2;
+</span><span class='line'>        srand(r);
+</span><span class='line'>        for (i=0;i&lt;(16&lt;&lt;20);i++) {
+</span><span class='line'>                r1 = (unsigned)(rand() % ((256&lt;&lt;20)-(1&lt;&lt;10)));
+</span><span class='line'>                r2 = (unsigned)(rand() % ((256&lt;&lt;20)-(1&lt;&lt;10)));
+</span><span class='line'>                k = 0;
+</span><span class='line'>                for (j=0;j&lt;(1&lt;&lt;10);j++) {
+</span><span class='line'>                        k += *(p1+r1+j);
+</span><span class='line'>                        k += *(p2+r2+j);
+</span><span class='line'>                }
+</span><span class='line'>                ret += k;
+</span><span class='line'>        }
+</span><span class='line'>        return ret;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>        int i,j;
+</span><span class='line'>        pthread_t pth1, pth2;
+</span><span class='line'>        p1 = (char*)malloc(256&lt;&lt;20);
+</span><span class='line'>        p2 = (char*)malloc(256&lt;&lt;20);
+</span><span class='line'>        memset(p1, sizeof(p1), 0);
+</span><span class='line'>        memset(p2, sizeof(p2), 0);
+</span><span class='line'>        pthread_create(&pth1, NULL, run, 123);
+</span><span class='line'>        pthread_create(&pth2, NULL, run, 456);
+</span><span class='line'>        pthread_join(pth1, NULL);
+</span><span class='line'>        pthread_join(pth2, NULL);
+</span><span class='line'>        return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>使用-O2编译出可执行文件test，分别使用下面2个命令运行该程序。运行时间和机器配置以及当前load有关，绝对值没有意义，这里仅比较相对值。</p>
+
+<table border="1">
+<tr>
+<td>命令</td>
+<td>time ./test</td>
+<td>time numactl -m 0 &#8211;physcpubind=2,3  ./test</td>
+</tr>
+<tr>
+<td>用时</td>
+<td><strong>real    0m38.678s</strong><br />
+user    1m6.270s<br />
+sys     0m5.569s
+</td>
+<td><strong>real    0m28.410s</strong><br />
+user    0m54.997s<br />
+sys     0m0.961s
+</td>
+</tr>
+</table>
+
+
+<p>发生了什么？为什么有这么大的差异？
+第一个命令直观，那么我们看一下第二个命令具体做了什么：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>numactl -m 0 --physcpubind=2,3 ./test
+</span><span class='line'>-m 0：在node 0上分配内存
+</span><span class='line'>--physcpubind=2,3：在cpu 2和3上运行程序，即一个线程运行在cpu2上，另一个运行在cpu3上。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>参考上面的CPUtopology图就很容易理解了，由于线程绑定cpu2和3执行，共享了L3 cache，且全部内存都是本node访问，运行效率自然比随机选择cpu运行，运行中还有可能切换cpu，内存访问有可能跨node的第一种方式要快了。</p>
+
+<p>接下来，让我们看看完整的表格，读者可以看看有没有惊喜：</p>
+
+<table border="1">
+<tr>
+<td>情况</td>
+<td>命令</td>
+<td>用时</td>
+<td>解释</td>
+</tr>
+<tr>
+<td>完全由OS控制</td>
+<td>time ./test</td>
+<td>real    0m38.678s<br />
+user    1m6.270s<br />
+sys     0m5.569s
+</td>
+<td>乐观主义者，甩手掌柜型</td>
+</tr>
+<tr>
+<td>绑定跨node的Cpu执行</td>
+<td>time numactl &#8211;physcpubind=2,6  ./test</td>
+<td>real    0m38.657s<br />
+user    1m7.126s<br />
+sys     0m5.045s
+</td>
+<td>Cpu 2和6不在同一个node，不能share L3 cache</td>
+</tr>
+<tr>
+<td>绑定单node的Cpu执行</td>
+<td>time numactl &#8211;physcpubind=2,3  ./test</td>
+<td>real    0m28.605s<br />
+user    0m55.161s<br />
+sys     0m0.856s
+</td>
+<td>Cpu 2和3在同一个node，share L3 cache。内存使用由OS控制，一般来说node 0和1内存都会使用。</td>
+</tr>
+<tr>
+<td>跨node内存访问+绑定单node CPU执行</td>
+<td>time numactl -m 1 &#8211;physcpubind=2,3  ./test</td>
+<td>real    0m33.218s<br />
+user    1m4.494s<br />
+sys     0m0.911s
+</td>
+<td>内存全使用node1，2个cpu在node0，内存访问比较吃亏</td>
+</tr>
+<tr>
+<td>单node内存访问+绑定本node CPU执行</td>
+<td>time numactl -m 0 &#8211;physcpubind=2,3  ./test</td>
+<td>real    0m28.367s<br />
+user    0m55.062s<br />
+sys     0m0.825s
+</td>
+<td>内存&amp;cpu都使用node0</td>
+</tr>
+<tr>
+<td>单node内存访问+绑定本node 单core执行</td>
+<td>time numactl -m 0 &#8211;physcpubind=2,10  ./test</td>
+<td>real    0m58.062s<br />
+user    1m55.520s<br />
+sys     0m0.270s
+</td>
+<td>CPU2和10不但在同一个node，且在同一个core，本意是希望共享L1，L2cache，提升性能。但是不要忘了，CPU2和10是HT出来的logical Processor，在本例cpu密集型的线程中硬件争用严重，效率急剧下降。有没有发现和上一个case的时间比率很有意思？</td>
+</tr>
+</table>
+
+
+<p>现在谁还能说了解点cpu topology没用呢？☺</p>
+
+<h4>Tips</h4>
+
+<p>补充几个小tips，方便有兴趣的同学分析上面表格的各个case</p>
+
+<h5>1.查看进程的内存numa node分布</h5>
+
+<p>简单的说可以查看进程的numa_maps文件</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/pid/numa_maps</span></code></pre></td></tr></table></div></figure>
+
+
+<p>文件格式可以直接：man numa_maps<br/>
+为了避免输入数字pid，我使用如下命令查看：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/$(pidof test|cut –d” ” -f1)/numa_maps</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2.查看线程run在哪个processor</h5>
+
+<p>可以使用top命令查看一个进程的各个线程分别run在哪个processor上<br/>
+同样，为了避免输入数字pid，我使用如下命令启动top：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>top -p$(pidof test |sed -e ‘s/ /,/g’)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在默认配置下不显示线程信息，需要进入Top后按“shift+H”，打开线程显示。<br/>
+另外，如果没有P列，还需要按“f”，按“j”，添加，这一列显示的数字就是这个线程上次run的processor id。<br/>
+关于top的使用，请读者自行man top</p>
+
+<h5>3.另一种绑定cpu执行的方法</h5>
+
+<p>如果读者的程序不涉及大量内存的访问，可以通过taskset绑定cpu执行。别怪我没提醒你，仔细判断是否应该绑定到同一个core的processor上哦。<br/>
+关于命令的使用，请读者自行Man taskset</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/02/09/system-base-attr/">隐藏权限--无法添加用户和组等</a></h2>
     
     
@@ -810,239 +1462,6 @@ flag：决定以什么样的方式来确定映射的地址(通常为0)</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/30/assembly-arm-sample/">ARM汇编简单样例</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-30T15:43:00+08:00'><span class='date'>2015-01-30</span> <span class='time'>15:43:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>例一</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>.section .data
-</span><span class='line'>    .align 2
-</span><span class='line'>    .LC0: .string "gggghhhii"
-</span><span class='line'>
-</span><span class='line'>.section .text
-</span><span class='line'>    .align 2
-</span><span class='line'>    .global main
-</span><span class='line'>    .type   main, %function
-</span><span class='line'>main:
-</span><span class='line'>    stmfd   sp!, {fp, lr} 
-</span><span class='line'>    ldr     r0, .L0 
-</span><span class='line'>    bl      puts
-</span><span class='line'>    ldmfd   sp!, {fp, pc} 
-</span><span class='line'>
-</span><span class='line'>.L0: .word .LC0</span></code></pre></td></tr></table></div></figure>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>android-ndk-r9d/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/arm-linux-androideabi-as b.s -o b.o
-</span><span class='line'>
-</span><span class='line'>/home/kk/android/android-ndk-r9d/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/arm-linux-androideabi-ld -dynamic-linker /system/bin/linker -X -m armelf_linux_eabi -z noexecstack -z relro -z now crtbegin_dynamic.o -L/home/kk/android/android-ndk-r9d/platforms/android-19/arch-arm/usr/lib/ -L/home/kk/android/android-ndk-r9d/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/../lib/gcc/arm-linux-androideabi/4.6 -L/home/kk/android/android-ndk-r9d/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/../lib/gcc -L/home/kk/android/android-ndk-r9d/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/../lib/gcc/arm-linux-androideabi/4.6/../../../../arm-linux-androideabi/lib b.o -lgcc -lc -ldl -lgcc crtend_android.o -o b.out</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>例二</h4>
-
-<p>a.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>
-</span><span class='line'>int i=12;
-</span><span class='line'>int j;
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>    i = 34; 
-</span><span class='line'>    j = 56; 
-</span><span class='line'>    printf("Hello World\n");
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/home/kk/android/android-ndk-r9d/toolchains/arm-linux-androideabi-4.6/prebuilt/linux-x86_64/bin/arm-linux-androideabi-gcc -I/home/kk/android/android-ndk-r9d/platforms/android-19/arch-arm/usr/include -L/home/kk/android/android-ndk-r9d/platforms/android-19/arch-arm/usr/lib/ -S a.c</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    .arch armv5te
-</span><span class='line'>    .fpu softvfp
-</span><span class='line'>    .eabi_attribute 20, 1
-</span><span class='line'>    .eabi_attribute 21, 1
-</span><span class='line'>    .eabi_attribute 23, 3
-</span><span class='line'>    .eabi_attribute 24, 1
-</span><span class='line'>    .eabi_attribute 25, 1
-</span><span class='line'>    .eabi_attribute 26, 2
-</span><span class='line'>    .eabi_attribute 30, 6
-</span><span class='line'>    .eabi_attribute 18, 4
-</span><span class='line'>    .file   "a.c"
-</span><span class='line'>    .global i
-</span><span class='line'>    .data
-</span><span class='line'>    .align  2
-</span><span class='line'>    .type   i, %object
-</span><span class='line'>    .size   i, 4
-</span><span class='line'>i:
-</span><span class='line'>    .word   12  
-</span><span class='line'>    .comm   j,4,4
-</span><span class='line'>    .section        .rodata
-</span><span class='line'>    .align  2
-</span><span class='line'>.LC0:
-</span><span class='line'>    .ascii  "Hello World\000"
-</span><span class='line'>    .text
-</span><span class='line'>    .align  2
-</span><span class='line'>    .global main
-</span><span class='line'>    .type   main, %function
-</span><span class='line'>main:
-</span><span class='line'>    @ args = 0, pretend = 0, frame = 0 
-</span><span class='line'>    @ frame_needed = 1, uses_anonymous_args = 0 
-</span><span class='line'>    stmfd   sp!, {fp, lr} 
-</span><span class='line'>    add     fp, sp, #4
-</span><span class='line'>    ldr     r3, .L2 
-</span><span class='line'>.LPIC0:
-</span><span class='line'>    add     r3, pc, r3
-</span><span class='line'>    ldr     r2, .L2+4
-</span><span class='line'>    ldr     r2, [r3, r2] 
-</span><span class='line'>    mov     r1, #34 
-</span><span class='line'>    str     r1, [r2, #0] 
-</span><span class='line'>    ldr     r2, .L2+8
-</span><span class='line'>    ldr     r3, [r3, r2] 
-</span><span class='line'>    mov     r2, #56 
-</span><span class='line'>    str     r2, [r3, #0] 
-</span><span class='line'>    ldr     r3, .L2+12
-</span><span class='line'>.LPIC1:
-</span><span class='line'>    add     r3, pc, r3
-</span><span class='line'>    mov     r0, r3
-</span><span class='line'>    bl      puts(PLT)
-</span><span class='line'>    mov     r3, #0
-</span><span class='line'>    mov     r0, r3
-</span><span class='line'>    ldmfd   sp!, {fp, pc}
-</span><span class='line'>.L3:
-</span><span class='line'>    .align  2
-</span><span class='line'>.L2:
-</span><span class='line'>    .word   _GLOBAL_OFFSET_TABLE_-(.LPIC0+8)
-</span><span class='line'>    .word   i(GOT)
-</span><span class='line'>    .word   j(GOT)
-</span><span class='line'>    .word   .LC0-(.LPIC1+8)
-</span><span class='line'>    .size   main, .-main
-</span><span class='line'>    .ident  "GCC: (GNU) 4.6 20120106 (prerelease)"
-</span><span class='line'>    .section        .note.GNU-stack,"",%progbits</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/5">&larr; Older</a>
@@ -1136,7 +1555,7 @@ if (!document.getElementById('system~centos')) document.getElementById('aexp_sys
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(58)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(60)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -1153,11 +1572,11 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>15</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~sched/?opendiv=kernel'>sched</a><a href='##' onmousedown=showDiv('kernel~sched') id='aexp_kernel~sched'><span class='exp_style' id='exp_kernel~sched'>[+]</span></a><span class='right_span'>13</span></li>
+<li><a href='/blog/cats/kernel~sched/?opendiv=kernel'>sched</a><a href='##' onmousedown=showDiv('kernel~sched') id='aexp_kernel~sched'><span class='exp_style' id='exp_kernel~sched'>[+]</span></a><span class='right_span'>14</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~sched')) document.getElementById('aexp_kernel~sched').style.visibility = 'hidden';
@@ -1273,8 +1692,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(38)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(39)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>9</span></li>
 <li><a href='/blog/cats/2015~02/?opendiv=2015'>2015-02</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2015~01/?opendiv=2015'>2015-01</a><span class='right_span'>19</span></li>
 </div><li class='catclass'><a href='/blog/cats/2014/'>2014</a><a href='##' onmousedown=showDiv('2014')><span class='exp_style' id='exp_2014'>[+]</span></a><span class='right_span'>(112)</span></li>
@@ -1290,11 +1709,11 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <li><a href='/blog/cats/2014~03/?opendiv=2014'>2014-03</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2014~02/?opendiv=2014'>2014-02</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2014~01/?opendiv=2014'>2014-01</a><span class='right_span'>2</span></li>
-</div><li class='catclass'><a href='/blog/cats/2013/'>2013</a><a href='##' onmousedown=showDiv('2013')><span class='exp_style' id='exp_2013'>[+]</span></a><span class='right_span'>(59)</span></li>
+</div><li class='catclass'><a href='/blog/cats/2013/'>2013</a><a href='##' onmousedown=showDiv('2013')><span class='exp_style' id='exp_2013'>[+]</span></a><span class='right_span'>(60)</span></li>
 <div id='2013' class='catsub'><li><a href='/blog/cats/2013~12/?opendiv=2013'>2013-12</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2013~11/?opendiv=2013'>2013-11</a><span class='right_span'>8</span></li>
 <li><a href='/blog/cats/2013~10/?opendiv=2013'>2013-10</a><span class='right_span'>8</span></li>
-<li><a href='/blog/cats/2013~09/?opendiv=2013'>2013-09</a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/2013~09/?opendiv=2013'>2013-09</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2013~08/?opendiv=2013'>2013-08</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2013~07/?opendiv=2013'>2013-07</a><span class='right_span'>3</span></li>
 <li><a href='/blog/cats/2013~06/?opendiv=2013'>2013-06</a><span class='right_span'>9</span></li>
@@ -1354,6 +1773,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/03/13/kernel-sched-rt/">linux进程调度之FIFO和RR调度策略</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/03/04/kernel-net-tcp5/">TCP拥塞状态机 tcp_fastretrans_alert</a>
       </li>
     
@@ -1367,10 +1790,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/03/04/kernel-net-tcp2/">拥塞避免处理函数 tcp_reno_cong_avoid</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/03/04/kernel-net-tcp1/">清理重传队列中函数 tcp_clean_rtx_queue</a>
       </li>
     
   </ul>
