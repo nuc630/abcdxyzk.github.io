@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "内核tcp的ack的处理"
+title: "内核tcp的ack的处理tcp_ack"
 date: 2013-09-06 15:40:00 +0800
 comments: false
 categories:
@@ -10,6 +10,8 @@ categories:
 - kernel~net
 tags:
 ---
+http://simohayha.iteye.com/blog/572505
+
 我们来看tcp输入对于ack，段的处理。
 
 * 先是ack的处理，在内核中，处理ack段是通过tcp_ack来进行的。  

@@ -25,6 +25,11 @@ if has("autocmd")
  au BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
 endif
 ```
+
+##### 解决vi/vim中粘贴会在行首多很多缩进和空格的问题
+1. 在拷贝前输入:set paste (这样的话，vim就不会启动自动缩进，而只是纯拷贝粘贴）  
+2. 拷贝完成之后，输入:set nopaste (关闭paste)  
+
 #### 1. Vim的几种模式
 Vim提供了诸多模式可供使用，不同模式带有不同的命令功能。  
 ##### 普通模式

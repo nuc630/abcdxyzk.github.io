@@ -117,9 +117,18 @@ kernel thread可以用kernel_thread创建，但是在执行函数里面必须用
 ```
 	int sched_setscheduler(struct task_struct *p, int policy, struct sched_param *param);
 	struct sched_param {
-        int sched_priority;
+        int sched_priority; // 实时线程对应区间[1, 99]
 	};
 ```
 CFS 调度模块（在 kernel/sched_fair.c 中实现）用于以下调度策略：SCHED_NORMAL、SCHED_BATCH 和 SCHED_IDLE。  
 对于 SCHED_RR 和 SCHED_FIFO 策略，将使用实时调度模块（该模块在 kernel/sched_rt.c 中实现）。
+
+
+#### top中NI, PR
+NI，nice，动态修正CPU调度。范围（-20~19）。越大，cpu调度越一般，越小，cpu调度越偏向它。一般用于后台进程，调整也是往大了调，用来给前台进程让出CPU资源。命令行下可以用renice设置。
+
+##### PR：优先级，会有两种格式，一种是数字（默认20），一种是RT字符串。
+PR默认是20，越小，优先级越高。修改nice可以同时修改PR，测试过程：先开一个窗口，运行wc，另开一个窗口运行top，按N按照PID倒序排，按r输入要renice的PID，然后输入-19~20之间的值，可以看到NI变成输入的值，PR=PR+NI。修改NI得到PR的范围是0~39。优先级由高到低
+
+RT是real-time。只能用chrt -p (1~99) pid来修改。chrt -p 1 1234会将1234的PR改成-2，chrt -p 98 1234变成-99。chrt -p 99 1234会变成RT......只要chrt过，修改nice后PR不会再更改。修改chrt得到的PR范围是RT~-2。优先级由高到低
 
