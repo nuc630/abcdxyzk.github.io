@@ -21,6 +21,20 @@ arch/x86/kernel/tsc.c:
 
 * 现象：top、ps出来的TIME和CPU的值非常异常。
 
+```
+	// 查看TSC寄存器的值
+	#include <stdio.h>
+
+	int main()
+	{
+		    unsigned long low, high, val;
+		    asm volatile("rdtsc": "=a" (low), "=d" (high));
+		    val = ((low) | ((unsigned long)(high) << 32));
+		    printf("%lu\n", val);
+		    return 0;
+	}
+```
+
 -------------
 
 https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=733043
@@ -80,6 +94,8 @@ Link: http://lkml.kernel.org/r/20120310004027.19291.88460.stgit@dungbeetle.mtv.c
 Signed-off-by: Ingo Molnar <`mingo@elte.hu`>  
 
 -------
+
+patch： http://kernel.opensuse.org/cgit/kernel/patch/?id=9993bc635d01a6ee7f6b833b4ee65ce7c06350b1
 
 ```
 diff --git a/arch/x86/include/asm/timer.h b/arch/x86/include/asm/timer.h
