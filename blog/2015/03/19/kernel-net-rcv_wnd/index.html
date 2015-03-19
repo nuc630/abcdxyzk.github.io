@@ -1,0 +1,1293 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>TCP接收窗口的调整算法 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>学习中......</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" id="query" type="text" placeholder="search...">
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+<script type="text/javascript">
+var query = GetRequest("query");
+if (query != null) {
+	document.getElementById("query").value = query;
+}
+</script>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">TCP接收窗口的调整算法</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-19T17:42:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>17:42:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/8588202">TCP接收窗口的调整算法（上）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8602493">TCP接收窗口的调整算法（中）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8603099">TCP接收窗口的调整算法（下）</a></p>
+
+<hr />
+
+<h3>TCP接收窗口的调整算法（上）</h3>
+
+<p>我们知道TCP首部中有一个16位的接收窗口字段，它可以告诉对端：我现在能接收多少数据。TCP的流控制主要就是通过调整接收窗口的大小来进行的。</p>
+
+<p>本文内容：分析TCP接收窗口的调整算法，包括一些相关知识和初始接收窗口的取值。</p>
+
+<p>内核版本：3.2.12</p>
+
+<h4>数据结构</h4>
+
+<p>以下是涉及到的数据结构。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* 最早接收但未确认的段的序号，即当前接收窗口的左端*/  
+</span><span class='line'>    u32 rcv_wup; /* rcv_nxt on last window update sent */  
+</span><span class='line'>    u16 advmss; /* Advertised MSS. 本端能接收的MSS上限，建立连接时用来通告对端*/  
+</span><span class='line'>    u32 rcv_ssthresh; /* Current window clamp. 当前接收窗口大小的阈值*/  
+</span><span class='line'>    u32 rcv_wnd; /* Current receiver window，当前的接收窗口大小*/  
+</span><span class='line'>    u32 window_clamp; /* 接收窗口的最大值，这个值也会动态调整*/  
+</span><span class='line'>    ...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {  
+</span><span class='line'>    ...  
+</span><span class='line'>        snd_wscale : 4, /* Window scaling received from sender, 对端接收窗口扩大因子 */  
+</span><span class='line'>        rcv_wscale : 4; /* Window scaling to send to receiver, 本端接收窗口扩大因子 */  
+</span><span class='line'>    u16 user_mss; /* mss requested by user in ioctl */  
+</span><span class='line'>    u16 mss_clamp; /* Maximal mss, negotiated at connection setup，对端的最大mss */  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * struct sock - network layer representation of sockets 
+</span><span class='line'> * @sk_rcvbuf: size of receive buffer in bytes 
+</span><span class='line'> * @sk_receive_queue: incoming packets 
+</span><span class='line'> * @sk_write_queue: packet sending queue 
+</span><span class='line'> * @sk_sndbuf: size of send buffer in bytes 
+</span><span class='line'> */  
+</span><span class='line'>struct sock {  
+</span><span class='line'>    ...  
+</span><span class='line'>    struct sk_buff_head sk_receive_queue;  
+</span><span class='line'>    /* 表示接收队列sk_receive_queue中所有段的数据总长度*/  
+</span><span class='line'>#define sk_rmem_alloc sk_backlog.rmem_alloc  
+</span><span class='line'>  
+</span><span class='line'>    int sk_rcvbuf; /* 接收缓冲区长度的上限*/  
+</span><span class='line'>    int sk_sndbuf; /* 发送缓冲区长度的上限*/  
+</span><span class='line'>  
+</span><span class='line'>    struct sk_buff_head sk_write_queue;  
+</span><span class='line'>    ...  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>struct sk_buff_head {  
+</span><span class='line'>    /* These two members must be first. */  
+</span><span class='line'>    struct sk_buff *next;  
+</span><span class='line'>    struct sk_buff *prev;  
+</span><span class='line'>    __u32 qlen;  
+</span><span class='line'>    spinlock_t lock;  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<!-- more -->
+
+
+<p>在慢速路径中，有可能只带有TIMES</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * inet_connection_sock - INET connection oriented sock 
+</span><span class='line'> * @icsk_ack: Delayed ACK control data 
+</span><span class='line'> */  
+</span><span class='line'>struct inet_connection_sock {  
+</span><span class='line'>    ...  
+</span><span class='line'>    struct {  
+</span><span class='line'>        ...  
+</span><span class='line'>        /* 在快速发送确认模式中，可以快速发送ACK段的数量*/  
+</span><span class='line'>        __u8 quick; /* Scheduled number of quick acks */  
+</span><span class='line'>        /* 由最近接收到的段计算出的对端发送MSS */  
+</span><span class='line'>        __16 rcv_mss; /* MSS used for delayed ACK decisions */  
+</span><span class='line'>    } icsk_ack;  
+</span><span class='line'>    ...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcphdr {  
+</span><span class='line'>    __be16 source;  
+</span><span class='line'>    __be16 dest;  
+</span><span class='line'>    __be32 seq;  
+</span><span class='line'>    __be32 ack_seq;  
+</span><span class='line'>  
+</span><span class='line'>#if defined (__LITTLE_ENDIAN_BITFIELD)  
+</span><span class='line'>    __u16 resl : 4,  
+</span><span class='line'>          doff : 4,  
+</span><span class='line'>          fin : 1,  
+</span><span class='line'>          syn : 1,  
+</span><span class='line'>          rst : 1,  
+</span><span class='line'>          psh : 1,  
+</span><span class='line'>          ack : 1,  
+</span><span class='line'>          urg : 1,  
+</span><span class='line'>          ece : 1,  
+</span><span class='line'>          cwr : 1;  
+</span><span class='line'>  
+</span><span class='line'>#elif defined (__BIG_ENDIAN_BITFIELD)  
+</span><span class='line'>    __u16 doff : 4,  
+</span><span class='line'>          resl : 4,  
+</span><span class='line'>          cwr : 1,  
+</span><span class='line'>          ece : 1,  
+</span><span class='line'>          urg : 1,  
+</span><span class='line'>          ack : 1,  
+</span><span class='line'>          psh : 1,  
+</span><span class='line'>          rst : 1,  
+</span><span class='line'>          syn : 1,  
+</span><span class='line'>          fin : 1;  
+</span><span class='line'>#else  
+</span><span class='line'>#error "Adjust your &lt;asm/byteorder.h&gt; defines"  
+</span><span class='line'>#endif  
+</span><span class='line'>    __be16 window; /* 接收窗口，在这边呢 */  
+</span><span class='line'>    __sum16 check;  
+</span><span class='line'>    __be16 urg_ptr;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>发送窗口和接收窗口的更新：</p>
+
+<p><img src="/images/kernel/2015-03-19-1.jpg" alt="" /></p>
+
+<h4>MSS</h4>
+
+<p>先来看下MSS，它在接收窗口的调整中扮演着重要角色。<br/>
+通过MSS (Max Segment Size)，数据被分割成TCP认为合适发送的数据块，称为段(Segment)。<br/>
+注意：这里说的段(Segment)不包括协议首部，只包含数据！</p>
+
+<p>与MSS最为相关的一个参数就是网络设备接口的MTU(Max Transfer Unit)。<br/>
+两台主机之间的路径MTU并不一定是个常数，它取决于当时所选的路由。而选路不一定是对称的(从A到B的路由和从B到A的路由不同)。因此路径MTU在两个方向上不一定是对称的。<br/>
+所以，从A到B的有效MSS、从B到A的有效MSS是动态变化的，并且可能不相同。</p>
+
+<p>每个端同时具有几个不同的MSS：<br/>
+（1）tp->advmss<br/>
+本端在建立连接时使用的MSS，是本端能接收的MSS上限。<br/>
+这是从路由缓存中获得的(dst->metrics[RTAX_ADVMSS - 1])，一般是1460。</p>
+
+<p>（2）tp->rx_opt.mss_clamp<br/>
+对端的能接收的MSS上限，min(tp->rx_opt.user_mss, 对端在建立连接时通告的MSS)。</p>
+
+<p>（3）tp->mss_cache<br/>
+本端当前有效的发送MSS。显然不能超过对端接收的上限，tp->mss_cache &lt;= tp->mss_clamp。</p>
+
+<p>（4）tp->rx_opt.user_mss<br/>
+用户通过TCP_MAXSEG选项设置的MSS上限，用于决定本端和对端的接收MSS上限。</p>
+
+<p>（5）icsk->icsk_ack.rcv_mss<br/>
+对端有效的发送MSS的估算值。显然不能超过本端接收的上限，icsk->icsk_ack.rcv_mss &lt;= tp->advmss。</p>
+
+<h4>Receive buffer</h4>
+
+<p>接收缓存sk->sk_rcvbuf分为两部分：<br/>
+（1） network buffer，一般占3/4，这部分是协议能够使用的。<br/>
+（2）application buffer，一般占1/4。</p>
+
+<p>我们在计算连接可用接收缓存的时候，并不会使用整个的sk_rcvbuf，防止应用程序读取数据的速度比网络数据包到达的速度慢时，接收缓存被耗尽的情况。</p>
+
+<p>以下是详细的说明：<br/>
+The idea is not to use a complete receive buffer space to calculate the receive buffer.<br/>
+We reserve some space as an application buffer, and the rest is used to queue incoming data segments.<br/>
+An application buffer corresponds to the space that should compensate for the delay in time it takes for an application to read from the socket buffer.</p>
+
+<p>If the application is reading more slowly than the rate at which data are arriving, data will be queued in the receive buffer. In order to avoid queue getting full, we advertise less receive window so that the sender can slow down the rate of data transmission and by that time the application gets a chance to read data from the receiver buffer.</p>
+
+<p>一个包含X字节数据的skb的最小真实内存消耗(truesize)：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* return minimum truesize of one skb containing X bytes of data，这里的X包含协议头 */  
+</span><span class='line'>#define SKB_TRUESIZE(X) ((X) +  \  
+</span><span class='line'>                    SKB_DATA_ALIGN(sizeof(struct sk_buff)) + \  
+</span><span class='line'>                    SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>接收窗口的初始化</h4>
+
+<p>从最简单的开始，先来看下接收窗口的初始值、接收窗口扩大因子是如何取值的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Determine a window scaling and initial window to offer. 
+</span><span class='line'> * Based on the assumption that the given amount of space will be offered. 
+</span><span class='line'> * Store the results in the tp structure. 
+</span><span class='line'> * NOTE: for smooth operation initial space offering should be a multiple of mss 
+</span><span class='line'> * if possible. We assume here that mss &gt;= 1. This MUST be enforced by all calllers. 
+</span><span class='line'> */  
+</span><span class='line'>  
+</span><span class='line'>void tcp_select_initial_window (int __space, __u32 mss, __u32 *rcv_wnd, __u32 *window_clamp,  
+</span><span class='line'>                                int wscale_ok, __u8 *rcv_wscale, __u32 init_rcv_wnd)  
+</span><span class='line'>{  
+</span><span class='line'>    unsigned int space = (__space &lt; 0 ? 0 : __space); /* 接收缓存不能为负*/  
+</span><span class='line'>  
+</span><span class='line'>    /* If no clamp set the clamp to the max possible scaled window。 
+</span><span class='line'>     * 如果接收窗口上限的初始值为0，则把它设成最大。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (*window_clamp == 0)  
+</span><span class='line'>        (*window_clamp) = (65535 &lt;&lt; 14); /*这是接收窗口的最大上限*/  
+</span><span class='line'>   
+</span><span class='line'>    /* 接收窗口不能超过它的上限 */  
+</span><span class='line'>    space = min(*window_clamp, space);   
+</span><span class='line'>  
+</span><span class='line'>    /* Quantize space offering to a multiple of mss if possible. 
+</span><span class='line'>     * 接收窗口大小最好是mss的整数倍。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (space &gt; mss)  
+</span><span class='line'>        space = (space / mss) * mss; /* 让space为mss的整数倍*/  
+</span><span class='line'>   
+</span><span class='line'>    /* NOTE: offering an initial window larger than 32767 will break some 
+</span><span class='line'>     * buggy TCP stacks. If the admin tells us it is likely we could be speaking 
+</span><span class='line'>     * with such a buggy stack we will truncate our initial window offering to 
+</span><span class='line'>     * 32K - 1 unless the remote has sent us a window scaling option, which 
+</span><span class='line'>     * we interpret as a sign the remote TCP is not misinterpreting the window 
+</span><span class='line'>     * field as a signed quantity. 
+</span><span class='line'>     */  
+</span><span class='line'>    /* 当协议使用有符号的接收窗口时，则接收窗口大小不能超过32767*/  
+</span><span class='line'>    if (sysctl_tcp_workaround_signed_windows)  
+</span><span class='line'>        (*rcv_wnd) = min(space, MAX_TCP_WINDOW);  
+</span><span class='line'>    esle  
+</span><span class='line'>        (*rcv_wnd) = space;  
+</span><span class='line'>   
+</span><span class='line'>    (*rcv_wscale) = 0;  
+</span><span class='line'>    /* 计算接收窗口扩大因子rcv_wscale，需要多大才能表示本连接的最大接收窗口大小？*/  
+</span><span class='line'>    if (wscale_ok) {  
+</span><span class='line'>        /* Set window scaling on max possible window 
+</span><span class='line'>         * See RFC1323 for an explanation of the limit to 14 
+</span><span class='line'>         * tcp_rmem[2]为接收缓冲区长度上限的最大值，用于调整sk_rcvbuf。 
+</span><span class='line'>          * rmem_max为系统接收窗口的最大大小。 
+</span><span class='line'>          */  
+</span><span class='line'>        space = max_t(u32, sysctl_tcp_rmem[2], sysctl_rmem_max);  
+</span><span class='line'>        space = min_t(u32, space, *window_clamp); /*受限于具体连接*/  
+</span><span class='line'>  
+</span><span class='line'>        while (space &gt; 65535 && (*rcv_wscale) &lt; 14) {  
+</span><span class='line'>            space &gt;&gt;= 1;  
+</span><span class='line'>            (*rcv_wscale)++;  
+</span><span class='line'>        }  
+</span><span class='line'>   }  
+</span><span class='line'>   
+</span><span class='line'>    /* Set initial window to a value enough for senders starting with initial 
+</span><span class='line'>     * congestion window of TCP_DEFAULT_INIT_RCVWND. Place a limit on the  
+</span><span class='line'>     * initial window when mss is larger than 1460. 
+</span><span class='line'>     * 
+</span><span class='line'>     * 接收窗口的初始值在这里确定，一般是10个数据段大小左右。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (mss &gt; (1 &lt;&lt; *rcv_wscale)) {  
+</span><span class='line'>        int init_cwnd = TCP_DEFAULT_INIT_RCVWND; /* 10 */  
+</span><span class='line'>        if (mss &gt; 1460)  
+</span><span class='line'>            init_cwnd = max_t(u32, 1460 * TCP_DEFAULT_INIT_RCVWND) / mss, 2);  
+</span><span class='line'>          
+</span><span class='line'>        /* when initializing use the value from init_rcv_wnd rather than the  
+</span><span class='line'>         * default from above. 
+</span><span class='line'>         * 决定初始接收窗口时，先考虑路由缓存中的，如果没有，再考虑系统默认的。 
+</span><span class='line'>          */  
+</span><span class='line'>        if (init_rcv_wnd) /* 如果路由缓存中初始接收窗口大小不为0*/  
+</span><span class='line'>            *rcv_wnd = min(*rcv_wnd, init_rcv_wnd * mss);  
+</span><span class='line'>        else   
+</span><span class='line'>            *rcv_wnd = min(*rcv_wnd, init_cwnd *mss);  
+</span><span class='line'>    }  
+</span><span class='line'>   
+</span><span class='line'>    /* Set the clamp no higher than max representable value */  
+</span><span class='line'>    (*window_clamp) = min(65535 &lt;&lt; (*rcv_wscale), *window_clamp);  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>初始的接收窗口的取值(mss的整数倍)：<br/>
+（1）先考虑路由缓存中的RTAX_INITRWND<br/>
+（2）在考虑系统默认的TCP_DEFAULT_INIT_RCVWND(10)<br/>
+（3）最后考虑min(&frac34; * sk_rcvbuf, window_clamp)，如果这个值很低</p>
+
+<p>窗口扩大因子的取值：<br/>
+接收窗口取最大值为max(tcp_rmem[2], rmem_max)，本连接接收窗口的最大值为 min(max(tcp_rmem[2], rmem_max), window_clamp)。<br/>
+那么我们需要多大的窗口扩大因子，才能用16位来表示最大的接收窗口呢？<br/>
+如果接收窗口的最大值受限于tcp_rmem[2] = 4194304，那么rcv_wscale = 7，窗口扩大倍数为128。</p>
+
+<p>发送SYN/ACK时的调用路径：tcp_v4_send_synack -> tcp_make_synack -> tcp_select_initial_window。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Prepare a SYN-ACK. */  
+</span><span class='line'>struct sk_buff *tcp_make_synack (struct sock *sk, struct dst_entry *dst,   
+</span><span class='line'>                                 struct request_sock *req, struct request_values *rvp)  
+</span><span class='line'>{  
+</span><span class='line'>    struct inet_request_sock *ireq = inet_rsk(req);  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    struct tcphdr *th;  
+</span><span class='line'>    struct sk_buff *skb;  
+</span><span class='line'>    ...  
+</span><span class='line'>    mss = dst_metric_advmss(dst); /*路由缓存中的mss*/  
+</span><span class='line'>    /*如果用户有特别设置，则取其小者*/  
+</span><span class='line'>    if (tp-&gt;rx_opt.user_mss && tp-&gt;rx_opt.user_mss &lt; mss)  
+</span><span class='line'>        mss = tp-&gt;rx_opt.user_mss;  
+</span><span class='line'>   
+</span><span class='line'>    if (req-&gt;rcv_wnd == 0) { /* ignored for retransmitted syns */  
+</span><span class='line'>        __u8 rcv_wscale;  
+</span><span class='line'>  
+</span><span class='line'>        /* Set this up on the first call only */  
+</span><span class='line'>        req-&gt;window_clamp = tp-&gt;window_clamp ? : dst_metric(dst, RTAX_WINDOW);  
+</span><span class='line'>  
+</span><span class='line'>        /* limit the window selection if the user enforce a smaller rx buffer */  
+</span><span class='line'>        if (sk-&gt;sk_userlocks & SOCK_RCVBUF_LOCK &&   
+</span><span class='line'>            (req-&gt;window_clamp &gt; tcp_full_space(sk) || req-&gt;window_clamp == 0))  
+</span><span class='line'>            req-&gt;window_clamp = tcp_full_space(sk);  
+</span><span class='line'>   
+</span><span class='line'>        /* tcp_full_space because it is guaranteed to be the first packet */  
+</span><span class='line'>        tcp_select_initial_window(tcp_full_space(sk),   
+</span><span class='line'>                            mss - (ireq-&gt;tstamp_ok ? TCPOLEN_TSTAMP_ALIGNED : 0),  
+</span><span class='line'>                            &req-&gt;rcv_wnd,  
+</span><span class='line'>                            &req-&gt;window_clamp,  
+</span><span class='line'>                            ireq-&gt;wscale_ok,  
+</span><span class='line'>                            &rcv_wscale,  
+</span><span class='line'>                            dst_metric(dst, RTAX_INITRWND));  
+</span><span class='line'>  
+</span><span class='line'>        ireq-&gt;rcv_wscale = rcv_wscale;  
+</span><span class='line'>    }  
+</span><span class='line'>    ...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h3>TCP接收窗口的调整算法（中）</h3>
+
+<p>本文内容：分析TCP接收窗口的调整算法，主要是接收窗口当前阈值的调整算法。</p>
+
+<p>内核版本：3.2.12</p>
+
+<h4>接收窗口当前阈值的调整算法</h4>
+
+<p>我们知道，在拥塞控制中，有个慢启动阈值，控制着拥塞窗口的增长。在流控制中，也有个接收窗口的当前阈值，控制着接收窗口的增长。可见TCP的拥塞控制和流控制，在某些地方有异曲同工之处。</p>
+
+<p>接收窗口当前阈值tp->rcv_ssthresh的主要功能：<br/>
+On reception of data segment from the sender, this value is recalculated based on the size of the segment, and later on this value is used as upper limit on the receive window to be advertised.</p>
+
+<p>可见，接收窗口当前阈值对接收窗口的大小有着重要的影响。</p>
+
+<p>接收窗口当前阈值调整算法的基本思想：<br/>
+When we receive a data segment, we need to calculate a receive window that needs to be advertised to the sender, depending on the segment size received.</p>
+
+<p>The idea is to avoid filling the receive buffer with too many small segments when an application is reading very slowly and packets are transmitted at a very high rate.</p>
+
+<p>在接收窗口当前阈值的调整算法中，收到数据报的负荷是个关键因素，至于它怎么影响接收窗口当前阈值的增长，来看下代码吧。</p>
+
+<p>当接收到一个报文段时，调用处理函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_event_data_recv (struct sock *sk, struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>    u32 now;  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* 当报文段的负荷不小于128字节时，考虑增大接收窗口当前阈值rcv_ssthresh */  
+</span><span class='line'>    if (skb-&gt;len &gt;= 128)  
+</span><span class='line'>        tcp_grow_window(sk, skb);  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面这个函数决定是否增长rcv_ssthresh，以及增长多少。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_grow_window (struct sock *sk, const struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>   
+</span><span class='line'>    /* Check #1,关于这三个判断条件的含义可见下文分析 */  
+</span><span class='line'>    if (tp-&gt;rcv_ssthresh &lt; tp-&gt;window_clamp &&   
+</span><span class='line'>         (int) tp-&gt;rcv_ssthresh &lt; tcp_space(sk) && ! tcp_memory_pressure) {  
+</span><span class='line'>        int incr;  
+</span><span class='line'>          
+</span><span class='line'>        /* Check #2. Increase window, if skb with such overhead will fit to rcvbuf in future.  
+</span><span class='line'>         * 如果应用层数据占这个skb总共消耗内存的75%以上，则说明这个数据报是大的数据报， 
+</span><span class='line'>          * 内存的额外开销较小。这样一来我们可以放心的增长rcv_ssthresh了。 
+</span><span class='line'>          */  
+</span><span class='line'>        if (tcp_win_from_space(skb-&gt;truesize) &lt;= skb-&gt;len)  
+</span><span class='line'>            incr = 2 * tp-&gt;advmss; /* 增加两个本端最大接收MSS */  
+</span><span class='line'>        else  
+</span><span class='line'>            /* 可能增大rcv_ssthresh，也可能不增大，具体视额外内存开销和剩余缓存而定*/  
+</span><span class='line'>            incr = __tcp_grow_window(sk, skb);  
+</span><span class='line'>  
+</span><span class='line'>        if (incr) {  
+</span><span class='line'>            /* 增加后不能超过window_clamp */  
+</span><span class='line'>            tp-&gt;rcv_ssthresh = min(tp-&gt;rcv_ssthresh + incr, tp-&gt;window_clamp);  
+</span><span class='line'>            inet_csk(sk)-&gt;icsk_ack.quick |= 1; /* 允许快速ACK */  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>}  
+</span><span class='line'>   
+</span><span class='line'>/* Slow part of check#2. */  
+</span><span class='line'>static int __tcp_grow_window (const struct sock *sk, const struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    /* Optimize this! */  
+</span><span class='line'>    int truesize = tcp_win_from_space(skb-&gt;truesize) &gt;&gt; 1;  
+</span><span class='line'>    int window = tcp_win_from_space(sysctl_tcp_rmem[2]) &gt;&gt; 1; /* 接收缓冲区长度上限的一半*/  
+</span><span class='line'>  
+</span><span class='line'>    /* rcv_ssthresh不超过一半的接收缓冲区上限才有可能*/  
+</span><span class='line'>    while (tp-&gt;rcv_ssthresh &lt;= window) {  
+</span><span class='line'>        if (truesize &lt;= skb-&gt;len)  
+</span><span class='line'>            return 2 * inet_csk(sk)-&gt;icsk_ack.rcv_mss; /* 增加两个对端发送MSS的估计值*/  
+</span><span class='line'>          
+</span><span class='line'>        truesize &gt;&gt;= 1;  
+</span><span class='line'>        window &gt;&gt;= 1;  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    return 0;/*不增长*/  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个算法可能不太好理解，我们来分析一下。</p>
+
+<p>只有当数据段长度大于128字节时才会考虑增长rcv_ssthresh，并且有以下大前提(就是check #1)：<br/>
+a. 接收窗口当前阈值不能超过接收窗口的上限。<br/>
+b. 接收窗口当前阈值不能超过剩余接收缓存的3/4，即network buffer。<br/>
+c.  没有内存压力。TCP socket系统总共使用的内存过大。</p>
+
+<p>check#2是根据额外开销的内存占的比重，来判断是否允许增长。额外的内存开销(overhead)指的是：<br/>
+sk_buff、skb_shared_info结构体，以及协议头。有效的内存开销指的是数据段的长度。</p>
+
+<p>（1） 额外开销小于25%，则rcv_ssthresh增长两个本端最大接收MSS。<br/>
+（2）额外开销大于25%，分为两种情况。</p>
+
+<p>算法如下：<br/>
+把3/4的剩余接收缓存，即剩余network buffer均分为2<sup>n</sup>块。把额外开销均分为2<sup>n</sup>份。<br/>
+如果均分后每块缓存的大小大于rcv_ssthresh，且均分后的每份开销小于数据段的长度，则：
+允许rcv_ssthresh增大2个对端发送MSS的估计值。<br/>
+否则，不允许增大rcv_ssthresh。</p>
+
+<p>我们注意到在(1)和(2)中，rcv_ssthresh的增长幅度是不同的。在(1)中，由于收到大的数据段，额外开销较低，所以增长幅度较大(2 * tp->advmss)。在(2)中，由于收到中等数据段，额外开销较高，所以增长幅度较小(2 * icsk->icsk_ack.rcv_mss)。这样做是为了防止额外开销过高，而耗尽接收窗口。</p>
+
+<p>rcv_ssthresh增长算法的基本思想：<br/>
+This algorithm works on the basis that we do not want to increase the advertised window if we receive lots of small segments (i.e. interactive data flow), as the per-segment overhead (headers and the buffer control block) is very high.</p>
+
+<p>额外开销大小，取决于数据段的大小。我们从这个角度来分析下当接收到一个数据报时，rcv_ssthresh的增长情况：
+（1）Small segment (len &lt; 128)<br/>
+如果接收到的数据段很小，这时不允许增大rcv_ssthresh，防止额外内存开销过大。</p>
+
+<p>（2）Medium segment (128 &lt;= len &lt;= 647)<br/>
+如果接收到中等长度的数据段，符合条件时，rcv_ssthresh += 2 * rcv_mss。</p>
+
+<p>（3）Large segment (len > 647)<br/>
+如果接收到数据段长度较大的报文，符合条件时(rcv_ssthresh不超过window_clamp和3/4剩余接收缓存等)，rcv_ssthresh += 2 * advmss。这是比较常见的情况，这时接收窗口阈值一般增加2 * 1460 = 2920字节。</p>
+
+<p>这个值还可能有细微波动，这是由于对齐窗口扩大因子的关系。</p>
+
+<hr />
+
+<h3>TCP接收窗口的调整算法（下）</h3>
+
+<p>本文内容：分析TCP接收窗口的调整算法，主要是接收窗口的调整算法和总结。</p>
+
+<p>内核版本：3.2.12</p>
+
+<h4>接收窗口的调整算法</h4>
+
+<p>经过一系列的前奏，我们终于到了最关键的地方。接下来我们可以看到，接收窗口的大小主要取决于剩余的接收缓存，以及接收窗口当前阈值。决定接收窗口大小的函数tcp_select_window()在tcp_transmit_skb()中调用，也就是说每次我们要发送数据包时，都要使用tcp_select_window()来决定通告的接收窗口大小。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_transmit_skb (struct sock *sk, struct sk_buff *skb, int clone_it,   
+</span><span class='line'>                             gfp_t gfp_mask)  
+</span><span class='line'>{  
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>    struct inet_sock *inet;  
+</span><span class='line'>    struct tcp_sock *tp;  
+</span><span class='line'>    struct tcp_skb_cb *tcb;  
+</span><span class='line'>    struct tcphdr *th;  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* Build TCP header and checksum it，以下是TCP头的赋值*/  
+</span><span class='line'>    th = tcp_hdr(skb); /* skb-&gt;transport_header */  
+</span><span class='line'>    th-&gt;source = inet-&gt;inet_sport;  
+</span><span class='line'>    th-&gt;dest = inet-&gt;inet_dport;  
+</span><span class='line'>    th-&gt;seq = htonl(tcb-&gt;seq);  
+</span><span class='line'>    th-&gt;ack_seq = htonl(tp-&gt;rcv_nxt);  
+</span><span class='line'>    /* 这个语句可以看出C语言的强大*/  
+</span><span class='line'>    *(((__be16 *) th) + 6) = htons(((tcp_header_size &gt;&gt; 2) &lt;&lt; 12) | tcb-&gt;tcp_flags);  
+</span><span class='line'>      
+</span><span class='line'>    if (unlikely(tcb-&gt;tcp_flags & TCPHDR_SYN)) {  
+</span><span class='line'>        /* RFC1323: The window in SYN & SYN/ACK segments in never scaled. 
+</span><span class='line'>         * 从这里我们可以看到，在三次握手阶段，接收窗口并没有按扩大因子缩放。 
+</span><span class='line'>          */  
+</span><span class='line'>        th-&gt;window = htons(min(tp-&gt;rcv_wnd, 65535U));  
+</span><span class='line'>  
+</span><span class='line'>    } else {  
+</span><span class='line'>        th-&gt;window = htons(tcp_select_window(sk)); /* 更新接收窗口的大小*/  
+</span><span class='line'>    }  
+</span><span class='line'>    th-&gt;check = 0;  
+</span><span class='line'>    th-&gt;urg_ptr = 0;  
+</span><span class='line'>    ...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>来看下tcp_select_window()。</p>
+
+<p>注意，接收窗口的返回值只有16位，所以如果不使用窗口扩大选项，那么接收窗口的最大值为65535。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static u16 tcp_select_window(struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>    u32 cur_win = tcp_receive_window(tp); /* 当前接收窗口的剩余大小*/  
+</span><span class='line'>    u32 new_win = __tcp_select_window(sk); /*根据剩余的接收缓存，计算新的接收窗口的大小 */  
+</span><span class='line'>  
+</span><span class='line'>    /* Never shrink the offered window，不允许缩小已分配的接收窗口*/  
+</span><span class='line'>    if (new_win &lt; cur_win) {  
+</span><span class='line'>        /* Danger Will Robinson! 
+</span><span class='line'>         * Don't update rcv_wup/rcv_wnd here or else 
+</span><span class='line'>         * we will not be able to advertise a zero window in time. --DaveM 
+</span><span class='line'>         * Relax Will Robinson. 
+</span><span class='line'>         */  
+</span><span class='line'>        new_win = ALIGN(cur_win, 1 &lt;&lt; tp-&gt;rx_opt.rcv_wscale);  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* 更新接收窗口大小。个人觉得这句代码应该后移，因为此时接收窗口的大小还未最终确定！*/  
+</span><span class='line'>    tp-&gt;rcv_wnd = new_win;  
+</span><span class='line'>    tp-&gt;rcv_wup = tp-&gt;rcv_nxt; /* 更新接收窗口的左边界，把未确认的数据累积确认*/  
+</span><span class='line'>   
+</span><span class='line'>    /* 确保接收窗口大小不超过规定的最大值。 
+</span><span class='line'>      * Make sure we do not exceed the maximum possible scaled window. 
+</span><span class='line'>     */  
+</span><span class='line'>    if (! tp-&gt;rx_opt.rcv_wscale && sysctl_tcp_workaround_signed_windows)  
+</span><span class='line'>        /* 不能超过32767，因为一些奇葩协议采用有符号的接收窗口大小*/  
+</span><span class='line'>        new_win = min(new_win, MAX_TCP_WINDOW);   
+</span><span class='line'>  
+</span><span class='line'>    else  
+</span><span class='line'>        new_win = min(new_win, (65535U &lt;&lt; tp-&gt;rx_opt.rcv_wscale));  
+</span><span class='line'>   
+</span><span class='line'>    /* RFC1323 scaling applied. 按比例因子缩小接收窗口，这样最多能表示30位*/  
+</span><span class='line'>    new_win &gt;&gt;= tp-&gt;rx_opt.rcv_wscale;  
+</span><span class='line'>   
+</span><span class='line'>    /* If we advertise zero window, disable fast path. */  
+</span><span class='line'>    if (new_win == 0)  
+</span><span class='line'>        tp-&gt;pred_flags = 0;  
+</span><span class='line'>   
+</span><span class='line'>    return new_win; /* 返回最终的接收窗口大小*/  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>每次发送一个TCP数据段，都要构建TCP首部，这时会调用tcp_select_window选择接收窗口大小。<br/>
+窗口大小选择的基本算法：<br/>
+1. 计算当前接收窗口的剩余大小cur_win。<br/>
+2. 计算新的接收窗口大小new_win，这个值为剩余接收缓存的3/4，且不能超过rcv_ssthresh。<br/>
+3. 取cur_win和new_win中值较大者作为接收窗口大小。</p>
+
+<h5>tcp_workaround_signed_windows</h5>
+
+<p>标识在未启用窗口扩大因子选项时，是否使用初始值不超过32767的TCP窗口，默认值为0(不启用)。<br/>
+我们知道在不启用窗口扩大因子选项时，接收窗口有16位，最大值为65535。但是有些很糟糕的协议<br/>
+采用的是有符号的窗口大小，所以最大值只能为32767。当然，这种协议并不多见：）。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>@include/net/tcp.h：  
+</span><span class='line'>/* 
+</span><span class='line'> * Never offer a window over 32767 without using window scaling. 
+</span><span class='line'> * Some poor stacks do signed 16bit maths!  
+</span><span class='line'> */  
+</span><span class='line'>#define MAX_TCP_WINDOW 32767U</span></code></pre></td></tr></table></div></figure>
+
+
+<p>计算当前接收窗口的剩余大小cur_win。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*  
+</span><span class='line'> * Compute the actual receive window we are currently advertising. 
+</span><span class='line'> * rcv_nxt can be after the window if our peer push more data than 
+</span><span class='line'> * the offered window. 
+</span><span class='line'> */  
+</span><span class='line'>static inline u32 tcp_receive_window (const struct tcp_sock *tp)  
+</span><span class='line'>{  
+</span><span class='line'>    s32 win = tp-&gt;rcv_wup + tp-&gt;rcv_wnd - tp-&gt;rcv_nxt;  
+</span><span class='line'>   
+</span><span class='line'>    if (win &lt; 0)  
+</span><span class='line'>        win = 0;  
+</span><span class='line'>  
+</span><span class='line'>    return (u32) win;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>详细说明：<br/>
+This is calculated as the last advertised window minus unacknowledged data length:<br/>
+tp->rcv_wnd - (tp->rcv_nxt - tp->rcv_wup)<br/>
+tp->rcv_wup is synced with next byte to be received (tp->rcv_nxt) only when we are sending ACK in tcp_select_window(). If there is no unacknowledged bytes, the routine returns the exact receive window advertised last.</p>
+
+<p>计算新的接收窗口大小new_win，这个是关键函数，我们将看到rcv_ssthresh所起的作用。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*  
+</span><span class='line'> * calculate the new window to be advertised. 
+</span><span class='line'> */  
+</span><span class='line'>u32 __tcp_select_window(struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>    struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>   
+</span><span class='line'>    /* MSS for the peer's data. Previous versions used mss_clamp here. 
+</span><span class='line'>     * I don't know if the value based on our guesses of peer's MSS is better 
+</span><span class='line'>     * for the performance. It's more correct but may be worse for the performance 
+</span><span class='line'>     * because of rcv_mss fluctuations. —— SAW 1998/11/1 
+</span><span class='line'>     */  
+</span><span class='line'>    int mss = icsk-&gt;icsk_ack.rcv_mss;/*这个是估计目前对端有效的发送mss，而不是最大的*/    
+</span><span class='line'>    int free_space = tcp_space(sk); /* 剩余接收缓存的3/4 */  
+</span><span class='line'>    int full_space = min_t(int, tp-&gt;window_clamp, tcp_full_space(sk)); /* 总的接收缓存 */  
+</span><span class='line'>    int window;  
+</span><span class='line'>   
+</span><span class='line'>    if (mss &gt; full_space)  
+</span><span class='line'>        mss = full_space; /* 减小mss，因为接收缓存太小了*/  
+</span><span class='line'>   
+</span><span class='line'>    /* receive buffer is half full，接收缓存使用一半以上时要小心了 */  
+</span><span class='line'>    if (free_space &lt; (full_space &gt;&gt; 1)) {  
+</span><span class='line'>        icsk-&gt;icsk_ack.quick = 0; /* 可以快速发送ACK段的数量置零*/  
+</span><span class='line'>   
+</span><span class='line'>        if (tcp_memory_pressure)/*有内存压力时，把接收窗口限制在5840字节以下*/  
+</span><span class='line'>            tp-&gt;rcv_ssthresh = min(tp-&gt;rcv_ssthresh, 4U * tp-&gt;advmss);  
+</span><span class='line'>  
+</span><span class='line'>        if (free_space &lt; mss) /* 剩余接收缓存不足以接收mss的数据*/  
+</span><span class='line'>            return 0;  
+</span><span class='line'>    }  
+</span><span class='line'>   
+</span><span class='line'>    if (free_space &gt; tp-&gt;rcv_ssthresh)  
+</span><span class='line'>        /* 看！不能超过当前接收窗口阈值，这可以达接收窗口平滑增长的效果*/  
+</span><span class='line'>        free_space = tp-&gt;rcv_ssthresh;    
+</span><span class='line'>  
+</span><span class='line'>    /* Don't do rounding if we are using window scaling, since the scaled window will 
+</span><span class='line'>     * not line up with the MSS boundary anyway. 
+</span><span class='line'>     */  
+</span><span class='line'>    window = tp-&gt;rcv_wnd;  
+</span><span class='line'>    if (tp-&gt;rx_opt.rcv_wscale) { /* 接收窗口扩大因子不为零*/  
+</span><span class='line'>        window = free_space;  
+</span><span class='line'>  
+</span><span class='line'>        /* Advertise enough space so that it won't get scaled away. 
+</span><span class='line'>         * Import case: prevent zero window announcement if 1 &lt;&lt; rcv_wscale &gt; mss. 
+</span><span class='line'>         * 防止四舍五入造通告的接收窗口偏小。 
+</span><span class='line'>          */  
+</span><span class='line'>        if (((window &gt;&gt; tp-&gt;rx_opt.rcv_wscale) &lt;&lt; tp-&gt;rx_opt.rcv_wscale) != window)  
+</span><span class='line'>            window =(((window &gt;&gt; tp-&gt;rx_opt.rcv_wscale) + 1) &lt;&lt; tp-&gt;rx_opt.rcv_wscale);  
+</span><span class='line'>  
+</span><span class='line'>    } else {  
+</span><span class='line'>        /* Get the largest window that is a nice multiple of mss. 
+</span><span class='line'>         * Window clamp already applied above. 
+</span><span class='line'>         * If our current window offering is within 1 mss of the free space we just keep it. 
+</span><span class='line'>         * This prevents the divide and multiply from happening most of the time. 
+</span><span class='line'>         * We also don't do any window rounding when the free space is too small. 
+</span><span class='line'>         */  
+</span><span class='line'>        /* 截取free_space中整数个mss，如果rcv_wnd和free_space的差距在一个mss以上*/  
+</span><span class='line'>        if (window &lt;= free_space - mss || window &gt; free_space)   
+</span><span class='line'>            window = (free_space / mss) * mss;  
+</span><span class='line'>        /* 如果free space过小，则直接取free space值*/  
+</span><span class='line'>        else if (mss = full_space && free_space &gt; window + (full_space &gt;&gt; 1))  
+</span><span class='line'>            window = free_space;  
+</span><span class='line'>        /* 当free_space -mss &lt; window &lt; free_space时，直接使用rcv_wnd，不做修改*/  
+</span><span class='line'>    }      
+</span><span class='line'>  
+</span><span class='line'>    return window;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 剩余接收缓存的3/4。 
+</span><span class='line'> * Note: caller must be prepared to deal with negative returns. 
+</span><span class='line'> */  
+</span><span class='line'>static inline int tcp_space (const struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>    return tcp_win_from_space(sk-&gt;sk_rcvbuf - atomic_read(&sk-&gt;sk_rmem_alloc));  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>static inline int tcp_win_from_space(int space)  
+</span><span class='line'>{  
+</span><span class='line'>    return sysctl_tcp_adv_win_scale &lt;= 0 ? (space &gt;&gt; (-sysctl_tcp_adv_win_scale)) :  
+</span><span class='line'>        space - (space &gt;&gt; sysctl_tcp_adv_win_scale);  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>/* 最大的接收缓存的3/4 */  
+</span><span class='line'>static inline int tcp_full_space(const struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>    return tcp_win_from_space(sk-&gt;sk_rcvbuf);  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>总体来说，新的接收窗口大小值为：剩余接收缓存的3/4，但不能超过接收缓存的阈值。</p>
+
+<h4>小结</h4>
+
+<p>接收窗口的调整算法主要涉及：<br/>
+（1）window_clamp和sk_rcvbuf的调整，在之前的blog《TCP接收缓存大小的动态调整》中有分析。<br/>
+（2）rcv_ssthresh接收窗口当前阈值的动态调整，一般增长2*advmss。<br/>
+（3）rcv_wnd接收窗口的动态调整，一般为min(&frac34; free space in sk_rcvbuf, rcv_ssthresh)。</p>
+
+<p>如果剩余的接收缓存够大，rcv_wnd受限于rcv_ssthresh。这个时候每收到一个大的数据包，rcv_wnd就增大2920字节(由于缩放原因这个值可能波动)。这就像慢启动一样，接收窗口指数增长。</p>
+
+<p>接收窗口当然不能无限制增长，当它增长到一定大小时，就会受到一系列因素的限制，比如window_clamp和sk_rcvbuf，或者剩余接收缓存区大小。</p>
+
+<p>当应用程序读取接收缓冲区数据不够快时，或者发生了丢包时，接收窗口会变小，这主要受限于剩余的接收缓存的大小。</p>
+
+<p>总的来说，接收窗口的调整算法涉及到一些变量，由于这些变量本身又是动态变化的，所以分析起来比较复杂，笔者也还需要再进行深入了解：）</p>
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2015-03-19T17:42:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>17:42:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~net/'>net</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2015/03/19/kernel-net-sack-dsack/" title="Previous Post: TCP的核心系列 — SACK和DSACK的实现">&laquo; TCP的核心系列 — SACK和DSACK的实现</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2015/03/19/kernel-net-cwnd/" title="Next Post: 拥塞窗口cwnd的理解">拥塞窗口cwnd的理解 &raquo;</a>
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2015 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>

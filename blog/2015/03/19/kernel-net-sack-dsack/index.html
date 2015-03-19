@@ -1,0 +1,3181 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>TCP的核心系列 — SACK和DSACK的实现 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>学习中......</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" id="query" type="text" placeholder="search...">
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+<script type="text/javascript">
+var query = GetRequest("query");
+if (query != null) {
+	document.getElementById("query").value = query;
+}
+</script>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">TCP的核心系列 — SACK和DSACK的实现</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-19T16:27:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>16:27:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/9613347">TCP的核心系列 — SACK和DSACK的实现（一）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8979718">TCP的核心系列 — SACK和DSACK的实现（二）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9706113">TCP的核心系列 — SACK和DSACK的实现（三）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9766895">TCP的核心系列 — SACK和DSACK的实现（四）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9768315">TCP的核心系列 — SACK和DSACK的实现（五）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9768519">TCP的核心系列 — SACK和DSACK的实现（六）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9698901">TCP的核心系列 — SACK和DSACK的实现（七）</a></p>
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（一）</h3>
+
+<p>TCP的实现中，SACK和DSACK是比较重要的一部分。</p>
+
+<p>SACK和DSACK的处理部分由Ilpo Järvinen (<a href="&#109;&#97;&#105;&#108;&#x74;&#x6f;&#58;&#x69;&#108;&#112;&#111;&#46;&#106;&#x61;&#114;&#118;&#x69;&#x6e;&#x65;&#110;&#64;&#x68;&#101;&#108;&#115;&#105;&#x6e;&#107;&#x69;&#46;&#x66;&#x69;">&#x69;&#x6c;&#112;&#111;&#x2e;&#106;&#x61;&#x72;&#118;&#105;&#x6e;&#101;&#x6e;&#64;&#x68;&#101;&#x6c;&#115;&#105;&#x6e;&#x6b;&#105;&#x2e;&#x66;&#x69;</a>) 维护。</p>
+
+<p>tcp_ack()处理接收到的带有ACK标志的数据段时，如果此ACK处于慢速路径，且此ACK的记分牌不为空，则调用<br/>
+tcp_sacktag_write_queue()来根据SACK选项标记发送队列中skb的记分牌状态。</p>
+
+<p>笔者主要分析18和37这两个版本的实现。<br/>
+相对而言，18版本的逻辑清晰，但效率较低；37版本的逻辑复杂，但效率较高。</p>
+
+<p>本文主要内容：18版tcp_sacktag_write_queue()的实现，也即18版SACK和DSACK的实现。</p>
+
+<h4>18版数据结构</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 这就是一个SACK块 */  
+</span><span class='line'>struct tcp_sack_block {  
+</span><span class='line'>    u32 start_seq; /* 起始序号 */  
+</span><span class='line'>    u32 end_seq; /* 结束序号 */  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* Options received (usually on last packet, some only on SYN packets). */  
+</span><span class='line'>    struct tcp_options_received rx_opt;  
+</span><span class='line'>    ...  
+</span><span class='line'>    struct tcp_sack_block recv_sack_cache[4]; /* 保存收到的SACK块，用于提高效率*/  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* 快速路径中使用，上次第一个SACK块的结束处，现在直接从这里开始处理 */  
+</span><span class='line'>    struct sk_buff *fastpath_skb_hint;       
+</span><span class='line'>    int fastpath_cnt_hint;  /* 快速路径中使用，上次记录的fack_count，现在继续累加 */  
+</span><span class='line'>    ...  
+</span><span class='line'>  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {  
+</span><span class='line'>    ...  
+</span><span class='line'>    u16 saw_tstamp : 1, /* Saw TIMESTAMP on last packet */  
+</span><span class='line'>            tstamp_ok : 1, /* TIMESTAMP seen on SYN packet */  
+</span><span class='line'>            dsack : 1, /* D-SACK is scheduled, 下一个发送段是否存在D-SACK */  
+</span><span class='line'>            sack_ok : 4, /* SACK seen on SYN packet, 接收方是否支持SACK */  
+</span><span class='line'>            ...  
+</span><span class='line'>    u8 num_sacks; /* Number of SACK blocks, 下一个发送段中SACK块数 */  
+</span><span class='line'>    ...  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<!-- more -->
+
+
+<h4>18版本实现</h4>
+
+<p>18版本的逻辑较清晰，我们先来看看。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_sacktag_write_queue(struct sock *sk, struct sk_buff *ack_skb, u32 prior_snd_una)  
+</span><span class='line'>{  
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>    /* SACK选项的起始地址，sacked为SACK选项在TCP首部的偏移 */  
+</span><span class='line'>    unsigned char *ptr = ack_skb-&gt;h.raw + TCP_SKB_CB(ack_skb)-&gt;sacked;  
+</span><span class='line'>  
+</span><span class='line'>    struct tcp_sack_block *sp = (struct tcp_sack_block *) (ptr + 2); /* 指向第一个sack块 */  
+</span><span class='line'>    int num_sacks = (ptr[1] - TCPOLEN_SACK_BASE) &gt;&gt; 3; /* sack的块数 */  
+</span><span class='line'>  
+</span><span class='line'>    int reord = tp-&gt;packets_out; /* 乱序的起始包位置，一开始设为最大 */  
+</span><span class='line'>    int prior_fackets; /* 上次的fackets_out */  
+</span><span class='line'>    u32 lost_retrans = 0; /* 重传包可能丢失时SACK块结束序号，表示需要遍历到的最高序号 */  
+</span><span class='line'>    int flag = 0; /* 有两种用途：先表示是否为快速路径，后用于返回标志 */  
+</span><span class='line'>    int dup_sack = 0; /* 有没有DSACK */  
+</span><span class='line'>    int i;  
+</span><span class='line'>  
+</span><span class='line'>     /* 如果之前没有SACKed的数据 */  
+</span><span class='line'>    if (! tp-&gt;sacked_out)  
+</span><span class='line'>        tp-&gt;fackets_out = 0;  /* FACK是根据最新的SACK来计算的，所以也要为0 */  
+</span><span class='line'>    prior_fackets = tp-&gt;fackets_out; /* 处理前先保存上次的fackets_out */  
+</span><span class='line'>  
+</span><span class='line'>    /* SACK fastpath: 
+</span><span class='line'>     * if the only SACK change is the increase of the end_seq of the first block then only 
+</span><span class='line'>     * apply that SACK block and use retrans queue hinting otherwise slowpath. 
+</span><span class='line'>     * 什么是快速路径：就是只有第一个SACK块的结束序号发生变化，其它的都不变。 
+</span><span class='line'>      */  
+</span><span class='line'>    flag = 1; /* 为1的话为快速路径，0为慢速路径 */  
+</span><span class='line'>  
+</span><span class='line'>    for (i = 0; i &lt; num_sacks; i++) {  
+</span><span class='line'>        __u32 start_seq = ntohl(sp[i].start_seq); /* 块的起始序号 */  
+</span><span class='line'>        __u32 end_seq = ntohl(sp[i].end_seq); /* 块的结束序号 */  
+</span><span class='line'>  
+</span><span class='line'>       /* 判断是否进入快速路径。 
+</span><span class='line'>         * 对第一个块：只要求起始序号相同 
+</span><span class='line'>         * 对于非第一个块：要求起始序号和结束序号都相同 
+</span><span class='line'>         * 也就是说，快速路径指的是只有第一个块的结束序号增加的情况 
+</span><span class='line'>         */  
+</span><span class='line'>        if (i == 0) {  
+</span><span class='line'>            if (tp-&gt;recv_sack_cache[i].start_seq != start_seq)  
+</span><span class='line'>                flag = 0;  
+</span><span class='line'>  
+</span><span class='line'>        } else {  
+</span><span class='line'>            if ((tp-&gt;recv_sack_cache[i].start_seq != start_seq) ||  
+</span><span class='line'>                (tp-&gt;recv_sack_cache[i].end_seq != end_seq))  
+</span><span class='line'>                flag = 0;  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        /* 更新，保存这次收到的SACK块 */  
+</span><span class='line'>        tp-&gt;recv_sack_cache[i].start_seq = start_seq;  
+</span><span class='line'>        tp-&gt;recv_sack_cache[i].end_seq = end_seq;  
+</span><span class='line'>  
+</span><span class='line'>        /* Check for D-SACK.  
+</span><span class='line'>         * 检测是否有DSACK ，DSACK块如果有，只能在第一个块 
+</span><span class='line'>          */  
+</span><span class='line'>        if (i == 0) {  
+</span><span class='line'>            u32 ack = TCP_SKB_CB(ack_skb)-&gt;ack_seq;  
+</span><span class='line'>  
+</span><span class='line'>            /* 如果第一个SACK块的起始序号小于它的确认序号，说明此SACK块包含了确认过的数据 */  
+</span><span class='line'>            if (before(start_seq, ack)) {  
+</span><span class='line'>                dup_sack = 1;  
+</span><span class='line'>                tp-&gt;rx_opt.sack_ok |= 4;   
+</span><span class='line'>                NET_INC_STATS_BH(LINUX_MIB_TCPDSACKRECV);  
+</span><span class='line'>  
+</span><span class='line'>            /* 如果第一个SACK块包含在第二个SACK块中，也说明第一个SACK块是重复的，即DSACK */  
+</span><span class='line'>            } else if (num_sacks &gt; 1 &&  
+</span><span class='line'>                !after(end_seq, ntohl(sp[1].end_seq)) &&  
+</span><span class='line'>                !before(start_seq, ntohl(sp[1].start_seq))) {  
+</span><span class='line'>                    dup_sack = 1;  
+</span><span class='line'>                    tp-&gt;rx_opt.sack_ok |= 4;  
+</span><span class='line'>                    NET_INC_STATS_BH(LINUX_MIB_TCPDSACKOFORECV);  
+</span><span class='line'>            }  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        /* D-SACK for already forgotten data... 
+</span><span class='line'>         * Do dumb counting. 
+</span><span class='line'>         * undo_retrans记录重传数据包的个数，如果undo_retrans降到0， 
+</span><span class='line'>          * 就说明之前的重传都是不必要的，进行拥塞调整撤销。 
+</span><span class='line'>          * 条件：DSACK、undo_marker &lt; end_seq &lt;= prior_snd_una 
+</span><span class='line'>         */  
+</span><span class='line'>        if (dup_sack && !after(end_seq, prior_snd_una) &&  
+</span><span class='line'>            after(end_seq, tp-&gt;undo_marker))  
+</span><span class='line'>            tp-&gt;undo_retrans--;  
+</span><span class='line'>  
+</span><span class='line'>        /* Eliminate too old ACKs, but take into account more or less fresh ones, 
+</span><span class='line'>         * they can contain valid SACK info. 
+</span><span class='line'>         * tp-&gt;max_window为接收方通告过的最大接收窗口。 
+</span><span class='line'>          * 如果SACK信息是很早以前的，直接丢弃。 
+</span><span class='line'>          */  
+</span><span class='line'>        if (before(ack, prior_snd_una - tp-&gt;max_window))  
+</span><span class='line'>            return 0;  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    if (flag)  
+</span><span class='line'>        num_sacks = 1; /* 快速路径时只有第一个块有变化，处理第一个块即可 */  
+</span><span class='line'>    else {  
+</span><span class='line'>        int j;  
+</span><span class='line'>        /* 上次第一个SACK块的结束处，也是这次快速路径的开始点，慢速路径中重置了 */  
+</span><span class='line'>        tp-&gt;fastpath_skb_hint = NULL;  
+</span><span class='line'>   
+</span><span class='line'>        /* order SACK blocks to allow in order walk of the retrans queue. 
+</span><span class='line'>         * 对SACK块按起始序号，从小到大冒泡排序，以便与接下来的顺序遍历。 
+</span><span class='line'>          */  
+</span><span class='line'>        for (i = num_sacks - 1; i &gt; 0; i--) {  
+</span><span class='line'>            for (j = 0; j &lt; i; j++) {  
+</span><span class='line'>                if (after(ntohl(sp[j].start_seq), ntohl(sp[j+1].start_seq))) {  
+</span><span class='line'>                    sp[j].start_seq = htonl(tp-&gt;recv_sack_cache[j+1].start_seq);  
+</span><span class='line'>                    sp[j].end_seq = htonl(tp-&gt;recv_sack_cache[j+1].end_seq);  
+</span><span class='line'>                    sp[j+1].start_seq = htonl(tp-&gt;recv_sack_cache[j].start_seq);  
+</span><span class='line'>                    sp[j+1].end_seq = htonl(tp-&gt;recv_sack_cache[j].end_seq);  
+</span><span class='line'>                }  
+</span><span class='line'>            }      
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* clear flag as used for different purpose in following code */  
+</span><span class='line'>    flag = 0; /* 用于返回一些标志 */  
+</span><span class='line'>   
+</span><span class='line'>    /* 逐个处理SACK块，可能只有一个，也可能多个 */  
+</span><span class='line'>    for (i = 0; i &lt; num_sacks; i++, sp++) {  
+</span><span class='line'>        struct sk_buff *skb;  
+</span><span class='line'>        __u32 start_seq = ntohl(sp-&gt;start_seq); /* SACK块起始序号 */  
+</span><span class='line'>        __u32 end_seq = ntohl(sp-&gt;end_seq); /* SACK块结束序号 */  
+</span><span class='line'>        int fack_count; /* 用于更新fackets_out */  
+</span><span class='line'>  
+</span><span class='line'>        /* Use SACK fastpath hint if valid. 
+</span><span class='line'>         * 如果处于快速路径，那么可以不用从头遍历发送队列。 
+</span><span class='line'>          */  
+</span><span class='line'>        if (tp-&gt;fastpath_skb_hint) {  
+</span><span class='line'>            skb = tp-&gt;fastpath_skb_hint; /* 从这个段开始处理 */  
+</span><span class='line'>            fack_count = tp-&gt;fastpath_cnt_hint; /* 已有的fackets_out */  
+</span><span class='line'>  
+</span><span class='line'>        } else { /* 否则慢速路径，从头开始处理 */  
+</span><span class='line'>            skb = sk-&gt;sk_write_queue.next; /* 发送队列头 */  
+</span><span class='line'>            fack_count = 0;  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        /* Event B in the comment above. 
+</span><span class='line'>         * high_seq是进入Recovery或Loss时的snd_nxt，如果high_seq被SACK了，那么很可能有数据包 
+</span><span class='line'>          * 丢失了，不然就可以ACK掉high_seq返回Open态了。 
+</span><span class='line'>          */  
+</span><span class='line'>        if (after(end_seq, tp-&gt;high_seq))  
+</span><span class='line'>            flag |= FLAG_DATA_LOST;  
+</span><span class='line'>  
+</span><span class='line'>        /* 从skb开始遍历发送队列 */  
+</span><span class='line'>        sk_stream_for_retrans_queue_from(skb, sk) {  
+</span><span class='line'>            int in_sack, pcount;  
+</span><span class='line'>            u8 sacked;  
+</span><span class='line'>  
+</span><span class='line'>            /* 记录最后一个正在处理的段，下次进入快速路径时，可以直接从这里 
+</span><span class='line'>               * 开始处理，而不用从头遍历发送队列。 
+</span><span class='line'>               */  
+</span><span class='line'>            tp-&gt;fastpath_skb_hint = skb;  
+</span><span class='line'>            tp-&gt;fastpath_cnt_hint = fack_count;  
+</span><span class='line'>  
+</span><span class='line'>            /* The retransmission queue is always in order, so we can short-circuit 
+</span><span class='line'>             * the walk early. 
+</span><span class='line'>             * 当前skb段的序号超过SACK块的右端时，说明这个SACK块已经处理好了。 
+</span><span class='line'>               */  
+</span><span class='line'>            if (! before(TCP_SKB_CB(skb)-&gt;seq, end_seq))  
+</span><span class='line'>                break;  
+</span><span class='line'>  
+</span><span class='line'>            /* 这个段是否完全包含在SACK块中 */  
+</span><span class='line'>            in_sack = ! after(start_seq, TCP_SKB_CB(skb)-&gt;seq) &&  
+</span><span class='line'>                               ! before(end_seq, TCP_SKB_CB(skb)-&gt;end_seq);  
+</span><span class='line'>            pcount = tcp_skb_pcount(skb); /* 这个段分为多少个包 */  
+</span><span class='line'>   
+</span><span class='line'>           /* 如果当前的段是TSO段，且它的一部份包含在SACK块中。 
+</span><span class='line'>              * 那么那些已经被SACK的部分就不用再重传了，所以需要重新分割TSO段。 
+</span><span class='line'>              */  
+</span><span class='line'>            if (pcount &gt; 1 && ! in_sack &&   
+</span><span class='line'>                after(TCP_SKB_CB(skb)-&gt;end_seq, start_seq)) {  
+</span><span class='line'>                unsigned int pkt_len;  
+</span><span class='line'>   
+</span><span class='line'>                /* 表示TSO段的后半部在SACK块之外 */  
+</span><span class='line'>                in_sack = ! after(start_seq, TCP_SKB_CB(skb)-&gt;seq);  
+</span><span class='line'>  
+</span><span class='line'>                if (! in_sack) /* 如果TSO段的前半部在SACK块之外 */  
+</span><span class='line'>                    pkt_len = (start_seq - TCP_SKB_CB(skb)-&gt;seq); /* SACK块之外段的长度 */  
+</span><span class='line'>                else  
+</span><span class='line'>                    pkt_len = (end_seq - TCP_SKB_CB(skb)-&gt;seq); /* SACK块之内段的长度 */  
+</span><span class='line'>  
+</span><span class='line'>                /* 把TSO段分为两部分 */  
+</span><span class='line'>                if (tcp_fragment(sk, skb, pkt_len, skb_shinfo(skb)-&gt;gso_size))  
+</span><span class='line'>                    break;  
+</span><span class='line'>  
+</span><span class='line'>                pcount += tcp_skb_pcount(skb); /* skb缩减了，需要重新计算 */  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>            fack_count += pcount; /* 累加fackets_out */  
+</span><span class='line'>   
+</span><span class='line'>            sacked = TCP_SKB_CB(skb)-&gt;sacked; /* 这就是记分板scoreboard */  
+</span><span class='line'>  
+</span><span class='line'>            /* Account D-SACK for retransmitted packet. 
+</span><span class='line'>             * 如果此skb属于DSACK块，且skb被重传过。 
+</span><span class='line'>               * 这里in_sack指的是：全部包含在SACK块中，还有前半部包含也算，因为分割了：） 
+</span><span class='line'>               */  
+</span><span class='line'>            if ((dup_sack && in_sack) && (sacked & TCPCB_RETRANS) &&  
+</span><span class='line'>                after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;undo_marker))  
+</span><span class='line'>                tp-&gt;undo_retrans--; /* 如果减为0，那么说明之前重传都是不必要的，进行拥塞控制调整撤销 */  
+</span><span class='line'>  
+</span><span class='line'>            /* The frame is ACKed. 当这个skb被确认了*/  
+</span><span class='line'>            if (! after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una)) {  
+</span><span class='line'>                /* 乱序情况1：R|S标志，收到DSACK */  
+</span><span class='line'>                if (sacked & TCPCB_RETRANS) {  
+</span><span class='line'>                    if ((dup_sack && in_sack) && (sacked & TCPCB_SACKED_ACKED))  
+</span><span class='line'>                        reord = min(fack_count, reord); /* 更新乱序的起始位置 */  
+</span><span class='line'>  
+</span><span class='line'>                } else {  
+</span><span class='line'>                   /* 乱序情况2：一个包落在highest_sack之前，它既没被SACK过，也不是重传的， 
+</span><span class='line'>                       * 现在才到达了，那么它就是乱序了。就是前面的洞自动填满了：） 
+</span><span class='line'>                       */  
+</span><span class='line'>                    if (fack_count &lt; prior_fackets && ! (sacked & TCPCB_SACKED_ACKED))  
+</span><span class='line'>                        reord = min(fack_count, reord);  
+</span><span class='line'>                }  
+</span><span class='line'>  
+</span><span class='line'>                /* Nothing to do; acked frame is about to be dropped. 
+</span><span class='line'>                 * 这个skb已经被正常确认了，不用再处理了，它即将被丢弃。 
+</span><span class='line'>                    */  
+</span><span class='line'>                continue;  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>           /* 如果这个包是重传包，并且它的snd_nxt小于此块的结束序号， 
+</span><span class='line'>             * 那么这个重传包可能是丢失了，我们记录这个块的结束序号， 
+</span><span class='line'>             * 作为接下来遍历的最高序号。 
+</span><span class='line'>             */  
+</span><span class='line'>            if ((sacked & TCPCB_SACKED_RETRANS) &&   
+</span><span class='line'>                after(end_seq, TCP_SKB_CB(skb)-&gt;ack_seq) &&  
+</span><span class='line'>                (! lost_retrans || after(end_seq, lost_retrans)))  
+</span><span class='line'>                lost_retrans = end_seq;  
+</span><span class='line'>  
+</span><span class='line'>            /* 如果这个包不包含在SACK块中，即在SACK块之外，则不用继续处理 */  
+</span><span class='line'>            if (! in_sack)  
+</span><span class='line'>                continue;  
+</span><span class='line'>  
+</span><span class='line'>            /* 如果skb还没有被标志为SACK，那么进行处理 */  
+</span><span class='line'>            if (! (sacked & TCPCB_SACKED_ACKED)) {  
+</span><span class='line'>                /* 有R标志，表示被重传过 */  
+</span><span class='line'>                if (sacked & TCPCB_SACKED_RETRANS) {  
+</span><span class='line'>                    /* If the segment is not tagged as lost, we do not clear RETRANS, believing 
+</span><span class='line'>                     * that retransmission is still in flight. 
+</span><span class='line'>                     * 如果之前的标志是：R | L，那么好，现在收到包了，可以清除R和L。 
+</span><span class='line'>                        * 如果之前的标志是：R，那么认为现在收到的是orig，重传包还在路上，所以不用干活：） 
+</span><span class='line'>                        */  
+</span><span class='line'>                    if (sacked & TCPCB_LOST) {  
+</span><span class='line'>                        TCP_SKB_CB(skb)-&gt;sacked &= ~(TCPCB_LOST | TCPCB_SACKED_RETRANS); /* 取消L和R标志 */  
+</span><span class='line'>                        tp-&gt;lost_out -= tcp_skb_pcount(skb); /* 更新LOST包个数 */  
+</span><span class='line'>                        tp-&gt;retrans_out -= tcp_skb_pcount(skb); /* 更新RETRANS包个数 */  
+</span><span class='line'>                        /* clear lost hint */  
+</span><span class='line'>                        tp-&gt;retransmit_skb_hint = NULL;  
+</span><span class='line'>                    }  
+</span><span class='line'>  
+</span><span class='line'>                } else {  
+</span><span class='line'>                    /* New sack for not retransmitted frame, which was in hole. It is reordering. 
+</span><span class='line'>                     * 如果一个包落在highest_sack之前，它即没被SACK过，也不是重传的，那么 
+</span><span class='line'>                        * 它肯定是乱序了，到现在才被SACK。 
+</span><span class='line'>                        */  
+</span><span class='line'>                    if (! (sacked & TCPCB_RETRANS) && fack_count &lt; prior_fackets)  
+</span><span class='line'>                        reord = min(fack_count, reord); /* 记录乱序的起始 */  
+</span><span class='line'>  
+</span><span class='line'>                    /* 如果有L标志 */  
+</span><span class='line'>                    if (sacked & TCPCB_LOST) {  
+</span><span class='line'>                        TCP_SKB_CB(skb)-&gt;sacked &= ~TCPCB_LOST; /* 清除L标志 */  
+</span><span class='line'>                        tp-&gt;lost_out -= tcp_skb_pcount(skb); /* 更新lost_out */  
+</span><span class='line'>                        /* clear lost hint */  
+</span><span class='line'>                        tp-&gt;retransmit_skb_hint = NULL;  
+</span><span class='line'>                    }  
+</span><span class='line'>                }  
+</span><span class='line'>  
+</span><span class='line'>                TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_SACKED_ACKED; /* 打上S标志 */  
+</span><span class='line'>                flag |= FLAG_DATA_SACKED; /* New SACK */  
+</span><span class='line'>                tp-&gt;sacked_out += tcp_skb_pcount(skb); /* 更新sacked_out */  
+</span><span class='line'>  
+</span><span class='line'>                if (fack_count &gt; tp-&gt;fackets_out)  
+</span><span class='line'>                    tp-&gt;fackets_out = fack_count; /* 更新fackets_out */  
+</span><span class='line'>  
+</span><span class='line'>            } else { /* 已经有S标志 */  
+</span><span class='line'>                /* 如果之前是R|S标志，且这个包被DSACK了，说明是乱序 */  
+</span><span class='line'>                if (dup_sack && (sacked & TCPCB_RETRANS))  
+</span><span class='line'>                    reord = min(fack_count, reord);  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>            /* D-SACK. We can detect redundant retransmission in S|R and plain R frames 
+</span><span class='line'>             * and clear it.  
+</span><span class='line'>             * undo_retrans is decreased above, L|R frames are accounted above as well. 
+</span><span class='line'>             * 如果skb被D-SACK，并且它的重传标志还未被清除，那么现在清除。 
+</span><span class='line'>               */  
+</span><span class='line'>            if (dup_sack && (TCP_SKB_CB(skb)-&gt;sacked & TCPCB_SACKED_RETRANS)) {  
+</span><span class='line'>                TCP_SKB_CB(skb)-&gt;sacked &= ~TCPCB_SACKED_RETRANS;  
+</span><span class='line'>                tp-&gt;retrans_out -= tcp_skb_pcount(skb);  
+</span><span class='line'>                tp-&gt;retransmit_skb_hint = NULL;  
+</span><span class='line'>            }  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* Check for lost retransmit. This superb idea is borrowed from "ratehalving." Event C. 
+</span><span class='line'>     * 如果lost_retrans不为0，且处于Recovery状态，说明有重传包丢失，进行处理。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (lost_retrans && icsk-&gt;icsk_ca_state == TCP_CA_Recovery) {  
+</span><span class='line'>        struct sk_buff *skb;  
+</span><span class='line'>  
+</span><span class='line'>        /* 从头开始遍历发送队列 */  
+</span><span class='line'>        sk_stream_for_retrans_queue(skb, sk) {  
+</span><span class='line'>            /* lost_retrans记录的是SACK块结束序号，并且只在小于lost_retrans内有发现重传包丢失 */  
+</span><span class='line'>            if (after(TCP_SKB_CB(skb)-&gt;seq, lost_retrans))  
+</span><span class='line'>                break;  
+</span><span class='line'>  
+</span><span class='line'>            /* 不关心成功确认过的包 */  
+</span><span class='line'>            if (! after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una)  
+</span><span class='line'>                continue;  
+</span><span class='line'>  
+</span><span class='line'>            /* 现在判断这个重传包是否丢失。 
+</span><span class='line'>              * 这个包要是重传包，并且它的snd_nxt小于lost_retrans 
+</span><span class='line'>             */  
+</span><span class='line'>            if ((TCP_SKB_CB(skb)-&gt;sacked & TCPCB_SACKED_RETRANS) &&  
+</span><span class='line'>                after(lost_retrans, TCP_SKB_CB(skb)-&gt;ack_seq) &&  (IsFack(tp) ||  
+</span><span class='line'>                !before(lost_retrans, TCP_SKB_CB(skb)-&gt;ack_seq + tp-&gt;reordering * tp-&gt;mss_cache))) {  
+</span><span class='line'>                TCP_SKB_CB(skb)-&gt;sacked &= ~TCPCB_SACKED_RETRANS; /* 清除R标志 */  
+</span><span class='line'>                tp-&gt;retrans_out -= tcp_skb_pcount(skb); /* 更新retrans_out */  
+</span><span class='line'>                /* clear lost hint */  
+</span><span class='line'>                tp-&gt;retransmit_skb_hint = NULL;  
+</span><span class='line'>  
+</span><span class='line'>                /* 给这个包重新打上L标志 */  
+</span><span class='line'>                if (! (TCP_SKB_CB(skb)-&gt;sacked & (TCPCB_LOST | TCPCB_SACKED_ACKED))) {  
+</span><span class='line'>                    tp-&gt;lost_out += tcp_skb_pcount(skb); /* 更新lost_out */  
+</span><span class='line'>                    TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_LOST; /* 打上L标志 */  
+</span><span class='line'>                    /* 这个弄错了吧？应该是FLAG_DATA_LOST才对 */  
+</span><span class='line'>                    flag |= FLAG_DATA_SACKED;  
+</span><span class='line'>                    NET_INC_STATS_BH(LINUX_MIB_TCPLOSTRETRANSMIT);  
+</span><span class='line'>                }  
+</span><span class='line'>            }   
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    tp-&gt;left_out = tp-&gt;sacked_out + tp-&gt;lost_out;  
+</span><span class='line'>    /* 更新乱序队列长度。 
+</span><span class='line'>     * 乱序队列的长度 = fackets_out - reord + 1，reord记录从第几个包开始乱序 
+</span><span class='line'>     */  
+</span><span class='line'>    if ((reord &lt; tp-&gt;fackets_out) && icsk-&gt;icsk_ca_state != TCP_CA_Loss)  
+</span><span class='line'>        tcp_update_reordering(sk, ((tp-&gt;fackets_out + 1) - reord), 0);  
+</span><span class='line'>  
+</span><span class='line'>#if FASTRETRANS_DEBUG &gt; 0  
+</span><span class='line'>    BUG_TRAP((int) tp-&gt;sacked_out &gt;= 0);  
+</span><span class='line'>    BUG_TRAP((int) tp-&gt;lost_out &gt;= 0);  
+</span><span class='line'>    BUG_TRAP((int) tp-&gt;retrans_out &gt;= 0);  
+</span><span class='line'>    BUG_TRAP((int) tcp_packets_in_flight(tp) &gt;= 0);  
+</span><span class='line'>#endif  
+</span><span class='line'>  
+</span><span class='line'>    return flag;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Q: 为什么说18版的实现效率不高呢？<br/>
+A: 我们收到num_sacks个SACK块，如果符合快速路径，那么遍历一次发送队列就可以了；<br/>
+但是如果不符合快速路径，那么对于每个SACK块，都要遍历一次发送队列，而且都是从头开始遍历，<br/>
+这样就做了很多重复工作，复杂度为O(num_sacks * cwnd)。如果cwnd很大的话，CPU消耗会较高。<br/>
+37版本在这一方面做了一些优化。</p>
+
+<p>对于18版本中的一些细节，接下来会对照37版本的实现进行详细分析，比如：<br/>
+SACK选项的地址在接收时是如何保存起来的，这是在tcp_rcv_established中处理的。<br/>
+DSACK的原理和实现，这部分在37中独立出来。<br/>
+检测重传包是否丢失的原理和实现，这部分在37中独立出来。<br/>
+乱序是如何检测的，它的原理和实现。</p>
+
+<h5>Reference</h5>
+
+<p>RFC 2018<br/>
+RFC 2883</p>
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（二）</h3>
+
+<p>和18版本相比，37版本的SACK和DSACK的实现做了很多改进，最明显的就是需要遍历的次数少了，<br/>
+减少了CPU的消耗。37版的性能提升了，代码有大幅度的改动，逻辑也更加复杂了。</p>
+
+<p>本文主要内容：37版tcp_sacktag_write_queue()的实现，也即37版SACK和DSACK的实现。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* This defines a selective acknowledgement block. */  
+</span><span class='line'>struct tcp_sack_block_wire {  
+</span><span class='line'>    __be32 start_seq;  
+</span><span class='line'>    __be32 end_seq;  
+</span><span class='line'>};  
+</span><span class='line'>  
+</span><span class='line'>/* 这就是一个SACK块 */  
+</span><span class='line'>struct tcp_sack_block {  
+</span><span class='line'>    u32 start_seq; /* 起始序号 */  
+</span><span class='line'>    u32 end_seq; /* 结束序号 */  
+</span><span class='line'>};  
+</span><span class='line'>  
+</span><span class='line'>/* 用于处理SACK块时保存一些信息 */  
+</span><span class='line'>struct tcp_sacktag_state {  
+</span><span class='line'>    int reord; /* 乱序的位置 */  
+</span><span class='line'>    int fack_count; /* 累加fackets_out */  
+</span><span class='line'>    int flag; /* 返回标志 */  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* Options received (usually on last packet, some only on SYN packets). */  
+</span><span class='line'>    struct tcp_options_received rx_opt;  
+</span><span class='line'>    ...  
+</span><span class='line'>    /* SACKs data, these 2 need to be together (see tcp_build_and_update_options) 
+</span><span class='line'>     * 收到乱序包时填入信息，用于回复 
+</span><span class='line'>     */  
+</span><span class='line'>    struct tcp_sack_block duplicate_sack[1]; /* D-SACK block */      
+</span><span class='line'>    struct tcp_sack_block selective_acks[4]; /* The SACKS themselves */  
+</span><span class='line'>  
+</span><span class='line'>    struct tcp_sack_block recv_sack_cache[4]; /* 保存收到的SACK块，用于提高效率*/  
+</span><span class='line'>    struct sk_buff *highest_sack; /* highest skb with SACK received 
+</span><span class='line'>                                   * (validity guaranteed only if sacked_out &gt; 0) */  
+</span><span class='line'>    ...  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {  
+</span><span class='line'>    ...  
+</span><span class='line'>    u16 saw_tstamp : 1, /* Saw TIMESTAMP on last packet */  
+</span><span class='line'>            tstamp_ok : 1, /* TIMESTAMP seen on SYN packet */  
+</span><span class='line'>            dsack : 1, /* D-SACK is scheduled, 下一个发送段是否存在D-SACK */  
+</span><span class='line'>            sack_ok : 4, /* SACK seen on SYN packet, 接收方是否支持SACK */  
+</span><span class='line'>            ...  
+</span><span class='line'>    u8 num_sacks; /* Number of SACK blocks, 下一个发送段中SACK块数 */  
+</span><span class='line'>    ...  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>37版本实现</h4>
+
+<p>37版本做了一些改进，主要是为了提升效率，减少重复工作。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_sacktag_write_queue (struct sock *sk, const struct sk_buff *ack_skb, u32 prior_snd_una)  
+</span><span class='line'>{  
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>    /* SACK选项的起始地址，sacked为SACK选项在TCP首部的偏移 */  
+</span><span class='line'>    const unsigned char *ptr = (skb_transport_header(ack_skb) + TCP_SKB_CB(ack_skb)-&gt;sacked);  
+</span><span class='line'>  
+</span><span class='line'>    struct tcp_sack_block_wire *sp_wire = (struct tcp_sack_block_wire *) (ptr + 2); /* 指向第一个sack块 */  
+</span><span class='line'>    struct tcp_sack_block sp[TCP_NUM_SACKS];  
+</span><span class='line'>    struct tcp_sack_block *cache;  
+</span><span class='line'>    struct tcp_sacktag_state state;  
+</span><span class='line'>    struct sk_buff *skb;  
+</span><span class='line'>    int num_sacks = min(TCP_NUM_SACKS, (ptr[1] - TCPOLEN_SACK_BASE) &gt;&gt; 3); /* sack的块数 */  
+</span><span class='line'>    int used_sacks;  
+</span><span class='line'>    int found_dup_sack = 0;  
+</span><span class='line'>    int i, j;  
+</span><span class='line'>    int first_sack_index;  
+</span><span class='line'>  
+</span><span class='line'>    state.flag = 0;  
+</span><span class='line'>    state.reord = tp-&gt;packets_out; /* 乱序的起始位置一开始设为最大 */  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果之前没有SACKed的数据 */  
+</span><span class='line'>    if (! tp-&gt;sacked_out) {  
+</span><span class='line'>        if (WARN_ON(tp-&gt;fackets_out))  
+</span><span class='line'>            tp-&gt;fackets_out = 0; /* FACK是根据最新的SACK来计算的，也要为0 */  
+</span><span class='line'>        tcp_highest_sack_reset(sk); /* tp-&gt;highest_sack置为发送队列的第一个数据包，因为没有SACK块 */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* 检查第一个SACK块是否为DSACK */  
+</span><span class='line'>    found_dup_sack = tcp_check_dsack(sk, ack_skb, sp_wire, num_sacks, prior_snd_una);  
+</span><span class='line'>    if (found_dup_sack)  
+</span><span class='line'>        state.flag |= FLAG_DSACKING_ACK; /* SACK blocks contained D-SACK info */  
+</span><span class='line'>  
+</span><span class='line'>    /* Eliminate too old ACKs, but take into account more or less fresh ones, 
+</span><span class='line'>     * they can contain valid SACK info. 
+</span><span class='line'>     * tp-&gt;max_window为接收方通告过的最大接收窗口。 
+</span><span class='line'>     * 如果SACK信息是很早以前的，直接丢弃。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (before(TCP_SKB_CB(ack_skb)-&gt;ack_seq, prior_snd_una - tp-&gt;max_window))  
+</span><span class='line'>        return 0;  
+</span><span class='line'>  
+</span><span class='line'>    if (! tp-&gt;packets_out) /* 如果我们并没有发送数据到网络中，错误 */  
+</span><span class='line'>        goto out;  
+</span><span class='line'>  
+</span><span class='line'>    used_sacks = 0;  
+</span><span class='line'>    first_sack_index = 0;  
+</span><span class='line'>  
+</span><span class='line'>    /* 进行SACK块的合法性检查，并确定要使用哪些SACK块 */  
+</span><span class='line'>    for (i = 0; i &lt; num_sacks; i++) {  
+</span><span class='line'>        int dup_sack = ! i && found_dup_sack; /* 是否为DSACK块，DSACK块只能是第一个块 */  
+</span><span class='line'>  
+</span><span class='line'>        sp[used_sacks].start_seq = get_unaligned_be32(&sp_wire[i].start_seq);  
+</span><span class='line'>        sp[used_sacks].end_seq = get_unaligned_be32(&sp_wire[i].end_seq);  
+</span><span class='line'>  
+</span><span class='line'>        /* 检查这个SACK块是否为合法的 */  
+</span><span class='line'>        if (! tcp_is_sackblock_valid(tp, dup_sack, sp[used_sacks].start_seq,  
+</span><span class='line'>                 sp[used_sacks].end_seq)) {  
+</span><span class='line'>  
+</span><span class='line'>            /* 不合法的话进行处理 */  
+</span><span class='line'>            int mib_idx;  
+</span><span class='line'>  
+</span><span class='line'>            if (dup_sack) { /* 如果是DSACK块 */  
+</span><span class='line'>                if (! tp-&gt;undo_marker) /* 之前没有进入Recovery或Loss状态 */  
+</span><span class='line'>                    mib_idx = LINUX_MIB_TCPDSACKINGOREDNOUNDO; /* TCPSACKIgnoredNoUndo */  
+</span><span class='line'>                else  
+</span><span class='line'>                    mib_idx = LINUX_MIB_TCPDSACKINGNOREDOLD; /* TCPSACKIgnoredOld */  
+</span><span class='line'>  
+</span><span class='line'>            } else { /* 不是DSACK块 */  
+</span><span class='line'>                /* Don't count olds caused by ACK reordering，不处理ACK乱序 */  
+</span><span class='line'>                if ((TCP_SKB_CB(ack_skb)-&gt;ack_seq != tp-&gt;snd_una) &&  
+</span><span class='line'>                    ! after(sp[used_sacks].end_seq, tp-&gt;snd_una))  
+</span><span class='line'>                    continue;  
+</span><span class='line'>                mib_idx = LINUX_MIB_TCPSACKDISCARD;  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>            NET_INC_STATS_BH(sock_net(sk), mib_idx);  
+</span><span class='line'>  
+</span><span class='line'>            if (i == 0)  
+</span><span class='line'>                first_sack_index = -1; /* 表示第一个块无效 */  
+</span><span class='line'>  
+</span><span class='line'>            continue;  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        /* Ignore very old stuff early，忽略已确认过的块 */  
+</span><span class='line'>        if (! after(sp[used_sacks].end_seq, prior_snd_una))  
+</span><span class='line'>            continue;  
+</span><span class='line'>  
+</span><span class='line'>        used_sacks++; /* 实际要使用的SACK块数，忽略不合法和已确认过的 */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* order SACK blocks to allow in order walk of the retrans queue. 
+</span><span class='line'>     * 对实际使用的SACK块，按起始序列号，从小到大进行冒泡排序。 
+</span><span class='line'>     */  
+</span><span class='line'>    for (i = used_sacks - 1; i &gt; 0; i--) {  
+</span><span class='line'>        for (j = 0; j &lt; i; j++) {  
+</span><span class='line'>            if (after(sp[j].start_seq, sp[j+1].start_seq)) {  
+</span><span class='line'>                swap(sp[j], sp[j+1]); /* 交换SACK块 */  
+</span><span class='line'>  
+</span><span class='line'>                /* Track where the first SACK block goes to，跟踪第一个SACK块 */  
+</span><span class='line'>                if (j == first_sack_index)  
+</span><span class='line'>                    first_sack_index = j + 1;  
+</span><span class='line'>            }  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    skb = tcp_write_queue_head(sk); /* 发送队列的第一个包 */  
+</span><span class='line'>    state.fack_count = 0;  
+</span><span class='line'>    i = 0;  
+</span><span class='line'>  
+</span><span class='line'>   /* 接下来使cache指向之前的SACK块，即recv_sack_cache */  
+</span><span class='line'>    if (! tp-&gt;sacked_out) {  /* 如果之前没有SACK块 */  
+</span><span class='line'>        /* It's already past, so skip checking against it. 
+</span><span class='line'>         * cache指向recv_sack_cache数组的末尾 
+</span><span class='line'>         */  
+</span><span class='line'>        cache = tp-&gt;recv_sack_cache + ARRAY_SIZE(tp-&gt;recv_sack_cache);  
+</span><span class='line'>  
+</span><span class='line'>    } else {  
+</span><span class='line'>        cache = tp-&gt;recv_sack_cache;  
+</span><span class='line'>        /* Skip empty blocks in at head of the cache. 跳过空的块 */  
+</span><span class='line'>        while(tcp_sack_cache_ok(tp, cache) && ! cache-&gt;start_seq && ! cache-&gt;end_seq)  
+</span><span class='line'>            cache++;  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* 遍历实际用到的SACK块 */  
+</span><span class='line'>    while (i &lt; used_sacks) {  
+</span><span class='line'>        u32 start_seq = sp[i].start_seq;  
+</span><span class='line'>        u32 end_seq = sp[i].end_seq;  
+</span><span class='line'>        int dup_sack = (found_dup_sack && (i == first_sack_index)); /* 这个SACK块是否为DSACK块 */  
+</span><span class='line'>        struct tcp_sack_block *next_dup = NULL;  
+</span><span class='line'>  
+</span><span class='line'>        /* 如果下一个SACK块是DSACK块，则next_dup指向DSACK块 */  
+</span><span class='line'>        if (found_dup_sack && ((i + 1) == first_sack_index))  
+</span><span class='line'>            next_dup = &sp[i + 1];  
+</span><span class='line'>  
+</span><span class='line'>        /* Event B in the comment above. 
+</span><span class='line'>         * high_seq是进入Recovery或Loss时的snd_nxt，如果high_seq被SACK了，那么很可能有数据包 
+</span><span class='line'>         * 丢失了，不然就可以ACK掉high_seq返回Open态了。 
+</span><span class='line'>         */  
+</span><span class='line'>        if (after(end_seq, tp-&gt;high_seq))  
+</span><span class='line'>            state.flag |= FLAG_DATA_LOST;  
+</span><span class='line'>  
+</span><span class='line'>        /* Skip too early cached blocks. 
+</span><span class='line'>         * 如果cache块的end_seq &lt; SACK块的start_seq，那说明cache块在当前块之前，不用管它了。 
+</span><span class='line'>         */  
+</span><span class='line'>        while (tcp_sack_cache_ok(tp, cache) && ! before(start_seq, cache-&gt;end_seq))  
+</span><span class='line'>            cache++;  
+</span><span class='line'>   
+</span><span class='line'>        /* Can skip some work by looking recv_sack_cache? 
+</span><span class='line'>         * 查看当前SACK块和cache块有无交集，避免重复工作。 
+</span><span class='line'>         */  
+</span><span class='line'>        if (tcp_sack_cache_ok(tp, cache) && ! dup_sack &&  
+</span><span class='line'>            after(end_seq, cache-&gt;start_seq)) {  
+</span><span class='line'>              
+</span><span class='line'>            /* Head todo? 处理start_seq到cache-&gt;start_seq之间的段 */  
+</span><span class='line'>            if (before(start_seq, cache-&gt;start_seq)) {  
+</span><span class='line'>                /* 找到start_seq对应的数据段 */  
+</span><span class='line'>                skb = tcp_sacktag_skip(skb, sk, &state, start_seq);  
+</span><span class='line'>                /* 遍历start_seq到cache-&gt;start_seq之间的段，为其间的skb更新记分牌 */  
+</span><span class='line'>                skb = tcp_sacktag_walk(skb, sk, next_dup, &state, start_seq, cache-&gt;start_seq, dup_sack);  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>            /* Rest of the block already fully processed? 
+</span><span class='line'>             * 如果此块剩下的部分都包含在cache块中，那么就不用再处理了。 
+</span><span class='line'>             */  
+</span><span class='line'>            if (! after(end_seq, cache-&gt;end_seq))  
+</span><span class='line'>                goto advance_sp;  
+</span><span class='line'>  
+</span><span class='line'>            /* 如果cache-&gt;start_seq &lt; next_dup-&gt;start_seq &lt; cache-&gt;end_seq，那么处理next_dup。 
+</span><span class='line'>             * 注意，如果start_seq &lt; next_dup-&gt;start_seq &lt; cache-&gt;start_seq，那么next_dup落在 
+</span><span class='line'>             * (start_seq, cache-&gt;start_seq) 内的部分已经被上面的处理过了：）现在处理的next_dup的剩余部分。 
+</span><span class='line'>             */  
+</span><span class='line'>            skb = tcp_maybe_skipping_dsack(skb, sk, next_dup, &state, cache-&gt;end_seq);  
+</span><span class='line'>  
+</span><span class='line'>            /* 处理(cache-&gt;end_seq, end_seq) ...tail remains todo... */  
+</span><span class='line'>            if (tcp_highest_sack_seq(tp) == cache-&gt;end_seq) {  
+</span><span class='line'>                skb = tcp_highest_sack(sk);  
+</span><span class='line'>                /* 如果已经到了snd_nxt了，那么直接退出SACK块的遍历 */  
+</span><span class='line'>                if (skb == NULL)  
+</span><span class='line'>                    break;  
+</span><span class='line'>                state.fack_count = tp-&gt;fackets_out;  
+</span><span class='line'>                cache++; /* 此cache已经用完了 */  
+</span><span class='line'>                goto walk; /* 继续SACK块还没处理完的部分 */  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>            /* 找到end_seq &gt; cache-&gt;end_seq的skb */  
+</span><span class='line'>             skb = tcp_sacktag_skip(skb, sk, &state, cache-&gt;end_seq);  
+</span><span class='line'>  
+</span><span class='line'>            /* Check overlap against next cached too (past this one already) */  
+</span><span class='line'>            cache++;  
+</span><span class='line'>  
+</span><span class='line'>            continue;  
+</span><span class='line'>        }  
+</span><span class='line'>   
+</span><span class='line'>        /* 这个块没有和cache块重叠，是新的 */  
+</span><span class='line'>        if (! before(start_seq, tcp_highest_sack_seq(tp))) {  
+</span><span class='line'>            skb = tcp_highest_sack(sk);  
+</span><span class='line'>            if (skb == NULL)  
+</span><span class='line'>                break;  
+</span><span class='line'>            state.fack_count = tp-&gt;fackets_out;  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        skb = tcp_sacktag_skip(skb, sk, &state, start_seq); /* skb跳到start_seq处，下面会walk遍历此块 */  
+</span><span class='line'>  
+</span><span class='line'>walk:  
+</span><span class='line'>        /* 从skb开始遍历，标志块间的包 */  
+</span><span class='line'>        skb = tcp_sacktag_walk(skb, sk, next_dup, &state, start_seq, end_seq, dup_sack);  
+</span><span class='line'>  
+</span><span class='line'>advance_sp:  
+</span><span class='line'>        /* SACK enhanced FRTO (RFC4138, Appendix B): Clearing correct due to 
+</span><span class='line'>         * in-order walk. 
+</span><span class='line'>         */  
+</span><span class='line'>        if (after(end_seq, tp-&gt;frto_highmark))  
+</span><span class='line'>            state.flag &= ~FLAG_ONLY_ORIG_SACKED; /* 清除这个标志 */  
+</span><span class='line'>  
+</span><span class='line'>        i++; /* 接下来处理下一个SACK块 */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* Clear the head of the cache sack blocks so we can skip it next time. 
+</span><span class='line'>    * 两个循环用于清除旧的SACK块，保存新的SACK块 
+</span><span class='line'>    */  
+</span><span class='line'>    for (i = 0; i &lt; ARRAY_SIZE(tp-&gt;recv_sack_cache) - used_sacks; i++) {  
+</span><span class='line'>        tp-&gt;recv_sack_cache[i].start_seq = 0;  
+</span><span class='line'>        tp-&gt;recv_sack_cache[i].end_seq = 0;  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    for (j = 0; j &lt; used_sacks; j++)  
+</span><span class='line'>        tp-&gt;recv_sack_cache[i++] = sp[j];  
+</span><span class='line'>  
+</span><span class='line'>    /* 检查重传包是否丢失，这部分独立出来 */  
+</span><span class='line'>    tcp_mark_lost_retrans(sk);  
+</span><span class='line'>  
+</span><span class='line'>    tcp_verify_left_out(tp);  
+</span><span class='line'>  
+</span><span class='line'>    if ((state.reord &lt; tp-&gt;fackets_out) && ((icsk-&gt;icsk_ca_state != TCP_CA_Loss) || tp-&gt;undo_marker) &&  
+</span><span class='line'>        (! tp-&gt;frto_highmark || after(tp-&gt;snd_una, tp-&gt;frto_highmark)))  
+</span><span class='line'>        tcp_update_reordering(sk, tp-&gt;fackets_out - state.reord, 0); /* 更新乱序长度 */  
+</span><span class='line'>  
+</span><span class='line'>out:  
+</span><span class='line'>#if FASTRETRANS_DEBUG &gt; 0  
+</span><span class='line'>    WARN_ON((int) tp-&gt;sacked_out &lt; 0);  
+</span><span class='line'>    WARN_ON((int) tp-&gt;lost_out &lt; 0);  
+</span><span class='line'>    WARN_ON((int) tp-&gt;retrans_out &lt; 0);  
+</span><span class='line'>    WARN_ON((int) tcp_packets_in_flight(tp) &lt; 0);  
+</span><span class='line'>#endif  
+</span><span class='line'>  
+</span><span class='line'>    return state.flag;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * swap - swap value of @a and @b 
+</span><span class='line'> */  
+</span><span class='line'>#define swap(a, b) \  
+</span><span class='line'>    do { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; } while (0)  
+</span><span class='line'>  
+</span><span class='line'>static int tcp_sack_cache_ok(struct tcp_sock *tp, struct tcp_sack_block *cache)  
+</span><span class='line'>{  
+</span><span class='line'>    return cache &lt; tp-&gt;recv_sack_cache + ARRAY_SIZE(tp-&gt;recv_sack_cache);  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>/* 被SACK过的包的最大初始序列号 
+</span><span class='line'> * Start sequence of the highest skb with SACKed bit, valid only if sacked &gt; 0 
+</span><span class='line'> * or when the caller has ensured validity by itself. 
+</span><span class='line'> */  
+</span><span class='line'>static inline u32 tcp_highest_sack_seq(struct tcp_sock *tp)  
+</span><span class='line'>{  
+</span><span class='line'>    if (! tp-&gt;sacked_out)  /* 没有包被SACK过，则设置成snd_una */  
+</span><span class='line'>        return tp-&gt;snd_una;  
+</span><span class='line'>   
+</span><span class='line'>    if (tp-&gt;highest_sack == NULL) /* 已经是发送队列的最后一个包了 */  
+</span><span class='line'>        return tp-&gt;snd_nxt;  
+</span><span class='line'>   
+</span><span class='line'>    return TCP_SKB_CB(tp-&gt;highest_sack)-&gt;seq;  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>static inline void tcp_advance_highest_sack(struct sock *sk, struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    tcp_sk(sk)-&gt;highest_sack = tcp_skb_is_last(sk, skb) ? NULL : tcp_write_queue_next(sk, skb);  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>使用cache</h4>
+
+<p>37版本利用上次缓存的tp->recv_sack_cache块来避免重复工作，提高处理效率。<br/>
+主要思想就是，处理sack块时，和cache块作比较，如果它们有交集，说明交集部分已经处理过了，<br/>
+不用再重复处理。</p>
+
+<h5>（1）忽略cache块</h5>
+
+<p>如果cache块完全在sack块的前面，即cache->end_seq &lt; start_seq，那么忽略此cache块。</p>
+
+<h5>（2）没有交集</h5>
+
+<p>如果sack块完全在cache块前面，即end_seq &lt; cache->start_seq，那么跳到walk处理，不考虑cache块。</p>
+
+<h5>（3）有交集</h5>
+
+<p>case 1： end_seq&lt;=cache->end_seq，只需处理(start_seq, cache->start_seq)这部分，交集不必处理。处理完后直接跳到advance_sp。<br/>
+case 2： start_seq>=cache->start_seq，只需处理(cache->end_seq, end_seq)这部分，交集不必处理。先skip到cache->end_seq，cache++，再continue。<br/>
+case 3： sack块完全包含在cache块中，那么什么都不用做，直接跳到advance_sp，处理下一个sack块。<br/>
+case 4： cache块完全包含在sack块中，这时候需要处理两部分：(start_seq, cache->start_seq)，(cache->end_seq, end_seq)。</p>
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（三）</h3>
+
+<p>不论是18版，还是37版，一开始都会从TCP的控制块中取出SACK选项的起始地址。<br/>
+SACK选项的起始地址是保存在tcp_skb_cb结构的sacked项中的，那么这是在什么时候做的呢？<br/>
+SACK块并不是总是合法的，非法的SACK块可能会引起处理错误，所以还需要进行SACK块的合法性检查。</p>
+
+<p>本文主要内容：TCP首部中SACK选项的解析和地址的获取，SACK块的合法性检查。</p>
+
+<h4>SACK选项的地址</h4>
+
+<p>TCP_SKB_CB(skb)->sacked is initialized to offset corresponding to the start of the SACK option in the<br/>
+TCP header for the segment received.</p>
+
+<p>处理时机为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_rcv_established()，进入慢速路径时调用
+</span><span class='line'>    | --&gt; tcp_validate_incoming()
+</span><span class='line'>            | --&gt; tcp_fast_parse_options()
+</span><span class='line'>                    | --&gt; tcp_parse_options()</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在慢速路径中，有可能只带有TIMESTAMP选项，因此先用tcp_fast_parse_options()快速解析。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Fast parse options. This hopes to only see timestamps. 
+</span><span class='line'> * If it is wrong it falls back on tcp_parse_options(). 
+</span><span class='line'> */  
+</span><span class='line'>static int tcp_fast_parse_options(struct sk_buff *skb, struct tcphdr *th, struct tcp_sock *tp, u8 **hvpp)  
+</span><span class='line'>{  
+</span><span class='line'>    /* In the spirit of fast parsing, compare doff directly to constant values. 
+</span><span class='line'>     * Because equality is used, short doff can be ignored here. 
+</span><span class='line'>     */  
+</span><span class='line'>    if (th-&gt;doff == (sizeof(*th) / 4)) { /* 没有带选项 */  
+</span><span class='line'>        tp-&gt;rx_opt.saw_tstamp = 0;  
+</span><span class='line'>        return 0;  
+</span><span class='line'>  
+</span><span class='line'>    } else if (tp-&gt;rx_opt.tstamp_ok &&  
+</span><span class='line'>        th-&gt;doff == ((sizeof(*th) + TCPOLEN_TSTAMP_ALIGNED) / 4)) { /* 只带有时间戳选项 */  
+</span><span class='line'>        if (tcp_parse_aligned_timestamp(tp, th))  
+</span><span class='line'>            return 1;  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果以上的快速解析失败，则进行全面解析 */  
+</span><span class='line'>    tcp_parse_options(skb, &tp-&gt;rx_opt, hvpp, 1);  
+</span><span class='line'>  
+</span><span class='line'>    return 1;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_parse_aligned_timestamp(struct tcp_sock *tp, struct tcphdr *th)  
+</span><span class='line'>{  
+</span><span class='line'>    __be32 *ptr = (__be32 *) (th + 1); /* 指向选项部分 */  
+</span><span class='line'>   
+</span><span class='line'>    /* 如果选项部分的前4个字节分别为：0x 01 01 08 0A */  
+</span><span class='line'>    if (*ptr == htonl((TCPOPT_NOP &lt;&lt; 24) | (TCPOPT_NOP &lt;&lt; 16)  
+</span><span class='line'>         | (TCPOPT_TIMESTAMP &lt;&lt; 8) | TCPOLEN_TIMESTAMP)) {  
+</span><span class='line'>  
+</span><span class='line'>        tp-&gt;rx_opt.saw_tstamp = 1;  
+</span><span class='line'>        ++ptr;  
+</span><span class='line'>  
+</span><span class='line'>        tp-&gt;rx_opt.rcv_tsval = ntohl(*ptr); /* 提取接收包的时间戳*/  
+</span><span class='line'>        ++ptr;  
+</span><span class='line'>  
+</span><span class='line'>        tp-&gt;rx_opt.rcv_tsecr = ntohl(*ptr); /* 提取接收包的回显值*/  
+</span><span class='line'>        return 1;  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    return 0;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在慢速路径中，如果tcp_fast_parse_options()失败，则调用tcp_parse_options()全面解析TCP选项。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Look for tcp options. Normally only called on SYN and SYNACK packets. 
+</span><span class='line'> * But, this can also be called on packets in the established flow when the fast version 
+</span><span class='line'> * below fails. 
+</span><span class='line'> */  
+</span><span class='line'>void tcp_parse_options(struct sk_buff *skb, struct tcp_options_received *opt_rx, u8 **hvpp, int estab)  
+</span><span class='line'>{  
+</span><span class='line'>    unsigned char *ptr;  
+</span><span class='line'>    struct tcphdr *th = tcp_hdr(skb);  
+</span><span class='line'>    int length = (th-&gt;doff * 4) - sizeof(struct tcphdr); /* 选项总长度 */  
+</span><span class='line'>  
+</span><span class='line'>    ptr = (unsigned char *) (th + 1); /* 选项起始地址 */  
+</span><span class='line'>    opt_rx-&gt;saw_tstamp = 0; /* 此ACK有没有带时间戳接下来才知道 */  
+</span><span class='line'>  
+</span><span class='line'>    while (length &gt; 0) {  
+</span><span class='line'>        int opcode = *ptr++; /* 选项kind */  
+</span><span class='line'>        int opsize;  
+</span><span class='line'>  
+</span><span class='line'>        switch (opcode) {  
+</span><span class='line'>            case TCPOPT_EOL: /* 结束选项，不常见到 */  
+</span><span class='line'>                return;  
+</span><span class='line'>  
+</span><span class='line'>            case TCPOPT_NOP: /* 填充选项 */  
+</span><span class='line'>                length--; /* 此选项只占一个字节 */  
+</span><span class='line'>                continue;  
+</span><span class='line'>  
+</span><span class='line'>            default:  
+</span><span class='line'>                opsize = *ptr++; /* 此选项长度 */  
+</span><span class='line'>  
+</span><span class='line'>                if (opsize &lt; 2) /* "silly options" */  
+</span><span class='line'>                    return; /* 选项长度过小 */  
+</span><span class='line'>  
+</span><span class='line'>                if (opsize &gt; length)  
+</span><span class='line'>                    return; /* don't parse partial options */  
+</span><span class='line'>  
+</span><span class='line'>                switch (opcode) {  
+</span><span class='line'>                    ...  
+</span><span class='line'>                    case TCPOPT_SACK_PERM:   
+</span><span class='line'>                        if (opsize == TCPOLEN_SACK_PERM && th-&gt;syn &&   
+</span><span class='line'>                             !estab && sysctl_tcp_sack) {  
+</span><span class='line'>  
+</span><span class='line'>                            opt_rx-&gt;sack_ok = 1; /* SYN包中显示支持SACK */  
+</span><span class='line'>                             tcp_sack_reset(opt_rx); /* 清空dsack和num_sacks */  
+</span><span class='line'>                        }  
+</span><span class='line'>                        break;  
+</span><span class='line'>  
+</span><span class='line'>                        case TCPOPT_SACK:  
+</span><span class='line'>                            if ((opsize &gt;= (TCPOLEN_SACK_BASE + TCPOLEN_SACK_PERBLOCK)) &&  
+</span><span class='line'>                               !((opsize - TCPOLEN_SACK_BASE) % TCPOLEN_SACK_PERBLOCK) &&  
+</span><span class='line'>                               opt_rx-&gt;sack_ok) {  
+</span><span class='line'>                                  
+</span><span class='line'>                                /*保存SACK选项的起始地址偏移*/  
+</span><span class='line'>                                TCP_SKB_CB(skb)-&gt;sacked = (ptr - 2) - (unsigned char *) th;   
+</span><span class='line'>                            }  
+</span><span class='line'>                            break;  
+</span><span class='line'>                        ...  
+</span><span class='line'>                }  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* TCP options */  
+</span><span class='line'>#define TCPOPT_NOP 1 /* Padding */  
+</span><span class='line'>#define TCPOPT_EOL 0 /* End of options */  
+</span><span class='line'>#define TCPOPT_MSS 2 /* Segment size negotiating */  
+</span><span class='line'>#define TCPOPT_WINDOW 3 /* Window Scaling */  
+</span><span class='line'>#define TCPOPT_SACK_PERM 4 /* SACK Permitted */  
+</span><span class='line'>#define TCPOPT_SACK 5 /* SACK Block */  
+</span><span class='line'>#define TCPOPT_TIMESTAMP 8 /* Better RTT estimations/PAWS */  
+</span><span class='line'>  
+</span><span class='line'>static inline void tcp_sack_reset(struct tcp_options_received *rx_opt)  
+</span><span class='line'>{  
+</span><span class='line'>    rx_opt-&gt;dsack = 0;  
+</span><span class='line'>    rx_opt-&gt;num_sacks = 0;  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>/* This is the max number of SACKS that we'll generate and process. 
+</span><span class='line'> * It's safe to increase this, although since: 
+</span><span class='line'> * size = TCPOLEN_SACK_BASE_ALIGNED(4) + n * TCPOLEN_SACK_PERBLOCK(8) 
+</span><span class='line'> * only four options will fit in a standard TCP header 
+</span><span class='line'> */  
+</span><span class='line'>#define TCP_NUM_SACKS 4 /* SACK块数最多为4 */</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>SACK块合法性检查</h4>
+
+<p>检查SACK块或者DSACK块是否合法。<br/>
+2.6.24之前的版本没有检查SACK块的合法性，而某些非法的SACK块可能会触发空指针的引用。<br/>
+在3.1版本之前有一个小bug，处理DSACK时会产生问题，修复非常简单：<br/>
+@if (! after(end_seq, tp->snd_una))，把非去掉。</p>
+
+<p>符合以下任一条件的SACK块是合法的：<br/>
+1. sack块和dsack块：snd_una &lt; start_seq &lt; end_seq &lt;= snd_nxt<br/>
+2. dsack块：undo_marker &lt;= start_seq &lt; end_seq &lt;= snd_una<br/>
+3. dsack块：start_seq &lt; undo_marker &lt; end_seq &lt;= snd_una 且 end_seq - start_seq &lt;= max_window</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* SACK block range validation checks that the received SACK block fits to the  
+</span><span class='line'> * expected sequence limits, i.e., it is between SND.UNA and SND.NXT. 
+</span><span class='line'> */  
+</span><span class='line'>static int tcp_is_sackblock_valid(struct tcp_sock *tp, int is_dsack, u32 start_seq, u32 end_seq)  
+</span><span class='line'>{  
+</span><span class='line'>    /* Too far in future, or reversed (interpretation is ambiguous) 
+</span><span class='line'>     * end_seq超过了snd_nxt，或者start_seq &gt;= end_seq，那么不合法 
+</span><span class='line'>     */  
+</span><span class='line'>    if (after(end_seq, tp-&gt;snd_nxt) || ! before(start_seq, end_seq))  
+</span><span class='line'>        return 0;  
+</span><span class='line'>  
+</span><span class='line'>    /* Nasty start_seq wrap-around check (see comments above) */  
+</span><span class='line'>     * start_seq超过了snd_nxt  
+</span><span class='line'>     */  
+</span><span class='line'>    if (! before(start_seq, tp-&gt;snd_nxt))  
+</span><span class='line'>        return 0;  
+</span><span class='line'>  
+</span><span class='line'>    /* In outstanding window? This is valid exit for D-SACKs too. 
+</span><span class='line'>     * start_seq == snd_una is non-sensical (see comments above) 
+</span><span class='line'>     */  
+</span><span class='line'>    if (after(start_seq, tp-&gt;snd_una))  
+</span><span class='line'>        return 1; /* 合法 */  
+</span><span class='line'>  
+</span><span class='line'>    if (! is_dsack || ! tp-&gt;undo_marker)  
+</span><span class='line'>        return 0;  
+</span><span class='line'>  
+</span><span class='line'>    /* Then it's D-SACK, and must reside below snd_una completely. 
+</span><span class='line'>     * 注意在3.1以前这里是：! after(end_seq, tp-&gt;snd_una)，是一个bug 
+</span><span class='line'>     */  
+</span><span class='line'>    if (after(end_seq, tp-&gt;snd_una))  
+</span><span class='line'>        return 0;   
+</span><span class='line'>  
+</span><span class='line'>    if (! before(start_seq, tp-&gt;undo_marker))  
+</span><span class='line'>        return 1; /* dsack块合法 */  
+</span><span class='line'>  
+</span><span class='line'>    /* Too old，DSACK块太旧了*/  
+</span><span class='line'>    if (! after(end_seq, tp-&gt;undo_marker))  
+</span><span class='line'>        return 0;  
+</span><span class='line'>  
+</span><span class='line'>    /* Undo_marker boundary crossing */  
+</span><span class='line'>    return !before(start_seq, end_seq - tp-&gt;max_window);  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（四）</h3>
+
+<p>和18版本不同，37版本把DSACK的检测部分独立出来，可读性更好。<br/>
+37版本在DSACK的处理中也做了一些优化，对DSACK的两种情况分别进行处理。</p>
+
+<p>本文主要内容：DSACK的检测、DSACK的处理。</p>
+
+<h4>dsack检测</h4>
+
+<p>根据RFC 2883，DSACK的处理流程如下：<br/>
+1）look at the first SACK block :<br/>
+—If the first SACK block is covered by the Cumulative Acknowledgement field, then it is a D-SACK block, and is reporting duplicate data.<br/>
+—Else, if the first SACK block is covered by the second SACK block, then the first SACK block is a D-SACK block, and is reporting duplicate data.
+2）otherwise, interpret the SACK blocks using the normal SACK procedures.</p>
+
+<p>简单来说，符合以下任一情况的，就是DSACK：<br/>
+1）第一个SACK块的起始序号小于它的确认序号，说明此SACK块包含了确认过的数据。<br/>
+2）第一个SACK块包含在第二个SACK块中，说明第一个SACK块是重复的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_check_dsack(struct sock *sk, struct sk_buff *ack_skb,   
+</span><span class='line'>        struct tcp_sack_block_wire *sp, int num_sacks, u32 prior_snd_una)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    u32 start_seq_0 = get_unaligned_be32(&sp[0].start_seq); /* 第一个SACK块的起始 */  
+</span><span class='line'>    u32 end_seq_0 = get_unaligned_be32(&sp[0].end_seq); /* 第一个SACK块的结束 */  
+</span><span class='line'>    int dup_sack = 0; /* 是否有DSACK */  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果第一个SACK块的起始序号小于它的确认序号，说明此SACK块包含了确认过的数据， 
+</span><span class='line'>     * 所以第一个SACK块是DSACK。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (before(start_seq_0, TCP_SKB_CB(ack_skb)-&gt;ack_seq)) {  
+</span><span class='line'>        dup_sack = 1;  
+</span><span class='line'>        tcp_dsack_seen(tp);  
+</span><span class='line'>        NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPDSACKRECV);  
+</span><span class='line'>  
+</span><span class='line'>    } else if (num_sacks &gt; 1) {  
+</span><span class='line'>        u32 end_seq_1 = get_unaligned_be32(&sp[1].end_seq); /* 第二个块的结束序号 */  
+</span><span class='line'>        u32 start_seq_1 = get_unaligned_be32(&sp[1].start_seq); /* 第二个块的起始序号 */  
+</span><span class='line'>  
+</span><span class='line'>        /* 如果第一个SACK块包含在第二个SACK块中，说明第一个SACK块是重复的，即为DSACK */  
+</span><span class='line'>        if (! after(end_seq_0, end_seq_1) && ! before(start_seq_0, start_seq_1)) {  
+</span><span class='line'>            dup_sack = 1;  
+</span><span class='line'>            tcp_dsack_seen(tp);  
+</span><span class='line'>            NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPDSACKOFORECV);  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* D-SACK for already forgotten data... Do dumb counting. 
+</span><span class='line'>     * undo_retrans记录重传数据包的个数，如果undo_retrans降到0， 
+</span><span class='line'>     * 就说明之前的重传都是不必要的，进行拥塞调整撤销。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (dup_sack && ! after(end_seq_0, prior_snd_una) &&  
+</span><span class='line'>        after(end_seq_0, tp-&gt;undo_marker))  
+</span><span class='line'>        tp-&gt;undo_retrans--;  
+</span><span class='line'>  
+</span><span class='line'>    return dup_sack;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Take a notice that peer is sending D-SACKs */  
+</span><span class='line'>static void tcp_dsack_seen(struct tcp_sock *tp)  
+</span><span class='line'>{  
+</span><span class='line'>    tp-&gt;rx_opt.sack_ok |= 4;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在以上函数中，undo_marker为进入Recovery或FRTO状态时记录的snd_una，prior_snd_una为根据该ACK更新窗口前的snd_una。如果回复的DSACK在这块中间，说明是超时重传或FRTO后进行的重传，因此需要减少undo_retrans。当undo_retrans减小到0，说明之前的重传都是不必要的，网络并没有拥塞，因此要进行拥塞调整撤销。</p>
+
+<h4>dsack处理</h4>
+
+<p>当处理一个块时，会检查下一个块是不是DSACK块，如果是则用next_dup指向该DSACK块。<br/>
+为什么在处理当前SACK块的时候，还要考虑到下个DSACK块呢？<br/>
+我们知道DSACK有两种情况，一种是DSACK块小于snd_una，另一种情况是DSACK块大于snd_una且包含在第一个块中，我们来分别分析下。</p>
+
+<p>（1）DSACK块大于snd_una且包含在第一个SACK块中
+两个块需要同时处理。不然等SACK块处理完后，再处理DSACK块，就需要做一些重复的工作。</p>
+
+<p>当DSACK包含在第一个SACK块中，那么处理DSACK块在cache中的部分。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct sk_buff *tcp_maybe_skipping_dsack(struct sk_buff *skb, struct sock *sk,  
+</span><span class='line'>                                                struct tcp_sack_block *next_dup,  
+</span><span class='line'>                                                struct tcp_sacktag_state *state,  
+</span><span class='line'>                                                u32 skip_to_seq)  
+</span><span class='line'>{  
+</span><span class='line'>    /* 如果下个SACK块不是DSACK块，那么不用进行dsack处理 */  
+</span><span class='line'>    if (next_dup == NULL)  
+</span><span class='line'>        return skb;  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果在(cache-&gt;start_seq, cache-&gt;end_seq)中包含dsack */  
+</span><span class='line'>    if (before(next_dup-&gt;start_seq, skip_to_seq)) {  
+</span><span class='line'>  
+</span><span class='line'>        /* 找到next_dup-&gt;start_seq之后的skb */  
+</span><span class='line'>        skb = tcp_sacktag_skip(skb, sk, state, next_dup-&gt;start_seq);  
+</span><span class='line'>  
+</span><span class='line'>        /* 处理next_dup-&gt;start_seq之后的skb */  
+</span><span class='line'>        skb = tcp_sacktag_walk(skb, sk, NULL, state, next_dup-&gt;start_seq, next_dup-&gt;end_seq, 1);  
+</span><span class='line'>    }  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>（2）DSACK块小于snd_una
+这时候DSACK排序后也是第一个块，会被直接处理，next_dup在这里就没有意义了。<br/>
+DSACK的两种情况都在tcp_sacktag_walk()中处理，第一种时next_dup不为空、dup_sack_in为0；第二种时next_dup为空，dup_sack_in为1。</p>
+
+<h5>Reference</h5>
+
+<p>RFC 2883</p>
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（五）</h3>
+
+<p>18版本对于每个SACK块，都是从重传队列头开始遍历。37版本则可以选择性的遍历重传队列的某一部分，忽略SACK块间的间隙、或者已经cache过的部分。这主要是通过tcp_sacktag_skip()和tcp_sacktag_walk()完成的。<br/>
+tcp_sacktag_skip()可以直接找到包含某个序号的skb，通常用于定位SACK块的开头。<br/>
+tcp_sacktag_walk()则遍历两个序号之间的skb，通常用于遍历一个SACK块。</p>
+
+<p>本文主要内容：SACK的遍历函数tcp_sacktag_skip()和tcp_sacktag_walk()。</p>
+
+<h4>tcp_sacktag_skip</h4>
+
+<p>从当前skb开始遍历，查找skip_to_seq序号对应的skb，同时统计fackets_out。<br/>
+这样可以从当前包，直接遍历到某个块的start_seq，而不用从头开始遍历，也可以跳过块间的间隙。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Avoid all extra work that is being done by sacktag while walking in a normal way */  
+</span><span class='line'>static struct sk_buff *tcp_sacktag_skip(struct sk_buff *skb, struct sock *sk,  
+</span><span class='line'>                               struct tcp_sacktag_state *state, u32 skip_to_seq)  
+</span><span class='line'>{  
+</span><span class='line'>    tcp_for_write_queue_from(skb, sk) {  
+</span><span class='line'>        if (skb == tcp_send_head(sk)) /* 到了发送队列头，即下一个将要发送的数据包 */  
+</span><span class='line'>            break;  
+</span><span class='line'>   
+</span><span class='line'>        if (after(TCP_SKB_CB(skb)-&gt;end_seq, skip_to_seq)) /* 找到包含skip_to_seq序号的数据包了 */  
+</span><span class='line'>            break;  
+</span><span class='line'>  
+</span><span class='line'>        state-&gt;fack_count += tcp_skb_pcount(skb); /* 统计fackets_out个数 */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    return skb; /* 返回包含skip_to_seq的skb */  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>tcp_sacktag_walk</h4>
+
+<p>遍历一个SACK块，如果SACK块包含了多个连续的skb，那么先尝试合并这些段。<br/>
+为什么要合并呢？因为下次遍历的时候，要遍历的包个数就减少了，能提高效率。<br/>
+如果skb完全包含在块中，则调用tcp_sacktag_one更新该段的记分牌。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct sk_buff *tcp_sacktag_walk(struct sk_buff *skb, struct sock *sk,  
+</span><span class='line'>                                        struct tcp_sack_block *next_dup,  
+</span><span class='line'>                                        struct tcp_sacktag_state *state,  
+</span><span class='line'>                                        u32 start_seq, u32 end_seq,  
+</span><span class='line'>                                        int dup_sack_in)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    struct sk_buff *tmp;  
+</span><span class='line'>  
+</span><span class='line'>    tcp_for_write_queue_from(skb, sk) {  
+</span><span class='line'>        int in_sack = 0;  
+</span><span class='line'>        int dup_sack = dup_sack_in;  
+</span><span class='line'>  
+</span><span class='line'>        if (skb == tcp_send_head(sk)) /* 遍历到发送队列头了 */  
+</span><span class='line'>            break;  
+</span><span class='line'>  
+</span><span class='line'>        if (! before(TCP_SKB_CB(skb)-&gt;seq, end_seq)) /* skb序号超过SACK块了 */  
+</span><span class='line'>            break;  
+</span><span class='line'>  
+</span><span class='line'>        /* 如果下一个块是DSACK，且此skb可能包含在其中 */  
+</span><span class='line'>        if ((next_dup != NULL) &&   
+</span><span class='line'>            before(TCP_SKB_CB(skb)-&gt;seq, next_dup-&gt;end_seq)) {  
+</span><span class='line'>  
+</span><span class='line'>            /* 此skb是否完全包含在DSACK块中 */  
+</span><span class='line'>            in_sack = tcp_match_skb_to_sack(sk, skb, next_dup-&gt;start_seq, next_dup-&gt;end_seq);  
+</span><span class='line'>  
+</span><span class='line'>            if (in_sack &gt; 0)  
+</span><span class='line'>                dup_sack = 1; /* 表示这个skb被DSACK */  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        if (in_sack &lt;= 0) {  
+</span><span class='line'>            /* 一个SACK块可能包括多个skb，尝试把这些连续的skb合并 */  
+</span><span class='line'>            tmp = tcp_shift_skb_data(sk, skb, state, start_seq, end_seq, dup_sack);  
+</span><span class='line'>  
+</span><span class='line'>            if (tmp != NULL) { /* 合并成功 */  
+</span><span class='line'>                if (tmp != skb) { /* tmp和当前段地址不同，则跳到合并后的段处理 */  
+</span><span class='line'>                    skb = tmp;  
+</span><span class='line'>                    continue;  
+</span><span class='line'>                }  
+</span><span class='line'>                in_sack = 0;  
+</span><span class='line'>  
+</span><span class='line'>            } else { /* 合并不成功，单独处理这个段 */  
+</span><span class='line'>                in_sack = tcp_match_skb_to_sack(sk, skb, start_seq, end_seq); /* 段是否完全包含在块中 */  
+</span><span class='line'>            }  
+</span><span class='line'>        }  
+</span><span class='line'>          
+</span><span class='line'>        if (unlikely(in_sack &lt; 0))  
+</span><span class='line'>            break;  
+</span><span class='line'>  
+</span><span class='line'>        /* 如果这个段完全包含在块中，进行处理 */  
+</span><span class='line'>        if (in_sack) {  
+</span><span class='line'>  
+</span><span class='line'>            /* 就是在这里：标志这个段的记分牌！*/  
+</span><span class='line'>            TCP_SKB_CB(skb)-&gt;sacked = tcp_sacktag_one(skb, sk, state, dup_sack, tcp_skb_pcount(skb));  
+</span><span class='line'>   
+</span><span class='line'>            /* 如果当前skb的开始序列号大于被SACK的包的最高初始序列号 */  
+</span><span class='line'>            if (! before(TCP_SKB_CB(skb)-&gt;seq, tcp_highest_sack_seq(tp)))  
+</span><span class='line'>                tcp_advance_highest_sack(sk, skb); /*把highest_sack设为skb-&gt;next */  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        state-&gt;fack_count += tcp_skb_pcount(skb); /* 更新fackets_out */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    return skb; /* 遍历到此skb退出 */  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>tcp_match_skb_to_sack()</h5>
+
+<p>用于检查一个数据段是否完全包含在一个SACK块中，主要考虑到GSO分段。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Check if skb is fully within the SACK block. 
+</span><span class='line'> * In presence of GSO skbs, the incoming SACK may not exactly match but we can find smaller MSS 
+</span><span class='line'> * aligned portion of it that matches. Therefore we might need to fragment which may fail and creates 
+</span><span class='line'> * some hassle (caller must handle error case returns). 
+</span><span class='line'> * FIXME: this could be merged to shift decision code 
+</span><span class='line'> */  
+</span><span class='line'>static int tcp_match_skb_to_sack(struct sock *sk, struct sk_buff *skb, u32 start_seq, u32 end_seq)  
+</span><span class='line'>{  
+</span><span class='line'>    int in_sack, err;  
+</span><span class='line'>    unsigned int pkt_len;  
+</span><span class='line'>    unsigned int mss;  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果start_seq &lt;= skb-&gt;seq &lt; skb-&gt;end_seq &lt;= end_seq，说明skb完全包含在SACK块中 */  
+</span><span class='line'>    in_sack = ! after(start_seq, TCP_SKB_CB(skb)-&gt;seq) &&  
+</span><span class='line'>                       ! before(end_seq, TCP_SKB_CB(skb)-&gt;end_seq);  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果有GSO分段，skb可能部分包含在块中 */  
+</span><span class='line'>    if (tcp_skb_pcount(skb) &gt; 1 && ! in_sack &&  
+</span><span class='line'>        after(TCP_SKB_CB(skb)-&gt;end_seq, start_seq)) {  
+</span><span class='line'>  
+</span><span class='line'>        mss = tcp_skb_mss(skb);  
+</span><span class='line'>        in_sack = ! after(start_seq, TCP_SKB_CB(skb)-&gt;seq); /* 前半部在块中 */  
+</span><span class='line'>   
+</span><span class='line'>        /* 这里根据skb-&gt;seq和start_seq的大小，分情况处理 */  
+</span><span class='line'>        if (! in_sack) { /* 后半部在块中 */  
+</span><span class='line'>            pkt_len = start_seq - TCP_SKB_CB(skb)-&gt;seq; /* skb在块之前的部分 */  
+</span><span class='line'>            if (pkt_len &lt; mss)  
+</span><span class='line'>                pkt_len = mss;  
+</span><span class='line'>  
+</span><span class='line'>        } else {  
+</span><span class='line'>            pkt_len = end_seq - TCP_SKB_CB(skb)-&gt;seq; /* skb在块内的部分 */  
+</span><span class='line'>            if (pkt_len &lt; mss)  
+</span><span class='line'>                return -EINVAL;  
+</span><span class='line'>        }  
+</span><span class='line'>          
+</span><span class='line'>        /* Round if necessary so that SACKs cover only full MSSes and/or the remaining 
+</span><span class='line'>         * small portion (if present) 
+</span><span class='line'>         */  
+</span><span class='line'>        if (pkt_len &gt; mss) {  
+</span><span class='line'>            unsigned int new_len = (pkt_len / mss) * mss;  
+</span><span class='line'>            if (! in_sack && new_len &lt; pkt_len) {  
+</span><span class='line'>                new_len += mss;  
+</span><span class='line'>                if (new_len &gt; skb-&gt;len)  
+</span><span class='line'>                    return 0;  
+</span><span class='line'>            }  
+</span><span class='line'>            pkt_len = new_len;  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        err = tcp_fragment(sk, skb, pkt_len, mss); /* 把skb分为两个包，SACK块内的和SACK块外的 */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    return in_sack;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>tcp_shift_skb_data()</h5>
+
+<p>尝试把SACK块内的多个包合成一个，可以提升遍历效率。<br/>
+一个SACK块可能包括多个skb，尝试把这些连续的skb合成一个。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Try to collapsing SACK blocks spanning across multiple skbs to a single skb. */  
+</span><span class='line'>static struct sk_buff *tcp_shift_skb_data(struct sock *sk, struct sk_buff *skb,  
+</span><span class='line'>                                          struct tcp_sacktag_state *state,  
+</span><span class='line'>                                          u32 start_seq, u32 end_seq, int dup_sack)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    struct sk_buff *prev;  
+</span><span class='line'>    int mss;  
+</span><span class='line'>    int pcount = 0;  
+</span><span class='line'>    int len;  
+</span><span class='line'>    int in_sack;  
+</span><span class='line'>  
+</span><span class='line'>    if (! sk_can_gso(sk))  
+</span><span class='line'>        goto fallback;  
+</span><span class='line'>  
+</span><span class='line'>    ...  
+</span><span class='line'>  
+</span><span class='line'>fallback:  
+</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_SACKSHIFTFALLBACK);  
+</span><span class='line'>    return NULL;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（六）</h3>
+
+<p>上篇文章中我们主要说明如何skip到一个SACK块对应的开始段，如何walk这个SACK块包含的段，而没有涉及到<br/>
+如何标志一个段的记分牌。37版本把给一个段打标志的内容独立出来，这就是tcp_sacktag_one()。</p>
+
+<p>本文主要内容：tcp_sacktag_one()，给一个段打上标志。</p>
+
+<h4>标志一个包</h4>
+
+<p>tcp_sacktag_walk()用于遍历块中的数据包，最终会调用tcp_sacktag_one()来标志一个数据包的记分牌，</p>
+
+<p>即TCP_SKB_CB(skb)->sacked。</p>
+
+<p>记分牌有哪些标志呢？</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TCPCB_SACKED_ACKED 0x01 /* SKB ACK'd by a SACK block， 标志S */
+</span><span class='line'>#define TCPCB_SACKED_RETRANS 0x02 /* SKB retransmitted，标志R */
+</span><span class='line'>#define TCPCB_LOST 0x04 /* SKB is lot，标志L */
+</span><span class='line'>#define TCPCB_TAGBITS 0x07 /* All tag bits，标志位掩码 */
+</span><span class='line'>#define TCPCB_EVER_RETRANS 0x08 /* Ever retransmitted frame，曾经重传过 */
+</span><span class='line'>#define TCPCB_RETRANS (TCPCB_SACKED_RETRANS | TCPCB_EVER_RETRANS)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以上标志的说明如下：<br/>
+We have three tag bits: SACKED(S)、RETRANS&reg; and LOST(L).<br/>
+Packets in queue with these bits set are counted in variables sacked_out、retrans_out and lost_out.</p>
+
+<p>tag标志可能的6种情况：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Tag        InFlight             Description
+</span><span class='line'>0             1            orig segment is in flight，正常情况
+</span><span class='line'>S             0            nothing flies, orig reached receiver.
+</span><span class='line'>L             0            nothing flies, orig lost by net.
+</span><span class='line'>R             2            both orig and retransmit is in flight.
+</span><span class='line'>L|R           1            orig is lost, retransmit is in flight.
+</span><span class='line'>S|R           1            orig reached receiver, retrans is still in flight.</span></code></pre></td></tr></table></div></figure>
+
+
+<p>L|S|R is logically valid, it could occur when L|R is sacked, but it is equivalent to plain S and code short-curcuits it to S.<br/>
+L|S is logically invalid, it would mean -1 packet in flight.</p>
+
+<p>以上6种情况是由以下事件触发的：<br/>
+These 6 states form finite state machine, controlled by the following events:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. New ACK (+SACK) arrives. (tcp_sacktag_write_queue())
+</span><span class='line'>2. Retransmission. (tcp_retransmit_skb(), tcp_xmit_retransmit_queue())
+</span><span class='line'>3. Loss detection event of one of three flavors:
+</span><span class='line'>    A. Scoreboard estimator decided the packet is lost.
+</span><span class='line'>        A'. Reno "three dupacks" marks head of queue lost.
+</span><span class='line'>        A''. Its FACK modification, head until snd.fack is lost.
+</span><span class='line'>    B. SACK arrives sacking data retransmitted after never retransmitted hole was sent out.
+</span><span class='line'>    C. SACK arrives sacking SND.NXT at the moment, when the segment was retransmitted.
+</span><span class='line'>4. D-SACK added new rule: D-SACK changes any tag to S. </span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static u8 tcp_sacktag_one(struct sk_buff *skb, struct sock *sk,   
+</span><span class='line'>                          struct tcp_sacktag_state *state, int dup_sack, int pcount)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    u8 sacked = TCP_SKB_CB(skb)-&gt;sacked;  
+</span><span class='line'>    int fack_count = state-&gt;fack_count;  
+</span><span class='line'>  
+</span><span class='line'>    /* Account D-SACK for retransmitted packet. 
+</span><span class='line'>     * 如果此skb属于DSACK块，且skb被重传过。即此前tag为R、或者R|S。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (dup_sack && (sacked & TCPCB_RETRANS)) {  
+</span><span class='line'>  
+</span><span class='line'>        /* 位于上次进入Recovery或Loss之后 */  
+</span><span class='line'>        if (after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;undo_marker))  
+</span><span class='line'>            tp-&gt;undo_retrans--; /* 如果减为0，那么说明之前重传都是不必要的，进行拥塞控制调整撤销 */  
+</span><span class='line'>  
+</span><span class='line'>        if (sacked & TCPCB_SACKED_ACKED) /* 如果这个包已经被SACK过，那么说明是乱序 */  
+</span><span class='line'>            state-&gt;reord = min(fack_count, state-&gt;reord); /* 更新乱序队列的起始点 */  
+</span><span class='line'>    }  
+</span><span class='line'>   
+</span><span class='line'>    /* Nothing to do; acked frame is about to be dropped (was ACKed). 
+</span><span class='line'>     * 这个skb已经被正常确认了，不用再处理了，它即将被丢弃。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (! after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))  
+</span><span class='line'>        return sacked;  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果skb还没有被SACK，那么进行处理 */  
+</span><span class='line'>    if (! (sacked & TCPCB_SACKED_ACKED)) {  
+</span><span class='line'>  
+</span><span class='line'>        /* 有R标志，表示被重传过 */  
+</span><span class='line'>        if (sacked & TCPCB_SACKED_RETRANS) {  
+</span><span class='line'>            /* If the segment is not tagged as lost, we do not clear RETRANS, believing 
+</span><span class='line'>             * that retransmission is still in flight. 
+</span><span class='line'>             * 如果之前的标志是：R | L，那么好，现在收到包了，可以清除R和L。 
+</span><span class='line'>             * 如果之前的标志是：R，那么认为现在收到的是orig，重传包还在路上，所以不用干活：） 
+</span><span class='line'>             */  
+</span><span class='line'>            if (sacked & TCPCB_LOST) {  
+</span><span class='line'>                sacked &= ~(TCPCB_LOST | TCPCB_SACKED_RETRANS); /* 取消L和R标志 */  
+</span><span class='line'>                tp-&gt;lost_out -= pcount; /* 更新LOST包个数 */  
+</span><span class='line'>                tp-&gt;retrans_out -= pcount; /* 更新RETRANS包个数 */  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>        } else { /* 没有R标志 */  
+</span><span class='line'>            if (! (sacked & TCPCB_RETRANS)) {  
+</span><span class='line'>                /* New sack for not retransmitted frame, which was in hole. It is reordering. 
+</span><span class='line'>                 * 如果一个包落在highest_sack之前，它即没被SACK过，也不是重传的，那么 
+</span><span class='line'>                 * 它肯定是乱序了，到现在才被SACK。 
+</span><span class='line'>                 */  
+</span><span class='line'>                if (before(TCP_SKB_CB(skb)-&gt;seq, tcp_highest_sack_seq(tp)))  
+</span><span class='line'>                    state-&gt;reord = min(fack_count, state-&gt;reord); /* 记录乱序的起始位置 */  
+</span><span class='line'>  
+</span><span class='line'>                /* SACK enhanced F-RTO (RFC4138; Appendix B) */  
+</span><span class='line'>                if (! after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;frto_highmark))  
+</span><span class='line'>                    state-&gt;flag |= FLAG_ONLY_ORIG_SACKED; /* SACKs only non-rexmit sent before RTO */  
+</span><span class='line'>            }  
+</span><span class='line'>  
+</span><span class='line'>            /* 如果它有LOST标志，既然收到了，那么要撤销了 */  
+</span><span class='line'>            if (sacked & TCPCB_LOST) {  
+</span><span class='line'>                sacked &= ~TCPCB_LOST; /* 撤销LOST标志 */  
+</span><span class='line'>                tp-&gt;lost_out -= pcount; /* 更新LOST包个数 */  
+</span><span class='line'>            }  
+</span><span class='line'>        }  
+</span><span class='line'>   
+</span><span class='line'>        sacked |= TCPCB_SACKED_ACKED; /* 给skb打上SACK标志，就是这里：） */  
+</span><span class='line'>        state-&gt;flag |= FLAG_DATA_SACKED;  
+</span><span class='line'>        tp-&gt;sacked_out += pcount; /* 更新SACK包个数 */  
+</span><span class='line'>        fack_count += pcount; /* fackets_out =sacked_out + lost_out，也跟着更新 */  
+</span><span class='line'>  
+</span><span class='line'>        /* 没有使用FACK时 */  
+</span><span class='line'>        if (! tcp_is_fack(tp) && (tp-&gt;lost_skb_hint != NULL) &&  
+</span><span class='line'>            before(TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(tp-&gt;lost_skb_hint)-&gt;seq))  
+</span><span class='line'>            tp-&gt;lost_cnt_hint += pcount;  
+</span><span class='line'>  
+</span><span class='line'>        if (fack_count &gt; tp-&gt;fackets_out)  
+</span><span class='line'>            tp-&gt;fackets_out = fack_count; /* 更新tp-&gt;fackets_out */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    /* D-SACK. We can detect redundant retransmission in S|R and plain R frames and clear it. 
+</span><span class='line'>     * undo_retrans is decreased above, L|R frames are accounted above as well. 
+</span><span class='line'>     * 如果skb被D-SACK，并且它的重传标志还未被清除，那么现在清除。 
+</span><span class='line'>     */  
+</span><span class='line'>    if (dup_sack && (sacked & TCPCB_SACKED_RETRANS)) {  
+</span><span class='line'>        sacked &= ~TCPCB_SACKED_RETRANS; /* 清除重传标志 */  
+</span><span class='line'>        tp-&gt;retrans_out -= pcount; /* 更新重传包个数 */  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    return sacked; /* 返回此skb的记分牌 */  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（七）</h3>
+
+<p>我们发送重传包时，重传包也可能丢失，如果没有检查重传包是否丢失的机制，那么只能依靠超时来恢复了。<br/>
+37版本把检查重传包是否丢失的部分独立出来，这就是tcp_mark_lost_retrans()。<br/>
+在处理SACK块的同时，会检测是否有出现乱序，如果有乱序，那么会计算乱序的长度并更新。</p>
+
+<p>本文主要内容：检查重传包是否丢失，以及乱序的检测和更新。</p>
+
+<h4>检查重传包是否丢失</h4>
+
+<p>tcp_mark_lost_retrans()用于检查重传的包是否丢失，2.6.22内核在检查重传包是否丢失时是有Bug的，<br/>
+具体可见：<a href="http://projects.itri.aist.go.jp/gnet/sack-bug.html">http://projects.itri.aist.go.jp/gnet/sack-bug.html</a></p>
+
+<p>Q: 怎么检查重传包是否丢失呢？<br/>
+A: 我们知道，要发送数据时，是先发送重传包，之后才发送新包的。<br/>
+    如果重传包顺利到达接收端，当新包到达时，服务器端会收到一个对新包的正常确认。<br/>
+    如果重传包丢失了，当新包到达时，服务器端会收到一个对新包的选择性确认。</p>
+
+<pre><code>基于这个事实：  
+当重传一个包时，我们记录当时要发送的下一新包的序列号(当时的tp-&gt;snd_nxt)。  
+当我们收到SACK时，就检查新包是被正常ACK，还是被SACK。如果新包被SACK，  
+但是重传包还没有，就说明当时重传的包已经丢失了。  
+</code></pre>
+
+<p>重传一个包时，会记录当时要发送的下一个新包的序号，即tp->snd_nxt。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    ...  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果之前网络中没有重传包 */  
+</span><span class='line'>    if (! tp-&gt;retrans_out)   
+</span><span class='line'>        tp-&gt;lost_retrans_low = tp-&gt;snd_nxt;  
+</span><span class='line'>  
+</span><span class='line'>    TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_RETRANS; /* 打上R标记 */  
+</span><span class='line'>    tp-&gt;retrans_out += tcp_skb_pcount(skb); /* 更新retrans_out */  
+</span><span class='line'>  
+</span><span class='line'>    /* Save stamp of the first retransmit. */  
+</span><span class='line'>    if (! tp-&gt;retrans_stamp)  
+</span><span class='line'>        tp-&gt;retrans_stamp = TCP_SKB_CB(skb)-&gt;when;  
+</span><span class='line'>  
+</span><span class='line'>    tp-&gt;undo_retrans++;  
+</span><span class='line'>  
+</span><span class='line'>    /* snd_nxt is stored to detect loss of retransmitted segment, 
+</span><span class='line'>     * see tcp_input.c tcp_sacktag_write_queue(). 
+</span><span class='line'>     * 就是在这里！把这时的snd_nxt保存到重传包的ack_seq。 
+</span><span class='line'>     */  
+</span><span class='line'>    TCP_SKB_CB(skb)-&gt;ack_seq = tp-&gt;snd_nxt;  
+</span><span class='line'>  
+</span><span class='line'>    ...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>检查重传包是否丢失，如果丢失了，重新打L标志。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Check for lost retransmit. */  
+</span><span class='line'>static void tcp_mark_lost_retrans(struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>    const struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>    struct sk_buff *skb;  
+</span><span class='line'>    int cnt = 0;  
+</span><span class='line'>    u32 new_low_seq = tp-&gt;snd_nxt; /* 下一个要发送的新包序列号 */  
+</span><span class='line'>    u32 received_upto = tcp_highest_sack_seq(tp); /* 被SACK过的最大序列号 */  
+</span><span class='line'>  
+</span><span class='line'>    /* 使用这个方法的条件： 
+</span><span class='line'>     * 使用FACK；有重传包；上次的最低snd_nxt被SACK；处于Recovery状态 
+</span><span class='line'>     */  
+</span><span class='line'>    if (! tcp_is_fack(tp) || ! tp-&gt;retrans_out || ! after(received_upto, tp-&gt;lost_retrans_low)  
+</span><span class='line'>        || icsk-&gt;icsk_ca_state != TCP_CA_Recovery)  
+</span><span class='line'>    return;  
+</span><span class='line'>  
+</span><span class='line'>    tcp_for_write_queue(skb, sk) {  
+</span><span class='line'>        /* 注意了：对于重传包来说，ack_seq其实是当时的snd_nxt */  
+</span><span class='line'>        u32 ack_seq = TCP_SKB_CB(skb)-&gt;ack_seq;  
+</span><span class='line'>  
+</span><span class='line'>        if (skb == tcp_send_head(sk)) /* 发送队列头了 */  
+</span><span class='line'>            break;  
+</span><span class='line'>  
+</span><span class='line'>        /* 我们关注的是重传的包，如果遍历完了，就退出 */  
+</span><span class='line'>        if (cnt == tp-&gt;retrans_out)  
+</span><span class='line'>            break;  
+</span><span class='line'>   
+</span><span class='line'>        /* 不关心成功确认过的包 */  
+</span><span class='line'>        if (! after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))  
+</span><span class='line'>            continue;  
+</span><span class='line'>  
+</span><span class='line'>        /* 只关注重传包，必须有R标志才处理 */  
+</span><span class='line'>        if (! (TCP_SKB_CB(skb)-&gt;sacked & TCPCB_SACKED_RETRANS))  
+</span><span class='line'>            continue;  
+</span><span class='line'>  
+</span><span class='line'>        /*  
+</span><span class='line'>         * 如果重传包记录的snd_nxt被SACK了，那说明重传包丢了；否则应该在新包之前被确认才对。 
+</span><span class='line'>         */  
+</span><span class='line'>        if (after(received_upto, ack_seq)) {  
+</span><span class='line'>            TCP_SKB_CB(skb)-&gt;sacked &= ~TCPCB_SACKED_RETRANS; /* 取消R标志 */  
+</span><span class='line'>            tp-&gt;retrans_out -= tcp_skb_pcount(skb); /* 更新网络中重传包数量 */  
+</span><span class='line'>            tcp_skb_mark_lost_uncond_verify(tp, skb); /* 给重传包打上LOST标志，并更新相关变量 */  
+</span><span class='line'>            NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPLOSTRETRANSMIT);  
+</span><span class='line'>  
+</span><span class='line'>        } else { /* 如果重传包对应的snd_nxt在最高SACK序列号之后 */  
+</span><span class='line'>            if (before(ack_seq, new_low_seq))  
+</span><span class='line'>                new_low_seq = ack_seq; /* 更新未检测的重传包对应的最小snd_nxt */  
+</span><span class='line'>            cnt += tcp_skb_pcount(skb); /* 用于判断重传包是否检查完了 */  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>   
+</span><span class='line'>    /* 如果还有未检查完的重传包，那么更新未检测的重传包对应的最小snd_nxt */  
+</span><span class='line'>    if (tp-&gt;retrans_out)  
+</span><span class='line'>        tp-&gt;lost_retrans_low = new_low_seq;  
+</span><span class='line'>  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>给数据包打上LOST标志，更新相关变量。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_skb_mark_lost_uncond_verify(struct tcp_sock *tp, struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    /* 更新重传过的包的最低、最高序号 */  
+</span><span class='line'>    tcp_verfiy_retransmit_hint(tp, skb);  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果这个包还未打上L标志，且没有S标志 */  
+</span><span class='line'>    if (! (TCP_SKB_CB(skb)-&gt;sacked & (TCP_LOST | TCPCB_SACKED_ACKED))) {  
+</span><span class='line'>        tp-&gt;lost_out += tcp_skb_pcount(skb); /* 更新网络中丢失包数量 */  
+</span><span class='line'>        TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_LOST; /* 打上L标志 */  
+</span><span class='line'>    }  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>/* This must be called before lost_out is incremented 
+</span><span class='line'> * 记录重传过的包的最低序号、最高序号。 
+</span><span class='line'> */  
+</span><span class='line'>static void tcp_verify_retransmit_hint(struct tcp_sock *tp, struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>    if ((tp-&gt;retransmit_skb_hint == NULL) || before(TCP_SKB_CB(skb)-&gt;seq,  
+</span><span class='line'>        TCP_SKB_CB(tp-&gt;retransmit_skb_hint)-&gt;seq))  
+</span><span class='line'>        tp-&gt;retransmit_skb_hint = skb;  
+</span><span class='line'>  
+</span><span class='line'>    if (! tp-&gt;lost_out || after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;retransmit_high))  
+</span><span class='line'>        tp-&gt;retransmit_high = TCP_SKB_CB(skb)-&gt;end_seq;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>乱序处理</h4>
+
+<p>说明<br/>
+Reordering metric is maximal distance, which a packet can be displaced in packet stream.<br/>
+With SACKs we can estimate it:<br/>
+1. SACK fills old hole and the corresponding segment was not ever retransmitted -> reordering.<br/>
+    Alas, we cannot use it when segment was retransmitted.<br/>
+2. The last flaw it solved with D-SACK. D-SACK arrives for retransmitted and already SACKed segment<br/>
+    -> reordering.. <br/>
+Both of these heuristics are not used in Loss state, when we cannot account for retransmits accurately.</p>
+
+<p>对于乱序，我们主要关注如何检测乱序，以及计算乱序的长度。<br/>
+在tcp_sacktag_one()中有进行乱序的检测，那么在收到SACK或DSACK时怎么判断有乱序呢？</p>
+
+<p>（1）skb的记分牌为S|R，然后它被DSACK。<br/>
+我们想象一下，一个数据包乱序了，它滞留在网络的某个角落里。我们收到后续包的SACK，认为这个包丢失了，进行重传。之后原始包到达接收端了，这个数据包被SACK了。最后重传包也到达接收端了，这个包被DSACK了。</p>
+
+<p>（2）如果一个包落在highest_sack之前，它既没被SACK过，也不是重传的，那么它肯定是乱序了，到现在才被SACK。</p>
+
+<p>如果检测到了乱序，那么乱序队列的长队为：tp->fackets_out - state.reord。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_update_reordering(struct sock *sk, const int metric,  
+</span><span class='line'>                                       const int ts)  
+</span><span class='line'>{  
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>    if (metric &gt; tp-&gt;reordering) {  
+</span><span class='line'>        int mib_idx;  
+</span><span class='line'>        /* 更新reordering的值，取其小者*/  
+</span><span class='line'>        tp-&gt;reordering = min(TCP_MAX_REORDERING, metric);  
+</span><span class='line'>          
+</span><span class='line'>        if (ts)  
+</span><span class='line'>            mib_idx = LINUX_MIB_TCPTSREORDER;  
+</span><span class='line'>        else if (tcp_is_reno(tp))  
+</span><span class='line'>            mib_idx = LINUX_MIB_TCPRENOREORDER;  
+</span><span class='line'>        else if (tcp_is_fack(tp))  
+</span><span class='line'>            mib_idx = LINUX_MIB_TCPFACKREORDER;  
+</span><span class='line'>        else   
+</span><span class='line'>            mib_idx = LINUX_MIB_TCPSACKREORDER;  
+</span><span class='line'>  
+</span><span class='line'>        NET_INC_STATS_BH(sock_net(sk), mib_idx);  
+</span><span class='line'>#if FASTRETRANS_DEBUG &gt; 1  
+</span><span class='line'>        printk(KERN_DEBUG "Disorder%d %d %u f%u s%u rr%d\n",  
+</span><span class='line'>                   tp-&gt;rx_opt.sack_ok, inet_csk(sk)-&gt;icsk_ca_state,  
+</span><span class='line'>                   tp-&gt;reordering, tp-&gt;fackets_out, tp-&gt;sacked_out,  
+</span><span class='line'>                   tp-&gt;undo_marker ? tp-&gt;undo_retrans : 0);  
+</span><span class='line'>#endif  
+</span><span class='line'>        tcp_disable_fack(tp); /* 出现了reorder，再用fack就太激进了*/  
+</span><span class='line'>    }  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Packet counting of FACK is based on in-order assumptions, therefore 
+</span><span class='line'> * TCP disables it when reordering is detected. 
+</span><span class='line'> */  
+</span><span class='line'>static void tcp_disable_fack(struct tcp_sock *tp)  
+</span><span class='line'>{  
+</span><span class='line'>    /* RFC3517 uses different metric in lost marker =&gt; reset on change */  
+</span><span class='line'>    if (tcp_is_fack(tp))  
+</span><span class='line'>        tp-&gt;lost_skb_hint = NULL;  
+</span><span class='line'>    tp-&gt;rx_opt.sack_ok &= ~2; /* 取消FACK选项*/  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2015-03-19T16:27:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>16:27:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~net/'>net</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2015/03/13/kernel-sched-rt/" title="Previous Post: linux进程调度之FIFO和RR调度策略">&laquo; linux进程调度之FIFO和RR调度策略</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2015/03/19/kernel-net-rcv_wnd/" title="Next Post: TCP接收窗口的调整算法">TCP接收窗口的调整算法 &raquo;</a>
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2015 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>
