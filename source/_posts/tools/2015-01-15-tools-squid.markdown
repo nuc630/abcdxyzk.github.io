@@ -39,3 +39,40 @@ ERROR:
 ```
 再去掉cache_peer
 
+
+#### centos 5
+```
+	# diff /tmp/orig_squid.conf /etc/squid/squid.conf
+	610c610
+	< # http_access deny all
+	---
+	> http_access allow all
+	615,616c615,616
+	< http_access allow manager localhost
+	< http_access deny manager
+	---
+	> #http_access allow manager localhost
+	> #http_access deny manager
+	618c618
+	< http_access deny !Safe_ports
+	---
+	> #http_access deny !Safe_ports
+	620c620
+	< http_access deny CONNECT !SSL_ports
+	---
+	> #http_access deny CONNECT !SSL_ports
+	636,637c636,637
+	< http_access allow localhost
+	< http_access deny all
+	---
+	> #http_access allow localhost
+	> #http_access deny all
+	921c921
+	< http_port 3128
+	---
+	> http_port 3128 accel vhost vport
+	4007a4008
+	> always_direct allow all
+```
+
+
