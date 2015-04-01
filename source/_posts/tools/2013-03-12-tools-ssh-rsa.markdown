@@ -39,3 +39,5 @@ $ssh bsduser@192.168.1.188
 
 * 注意authorized_keys文件权限设置600
 
+* 服务器上若对用户主目录进行了软链接，则软链接的目录权限要小等于755。如 `ln -s /opt/kk /home/kk`, 则需要`chmod 755 /opt/kk`，不然会不起作用。
+

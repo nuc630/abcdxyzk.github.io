@@ -87,12 +87,15 @@ TCP_HP_BITS的作用就是排除flag中的PSH标志位。只有在头部预测�
      */  
       
     /* Check timestamp */  
+    //相等说明tcp timestamp option被打开。
     if (tcp_header_len == sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) {  
         /* No? Slow path! */  
+        //这里主要是parse timestamp选项，如果返回0则表明pase出错，此时我们进入slow_path
         if (!tcp_parse_aligned_timestamp(tp, th))  
             goto slow_path;  
       
         /* If PAWS failed, check it more carefully in slow path */  
+        //如果上面pase成功，则tp对应的rx_opt域已经被正确赋值，此时如果rcv_tsval（新的接收的数据段的时间戳)比ts_recent(对端发送过来的数据(也就是上一次)的最新的一个时间戳)小，则我们要进入slow path 处理paws。
         if ((s32)(tp->rx_opt.rcv_tsval - tp->rx_opt.ts_recent) < 0)  
             goto slow_path;  
       

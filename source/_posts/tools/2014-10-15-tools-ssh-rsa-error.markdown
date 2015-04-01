@@ -10,7 +10,10 @@ categories:
 - tools~ssh
 tags:
 ---
-* restorecon -r -vv /root/.ssh  
+```
+	restorecon -r -vv /root/.ssh  
+```
+------------
 
   新装一台机器按照正常配置以后居然使用publickey方式认证不成功，但是使用密码认证是可以的。 
 
