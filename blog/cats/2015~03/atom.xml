@@ -4,7 +4,7 @@
   <title><![CDATA[Category: 2015~03 | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/2015~03/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-03-23T14:58:52+08:00</updated>
+  <updated>2015-04-01T18:29:16+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,992 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[内核网络设备的注册与初始化(eth0...)]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/03/27/kernel-net-netdevice/"/>
+    <updated>2015-03-27T17:56:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/03/27/kernel-net-netdevice</id>
+    <content type="html"><![CDATA[<h4>找到eth0&hellip;之类的设备的数据结构</h4>
+
+<pre><code>    # crash vmlinux
+
+    p init_net
+    找到：
+      dev_base_head = {
+        next = 0xffff88003e48b070, 
+        prev = 0xffff880037582070
+      },
+    next 就是 struct net_device *dev; 中 dev-&gt;dev_list;
+    算算 dev_list 在 dev 中的偏移为0x50（可能会不同）
+
+    struct net_device 0xffff88003e48b020
+    然后根据 dev中的dev_list.next取下一个net_device
+      dev_list = {
+        next = 0xffff880037582070, 
+        prev = 0xffffffff81b185b0
+      },
+</code></pre>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/sfrysh/article/details/5736752">http://blog.csdn.net/sfrysh/article/details/5736752</a></p>
+
+<p>首先来看如何分配内存给一个网络设备。</p>
+
+<p>内核通过alloc_netdev来分配内存给一个指定的网络设备:</p>
+
+<pre><code>    #define alloc_netdev(sizeof_priv, name, setup) /   
+        alloc_netdev_mq(sizeof_priv, name, setup, 1)   
+
+    struct net_device *alloc_netdev_mq(int sizeof_priv, const char *name,   
+            void (*setup)(struct net_device *), unsigned int queue_count)  
+</code></pre>
+
+<p>其中alloc_netdev_mq中的第一个元素是每个网络设备的私有数据(主要是包含一些硬件参数，比如中断之类的)的大小，也就是net_device结构中的priv的大小。第二个参数是设备名，我们传递进来一般都是一个待format的字符串，比如"eth%d",到时多个相同类型网卡设备就会依次为eth0,1(内核会通过dev_alloc_name来进行设置)&hellip; 第三个参数setup是一个初始化net_device结构的回调函数。</p>
+
+<p>可是一般我们不需要直接调用alloc_netdev的，内核提供了一些包装好的函数：</p>
+
+<p>这里我们只看alloc_etherdev：</p>
+
+<pre><code>    #define alloc_etherdev(sizeof_priv) alloc_etherdev_mq(sizeof_priv, 1)   
+    struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int queue_count)   
+    {   
+        return alloc_netdev_mq(sizeof_priv, "eth%d", ether_setup, queue_count);   
+    }  
+</code></pre>
+
+<p>这里实际是根据网卡的类型进行包装，也就类似于oo中的基类，ether_setup初始化一些所有相同类型的网络设备的一些相同配置的域：</p>
+
+<pre><code>    void ether_setup(struct net_device *dev)   
+    {   
+        dev-&gt;header_ops      = &amp;eth_header_ops;   
+
+        dev-&gt;change_mtu      = eth_change_mtu;   
+        dev-&gt;set_mac_address     = eth_mac_addr;   
+        dev-&gt;validate_addr   = eth_validate_addr;   
+
+        dev-&gt;type        = ARPHRD_ETHER;   
+        dev-&gt;hard_header_len     = ETH_HLEN;   
+        dev-&gt;mtu     = ETH_DATA_LEN;   
+        dev-&gt;addr_len        = ETH_ALEN;   
+        dev-&gt;tx_queue_len    = 1000; /* Ethernet wants good queues */  
+        dev-&gt;flags       = IFF_BROADCAST|IFF_MULTICAST;   
+
+        memset(dev-&gt;broadcast, 0xFF, ETH_ALEN);   
+
+    }  
+</code></pre>
+
+<p>接下来我们来看注册网络设备的一些细节。</p>
+
+<pre><code>    int register_netdev(struct net_device *dev)   
+    {   
+        int err;   
+
+        rtnl_lock();   
+
+        /*  
+         * If the name is a format string the caller wants us to do a  
+         * name allocation.  
+         */  
+        if (strchr(dev-&gt;name, '%')) {   
+    ///这里通过dev_alloc_name函数来对设备名进行设置。   
+            err = dev_alloc_name(dev, dev-&gt;name);   
+            if (err &lt; 0)   
+                goto out;   
+        }   
+    ///注册当前的网络设备到全局的网络设备链表中.下面会详细看这个函数.   
+        err = register_netdevice(dev);   
+    out:   
+        rtnl_unlock();   
+        return err;   
+    }  
+</code></pre>
+
+<p>整个网络设备就是一个链表，他需要很方便的遍历所有设备，以及很快的定位某个指定的设备。为此net_device包含了下面3个链表(有关内核中数据结构的介绍，可以去自己google下)：</p>
+
+<pre><code>    ///可以根据index来定位设备   
+    struct hlist_node   index_hlist;   
+    ///可以根据name来定位设备   
+    struct hlist_node   name_hlist;   
+    ///通过dev_list，将此设备插入到全局的dev_base_head中，我们下面会介绍这个。   
+    struct list_head    dev_list;  
+</code></pre>
+
+<p>当设备注册成功后，还需要通知内核的其他组件，这里通过netdev_chain类型的notifier chain来通知其他组件。事件是NETDEV_REGISTER..其他设备通过register_netdevice_notifier来注册自己感兴趣的事件到此notifier chain上。</p>
+
+<p>网络设备(比如打开或关闭一个设备)，与用户空间的通信通过rtmsg_ifinfo函数，也就是RTMGRP_LINK的netlink。</p>
+
+<p>每个设备还包含两个状态，一个是state字段，表示排队策略状态(用位图表示)，一个是注册状态。</p>
+
+<p>包的排队策略也就是qos了。。</p>
+
+<pre><code>    int register_netdevice(struct net_device *dev)   
+    {   
+        struct hlist_head *head;   
+        struct hlist_node *p;   
+        int ret;   
+        struct net *net;   
+
+        BUG_ON(dev_boot_phase);   
+        ASSERT_RTNL();   
+
+        might_sleep();   
+
+        /* When net_device's are persistent, this will be fatal. */  
+        BUG_ON(dev-&gt;reg_state != NETREG_UNINITIALIZED);   
+        BUG_ON(!dev_net(dev));   
+        net = dev_net(dev);   
+
+    ///初始化相关的锁   
+        spin_lock_init(&amp;dev-&gt;addr_list_lock);   
+        netdev_set_addr_lockdep_class(dev);   
+        netdev_init_queue_locks(dev);   
+
+        dev-&gt;iflink = -1;   
+
+        /* Init, if this function is available */  
+        if (dev-&gt;init) {   
+            ret = dev-&gt;init(dev);   
+            if (ret) {   
+                if (ret &gt; 0)   
+                    ret = -EIO;   
+                goto out;   
+            }   
+        }   
+
+        if (!dev_valid_name(dev-&gt;name)) {   
+            ret = -EINVAL;   
+            goto err_uninit;   
+        }   
+    ///给设备分配一个唯一的identifier.   
+        dev-&gt;ifindex = dev_new_index(net);   
+        if (dev-&gt;iflink == -1)   
+            dev-&gt;iflink = dev-&gt;ifindex;   
+
+    ///在全局的链表中检测是否有重复的名字   
+        head = dev_name_hash(net, dev-&gt;name);   
+        hlist_for_each(p, head) {   
+            struct net_device *d   
+                = hlist_entry(p, struct net_device, name_hlist);   
+            if (!strncmp(d-&gt;name, dev-&gt;name, IFNAMSIZ)) {   
+                ret = -EEXIST;   
+                goto err_uninit;   
+            }   
+        }   
+    ///下面是检测一些特性的组合是否合法。   
+        /* Fix illegal checksum combinations */  
+        if ((dev-&gt;features &amp; NETIF_F_HW_CSUM) &amp;&amp;   
+            (dev-&gt;features &amp; (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {   
+            printk(KERN_NOTICE "%s: mixed HW and IP checksum settings./n",   
+                   dev-&gt;name);   
+            dev-&gt;features &amp;= ~(NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM);   
+        }   
+
+        if ((dev-&gt;features &amp; NETIF_F_NO_CSUM) &amp;&amp;   
+            (dev-&gt;features &amp; (NETIF_F_HW_CSUM|NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {   
+            printk(KERN_NOTICE "%s: mixed no checksumming and other settings./n",   
+                   dev-&gt;name);   
+            dev-&gt;features &amp;= ~(NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM|NETIF_F_HW_CSUM);   
+        }   
+
+
+        /* Fix illegal SG+CSUM combinations. */  
+        if ((dev-&gt;features &amp; NETIF_F_SG) &amp;&amp;   
+            !(dev-&gt;features &amp; NETIF_F_ALL_CSUM)) {   
+            printk(KERN_NOTICE "%s: Dropping NETIF_F_SG since no checksum feature./n",   
+                   dev-&gt;name);   
+            dev-&gt;features &amp;= ~NETIF_F_SG;   
+        }   
+
+        /* TSO requires that SG is present as well. */  
+        if ((dev-&gt;features &amp; NETIF_F_TSO) &amp;&amp;   
+            !(dev-&gt;features &amp; NETIF_F_SG)) {   
+            printk(KERN_NOTICE "%s: Dropping NETIF_F_TSO since no SG feature./n",   
+                   dev-&gt;name);   
+            dev-&gt;features &amp;= ~NETIF_F_TSO;   
+        }   
+        if (dev-&gt;features &amp; NETIF_F_UFO) {   
+            if (!(dev-&gt;features &amp; NETIF_F_HW_CSUM)) {   
+                printk(KERN_ERR "%s: Dropping NETIF_F_UFO since no "  
+                        "NETIF_F_HW_CSUM feature./n",   
+                                dev-&gt;name);   
+                dev-&gt;features &amp;= ~NETIF_F_UFO;   
+            }   
+            if (!(dev-&gt;features &amp; NETIF_F_SG)) {   
+                printk(KERN_ERR "%s: Dropping NETIF_F_UFO since no "  
+                        "NETIF_F_SG feature./n",   
+                        dev-&gt;name);   
+                dev-&gt;features &amp;= ~NETIF_F_UFO;   
+            }   
+        }   
+
+        /* Enable software GSO if SG is supported. */  
+        if (dev-&gt;features &amp; NETIF_F_SG)   
+            dev-&gt;features |= NETIF_F_GSO;   
+
+    ///初始化设备驱动的kobject并创建相关的sysfs   
+        netdev_initialize_kobject(dev);   
+        ret = netdev_register_kobject(dev);   
+        if (ret)   
+            goto err_uninit;   
+    ///设置注册状态。   
+        dev-&gt;reg_state = NETREG_REGISTERED;   
+
+        /*  
+         *  Default initial state at registry is that the  
+         *  device is present.  
+         */  
+
+    ///设置排队策略状态。   
+        set_bit(__LINK_STATE_PRESENT, &amp;dev-&gt;state);   
+    ///初始化排队规则   
+        dev_init_scheduler(dev);   
+        dev_hold(dev);   
+    ///将相应的链表插入到全局的链表中。紧接着会介绍这个函数   
+        list_netdevice(dev);   
+
+        /* Notify protocols, that a new device appeared. */  
+    ///调用netdev_chain通知内核其他子系统。   
+        ret = call_netdevice_notifiers(NETDEV_REGISTER, dev);   
+        ret = notifier_to_errno(ret);   
+        if (ret) {   
+            rollback_registered(dev);   
+            dev-&gt;reg_state = NETREG_UNREGISTERED;   
+        }   
+
+    out:   
+        return ret;   
+
+    err_uninit:   
+        if (dev-&gt;uninit)   
+            dev-&gt;uninit(dev);   
+        goto out;   
+    }  
+</code></pre>
+
+<p>这里要注意有一个全局的struct net init_net;变量，这个变量保存了全局的name,index  hlist以及全局的网络设备链表。</p>
+
+<p>net结构我们这里所需要的也就三个链表：</p>
+
+<pre><code>    ///设备链表   
+    struct list_head    dev_base_head;   
+    ///名字为索引的hlist   
+    struct hlist_head   *dev_name_head;   
+    ///index为索引的hlist   
+    struct hlist_head   *dev_index_head;  
+</code></pre>
+
+<pre><code>    static int list_netdevice(struct net_device *dev)   
+    {   
+        struct net *net = dev_net(dev);   
+
+        ASSERT_RTNL();   
+
+        write_lock_bh(&amp;dev_base_lock);   
+    ///插入全局的list   
+        list_add_tail(&amp;dev-&gt;dev_list, &amp;net-&gt;dev_base_head);   
+    插入全局的name_list以及index_hlist   
+        hlist_add_head(&amp;dev-&gt;name_hlist, dev_name_hash(net, dev-&gt;name));   
+        hlist_add_head(&amp;dev-&gt;index_hlist, dev_index_hash(net, dev-&gt;ifindex));   
+        write_unlock_bh(&amp;dev_base_lock);   
+        return 0;   
+    }  
+</code></pre>
+
+<p>最终执行完之后，注册函数将会执行rtnl_unlock函数，而此函数则会执行netdev_run_todo方法。也就是完成最终的注册。(要注意，当取消注册这个设备时也会调用这个函数来完成最终的取消注册)</p>
+
+<p>这里有一个全局的net_todo_list的链表：</p>
+
+<pre><code>    static LIST_HEAD(net_todo_list);  
+</code></pre>
+
+<p>而在取消注册的函数中会调用这个函数：
+<code>
+    static void net_set_todo(struct net_device *dev)   
+    {   
+        list_add_tail(&amp;dev-&gt;todo_list, &amp;net_todo_list);   
+    }  
+</code></p>
+
+<p>也就是把当前将要取消注册的函数加入到todo_list链表中。</p>
+
+<pre><code>    void netdev_run_todo(void)   
+    {   
+        struct list_head list;   
+
+        /* Snapshot list, allow later requests */  
+    ///replace掉net_todo_list用list代替。   
+        list_replace_init(&amp;net_todo_list, &amp;list);   
+
+        __rtnl_unlock();   
+    ///当注册设备时没有调用net_set_todo函数来设置net_todo_list，因此list为空，所以就会直接跳过。   
+        while (!list_empty(&amp;list)) {   
+    ///通过todo_list得到当前的device对象。   
+            struct net_device *dev   
+                = list_entry(list.next, struct net_device, todo_list);   
+    ///删除此todo_list;   
+            list_del(&amp;dev-&gt;todo_list);   
+
+
+            if (unlikely(dev-&gt;reg_state != NETREG_UNREGISTERING)) {   
+                printk(KERN_ERR "network todo '%s' but state %d/n",   
+                       dev-&gt;name, dev-&gt;reg_state);   
+                dump_stack();   
+                continue;   
+            }   
+    ///设置注册状态为NETREG_UNREGISTERED.   
+            dev-&gt;reg_state = NETREG_UNREGISTERED;   
+    ///在每个cpu上调用刷新函数。   
+            on_each_cpu(flush_backlog, dev, 1);   
+
+    ///等待引用此设备的所有系统释放资源，也就是引用计数清0.   
+            netdev_wait_allrefs(dev);   
+
+            /* paranoia */  
+            BUG_ON(atomic_read(&amp;dev-&gt;refcnt));   
+            WARN_ON(dev-&gt;ip_ptr);   
+            WARN_ON(dev-&gt;ip6_ptr);   
+            WARN_ON(dev-&gt;dn_ptr);   
+
+            if (dev-&gt;destructor)   
+                dev-&gt;destructor(dev);   
+
+            /* Free network device */  
+            kobject_put(&amp;dev-&gt;dev.kobj);   
+        }   
+    }  
+</code></pre>
+
+<p>下面来看netdev_wait_allrefs函数，我们先看它的调用流程:</p>
+
+<pre><code>    static void netdev_wait_allrefs(struct net_device *dev)   
+    {   
+        unsigned long rebroadcast_time, warning_time;   
+
+        rebroadcast_time = warning_time = jiffies;   
+        while (atomic_read(&amp;dev-&gt;refcnt) != 0) {   
+            if (time_after(jiffies, rebroadcast_time + 1 * HZ)) {   
+                rtnl_lock();   
+
+    ///给netdev_chain发送NETDEV_UNREGISTER事件，通知各个子模块释放资源   
+                /* Rebroadcast unregister notification */  
+                call_netdevice_notifiers(NETDEV_UNREGISTER, dev);   
+
+                if (test_bit(__LINK_STATE_LINKWATCH_PENDING,   
+                         &amp;dev-&gt;state)) {   
+                    /* We must not have linkwatch events  
+                     * pending on unregister. If this  
+                     * happens, we simply run the queue  
+                     * unscheduled, resulting in a noop  
+                     * for this device.  
+                     */  
+                    linkwatch_run_queue();   
+                }   
+
+                __rtnl_unlock();   
+
+                rebroadcast_time = jiffies;   
+            }   
+
+            msleep(250);   
+
+            if (time_after(jiffies, warning_time + 10 * HZ)) {   
+                printk(KERN_EMERG "unregister_netdevice: "  
+                       "waiting for %s to become free. Usage "  
+                       "count = %d/n",   
+                       dev-&gt;name, atomic_read(&amp;dev-&gt;refcnt));   
+                warning_time = jiffies;   
+            }   
+        }   
+    }  
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[TCP的TSO/GSO处理（二）]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/03/27/kernel-net-tso3/"/>
+    <updated>2015-03-27T17:45:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/03/27/kernel-net-tso3</id>
+    <content type="html"><![CDATA[<p><a href="http://book.51cto.com/art/201206/345021.htm">http://book.51cto.com/art/201206/345021.htm</a></p>
+
+<p>有些网络设备硬件可以完成一些传统上由CPU完成的任务，最常见的例子就是计算三层和四层校验和。有些网络设备甚至可以维护四层协议的状态机，由硬件完成分段或分片，因此传输层通过网络层提交给网络设备时可能是个GSO段，参见1.3.1节。本节论述SKB的成员都是用来支持GSO的。
+<code>
+    unsigned short gso_size
+</code>
+生成GSO段时的MSS，因为GSO段的长度是与发送该段的套接口中合适MSS的整数倍。
+<code>
+    unsigned short gso_segs
+</code>
+GSO段的长度是gso_size的倍数，即用gso_size来分割大段时产生的段数。
+<code>
+    unsigned short gso_type
+</code>
+该SKB中的数据支持的GSO类型，见表3-5。</p>
+
+<p>表3-5  gso_type的取值</p>
+
+<p>gso_type            描述<br/>
+SKB_GSO_TCPV4   IPv4的TCP段卸载<br/>
+SKB_GSO_UDP     IPv4的UDP分片卸载<br/>
+SKB_GSO_DODGY   表明数据报是从一个不可信赖的来源发出的<br/>
+SKB_GSO_TCP_ECN IPv4的TCP段卸载，当设置TCP首部的CWR时，使用此gos_type。CWR参见29.4节<br/>
+SKB_GSO_TCPV6   IPv6的TCP段卸载</p>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/majieyue/article/details/11881325">http://blog.csdn.net/majieyue/article/details/11881325</a></p>
+
+<p>GSO用来扩展之前的TSO，目前已经并入upstream内核。TSO只能支持tcp协议，而GSO可以支持tcpv4, tcpv6, udp等协议。在GSO之前，skb_shinfo(skb)有两个成员ufo_size, tso_size，分别表示udp fragmentation offloading支持的分片长度，以及tcp segmentation offloading支持的分段长度，现在都用skb_shinfo(skb)->gso_size代替。skb_shinfo(skb)->ufo_segs, skb_shinfo(skb)->tso_segs也被替换成了skb_shinfo(skb)->gso_segs，表示分片的个数。</p>
+
+<p>skb_shinfo(skb)->gso_type包括SKB_GSO_TCPv4, SKB_GSO_UDPv4，同时NETIF_F_XXX的标志也增加了相应的bit，标识设备是否支持TSO, GSO, e.g.
+<code>
+    NETIF_F_TSO = SKB_GSO_TCPV4 &lt;&lt; NETIF_F_GSO_SHIFT
+    NETIF_F_UFO = SKB_GSO_UDPV4 &lt;&lt; NETIF_F_GSO_SHIFT
+    #define NETIF_F_GSO_SHIFT 16
+</code>
+dev_hard_start_xmit在调用设备驱动的发送函数之前，会通过netif_needs_gso判断是否需要软件做GSO，如果需要，那么会调用到dev_gso_segment</p>
+
+<pre><code>    /**
+     *  dev_gso_segment - Perform emulated hardware segmentation on skb.
+     *  @skb: buffer to segment
+     *
+     *  This function segments the given skb and stores the list of segments
+     *  in skb-&gt;next.
+     */
+    static int dev_gso_segment(struct sk_buff *skb)
+    {
+        struct net_device *dev = skb-&gt;dev;
+        struct sk_buff *segs;
+        int features = dev-&gt;features &amp; ~(illegal_highdma(dev, skb) ?
+                         NETIF_F_SG : 0);
+
+        segs = skb_gso_segment(skb, features);
+
+        /* Verifying header integrity only. */
+        if (!segs)
+            return 0;
+
+        if (IS_ERR(segs))
+            return PTR_ERR(segs);
+
+        skb-&gt;next = segs;
+        DEV_GSO_CB(skb)-&gt;destructor = skb-&gt;destructor;
+        skb-&gt;destructor = dev_gso_skb_destructor;
+
+        return 0;
+    }
+</code></pre>
+
+<p>分析skb_gso_segment之前，看下析构过程，此时skb经过分片之后已经是一个skb list，通过skb->next串在一起，此时把初始的skb->destructor函数存到skb->cb中，然后把skb->destructor变更为dev_gso_skb_destructor。</p>
+
+<p>dev_gso_skb_destructor会把skb->next一个个通过kfree_skb释放掉，最后调用DEV_GSO_CB(skb)->destructor，即skb初始的析构函数做最后的清理。</p>
+
+<p>skb_gso_segment是通过软件方式模拟网卡分段的函数。</p>
+
+<pre><code>    struct sk_buff *skb_gso_segment(struct sk_buff *skb, int features)
+    {
+        struct sk_buff *segs = ERR_PTR(-EPROTONOSUPPORT);
+        struct packet_type *ptype;
+        __be16 type = skb-&gt;protocol;
+        int err;
+
+        skb_reset_mac_header(skb);
+        skb-&gt;mac_len = skb-&gt;network_header - skb-&gt;mac_header;
+        __skb_pull(skb, skb-&gt;mac_len);
+
+        if (unlikely(skb-&gt;ip_summed != CHECKSUM_PARTIAL)) {
+            struct net_device *dev = skb-&gt;dev;
+            struct ethtool_drvinfo info = {};
+
+            if (dev &amp;&amp; dev-&gt;ethtool_ops &amp;&amp; dev-&gt;ethtool_ops-&gt;get_drvinfo)
+                dev-&gt;ethtool_ops-&gt;get_drvinfo(dev, &amp;info);
+
+            WARN(1, "%s: caps=(0x%lx, 0x%lx) len=%d data_len=%d "
+                "ip_summed=%d",
+                 info.driver, dev ? dev-&gt;features : 0L,
+                 skb-&gt;sk ? skb-&gt;sk-&gt;sk_route_caps : 0L,
+                 skb-&gt;len, skb-&gt;data_len, skb-&gt;ip_summed);
+
+            if (skb_header_cloned(skb) &amp;&amp;
+                (err = pskb_expand_head(skb, 0, 0, GFP_ATOMIC)))
+                return ERR_PTR(err);
+
+    如果skb header是clone，分离出来
+        }
+
+    如果skb-&gt;ip_summed 不是 CHECKSUM_PARTIAL，那么报个warning，因为GSO类型的skb其ip_summed一般都是CHECKSUM_PARTIAL
+
+        rcu_read_lock();
+        list_for_each_entry_rcu(ptype,
+                &amp;ptype_base[ntohs(type) &amp; PTYPE_HASH_MASK], list) {
+            if (ptype-&gt;type == type &amp;&amp; !ptype-&gt;dev &amp;&amp; ptype-&gt;gso_segment) {
+                if (unlikely(skb-&gt;ip_summed != CHECKSUM_PARTIAL)) {
+                    err = ptype-&gt;gso_send_check(skb);
+                    segs = ERR_PTR(err);
+                    if (err || skb_gso_ok(skb, features))
+                        break;
+                    __skb_push(skb, (skb-&gt;data -
+                             skb_network_header(skb)));
+                }
+                segs = ptype-&gt;gso_segment(skb, features);
+                break;
+
+    把skb-&gt;data指向network header，然后调用inet_gso_segment，四层的gso_segment会在inet_gso_segment中被调用
+            }
+        }
+        rcu_read_unlock();
+
+        __skb_push(skb, skb-&gt;data - skb_mac_header(skb));
+
+    把skb-&gt;data再次指向mac header
+
+        return segs;
+    }
+
+
+    static struct sk_buff *inet_gso_segment(struct sk_buff *skb, int features)
+    {
+        struct sk_buff *segs = ERR_PTR(-EINVAL);
+        struct iphdr *iph;
+        const struct net_protocol *ops;
+        int proto;
+        int ihl;
+        int id;
+        unsigned int offset = 0;
+
+        if (!(features &amp; NETIF_F_V4_CSUM))
+            features &amp;= ~NETIF_F_SG;
+    如果设备不支持NETIF_F_V4_CSUM，那么就当设备不支持SG
+
+        if (unlikely(skb_shinfo(skb)-&gt;gso_type &amp;
+                 ~(SKB_GSO_TCPV4 |
+                   SKB_GSO_UDP |
+                   SKB_GSO_DODGY |
+                   SKB_GSO_TCP_ECN |
+                   0)))
+            goto out;
+    gso_type不合法，直接返错
+
+        if (unlikely(!pskb_may_pull(skb, sizeof(*iph))))
+            goto out;
+    20字节ip头部无法获得，返错
+
+        iph = ip_hdr(skb);
+        ihl = iph-&gt;ihl * 4;
+        if (ihl &lt; sizeof(*iph))
+            goto out;
+
+        if (unlikely(!pskb_may_pull(skb, ihl)))
+            goto out;
+    实际ip头部无法获得，返错
+
+        __skb_pull(skb, ihl);
+        skb_reset_transport_header(skb);
+        iph = ip_hdr(skb);
+
+    OK，现在拿到ip头部了
+
+
+        id = ntohs(iph-&gt;id);
+
+    ip包的id
+
+
+        proto = iph-&gt;protocol &amp; (MAX_INET_PROTOS - 1);
+        segs = ERR_PTR(-EPROTONOSUPPORT);
+
+        rcu_read_lock();
+        ops = rcu_dereference(inet_protos[proto]);
+        if (likely(ops &amp;&amp; ops-&gt;gso_segment))
+            segs = ops-&gt;gso_segment(skb, features);
+
+    如果是tcp，那么调用tcp_tso_segment，如果是udp，那么调用udp4_ufo_fragment
+
+
+        rcu_read_unlock();
+
+        if (!segs || IS_ERR(segs))
+            goto out;
+
+        skb = segs;
+        do {
+            iph = ip_hdr(skb);
+            if (proto == IPPROTO_UDP) {
+                iph-&gt;id = htons(id);
+                iph-&gt;frag_off = htons(offset &gt;&gt; 3);
+                if (skb-&gt;next != NULL)
+                    iph-&gt;frag_off |= htons(IP_MF);
+                offset += (skb-&gt;len - skb-&gt;mac_len - iph-&gt;ihl * 4);
+            } else
+                iph-&gt;id = htons(id++);
+            iph-&gt;tot_len = htons(skb-&gt;len - skb-&gt;mac_len);
+            iph-&gt;check = 0;
+            iph-&gt;check = ip_fast_csum(skb_network_header(skb), iph-&gt;ihl);
+        } while ((skb = skb-&gt;next));
+
+    对每一个skb segment，填充ip包头，计算ip checksum。如果是tcp segmentation，那么ip头的id递增。如果是udp fragmentation，那么ip头的id不变，每次计算增加的offset，等于是在做ip分片
+
+    out:
+        return segs;
+    }
+</code></pre>
+
+<p>下面来看TCP协议的分段函数tcp_tso_segment</p>
+
+<pre><code>    struct sk_buff *tcp_tso_segment(struct sk_buff *skb, int features)
+    {
+        struct sk_buff *segs = ERR_PTR(-EINVAL);
+        struct tcphdr *th;
+        unsigned thlen;
+        unsigned int seq;
+        __be32 delta;
+        unsigned int oldlen;
+        unsigned int mss;
+
+        if (!pskb_may_pull(skb, sizeof(*th)))
+            goto out;
+
+        th = tcp_hdr(skb);
+        thlen = th-&gt;doff * 4;
+        if (thlen &lt; sizeof(*th))
+            goto out;
+
+        if (!pskb_may_pull(skb, thlen))
+            goto out;
+
+        oldlen = (u16)~skb-&gt;len;
+        __skb_pull(skb, thlen);
+    把tcp header移到skb header里，把skb-&gt;len存到oldlen中，此时skb-&gt;len就只有tcp payload的长度
+
+        mss = skb_shinfo(skb)-&gt;gso_size;
+        if (unlikely(skb-&gt;len &lt;= mss))
+            goto out;
+
+        if (skb_gso_ok(skb, features | NETIF_F_GSO_ROBUST)) {
+            /* Packet is from an untrusted source, reset gso_segs. */
+            int type = skb_shinfo(skb)-&gt;gso_type;
+
+            if (unlikely(type &amp;
+                     ~(SKB_GSO_TCPV4 |
+                       SKB_GSO_DODGY |
+                       SKB_GSO_TCP_ECN |
+                       SKB_GSO_TCPV6 |
+                       0) ||
+                     !(type &amp; (SKB_GSO_TCPV4 | SKB_GSO_TCPV6))))
+                goto out;
+
+            skb_shinfo(skb)-&gt;gso_segs = DIV_ROUND_UP(skb-&gt;len, mss);
+    重新计算skb_shinfo(skb)-&gt;gso_segs的个数，基于skb-&gt;len和mss值
+
+            segs = NULL;
+            goto out;
+        }
+
+
+        segs = skb_segment(skb, features);
+        if (IS_ERR(segs))
+            goto out;
+    skb_segment是真正的分段实现，后面再分析
+
+        delta = htonl(oldlen + (thlen + mss));
+
+        skb = segs;
+        th = tcp_hdr(skb);
+        seq = ntohl(th-&gt;seq);
+
+        do {
+            th-&gt;fin = th-&gt;psh = 0;
+
+            th-&gt;check = ~csum_fold((__force __wsum)((__force u32)th-&gt;check +
+                           (__force u32)delta));
+            if (skb-&gt;ip_summed != CHECKSUM_PARTIAL)
+                th-&gt;check =
+                     csum_fold(csum_partial(skb_transport_header(skb),
+                                thlen, skb-&gt;csum));
+    对每个分段都要计算tcp checksum
+
+            seq += mss;
+            skb = skb-&gt;next;
+            th = tcp_hdr(skb);
+
+            th-&gt;seq = htonl(seq);
+
+    对每个分段重新计算sequence值
+
+
+            th-&gt;cwr = 0;
+        } while (skb-&gt;next);
+
+        delta = htonl(oldlen + (skb-&gt;tail - skb-&gt;transport_header) +
+                  skb-&gt;data_len);
+        th-&gt;check = ~csum_fold((__force __wsum)((__force u32)th-&gt;check +
+                    (__force u32)delta));
+        if (skb-&gt;ip_summed != CHECKSUM_PARTIAL)
+            th-&gt;check = csum_fold(csum_partial(skb_transport_header(skb),
+                               thlen, skb-&gt;csum));
+
+    out:
+        return segs;
+    }
+</code></pre>
+
+<p>UDP协议的分片函数是udp4_ufo_fragment</p>
+
+<pre><code>    struct sk_buff *udp4_ufo_fragment(struct sk_buff *skb, int features)
+    {
+        struct sk_buff *segs = ERR_PTR(-EINVAL);
+        unsigned int mss;
+        int offset;
+        __wsum csum;
+
+        mss = skb_shinfo(skb)-&gt;gso_size;
+        if (unlikely(skb-&gt;len &lt;= mss))
+            goto out;
+
+        if (skb_gso_ok(skb, features | NETIF_F_GSO_ROBUST)) {
+            /* Packet is from an untrusted source, reset gso_segs. */
+            int type = skb_shinfo(skb)-&gt;gso_type;
+
+            if (unlikely(type &amp; ~(SKB_GSO_UDP | SKB_GSO_DODGY) ||
+                     !(type &amp; (SKB_GSO_UDP))))
+                goto out;
+
+            skb_shinfo(skb)-&gt;gso_segs = DIV_ROUND_UP(skb-&gt;len, mss);
+
+            segs = NULL;
+            goto out;
+        }
+
+        /* Do software UFO. Complete and fill in the UDP checksum as HW cannot
+         * do checksum of UDP packets sent as multiple IP fragments.
+         */
+        offset = skb-&gt;csum_start - skb_headroom(skb);
+        csum = skb_checksum(skb, offset, skb-&gt;len - offset, 0);
+        offset += skb-&gt;csum_offset;
+        *(__sum16 *)(skb-&gt;data + offset) = csum_fold(csum);
+        skb-&gt;ip_summed = CHECKSUM_NONE;
+
+    计算udp的checksum
+
+        /* Fragment the skb. IP headers of the fragments are updated in
+         * inet_gso_segment()
+         */
+        segs = skb_segment(skb, features);
+    out:
+        return segs;
+    }
+</code></pre>
+
+<p>udp的分段其实和ip的分片没什么区别，只是多一个计算checksum的步骤</p>
+
+<p>最后来分析下skb_segment</p>
+
+<pre><code>    struct sk_buff *skb_segment(struct sk_buff *skb, int features)
+    {
+        struct sk_buff *segs = NULL;
+        struct sk_buff *tail = NULL;
+        struct sk_buff *fskb = skb_shinfo(skb)-&gt;frag_list;
+        unsigned int mss = skb_shinfo(skb)-&gt;gso_size;
+        unsigned int doffset = skb-&gt;data - skb_mac_header(skb);
+        unsigned int offset = doffset;
+        unsigned int headroom;
+        unsigned int len;
+        int sg = features &amp; NETIF_F_SG;
+        int nfrags = skb_shinfo(skb)-&gt;nr_frags;
+        int err = -ENOMEM;
+        int i = 0;
+        int pos;
+
+        __skb_push(skb, doffset);
+        headroom = skb_headroom(skb);
+        pos = skb_headlen(skb);
+
+    skb-&gt;data指向mac header，计算headroom，skb_headlen长度
+
+        do {
+            struct sk_buff *nskb;
+            skb_frag_t *frag;
+            int hsize;
+            int size;
+
+            len = skb-&gt;len - offset;
+            if (len &gt; mss)
+                len = mss;
+    len为skb-&gt;len减去直到offset的部分。开始时，offset只是mac header + ip header + tcp header的长度，len即tcp payload的长度。随着segment增加, offset每次都增加mss长度。因此len的定义是每个segment的payload长度（最后一个segment的payload可能小于一个mss长度）
+
+            hsize = skb_headlen(skb) - offset;
+
+    hsize为skb header减去offset后的大小，如果hsize小于0，那么说明payload在skb的frags, frag_list中。随着offset一直增长，必定会有hsize一直&lt;0的情况开始出现，除非skb是一个完全linearize化的skb
+
+
+            if (hsize &lt; 0)
+                hsize = 0;
+
+    这种情况说明skb_headlen没有tcp payload的部分，需要pull数据过来
+
+
+            if (hsize &gt; len || !sg)
+                hsize = len;
+
+    如果不支持sg同时hsize大于len，那么hsize就为len，此时说明segment的payload还在skb header中
+
+
+            if (!hsize &amp;&amp; i &gt;= nfrags) {
+                BUG_ON(fskb-&gt;len != len);
+
+                pos += len;
+                nskb = skb_clone(fskb, GFP_ATOMIC);
+                fskb = fskb-&gt;next;
+
+                if (unlikely(!nskb))
+                    goto err;
+
+                hsize = skb_end_pointer(nskb) - nskb-&gt;head;
+                if (skb_cow_head(nskb, doffset + headroom)) {
+                    kfree_skb(nskb);
+                    goto err;
+                }
+
+                nskb-&gt;truesize += skb_end_pointer(nskb) - nskb-&gt;head -
+                          hsize;
+                skb_release_head_state(nskb);
+                __skb_push(nskb, doffset);
+            } else {
+
+                nskb = alloc_skb(hsize + doffset + headroom,
+                         GFP_ATOMIC);
+
+                if (unlikely(!nskb))
+                    goto err;
+
+                skb_reserve(nskb, headroom);
+                __skb_put(nskb, doffset);
+
+    alloc新的skb，skb-&gt;data到skb-&gt;head之间保留headroom，skb-&gt;tail到skb-&gt;data之间保留mac header + ip header + tcp header + hsize的长度
+
+
+            }
+
+            if (segs)
+                tail-&gt;next = nskb;
+            else
+                segs = nskb;
+            tail = nskb;
+
+
+            __copy_skb_header(nskb, skb);
+            nskb-&gt;mac_len = skb-&gt;mac_len;
+    把老skb的skb_buff内容拷贝到新skb中
+
+            /* nskb and skb might have different headroom */
+            if (nskb-&gt;ip_summed == CHECKSUM_PARTIAL)
+                nskb-&gt;csum_start += skb_headroom(nskb) - headroom;
+    修正下checksum计算的位置
+
+            skb_reset_mac_header(nskb);
+            skb_set_network_header(nskb, skb-&gt;mac_len);
+            nskb-&gt;transport_header = (nskb-&gt;network_header +
+                          skb_network_header_len(skb));
+            skb_copy_from_linear_data(skb, nskb-&gt;data, doffset);
+
+    把skb-&gt;data开始doffset长度的内容拷贝到nskb-&gt;data中，即把mac header , ip header, tcp header都复制过去
+
+
+            if (fskb != skb_shinfo(skb)-&gt;frag_list)
+                continue;
+
+            if (!sg) {
+                nskb-&gt;ip_summed = CHECKSUM_NONE;
+                nskb-&gt;csum = skb_copy_and_csum_bits(skb, offset,
+                                    skb_put(nskb, len),
+                                    len, 0);
+                continue;
+            }
+
+            frag = skb_shinfo(nskb)-&gt;frags;
+
+            skb_copy_from_linear_data_offset(skb, offset,
+                             skb_put(nskb, hsize), hsize);
+
+    如果hsize不为0，那么拷贝hsize的内容到nskb header中
+
+
+            while (pos &lt; offset + len &amp;&amp; i &lt; nfrags) {
+
+    offset + len长度超过了pos，即超过了nskb header，这时需要用到frag
+
+
+                *frag = skb_shinfo(skb)-&gt;frags[i];
+                get_page(frag-&gt;page);
+                size = frag-&gt;size;
+
+                if (pos &lt; offset) {
+                    frag-&gt;page_offset += offset - pos;
+                    frag-&gt;size -= offset - pos;
+                }
+
+
+                skb_shinfo(nskb)-&gt;nr_frags++;
+
+                if (pos + size &lt;= offset + len) {
+                    i++;
+                    pos += size;
+                } else {
+                    frag-&gt;size -= pos + size - (offset + len);
+                    goto skip_fraglist;
+                }
+
+                frag++;
+            }
+
+    如果skb header空间不够，那么通过frag，把一个mss的内容拷贝到nskb的frag中
+
+
+            if (pos &lt; offset + len) {
+                struct sk_buff *fskb2 = fskb;
+
+                BUG_ON(pos + fskb-&gt;len != offset + len);
+
+                pos += fskb-&gt;len;
+                fskb = fskb-&gt;next;
+
+                if (fskb2-&gt;next) {
+                    fskb2 = skb_clone(fskb2, GFP_ATOMIC);
+                    if (!fskb2)
+                        goto err;
+                } else
+                    skb_get(fskb2);
+
+                SKB_FRAG_ASSERT(nskb);
+                skb_shinfo(nskb)-&gt;frag_list = fskb2;
+            }
+
+    如果frag都用完还是无法满足mss的大小，那么就要用到frag_list，这段代码跳过去了，因为基本永远不会走到这里
+
+
+    skip_fraglist:
+            nskb-&gt;data_len = len - hsize;
+            nskb-&gt;len += nskb-&gt;data_len;
+            nskb-&gt;truesize += nskb-&gt;data_len;
+        } while ((offset += len) &lt; skb-&gt;len);
+
+    完成一个nskb之后，继续下一个seg，一直到offset &gt;= skb-&gt;len
+
+        return segs;
+
+    err:
+        while ((skb = segs)) {
+            segs = skb-&gt;next;
+            kfree_skb(skb);
+        }
+        return ERR_PTR(err);
+    }
+</code></pre>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[FRTO—虚假超时剖析]]></title>
@@ -3467,372 +4453,6 @@ tcp_rmem[2] — max：接收缓冲区长度的最大值，用来调整sock的sk_
 <h4>Reference</h4>
 
 <p>[1] Mike Fisk, Wu-chun Feng, &ldquo;Dynamic Right-Sizing in TCP&rdquo;.</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[TCP的TSO处理（一）]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/03/19/kernel-net-tso2/"/>
-    <updated>2015-03-19T18:27:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/03/19/kernel-net-tso2</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/7699081">http://blog.csdn.net/zhangskd/article/details/7699081</a></p>
-
-<h4>概述</h4>
-
-<p>In computer networking, large segment offload (LSO) is a technique for increasing outbound
-throughput of high-bandwidth network connections by reducing CPU overhead. It works by queuing
-up large buffers and letting the network interface card (NIC) split them into separate packets.
-The technique is also called TCP segmentation offload (TSO) when applied to TCP, or generic
-segmentation offload (GSO).</p>
-
-<p>The inbound counterpart of large segment offload is large recive offload (LRO).</p>
-
-<p>When large chunks of data are to be sent over a computer network, they need to be first broken
-down to smaller segments that can pass through all the network elements like routers and
-switches between the source and destination computers. This process it referred to as
-segmentation. Segmentation is often done by the TCP protocol in the host computer. Offloading
-this work to the NIC is called TCP segmentation offload (TSO).</p>
-
-<p>For example, a unit of 64KB (65,536 bytes) of data is usually segmented to 46 segments of 1448
-bytes each before it is sent over the network through the NIC. With some intelligence in the NIC,
-the host CPU can hand over the 64KB of data to the NIC in a single transmit request, the NIC can
-break that data down into smaller segments of 1448 bytes, add the TCP, IP, and data link layer
-protocol headers——according to a template provided by the host&rsquo;s TCP/IP stack——to each
-segment, and send the resulting frames over the network. This significantly reduces the work
-done by the CPU. Many new NICs on the market today support TSO. [1]</p>
-
-<h4>具体</h4>
-
-<p>It is a method to reduce CPU workload of packet cutting in 1500byte and asking hardware to
-perform the same functionality.</p>
-
-<p>1.TSO feature is implemented using the hardware support. This means hardware should be
-able to segment the packets in max size of 1500 byte and reattach the header with every
-packets.</p>
-
-<p>2.Every network hardware is represented by netdevice structure in kernel. If hardware supports
-TSO, it enables the Segmentation offload features in netdevice, mainly represented by
-&ldquo; NETIF_F_TSO&rdquo; and other fields. [2]</p>
-
-<p>TCP Segmentation Offload is supported in Linux by the network device layer. A driver that wants
-to offer TSO needs to set the NETIF_F_TSO bit in the network device structure. In order for a
-device to support TSO, it needs to also support Net : TCP Checksum Offloading and
-Net : Scatter Gather.</p>
-
-<p>The driver will then receive super-sized skb&rsquo;s. These are indicated to the driver by
-skb_shinfo(skb)->gso_size being non-zero. The gso_size is the size the hardware should
-fragment the TCP data. TSO may change how and when TCP decides to send data. [3]</p>
-
-<h4>实现</h4>
-
-<pre><code>    /* This data is invariant across clones and lives at the end of the 
-     * header data, ie. at skb-&gt;end. 
-     */  
-    struct skb_share_info {  
-        ...  
-       unsigned short gso_size; // 每个数据段的大小  
-       unsigned short gso_segs; // skb被分割成多少个数据段  
-       unsigned short gso_type;  
-       struct sk_buff *frag_list; // 分割后的数据包列表  
-       ...  
-    }
-</code></pre>
-
-<pre><code>    /* Initialize TSO state of skb. 
-     * This must be invoked the first time we consider transmitting 
-     * SKB onto the wire. 
-     */  
-    static int tcp_init_tso_segs(struct sock *sk, struct sk_buff *skb,  
-                                                unsigned int mss_now)  
-    {  
-        int tso_segs = tcp_skb_pcount(skb);  
-
-        /* 如果还没有分段，或者有多个分段但是分段长度不等于当前MSS，则需处理*/  
-        if (! tso_segs || (tso_segs &gt; 1 &amp;&amp; tcp_skb_mss(skb) != mss_now)) {  
-            tcp_set_skb_tso_segs(sk, skb, mss_now);  
-
-            tso_segs = tcp_skb_pcount(skb);/* 重新获取分段数量 */  
-        }  
-        return tso_segs;  
-    }  
-
-    /* Initialize TSO segments for a packet. */  
-    static void tcp_set_skb_tso_segs(struct sock *sk, struct sk_buff *skb,  
-                                            unsigned int mss_now)  
-    {  
-        /* 有以下情况则不需要分片： 
-          * 1. 数据的长度不超过允许的最大长度MSS 
-         * 2. 网卡不支持GSO 
-         * 3. 网卡不支持重新计算校验和 
-         */  
-        if (skb-&gt;len &lt;= mss_now || ! sk_can_gso(sk) ||  
-            skb-&gt;ip_summed == CHECKSUM_NONE) {  
-
-            /* Avoid the costly divide in the normal non-TSO case.*/  
-            skb_shinfo(skb)-&gt;gso_segs = 1;  
-            skb_shinfo(skb)-&gt;gso_size = 0;  
-            skb_shinfo(skb)-&gt;gso_type = 0;  
-        } else {  
-
-            /* 计算需要分成几个数据段*/  
-            skb_shinfo(skb)-&gt;gso_segs = DIV_ROUND_UP(skb-&gt;len, mss_now);/*向上取整*/  
-            skb_shinfo(skb)-&gt;gso_size = mss_now; /* 每个数据段的大小*/  
-            skb_shinfo(skb)-&gt;gso_type = sk-&gt;sk_gso_type;  
-        }  
-    }  
-
-    /* Due to TSO, an SKB can be composed of multiple actual packets.  
-     * To keep these tracked properly, we use this. 
-     */  
-    static inline int tcp_skb_pcount (const struct sk_buff *skb)  
-    {  
-        return skb_shinfo(skb)-&gt;gso_segs;  
-    }  
-
-    /* This is valid if tcp_skb_pcount() &gt; 1 */  
-    static inline int tcp_skb_mss(const struct sk_buff *skb)  
-    {  
-        return skb_shinfo(skb)-&gt;gso_size;  
-    }  
-
-    static inline int sk_can_gso(const struct sock *sk)  
-    {  
-        /* sk_route_caps标志网卡驱动的特征, sk_gso_type表示GSO的类型， 
-         * 设置为SKB_GSO_TCPV4 
-         */  
-        return net_gso_ok(sk-&gt;sk_route_caps, sk-&gt;sk_gso_type);  
-    }  
-
-    static inline int net_gso_ok(int features, int gso_type)  
-    {  
-        int feature = gso_type &lt;&lt; NETIF_F_GSO_SHIFT;  
-        return (features &amp; feature) == feature;  
-    }
-</code></pre>
-
-<h5>sk_gso_max_size</h5>
-
-<p>NIC also specify the maximum segment size which it can handle, in sk_gso_max_size field.
-Mostly it will be set to 64k. This 64k values means if the data at TCP is more than 64k,
-then again TCP has to segment it in 64k and then push to interface.</p>
-
-<p>相关变量，sock中：unsigned int sk_gso_max_size.</p>
-
-<pre><code>    /* RFC2861 Check whether we are limited by application or congestion window 
-     * This is the inverse of cwnd check in tcp_tso_should_defer 
-     * 函数返回1，受拥塞控制窗口的限制，需要增加拥塞控制窗口； 
-     * 函数返回0，受应用程序的限制，不需要增加拥塞控制窗口。 
-     */  
-
-    int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)  
-    {  
-        const struct tcp_sock *tp = tcp_sk(sk);  
-        u32 left;  
-
-        if (in_flight &gt;= tp-&gt;snd_cwnd)  
-            return 1;  
-
-        /* left表示还可以发送的数据量 */  
-        left = tp-&gt;snd_cwnd - in_flight;  
-
-
-        /* 如果使用gso，符合以下条件，认为是拥塞窗口受到了限制， 
-         * 可以增加拥塞窗口。 
-         */  
-        if (sk_can_gso(sk) &amp;&amp;   
-            left * sysctl_tcp_tso_win_divisor &lt; tp-&gt;snd_cwnd &amp;&amp;  
-            left * tp-&gt;mss_cache &lt; sk-&gt;sk_gso_max_size)  
-            return 1;  
-
-        /* 如果left大于允许的突发流量，那么拥塞窗口的增长已经很快了， 
-         * 不能再增加了。 
-         */  
-        return left &lt;= tcp_max_burst(tp);  
-    }
-</code></pre>
-
-<h4>TSO Nagle</h4>
-
-<p>GSO, Generic Segmentation Offload，是协议栈提高效率的一个策略。</p>
-
-<p>它尽可能晚的推迟分段(segmentation)，最理想的是在网卡驱动里分段，在网卡驱动里把
-大包(super-packet)拆开，组成SG list，或在一块预先分配好的内存中重组各段，然后交给
-网卡。</p>
-
-<p>The idea behind GSO seems to be that many of the performance benefits of LSO (TSO/UFO)
-can be obtained in a hardware-independent way, by passing large &ldquo;superpackets&rdquo; around for
-as long as possible, and deferring segmentation to the last possible moment - for devices
-without hardware segmentation/fragmentation support, this would be when data is actually
-handled to the device driver; for devices with hardware support, it could even be done in hardware.</p>
-
-<p>Try to defer sending, if possible, in order to minimize the amount of TSO splitting we do.
-View it as a kind of TSO Nagle test.</p>
-
-<p>通过延迟数据包的发送，来减少TSO分段的次数，达到减小CPU负载的目的。</p>
-
-<pre><code>    struct tcp_sock {  
-        ...  
-        u32 tso_deferred; /* 上次TSO延迟的时间戳 */  
-        ...  
-    };
-</code></pre>
-
-<pre><code>    /** This algorithm is from John Heffner. 
-     * 0: send now ; 1: deferred 
-     */  
-    static int tcp_tso_should_defer (struct sock *sk, struct sk_buff *skb)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        const struct inet_connection_sock *icsk = inet_csk(sk);  
-        u32 in_flight, send_win, cong_win, limit;  
-        int win_divisor;  
-
-        /* 如果此skb包含结束标志，则马上发送*/  
-        if (TCP_SKB_CB(skb)-&gt;flags &amp; TCPHDR_FIN)  
-            goto send_now;  
-
-        /* 如果此时不处于Open态，则马上发送*/  
-        if (icsk-&gt;icsk_ca_state != TCP_CA_Open)  
-            goto send_now;  
-
-        /* Defer for less than two clock ticks. 
-         * 上个skb被延迟了，且超过现在1ms以上，则不再延迟。 
-         * 也就是说，TSO延迟不能超过2ms！ 
-         */  
-        if (tp-&gt;tso_deferred &amp;&amp; (((u32)jiffies &lt;&lt;1) &gt;&gt; 1) - (tp-&gt;tso_deferred &gt;&gt; 1) &gt; 1)  
-            goto send_now;  
-
-        in_flight = tcp_packets_in_flight(tp);  
-        /* 如果此数据段不用分片，或者受到拥塞窗口的限制不能发包，则报错*/  
-        BUG_ON(tcp_skb_pcount(skb) &lt;= 1 || (tp-&gt;snd_cwnd &lt;= in_flight));  
-        /* 通告窗口的剩余大小*/  
-        send_win = tcp_wnd_end(tp) - TCP_SKB_CB(skb)-&gt;seq;  
-        /* 拥塞窗口的剩余大小*/  
-        cong_win = (tp-&gt;snd_cwnd - in_flight) * tp-&gt;mss_cache;  
-        /* 取其小者作为最终的发送限制*/  
-        limit = min(send_win, cong_win);  
-
-        /*If a full-sized TSO skb can be sent, do it. 
-         * 一般来说是64KB 
-         */  
-        if (limit &gt;= sk-&gt;sk_gso_max_size)  
-            goto send_now;  
-
-        /* Middle in queue won't get any more data, full sendable already ? */  
-        if ((skb != tcp_write_queue_tail(sk)) &amp;&amp; (limit &gt;= skb-&gt;len))  
-            goto send_now;  
-
-        win_divisor = ACCESS_ONCE(sysctl_tcp_tso_win_divisor);  
-        if (win_divisor) {  
-            /* 一个RTT内允许发送的最大字节数*/  
-            u32 chunk = min(tp-&gt;snd_wnd, tp-&gt;snd_cwnd * tp-&gt;mss_cache);  
-            chunk /= win_divisor; /* 单个TSO段可消耗的发送量*/  
-
-            /* If at least some fraction of a window is available, just use it. */  
-            if (limit &gt;= chunk)  
-                goto send_now;  
-        } else {  
-            /* Different approach, try not to defer past a single ACK. 
-             * Receiver should ACK every other full sized frame, so if we have space for 
-             * more than 3 frames then send now. 
-             */  
-            if (limit &gt; tcp_max_burst(tp) * tp-&gt;mss_cache)  
-                goto send_now;  
-        }  
-
-        /* OK, it looks like it is advisable to defer. */  
-        tp-&gt;tso_deferred = 1 | (jiffies &lt;&lt; 1); /* 记录此次defer的时间戳*/  
-
-        return 1;  
-
-    send_now:  
-        tp-&gt;tso_deferred = 0;  
-        return 0;  
-    }  
-
-    /* Returns end sequence number of the receiver's advertised window */  
-    static inline u32 tcp_wnd_end (const struct tcp_sock *tp)  
-    {  
-        /* snd_wnd的单位为字节*/  
-        return tp-&gt;snd_una + tp-&gt;snd_wnd;  
-    }
-</code></pre>
-
-<p>tcp_tso_win_divisor：单个TSO段可消耗拥塞窗口的比例，默认值为3。</p>
-
-<h5>符合以下任意条件，不会TSO延迟，可马上发送：</h5>
-
-<p>(1) 数据包带有FIN标志。传输快结束了，不宜延迟。<br/>
-(2) 发送方不处于Open拥塞状态。处于异常状态时，不宜延迟。<br/>
-(3) 上一次skb被延迟了，且距离现在大于等于2ms。延迟不能超过2ms。<br/>
-(4) min(send_win, cong_win) > full-sized TSO skb。允许发送的数据量超过TSO一次能处理的最大值，没必要再defer。<br/>
-(5) skb处于发送队列中间，且允许整个skb一起发送。处于发送队列中间的skb不能再获得新的数据，没必要再defer。<br/>
-(6) tcp_tso_win_divisor有设置时，limit > 单个TSO段可消耗的数据量，即min(snd_wnd, snd_cwnd * mss_cache) / tcp_tso_win_divisor。<br/>
-(7) tcp_tso_win_divisor没有设置时，limit > tcp_max_burst(tp) * mss_cache，一般是3个数据包。</p>
-
-<p>条件4、5、6/7，都是limit > 某个阈值，就可以马上发送。这个因为通过这几个条件，可以确定此时发送是受到应用程序的限制，而不是通告窗口或者拥塞窗口。在应用程序发送的数据量很少的情况下，不宜采用TSO Nagle，因为这会影响此类应用。</p>
-
-<p>我们注意到tcp_is_cwnd_limited()中的注释说：<br/>
-&ldquo; This is the inverse of cwnd check in tcp_tso_should_defer"，所以可以认为在tcp_tso_should_defer()中包含判断
-tcp_is_not_cwnd_limited (或者tcp_is_application_limited) 的条件。</p>
-
-<h5>符合以下所有条件，才会进行TSO延迟：</h5>
-
-<p>(1) 数据包不带有FIN标志。<br/>
-(2) 发送方处于Open拥塞状态。<br/>
-(3) 距离上一次延迟的时间在2ms以内。<br/>
-(4) 允许发送的数据量小于sk_gso_max_size。<br/>
-(5) skb处于发送队列末尾，或者skb不能整个发送出去。<br/>
-(6) tcp_tso_win_divisor有设置时，允许发送的数据量不大于单个TSO段可消耗的。<br/>
-(7) tcp_tso_win_divisor没有设置时，允许发送的数据量不大于3个包。</p>
-
-<p>可以看到TSO的触发条件并不苛刻，所以被调用时并没有加unlikely。</p>
-
-<h4>应用</h4>
-
-<h5>(1) 禁用TSO</h5>
-
-<pre><code>    ethtool -K ethX tso off
-</code></pre>
-
-<h5>(2) 启用TSO</h5>
-
-<p>TSO是默认启用的。
-<code>
-    ethtool -K ethX tso on
-</code></p>
-
-<h4>Reference</h4>
-
-<p>[1] <a href="http://en.wikipedia.org/wiki/Large_segment_offload">http://en.wikipedia.org/wiki/Large_segment_offload</a></p>
-
-<p>[2] <a href="http://tejparkash.wordpress.com/2010/03/06/tso-explained/">http://tejparkash.wordpress.com/2010/03/06/tso-explained/</a></p>
-
-<p>[3] <a href="http://www.linuxfoundation.org/collaborate/workgroups/networking/tso">http://www.linuxfoundation.org/collaborate/workgroups/networking/tso</a></p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[TSO/GSO]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/03/19/kernel-net-tso1/"/>
-    <updated>2015-03-19T18:24:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/03/19/kernel-net-tso1</id>
-    <content type="html"><![CDATA[<p><a href="http://book.51cto.com/art/201206/344985.htm">http://book.51cto.com/art/201206/344985.htm</a></p>
-
-<p>TSO是通过网络设备进行TCP段的分割，从而来提高网络性能的一种技术。较大的数据包（超过标准1518B的帧）可以使用该技术，使操作系统减少必须处理的数据数量以提高性能。通常，当请求大量数据时，TCP发送方必须将数据拆分为MSS大小的数据块，然后进一步将其封装为数据包形式，以便最终可以在网络中进行传输。而当启用了TSO技术之后，TCP发送方可以将数据拆分为MSS整数倍大小的数据块，然后将大块数据的分段直接交给网络设备处理，操作系统需要创建并传输的数据包数量更少，因此性能会有较大的提高。图1-3所示为标准帧和TSO技术特性比较。</p>
-
-<p><img src="/images/kernel/2015-03-19-3.jpg" alt="" /></p>
-
-<p> 图是标准帧和TSO的处理过程<br/>
-a) 不支持TSO  b) 启用TSO后</p>
-
-<p>从前面有关TSO的论述可以看出，TSO只是针对TCP协议的，使TCP协议在硬件上得到了有力的支持。事实上，这种概念也可以应用于其他的传输层协议，如TCPv6，UDP，甚至DCCP等，这就是GSO(Generic Segmentation Offload)。</p>
-
-<p>性能提高的关键在于尽可能地推迟分段的时机，这样才能有效地降低成本。最理想的是在网络设备驱动里进行分段，在网络设备驱动里把大包进行拆分，组成分段列表，或在一块预先分配好的内存中重组各段，然后交给网络设备。这样，就要在网络设备的驱动里边来实现它，那么就需要修改每一个网络设备的驱动程序。事实上，这样做不大现实。</p>
-
-<p>然而似乎有另一种更容易的解决办法来支持GSO，那就是在把数据报文提交给网络设备驱动之前进行聚合/分散操作。Linux目前支持GSO框架已经支持的传输层的其他协议。有关GSO方面的代码，参见后续章节。</p>
-
-<p>应用层可以使用ethtool -K eth0 tso off|on命令对支持TSO特性的网络设备进行TSO功能的关闭和启用。</p>
 ]]></content>
   </entry>
   

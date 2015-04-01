@@ -1,0 +1,1350 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2015~04 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2015~04/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2015-04-01T18:29:16+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Linux TCP数据包接收处理tcp_data_queue]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/01/kernel-net-data-queue/"/>
+    <updated>2015-04-01T18:20:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/01/kernel-net-data-queue</id>
+    <content type="html"><![CDATA[<p><a href="http://www.cppblog.com/fwxjj/archive/2013/02/18/197906.aspx">http://www.cppblog.com/fwxjj/archive/2013/02/18/197906.aspx</a></p>
+
+<h4>tcp_data_queue函数</h4>
+
+<p>这里就是对数据包的处理了。</p>
+
+<pre><code>    static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)  
+    {  
+        struct tcphdr *th = tcp_hdr(skb);  
+        struct tcp_sock *tp = tcp_sk(sk);  
+        int eaten = -1;  
+        /* 没有数据处理*/  
+        if (TCP_SKB_CB(skb)-&gt;seq == TCP_SKB_CB(skb)-&gt;end_seq)  
+            goto drop;  
+        /* 跳过tcp头部*/  
+        __skb_pull(skb, th-&gt;doff * 4);  
+        /* 如果收到对方发来的CWR，则本地TCP发送时不在设置ECE*/  
+        TCP_ECN_accept_cwr(tp, skb);  
+        /* 初始化Duplicate SACK*/  
+        if (tp-&gt;rx_opt.dsack) {  
+            tp-&gt;rx_opt.dsack = 0;  
+            tp-&gt;rx_opt.eff_sacks = tp-&gt;rx_opt.num_sacks;  
+        }  
+</code></pre>
+
+<p>如果该数据包刚好是下一个要接收的数据，则可以直接copy到用户空间（如果存在且可用），否则排队到receive queue</p>
+
+<pre><code>    /*  Queue data for delivery to the user. 
+     *  Packets in sequence go to the receive queue. 
+     *  Out of sequence packets to the out_of_order_queue. 
+     */  
+    if (TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt) {  
+        if (tcp_receive_window(tp) == 0)  
+            goto out_of_window;  
+
+        /* Ok. In sequence. In window. */  
+        if (tp-&gt;ucopy.task == current &amp;&amp;  
+            tp-&gt;copied_seq == tp-&gt;rcv_nxt &amp;&amp; tp-&gt;ucopy.len &amp;&amp;  
+            sock_owned_by_user(sk) &amp;&amp; !tp-&gt;urg_data) {  
+            int chunk = min_t(unsigned int, skb-&gt;len,  
+                      tp-&gt;ucopy.len);  
+
+            __set_current_state(TASK_RUNNING);  
+            /* 这里的下半部开关的作用不解*/  
+            local_bh_enable();  
+            if (!skb_copy_datagram_iovec(skb, 0, tp-&gt;ucopy.iov, chunk)) {  
+                tp-&gt;ucopy.len -= chunk;  
+                tp-&gt;copied_seq += chunk;  
+                eaten = (chunk == skb-&gt;len &amp;&amp; !th-&gt;fin);  
+                tcp_rcv_space_adjust(sk);  
+            }  
+            local_bh_disable();  
+        }  
+
+        if (eaten &lt;= 0) {  
+    ueue_and_out:  
+            if (eaten &lt; 0 &amp;&amp;  
+                /* 该函数用于判断是否有接收缓存，在tcp内存管理中将分析*/  
+                tcp_try_rmem_schedule(sk, skb-&gt;truesize))  
+                goto drop;  
+
+            skb_set_owner_r(skb, sk);  
+            __skb_queue_tail(&amp;sk-&gt;sk_receive_queue, skb);  
+        }  
+        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;  
+        if (skb-&gt;len)  
+            tcp_event_data_recv(sk, skb);  
+        if (th-&gt;fin)  
+            tcp_fin(skb, sk, th);  
+        /* 到达的数据包哟可能填充了乱序队列中的hole */  
+        if (!skb_queue_empty(&amp;tp-&gt;out_of_order_queue)) {  
+            tcp_ofo_queue(sk);  
+
+            /* RFC2581. 4.2. SHOULD send immediate ACK, when 
+             * gap in queue is filled. 
+             */  
+            /*关闭乒乓模式，在quick计数没消耗完时则可立即发送ACK，见tcp_in_quickack_mode*/  
+            if (skb_queue_empty(&amp;tp-&gt;out_of_order_queue))  
+                inet_csk(sk)-&gt;icsk_ack.pingpong = 0;  
+        }  
+        /* 新数据到达导致返回给对方的SACK Block 调整*/  
+        if (tp-&gt;rx_opt.num_sacks)  
+            tcp_sack_remove(tp);  
+        /* 在当前slow path，检测是否可以进入fast path*/  
+        tcp_fast_path_check(sk);  
+
+        if (eaten &gt; 0)  
+            __kfree_skb(skb);  
+        else if (!sock_flag(sk, SOCK_DEAD))  
+            sk-&gt;sk_data_ready(sk, 0);  
+        return;  
+    }  
+</code></pre>
+
+<p>下面看看函数tcp_ofo_queue，也即out-of-order queue的处理</p>
+
+<pre><code>    /* This one checks to see if we can put data from the 
+     * out_of_order queue into the receive_queue. 
+     */  
+    static void tcp_ofo_queue(struct sock *sk)  
+    {  
+        struct tcp_sock *tp = tcp_sk(sk);  
+        __u32 dsack_high = tp-&gt;rcv_nxt;  
+        struct sk_buff *skb;  
+
+        while ((skb = skb_peek(&amp;tp-&gt;out_of_order_queue)) != NULL) {  
+            /* 当前hole未覆盖，则处理结束*/  
+            if (after(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt))  
+                break;  
+            /* DSACK处理*/  
+            if (before(TCP_SKB_CB(skb)-&gt;seq, dsack_high)) {  
+                __u32 dsack = dsack_high;  
+                if (before(TCP_SKB_CB(skb)-&gt;end_seq, dsack_high))  
+                    dsack_high = TCP_SKB_CB(skb)-&gt;end_seq;  
+                tcp_dsack_extend(sk, TCP_SKB_CB(skb)-&gt;seq, dsack);  
+            }  
+            /* 该乱序数据包完全被到达的数据包覆盖，则从乱序队列中删除之，并释放该数据包*/  
+            if (!after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;rcv_nxt)) {  
+                SOCK_DEBUG(sk, "ofo packet was already received /n");  
+                __skb_unlink(skb, &amp;tp-&gt;out_of_order_queue);  
+                __kfree_skb(skb);  
+                continue;  
+            }  
+            SOCK_DEBUG(sk, "ofo requeuing : rcv_next %X seq %X - %X/n",  
+                   tp-&gt;rcv_nxt, TCP_SKB_CB(skb)-&gt;seq,  
+                   TCP_SKB_CB(skb)-&gt;end_seq);  
+            /* hole被填充，取出该乱序数据包到receive queue中排队，并更新rcv_nxt */  
+            __skb_unlink(skb, &amp;tp-&gt;out_of_order_queue);  
+            __skb_queue_tail(&amp;sk-&gt;sk_receive_queue, skb);  
+            tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;  
+            if (tcp_hdr(skb)-&gt;fin)  
+                tcp_fin(skb, sk, tcp_hdr(skb));  
+        }  
+    }
+</code></pre>
+
+<pre><code>    /* 该数据包的数据已经完全存在，则发送DSACK，并进入快速ACK模式，调度ACK发送*/    
+    if (!after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;rcv_nxt)) {  
+            /* A retransmit, 2nd most common case.  Force an immediate ack. */  
+            NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKLOST);  
+            tcp_dsack_set(sk, TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq);  
+
+    out_of_window:  
+            tcp_enter_quickack_mode(sk);  
+            inet_csk_schedule_ack(sk);  
+    drop:  
+            __kfree_skb(skb);  
+            return;  
+        }  
+
+        /* Out of window. F.e. zero window probe. */  
+        if (!before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt + tcp_receive_window(tp)))  
+            goto out_of_window;  
+
+        tcp_enter_quickack_mode(sk);  
+        /* 部分数据已存在，则设置正确的DSACK，然后排队到receive queue*/  
+        if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt)) {  
+            /* Partial packet, seq &lt; rcv_next &lt; end_seq */  
+            SOCK_DEBUG(sk, "partial packet: rcv_next %X seq %X - %X/n",  
+                   tp-&gt;rcv_nxt, TCP_SKB_CB(skb)-&gt;seq,  
+                   TCP_SKB_CB(skb)-&gt;end_seq);  
+
+            tcp_dsack_set(sk, TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt);  
+
+            /* If window is closed, drop tail of packet. But after 
+             * remembering D-SACK for its head made in previous line. 
+             */  
+            if (!tcp_receive_window(tp))  
+                goto out_of_window;  
+            goto queue_and_out;  
+        }  
+</code></pre>
+
+<pre><code>        TCP_ECN_check_ce(tp, skb); /* 检查ECE是否设置 */  
+        /* 以下则把数据包排队到失序队列 */  
+        /* 同样先判断内存是否满足 */  
+        if (tcp_try_rmem_schedule(sk, skb-&gt;truesize))  
+            goto drop;  
+
+        /* Disable header prediction. */  
+        tp-&gt;pred_flags = 0;  
+        inet_csk_schedule_ack(sk);  
+
+        SOCK_DEBUG(sk, "out of order segment: rcv_next %X seq %X - %X/n",  
+               tp-&gt;rcv_nxt, TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq);  
+
+        skb_set_owner_r(skb, sk);  
+        /* 该数据包是失序队列的第一个数据包*/  
+        if (!skb_peek(&amp;tp-&gt;out_of_order_queue)) {  
+            /* Initial out of order segment, build 1 SACK. */  
+            if (tcp_is_sack(tp)) {  
+                tp-&gt;rx_opt.num_sacks = 1;  
+                tp-&gt;rx_opt.dsack     = 0;  
+                tp-&gt;rx_opt.eff_sacks = 1;  
+                tp-&gt;selective_acks[0].start_seq = TCP_SKB_CB(skb)-&gt;seq;  
+                tp-&gt;selective_acks[0].end_seq =  
+                            TCP_SKB_CB(skb)-&gt;end_seq;  
+            }  
+            __skb_queue_head(&amp;tp-&gt;out_of_order_queue, skb);  
+        } else {  
+            struct sk_buff *skb1 = tp-&gt;out_of_order_queue.prev;  
+            u32 seq = TCP_SKB_CB(skb)-&gt;seq;  
+            u32 end_seq = TCP_SKB_CB(skb)-&gt;end_seq;  
+            /*刚好与失序队列最后一个数据包数据衔接*/  
+            if (seq == TCP_SKB_CB(skb1)-&gt;end_seq) {  
+                __skb_queue_after(&amp;tp-&gt;out_of_order_queue, skb1, skb);  
+                /*如果没有sack block或者当前数据包开始序号不等于第一个block右边界*/  
+                if (!tp-&gt;rx_opt.num_sacks ||  
+                    tp-&gt;selective_acks[0].end_seq != seq)  
+                    goto add_sack;  
+                /*该数据包在某个hole后是按序到达的，所以可以直接扩展第一个sack*/    
+                /* Common case: data arrive in order after hole. */  
+                tp-&gt;selective_acks[0].end_seq = end_seq;  
+                return;  
+            }  
+
+            /* Find place to insert this segment. */  
+            /* 该循环找到一个开始序号不大于该数据包开始序号的失序队列中的数据包*/  
+            do {  
+                if (!after(TCP_SKB_CB(skb1)-&gt;seq, seq))  
+                    break;  
+            } while ((skb1 = skb1-&gt;prev) !=  
+                 (struct sk_buff *)&amp;tp-&gt;out_of_order_queue);  
+
+            /* Do skb overlap to previous one? 检查与前个数据包是否有重叠*/  
+            if (skb1 != (struct sk_buff *)&amp;tp-&gt;out_of_order_queue &amp;&amp;  
+                before(seq, TCP_SKB_CB(skb1)-&gt;end_seq)) {  
+                if (!after(end_seq, TCP_SKB_CB(skb1)-&gt;end_seq)) {  
+                    /* All the bits are present. Drop. */  
+                    __kfree_skb(skb);  
+                    tcp_dsack_set(sk, seq, end_seq);  
+                    goto add_sack;  
+                }  
+                if (after(seq, TCP_SKB_CB(skb1)-&gt;seq)) {  
+                    /* Partial overlap. */  
+                    tcp_dsack_set(sk, seq,  
+                              TCP_SKB_CB(skb1)-&gt;end_seq);  
+                } else {  
+                    skb1 = skb1-&gt;prev;  
+                }  
+            }  
+            /* 排队到失序队列*/  
+            __skb_queue_after(&amp;tp-&gt;out_of_order_queue, skb1, skb);  
+
+            /* And clean segments covered by new one as whole. 检测与后面的数据包重叠*/  
+            while ((skb1 = skb-&gt;next) !=  
+                   (struct sk_buff *)&amp;tp-&gt;out_of_order_queue &amp;&amp;  
+                   after(end_seq, TCP_SKB_CB(skb1)-&gt;seq)) {  
+                if (before(end_seq, TCP_SKB_CB(skb1)-&gt;end_seq)) {  
+                    tcp_dsack_extend(sk, TCP_SKB_CB(skb1)-&gt;seq,  
+                             end_seq);  
+                    break;  
+                }  
+                __skb_unlink(skb1, &amp;tp-&gt;out_of_order_queue);  
+                tcp_dsack_extend(sk, TCP_SKB_CB(skb1)-&gt;seq,  
+                         TCP_SKB_CB(skb1)-&gt;end_seq);  
+                __kfree_skb(skb1);  
+            }  
+
+    add_sack:  
+            if (tcp_is_sack(tp))  
+                /* 根据失序队列的现状更新SACK的blocks */  
+                tcp_sack_new_ofo_skb(sk, seq, end_seq);  
+        }  
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux TCP数据包接收处理tcp_rcv_established]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/01/kernel-net-estab/"/>
+    <updated>2015-04-01T17:50:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/01/kernel-net-estab</id>
+    <content type="html"><![CDATA[<p><a href="http://www.cppblog.com/fwxjj/archive/2013/02/18/197906.aspx">http://www.cppblog.com/fwxjj/archive/2013/02/18/197906.aspx</a></p>
+
+<p>tcp_rcv_established函数的工作原理是把数据包的处理分为2类：fast path和slow path，其含义显而易见。这样分类的目的当然是加快数据包的处理，因为在正常情况下，数据包是按顺序到达的，网络状况也是稳定的，这时可以按照fast path直接把数据包存放到receive queue了。而在其他的情况下则需要走slow path流程了。</p>
+
+<p>在协议栈中，是用头部预测来实现的，每个tcp sock有个pred_flags成员，它就是判别的依据。</p>
+
+<pre><code>    static inline void __tcp_fast_path_on(struct tcp_sock *tp, u32 snd_wnd)  
+    {  
+        tp-&gt;pred_flags = htonl((tp-&gt;tcp_header_len &lt;&lt; 26) |  
+                       ntohl(TCP_FLAG_ACK) |  
+                       snd_wnd);  
+    }  
+</code></pre>
+
+<p>可以看出头部预测依赖的是头部长度字段和通告窗口。也就是说标志位除了ACK和PSH外，如果其他的存在的话，就不能用</p>
+
+<h5>fast path处理，其揭示的含义如下：</h5>
+
+<p>1 Either the data transaction is taking place in only one direction (which means that we are the receiver and not transmitting any data) or in the case where we are sending out data also, the window advertised from the other end is constant. The latter means that we have not transmitted any data from our side for quite some time but are receiving data from the other end. The receive window advertised by the other end is constant.</p>
+
+<ol>
+<li><p>Other than PSH|ACK flags in the TCP header, no other flag is set (ACK is set for each TCP segment). <br/>
+This means that if any other flag is set such as URG, FIN, SYN, ECN, RST, and CWR, we know that something important is there to be attended and we need to move into the SLOW path.</p></li>
+<li><p>The header length has unchanged. If the TCP header length remains unchanged, we have not added/reduced any TCP option and we can safely assume that there is nothing important to be attended, if the above two conditions are TRUE.</p></li>
+</ol>
+
+
+<h5>fast path工作的条件</h5>
+
+<pre><code>    static inline void tcp_fast_path_check(struct sock *sk)  
+    {  
+        struct tcp_sock *tp = tcp_sk(sk);  
+
+        if (skb_queue_empty(&amp;tp-&gt;out_of_order_queue) &amp;&amp;  
+            tp-&gt;rcv_wnd &amp;&amp;  
+            atomic_read(&amp;sk-&gt;sk_rmem_alloc) &lt; sk-&gt;sk_rcvbuf &amp;&amp;  
+            !tp-&gt;urg_data)  
+            tcp_fast_path_on(tp);  
+    }  
+</code></pre>
+
+<p>1 没有乱序数据包<br/>
+2 接收窗口不为0<br/>
+3 还有接收缓存空间<br/>
+4 没有紧急数据</p>
+
+<p>反之，则进入slow path处理；另外当连接新建立时处于slow path。</p>
+
+<h5>从fast path进入slow path的触发条件（进入slow path 后pred_flags清除为0）：</h5>
+
+<p>1 在tcp_data_queue中接收到乱序数据包<br/>
+2 在tcp_prune_queue中用完缓存并且开始丢弃数据包<br/>
+3 在tcp_urgent_check中遇到紧急指针<br/>
+4 在tcp_select_window中发送的通告窗口下降到0.</p>
+
+<h5>从slow_path进入fast_path的触发条件：</h5>
+
+<p>1 When we have read past an urgent byte in tcp_recvmsg() . Wehave gotten an urgent byte and we remain in the slow path mode until we receive the urgent byte because it is handled in the slow path in tcp_rcv_established().<br/>
+2 当在tcp_data_queue中乱序队列由于gap被填充而处理完毕时，运行tcp_fast_path_check。<br/>
+3 tcp_ack_update_window()中更新了通告窗口。</p>
+
+<h4>fast path处理流程</h4>
+
+<p>A 判断能否进入fast path</p>
+
+<pre><code>    if ((tcp_flag_word(th) &amp; TCP_HP_BITS) == tp-&gt;pred_flags &amp;&amp;  
+            TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt) {  
+</code></pre>
+
+<p>TCP_HP_BITS的作用就是排除flag中的PSH标志位。只有在头部预测满足并且数据包以正确的顺序（该数据包的第一个序号就是下个要接收的序号）到达时才进入fast path。</p>
+
+<pre><code>    int tcp_header_len = tp-&gt;tcp_header_len;  
+
+    /* Timestamp header prediction: tcp_header_len 
+     * is automatically equal to th-&gt;doff*4 due to pred_flags 
+     * match. 
+     */  
+
+    /* Check timestamp */  
+    if (tcp_header_len == sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) {  
+        /* No? Slow path! */  
+        if (!tcp_parse_aligned_timestamp(tp, th))  
+            goto slow_path;  
+
+        /* If PAWS failed, check it more carefully in slow path */  
+        if ((s32)(tp-&gt;rx_opt.rcv_tsval - tp-&gt;rx_opt.ts_recent) &lt; 0)  
+            goto slow_path;  
+
+        /* DO NOT update ts_recent here, if checksum fails 
+         * and timestamp was corrupted part, it will result 
+         * in a hung connection since we will drop all 
+         * future packets due to the PAWS test. 
+         */  
+    }  
+</code></pre>
+
+<p>该代码段是依据时戳选项来检查PAWS（Protect Against Wrapped Sequence numbers）。
+如果发送来的仅是一个TCP头的话（没有捎带数据或者接收端检测到有乱序数据这些情况时都会发送一个纯粹的ACK包）</p>
+
+<pre><code>    /* Bulk data transfer: sender */  
+    if (len == tcp_header_len) {  
+        /* Predicted packet is in window by definition. 
+         * seq == rcv_nxt and rcv_wup &lt;= rcv_nxt. 
+         * Hence, check seq&lt;=rcv_wup reduces to: 
+         */  
+        if (tcp_header_len ==  
+            (sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) &amp;&amp;  
+            tp-&gt;rcv_nxt == tp-&gt;rcv_wup)  
+            tcp_store_ts_recent(tp);  
+
+        /* We know that such packets are checksummed 
+         * on entry. 
+         */  
+        tcp_ack(sk, skb, 0);  
+        __kfree_skb(skb);  
+        tcp_data_snd_check(sk);  
+        return 0;  
+    } else { /* Header too small */  
+        TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);  
+        goto discard;  
+    }  
+</code></pre>
+
+<p>主要的工作如下：<br/>
+1 保存对方的最近时戳 tcp_store_ts_recent。通过前面的if判断可以看出tcp总是回显2次时戳回显直接最先到达的数据包的时戳，<br/>
+  rcv_wup只在发送数据（这时回显时戳）时重置为rcv_nxt，所以接收到前一次回显后第一个数据包后，rcv_nxt增加了，但是<br/>
+  rcv_wup没有更新，所以后面的数据包处理时不会调用该函数来保存时戳。<br/>
+2 ACK处理。这个函数非常复杂，包含了拥塞控制机制，确认处理等等。<br/>
+3 检查是否有数据待发送 tcp_data_snd_check。</p>
+
+<p>如果该数据包中包含了数据的话</p>
+
+<pre><code>            } else {  
+                int eaten = 0;  
+                int copied_early = 0;  
+                /* 此数据包刚好是下一个读取的数据，并且用户空间可存放下该数据包*/  
+                if (tp-&gt;copied_seq == tp-&gt;rcv_nxt &amp;&amp;  
+                    len - tcp_header_len &lt;= tp-&gt;ucopy.len) {  
+    #ifdef CONFIG_NET_DMA  
+                    if (tcp_dma_try_early_copy(sk, skb, tcp_header_len)) {  
+                        copied_early = 1;  
+                        eaten = 1;  
+                    }  
+    #endif          /* 如果该函数在进程上下文中调用并且sock被用户占用的话*/  
+                    if (tp-&gt;ucopy.task == current &amp;&amp;  
+                        sock_owned_by_user(sk) &amp;&amp; !copied_early) {  
+                        /* 进程有可能被设置为TASK_INTERRUPTIBLE */  
+                        __set_current_state(TASK_RUNNING);  
+                        /* 直接copy数据到用户空间*/  
+                        if (!tcp_copy_to_iovec(sk, skb, tcp_header_len))  
+                            eaten = 1;  
+                    }  
+                    if (eaten) {  
+                        /* Predicted packet is in window by definition. 
+                         * seq == rcv_nxt and rcv_wup &lt;= rcv_nxt. 
+                         * Hence, check seq&lt;=rcv_wup reduces to: 
+                         */  
+                        if (tcp_header_len ==  
+                            (sizeof(struct tcphdr) +  
+                             TCPOLEN_TSTAMP_ALIGNED) &amp;&amp;  
+                            tp-&gt;rcv_nxt == tp-&gt;rcv_wup)  
+                            tcp_store_ts_recent(tp);  
+                        /* 更新RCV RTT，Dynamic Right-Sizing算法*/  
+                        tcp_rcv_rtt_measure_ts(sk, skb);  
+
+                        __skb_pull(skb, tcp_header_len);  
+                        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;  
+                        NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHPHITSTOUSER);  
+                    }  
+                    if (copied_early)  
+                        tcp_cleanup_rbuf(sk, skb-&gt;len);  
+                }  
+                if (!eaten) { /* 没有直接读到用户空间*/  
+                    if (tcp_checksum_complete_user(sk, skb))  
+                        goto csum_error;  
+
+                    /* Predicted packet is in window by definition. 
+                     * seq == rcv_nxt and rcv_wup &lt;= rcv_nxt. 
+                     * Hence, check seq&lt;=rcv_wup reduces to: 
+                     */  
+                    if (tcp_header_len ==  
+                        (sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) &amp;&amp;  
+                        tp-&gt;rcv_nxt == tp-&gt;rcv_wup)  
+                        tcp_store_ts_recent(tp);  
+
+                    tcp_rcv_rtt_measure_ts(sk, skb);  
+
+                    if ((int)skb-&gt;truesize &gt; sk-&gt;sk_forward_alloc)  
+                        goto step5;  
+
+                    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHPHITS);  
+
+                    /* Bulk data transfer: receiver */  
+                    __skb_pull(skb, tcp_header_len);  
+                                    /* 进入receive queue 排队，以待tcp_recvmsg读取*/  
+                    __skb_queue_tail(&amp;sk-&gt;sk_receive_queue, skb);  
+                    skb_set_owner_r(skb, sk);  
+                    tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;  
+                }  
+                /* 数据包接收后续处理*/  
+                tcp_event_data_recv(sk, skb);  
+                /* ACK 处理*/  
+                if (TCP_SKB_CB(skb)-&gt;ack_seq != tp-&gt;snd_una) {  
+                    /* Well, only one small jumplet in fast path... */  
+                    tcp_ack(sk, skb, FLAG_DATA);  
+                    tcp_data_snd_check(sk);  
+                    if (!inet_csk_ack_scheduled(sk))  
+                        goto no_ack;  
+                }  
+                /* ACK发送处理*/  
+                if (!copied_early || tp-&gt;rcv_nxt != tp-&gt;rcv_wup)  
+                    __tcp_ack_snd_check(sk, 0);  
+    no_ack:  
+    #ifdef CONFIG_NET_DMA  
+                if (copied_early)  
+                    __skb_queue_tail(&amp;sk-&gt;sk_async_wait_queue, skb);  
+                else  
+    #endif                    
+                /* eaten为1，表示数据直接copy到了用户空间，这时无需提醒用户进程数据的到达，否则需调用sk_data_ready来通知，因为此时数据到达了receive queue*/  
+                if (eaten)  
+                    __kfree_skb(skb);  
+                else  
+                    sk-&gt;sk_data_ready(sk, 0);  
+                return 0;  
+            }  
+</code></pre>
+
+<h4>tcp_event_data_recv函数</h4>
+
+<pre><code>    static void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb)  
+    {  
+        struct tcp_sock *tp = tcp_sk(sk);  
+        struct inet_connection_sock *icsk = inet_csk(sk);  
+        u32 now;  
+        /* 接收到了数据，设置ACK需调度标志*/  
+        inet_csk_schedule_ack(sk);  
+
+        tcp_measure_rcv_mss(sk, skb);  
+
+        tcp_rcv_rtt_measure(tp);  
+
+        now = tcp_time_stamp;  
+        /* 以下为根据接收间隔更新icsk_ack.ato，该值主要用于判断pingpong模式见函数tcp_event_data_sent */  
+        if (!icsk-&gt;icsk_ack.ato) {  
+            /* The _first_ data packet received, initialize 
+             * delayed ACK engine. 
+             */  
+            tcp_incr_quickack(sk);  
+            icsk-&gt;icsk_ack.ato = TCP_ATO_MIN;  
+        } else {  
+            int m = now - icsk-&gt;icsk_ack.lrcvtime;  
+
+            if (m &lt;= TCP_ATO_MIN / 2) {  
+                /* The fastest case is the first. */  
+                icsk-&gt;icsk_ack.ato = (icsk-&gt;icsk_ack.ato &gt;&gt; 1) + TCP_ATO_MIN / 2;  
+            } else if (m &lt; icsk-&gt;icsk_ack.ato) {  
+                icsk-&gt;icsk_ack.ato = (icsk-&gt;icsk_ack.ato &gt;&gt; 1) + m;  
+                if (icsk-&gt;icsk_ack.ato &gt; icsk-&gt;icsk_rto)  
+                    icsk-&gt;icsk_ack.ato = icsk-&gt;icsk_rto;  
+            } else if (m &gt; icsk-&gt;icsk_rto) {  
+                /* Too long gap. Apparently sender failed to 
+                 * restart window, so that we send ACKs quickly. 
+                 */  
+                tcp_incr_quickack(sk);  
+                sk_mem_reclaim(sk);  
+            }  
+        }  
+        icsk-&gt;icsk_ack.lrcvtime = now;  
+
+        TCP_ECN_check_ce(tp, skb);  
+        /* 每次接收到来自对方的一个TCP数据报，且数据报长度大于128字节时，我们需要调用tcp_grow_window，增加rcv_ssthresh的值，一般每次为rcv_ssthresh增长两倍的mss，增加的条件是rcv_ssthresh小于window_clamp,并且 rcv_ssthresh小于接收缓存剩余空间的3/4，同时tcp_memory_pressure没有被置位(即接收缓存中的数据量没有太大)。 tcp_grow_window中对新收到的skb的长度还有一些限制，并不总是增长rcv_ssthresh的值*/  
+        if (skb-&gt;len &gt;= 128)  
+            tcp_grow_window(sk, skb);  
+    }  
+</code></pre>
+
+<p>rcv_ssthresh是当前的接收窗口大小的一个阀值，其初始值就置为rcv_wnd。它跟rcv_wnd配合工作，当本地socket收到数据报，并满足一定条件时，增长rcv_ssthresh的值，在下一次发送数据报组建TCP首部时，需要通告对方当前的接收窗口大小，这时需要更新rcv_wnd，此时rcv_wnd的取值不能超过rcv_ssthresh的值。两者配合，达到一个滑动窗口大小缓慢增长的效果。</p>
+
+<p><code>__tcp_ack_snd_check</code>用来判断ACK的发送方式
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/&lt;em&gt;
+</span><span class='line'> * Check if sending an ack is needed.
+</span><span class='line'> &lt;/em&gt;/&lt;br/&gt;
+</span><span class='line'>static void __tcp_ack_snd_check(struct sock &lt;em&gt;sk, int ofo_possible)&lt;br/&gt;
+</span><span class='line'>{&lt;br/&gt;
+</span><span class='line'>    struct tcp_sock &lt;/em&gt;tp = tcp_sk(sk);&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        /* More than one full frame received... */  
+</span><span class='line'>if (((tp-&gt;rcv_nxt - tp-&gt;rcv_wup) &gt; inet_csk(sk)-&gt;icsk_ack.rcv_mss  
+</span><span class='line'>     /* ... and right edge of window advances far enough. 
+</span><span class='line'>      * (tcp_recvmsg() will send ACK otherwise). Or... 
+</span><span class='line'>      */  
+</span><span class='line'>     &amp;&amp; __tcp_select_window(sk) &gt;= tp-&gt;rcv_wnd) ||  
+</span><span class='line'>    /* We ACK each frame or... */  
+</span><span class='line'>    tcp_in_quickack_mode(sk) ||  
+</span><span class='line'>    /* We have out of order data. */  
+</span><span class='line'>    (ofo_possible &amp;&amp; skb_peek(&amp;tp-&gt;out_of_order_queue))) {  
+</span><span class='line'>    /* Then ack it now */  
+</span><span class='line'>    tcp_send_ack(sk);  
+</span><span class='line'>} else {  
+</span><span class='line'>    /* Else, send delayed ack. */  
+</span><span class='line'>    tcp_send_delayed_ack(sk);  
+</span><span class='line'>}  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>这里有个疑问，就是当ucopy应用读到需要读取到的数据包后，也即在一次处理中
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;if (tp-&gt;copied_seq == tp-&gt;rcv_nxt &amp;&amp;  
+</span><span class='line'>            len - tcp_header_len &lt;= tp-&gt;ucopy.len) {  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>的第二个条件的等号为真 len - tcp_header_len == tp-&gt;ucopy.len，然后执行流程到后面eaten为1，所以函数以释放skb结束，没有调用sk_data_ready函数。假设这个处理调用流程如下：  
+</span><span class='line'>tcp_recvmsg-&gt; sk_wait_data  -&gt; sk_wait_event -&gt; release_sock -&gt; __release_sock-&gt; sk_backlog_rcv-&gt; tcp_rcv_established那么即使此时用户得到了所需的数据，但是在tcp_rcv_established返回前没有提示数据已得到，
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define sk_wait_event(__sk, __timeo, __condition)           /  
+</span><span class='line'>({  int __rc;                       /  
+</span><span class='line'>    release_sock(__sk);                 /  
+</span><span class='line'>    __rc = __condition;                 /  
+</span><span class='line'>    if (!__rc) {                        /  
+</span><span class='line'>        *(__timeo) = schedule_timeout(*(__timeo));  /  
+</span><span class='line'>    }                           /  
+</span><span class='line'>    lock_sock(__sk);                    /  
+</span><span class='line'>    __rc = __condition;                 /  
+</span><span class='line'>    __rc;                           /  
+</span><span class='line'>})  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>但是在回到sk_wait_event后，由于__condition为 !skb_queue_empty(&amp;sk-&gt;sk_receive_queue)，所以还是会调用schedule_timeout来等待。这点显然是浪费时间，所以这个condition应该考虑下这个数据已经读满的情况，而不能光靠观察receive queue来判断是否等待。
+</span><span class='line'>
+</span><span class='line'>接下来分析slow path
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;slow_path:  
+</span><span class='line'>if (len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete_user(sk, skb))  
+</span><span class='line'>    goto csum_error;  
+</span><span class='line'>
+</span><span class='line'>/* 
+</span><span class='line'> *  Standard slow path. 
+</span><span class='line'> */  
+</span><span class='line'>    /* 检查到达的数据包 */  
+</span><span class='line'>res = tcp_validate_incoming(sk, skb, th, 1);  
+</span><span class='line'>if (res &lt;= 0)  
+</span><span class='line'>    return -res;  
+</span><span class='line'>
+</span><span class='line'>step5:  /* 如果设置了ACK，则调用tcp_ack处理，后面再分析该函数*/  
+</span><span class='line'>if (th-&gt;ack)  
+</span><span class='line'>    tcp_ack(sk, skb, FLAG_SLOWPATH);  
+</span><span class='line'>
+</span><span class='line'>tcp_rcv_rtt_measure_ts(sk, skb);  
+</span><span class='line'>
+</span><span class='line'>/* Process urgent data. */  
+</span><span class='line'>tcp_urg(sk, skb, th);  
+</span><span class='line'>
+</span><span class='line'>/* step 7: process the segment text */  
+</span><span class='line'>tcp_data_queue(sk, skb);  
+</span><span class='line'>
+</span><span class='line'>tcp_data_snd_check(sk);  
+</span><span class='line'>tcp_ack_snd_check(sk);  
+</span><span class='line'>return 0;  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>先看看tcp_validate_incoming函数，在slow path处理前检查输入数据包的合法性。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Does PAWS and seqno based validation of an incoming segment, flags will 
+</span><span class='line'> * play significant role here. 
+</span><span class='line'> */  
+</span><span class='line'>static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,  
+</span><span class='line'>              struct tcphdr *th, int syn_inerr)  
+</span><span class='line'>{  
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>
+</span><span class='line'>/* RFC1323: H1. Apply PAWS check first. */  
+</span><span class='line'>if (tcp_fast_parse_options(skb, th, tp) &amp;&amp; tp-&gt;rx_opt.saw_tstamp &amp;&amp;  
+</span><span class='line'>    tcp_paws_discard(sk, skb)) {  
+</span><span class='line'>    if (!th-&gt;rst) {  
+</span><span class='line'>        NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSESTABREJECTED);  
+</span><span class='line'>        tcp_send_dupack(sk, skb);  
+</span><span class='line'>        goto discard;  
+</span><span class='line'>    }  
+</span><span class='line'>    /* Reset is accepted even if it did not pass PAWS. */  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>/* Step 1: check sequence number */  
+</span><span class='line'>if (!tcp_sequence(tp, TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq)) {  
+</span><span class='line'>    /* RFC793, page 37: "In all states except SYN-SENT, all reset 
+</span><span class='line'>     * (RST) segments are validated by checking their SEQ-fields." 
+</span><span class='line'>     * And page 69: "If an incoming segment is not acceptable, 
+</span><span class='line'>     * an acknowledgment should be sent in reply (unless the RST 
+</span><span class='line'>     * bit is set, if so drop the segment and return)". 
+</span><span class='line'>     */  
+</span><span class='line'>    if (!th-&gt;rst)  
+</span><span class='line'>        tcp_send_dupack(sk, skb);  
+</span><span class='line'>    goto discard;  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>/* Step 2: check RST bit */  
+</span><span class='line'>if (th-&gt;rst) {  
+</span><span class='line'>    tcp_reset(sk);  
+</span><span class='line'>    goto discard;  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>/* ts_recent update must be made after we are sure that the packet 
+</span><span class='line'> * is in window. 
+</span><span class='line'> */  
+</span><span class='line'>tcp_replace_ts_recent(tp, TCP_SKB_CB(skb)-&gt;seq);  
+</span><span class='line'>
+</span><span class='line'>/* step 3: check security and precedence [ignored] */  
+</span><span class='line'>
+</span><span class='line'>/* step 4: Check for a SYN in window. */  
+</span><span class='line'>if (th-&gt;syn &amp;&amp; !before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt)) {  
+</span><span class='line'>    if (syn_inerr)  
+</span><span class='line'>        TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);  
+</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPABORTONSYN);  
+</span><span class='line'>    tcp_reset(sk);  
+</span><span class='line'>    return -1;  
+</span><span class='line'>}  
+</span><span class='line'>
+</span><span class='line'>return 1;  
+</span><span class='line'>
+</span><span class='line'>discard:  
+</span><span class='line'>__kfree_skb(skb);  
+</span><span class='line'>return 0;  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>第一步：检查PAWS tcp_paws_discard
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline int tcp_paws_discard(const struct sock *sk,  
+</span><span class='line'>               const struct sk_buff *skb)  
+</span><span class='line'>{  
+</span><span class='line'>const struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>return ((s32)(tp-&gt;rx_opt.ts_recent - tp-&gt;rx_opt.rcv_tsval) &gt; TCP_PAWS_WINDOW &amp;&amp;  
+</span><span class='line'>    get_seconds() &lt; tp-&gt;rx_opt.ts_recent_stamp + TCP_PAWS_24DAYS &amp;&amp;  
+</span><span class='line'>    !tcp_disordered_ack(sk, skb));  
+</span><span class='line'>}  
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;PAWS丢弃数据包要满足以下条件
+</span><span class='line'>
+</span><span class='line'>1 The difference between the timestamp value obtained in the current segmentand last seen timestamp on the incoming TCP segment should be more than TCP_PAWS_WINDOW (= 1), which means that if the segment that was transmitted 1 clock tick before the segment that reached here earlier TCP seq should be acceptable.  
+</span><span class='line'>It may be because of reordering of the segments that the latter reached earlier.  
+</span><span class='line'>2 the 24 days have not elapsed since last time timestamp was stored,  
+</span><span class='line'>3 tcp_disordered_ack返回0.  
+</span><span class='line'>
+</span><span class='line'>以下转载自CU论坛http://linux.chinaunix.net/bbs/viewthread.php?tid=1130308
+</span><span class='line'>----------
+</span><span class='line'>在实际进行PAWS预防时，Linux是通过如下代码调用来完成的
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;tcp_rcv_established&lt;br/&gt;
+</span><span class='line'>|&lt;br/&gt;
+</span><span class='line'>|&ndash;&gt;tcp_paws_discard&lt;br/&gt;
+</span><span class='line'>      |&lt;br/&gt;
+</span><span class='line'>      |&ndash;&gt;tcp_disordered_ack&lt;br/&gt;</span></code></pre></td></tr></table></div></figure></p>
+
+<p>其中关键是local方通过tcp_disordered_ack函数对一个刚收到的数据分段进行判断，下面我们对该函数的判断逻辑进行下总结：<br/>
+大前提：该收到分段的TS值表明有回绕现象发生<br/>
+a）若该分段不是一个纯ACK，则丢弃。因为显然这个分段所携带的数据是一个老数据了，不是local方目前希望接收的（参见PAWS的处理依据一节）<br/>
+b）若该分段不是local所希望接收的，则丢弃。这个原因很显然<br/>
+c）若该分段是一个纯ACK，但该ACK并不是一个重复ACK（由local方后续数据正确到达所引发的），则丢弃。因为显然该ACK是一个老的ACK，并不是由于为了加快local方重发而在每收到一个丢失分段后的分段而发出的ACK。<br/>
+d）若该分段是一个ACK，且为重复ACK，并且该ACK的TS值超过了local方那个丢失分段后的重发rto，则丢弃。因为显然此时local方已经重发了那个导致此重复ACK产生的分段，因此再收到此重复ACK就可以直接丢弃。<br/>
+e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的时间，则不能丢弃，因为这正代表peer方收到了local方发出的丢失分段后的分段，local方要对此ACK进行处理（例如立刻重传）</p>
+
+<p>  这里有一个重要概念需要理解，即在出现TS问题后，纯ACK和带ACK的数据分段二者是显著不同的，对于后者，可以立刻丢弃掉，因为从一个窗口的某个seq到下一个窗口的同一个seq过程中，一定有窗口变化曾经发生过，从而TS记录值ts_recent也一定更新过，此时一定可以通过PAWS进行丢弃处理。但是对于前者，一个纯ACK，就不能简单丢弃了，因为有这样一个现象是合理的，即假定local方的接收缓存很大，并且peer方在发送时很快就回绕了，于是在local方的某个分段丢失后，peer方需要在每收到的后续分段时发送重复ACK，而此时该重发ACK的ack_seq就是这个丢失分段的序号，而该重发ACK的seq已经是回绕后的重复序号了，尽管此时到底是回绕后的那个重复ACK还是之前的那个同样序号seq的重复ACK，对于local方来都需要处理（立刻启动重发动作），而不能简单丢弃掉。</p>
+
+<hr />
+
+<p>第2步 检查数据包的序号是否正确，该判断失败后调用tcp_send_dupack发送一个duplicate acknowledge（未设置RST标志位时）。
+<code>
+    static inline int tcp_sequence(struct tcp_sock *tp, u32 seq, u32 end_seq)  
+    {  
+        return  !before(end_seq, tp-&gt;rcv_wup) &amp;&amp;  
+            !after(seq, tp-&gt;rcv_nxt + tcp_receive_window(tp));  
+    }  
+</code></p>
+
+<p>由rcv_wup的更新时机（发送ACK时的tcp_select_window）可知位于序号rcv_wup前面的数据都已确认，所以待检查数据包的结束序号至少要大于该值；同时开始序号要落在接收窗口内。</p>
+
+<p>第3步 如果设置了RST，则调用tcp_reset处理</p>
+
+<p>第4步 更新ts_recent，</p>
+
+<p>第5步 检查SYN，因为重发的SYN和原来的SYN之间不会发送数据，所以这2个SYN的序号是相同的，如果不满足则reset连接。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[skb 申请释放]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/01/kernel-net-skb_mem/"/>
+    <updated>2015-04-01T17:20:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/01/kernel-net-skb_mem</id>
+    <content type="html"><![CDATA[<p><a href="http://book.51cto.com/art/201206/345040.htm">http://book.51cto.com/art/201206/345040.htm</a></p>
+
+<hr />
+
+<h3>一、SKB的缓存池</h3>
+
+<p>网络模块中，有两个用来分配SKB描述符的高速缓存，在SKB模块初始函数skb_init()中被创建。
+<code>
+    2048 void __init skb_init(void)  
+    2049 {  
+    2050     skbuff_head_cache = kmem_cache_create("skbuff_head_cache",  
+    2051                           sizeof(struct sk_buff),  
+    2052                           0,  
+    2053                           SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
+    2054                           NULL, NULL);  
+    2055     skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",  
+    2056                         (2*sizeof(struct sk_buff)) +  
+    2057                         sizeof(atomic_t),  
+    2058                         0,  
+    2059                         SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
+    2060                         NULL, NULL);  
+    2061 }
+</code>
+2050-2054 创建skbuff_head_cache高速缓存，一般情况下，SKB都是从该高速缓存中分配的。</p>
+
+<p>2055-2060 创建每次以两倍SKB描述符长度来分配空间的skbuff_fclone_cache高速缓存。如果在分配SKB时就知道可能被克隆，那么应该从这个高速缓存中分配空间，因为在这个高速缓存中分配SKB时，会同时分配一个后备的SKB，以便将来用于克隆，这样在克隆时就不用再次分配SKB了，直接使用后备的SKB即可，这样做的目的主要是提高效率。</p>
+
+<p>两个高速缓存的区别在于创建时指定的单位内存区域大小不同，skbuff_head_cache的单位内存区域长度是sizeof(struct sk_buff)，而skbuff_fclone_cache的单位内存区域长度是2*sizeof(struct sk_buff)+sizeof(atomic_t)，即一对SKB和一个引用计数，可以说这一对SKB是"父子"关系，指向同一个数据缓存区，引用计数值为0,1或2，用来表示这一对SKB中有几个已被使用，如图3-12所示。</p>
+
+<p><img src="/images/kernel/2015-04-01-0.jpg" alt="" /></p>
+
+<hr />
+
+<h3>二、分配SKB</h3>
+
+<h4>1. alloc_skb()</h4>
+
+<p>alloc_skb()用来分配SKB。数据缓存区和SKB描述符是两个不同的实体，这就意味着，在分配一个SKB时，需要分配两块内存，一块是数据缓存区，一块是SKB描述符。__alloc_skb()调用kmem_cache_alloc_node()从高速缓存中获取一个sk_buff结构的空间，然后调用kmalloc_node_track_caller()分配数据缓存区。参数说明如下：</p>
+
+<p>size，待分配SKB的线性存储区的长度。</p>
+
+<p>gfp_mask，分配内存的方式，见表25-3。</p>
+
+<p>fclone，预测是否会克隆，用于确定从哪个高速缓存中分配。</p>
+
+<p>node，当支持NUMA（非均匀质存储结构）时，用于确定何种区域中分配SKB。NUMA参见相关资料。</p>
+
+<pre><code>    144 struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,  
+    145                 int fclone, int node)  
+    146 {  
+    147     struct kmem_cache *cache;  
+    148     struct skb_shared_info *shinfo;  
+    149     struct sk_buff *skb;  
+    150     u8 *data;  
+    151  
+    152     cache = fclone ? skbuff_fclone_cache : skbuff_head_cache;  
+    153  
+    154     /* Get the HEAD */  
+    155     skb = kmem_cache_alloc_node(cache, gfp_mask &amp; ~__GFP_DMA, node);  
+    156     if (!skb)  
+    157         goto out;  
+    158  
+    159     /* Get the DATA. Size must match skb_add_mtu(). */  
+    160     size = SKB_DATA_ALIGN(size);  
+    161     data = kmalloc_node_track_caller(size + sizeof(struct skb_shared_info),  
+    162             gfp_mask, node);  
+    163     if (!data)  
+    164         goto nodata;  
+    165  
+    166     memset(skb, 0, offsetof(struct sk_buff, truesize));  
+    167     skb-&gt;truesize = size + sizeof(struct sk_buff);  
+    168     atomic_set(&amp;skb-&gt;users, 1);  
+    169     skb-&gt;head = data;  
+    170     skb-&gt;datadata = data;  
+    171     skb-&gt;tail = data;  
+    172     skb-&gt;end  = data + size;  
+    173     /* make sure we initialize shinfo sequentially */  
+    174     shinfo = skb_shinfo(skb);  
+    175     atomic_set(&amp;shinfo-&gt;dataref, 1);  
+    176     shinfo-&gt;nr_frags  = 0;  
+    177     shinfo-&gt;gso_size = 0;  
+    178     shinfo-&gt;gso_segs = 0;  
+    179     shinfo-&gt;gso_type = 0;  
+    180     shinfo-&gt;ip6_frag_id = 0;  
+    181     shinfo-&gt;frag_list = NULL;  
+    182  
+    183     if (fclone) {  
+    184         struct sk_buff *child = skb + 1;  
+    185         atomic_t *fclone_ref = (atomic_t *) (child + 1);  
+    186  
+    187         skb-&gt;fclone = SKB_FCLONE_ORIG;  
+    188         atomic_set(fclone_ref, 1);  
+    189  
+    190         child-&gt;fclone = SKB_FCLONE_UNAVAILABLE;  
+    191     }  
+    192 out:  
+    193     return skb;  
+    194 nodata:  
+    195     kmem_cache_free(cache, skb);  
+    196     skb = NULL;  
+    197     goto out;  
+    198 }
+</code></pre>
+
+<p>152 根据参数fclone确定从哪个高速缓存中分配SKB。</p>
+
+<p>155 调用kmem_cache_alloc_node()从选定的高速缓存中分配一个SKB。在此从分配标志中去除GFP_DMA，是为了不从DMA内存区域中分配SKB描述符，因为DMA内存区域比较小且有特定用途，没有必要用来分配SKB描述符。而后面分配数据缓存区时，就不会去掉GFP_DMA标志，因为很有可能数据缓存区就需要在DMA内存区域中分配，这样硬件可以直接进行DMA操作，参见161~162行。</p>
+
+<p>160 在分配数据缓存区之前，强制对给定的数据缓存区大小size作对齐操作。</p>
+
+<p>161-165 调用kmalloc_node_track_caller()分配数据缓存区，其长度为size和sizeof(struct skb_shared_info)之和，因为在缓存区尾部紧跟着一个skb_shared_info结构。</p>
+
+<p>168-181 初始化新分配SKB描述符和skb_shared_info结构。</p>
+
+<p>183-191 如果是skbuff_fclone_cache高速缓存中分配SKB描述符，则还需置父SKB描述符的fclone为SKB_FCLONE_ORIG，表示可以被克隆；同时将子SKB描述符的fclone成员置为SKB_FCLONE_UNAVAILABLE，表示该SKB还没有被创建出来；最后将引用计数置为1。</p>
+
+<p>最后SKB结构如图3-13所示，在图右边所示的内存块中部，可以看到对齐操作所带来的填充区域。需要说明的是，<code>__alloc_skb()</code>一般不被直接调用，而是被封装函数调用，如<code>__netdev_alloc_skb()</code>、alloc_skb()、alloc_skb_fclone()等函数。</p>
+
+<p><img src="/images/kernel/2015-04-01-1.jpg" alt="" /></p>
+
+<h4>2. dev_alloc_skb()</h4>
+
+<p>dev_alloc_skb()也是一个缓存区分配函数，通常被设备驱动用在中断上下文中。这是一个alloc_skb()的封装函数，因为是在中断处理函数中被调用的，因此要求原子操作（GFP_ATOMIC）。
+<code>
+    1124 static inline struct sk_buff *dev_alloc_skb(unsigned int length)  
+    1125 {  
+    1126     return __dev_alloc_skb(length, GFP_ATOMIC);  
+    1127 }  
+    ... ...  
+    1103 static inline struct sk_buff *__dev_alloc_skb(unsigned int length,  
+    1104                           gfp_t gfp_mask)  
+    1105 {  
+    1106     struct sk_buff *skb = alloc_skb(length + NET_SKB_PAD, gfp_mask);  
+    1107     if (likely(skb))  
+    1108         skb_reserve(skb, NET_SKB_PAD);  
+    1109     return skb;  
+    1110 }
+</code></p>
+
+<p>1108 调用skb_reserve()在skb->head与skb->data之间预留NET_SKB_PAD个字节。NET_SKB_PAD的定义在skbuff.h中，其值为 16。这部分空间将被填入硬件帧头，如14B的以太网帧头。</p>
+
+<p>1126 以GFP_ATOMIC为内存分配优先级，表示分配过程为原子操作，不能被中断。</p>
+
+<hr />
+
+<h3>三、释放SKB</h3>
+
+<p>dev_kfree_skb()和kfree_skb()用来释放SKB，把它返回给高速缓存。kfree_skb()可以直接调用，也可以通过封装函数dev_kfree_skb()来调用。而dev_kfree_skb()只是一个简单调用kfree_skb()的宏，一般为设备驱动使用，与之功能相反的函数是dev_alloc_skb()。这些函数只在skb->users为1的情况下才释放内存，否则只简单地递减skb->users，因此假设SKB有三个引用者，那么只有第三次调用dev_kfree_skb()或kfree_skb()时才释放内存。kfree_skb()的流程如图3-14所示。</p>
+
+<p><img src="/images/kernel/2015-04-01-2.jpg" alt="" /></p>
+
+<p>图3-14所示的流程显示了释放一个SKB的步骤：</p>
+
+<p>1）kfree_skb()检测sk_buff结构的引用计数users，如果不为1，则说明此次释放后该SKB还将被用户占用，因此递减引用计数users后即返回；否则说明不再有其他用户占用该sk_buff结构，调用__kfree_skb()释放之。</p>
+
+<p>2）SKB描述符中包含一个dst_entry结构的引用，在释放SKB后，会调用dst_release()来递减dst_entry结构的引用计数。</p>
+
+<p>3）如果初始化了SKB的析构函数，则调用相应的函数。</p>
+
+<p>4）一个SKB描述符是与一个存有真正数据的内存块，即数据区相关的。如果存在聚合分散I/O数据，该数据区底部的skb_shared_info结构还会包含指向聚合分散I/O数据的指针，同样需要释放这些分片所占用的内存。最后需把SKB描述符所占内存返回给skbuff_head_cache缓存。释放内存由kfree_skbmem()处理，过程如下：</p>
+
+<p>如果SKB没有被克隆，或者payload没有被单独引用，则释放SKB的数据缓存区，包括存储聚合分散I/O数据的缓存区和SKB描述符。</p>
+
+<p>如果是释放从skbuff_fclone_cache中分配的父SKB描述符，且克隆计数为1，则释放父SKB描述符。</p>
+
+<p>如果是释放从skbuff_fclone_cache中分配的子SKB描述符，设置父SKLB的fclone字段为SKB_FCLONE_UNAVAILABLE，在克隆计数为1的情况下，释放子SKB描述符。</p>
+
+<hr />
+
+<h3>四、数据预留和对齐</h3>
+
+<p>数据预留和对齐主要由skb_reserve()、skb_put()、skb_push()以及skb_pull()这几个函数来完成。</p>
+
+<h4>1. skb_reserve()</h4>
+
+<p>skb_reserve()在数据缓存区头部预留一定的空间，通常被用来在数据缓存区中插入协议首部或者在某个边界上对齐。它并没有把数据移出或移入数据缓存区，而只是简单地更新了数据缓存区的两个指针-分别指向负载起始和结尾的data和tail指针，图3-15 展示了调用skb_reserve()前后这两个指针的变化。</p>
+
+<p>请注意：skb_reserve()只能用于空的SKB，通常会在分配SKB之后就调用该函数，此时data和tail指针还一同指向数据区的起始位置，如图3-15a所示。例如，某个以太网设备驱动的接收函数，在分配SKB之后，向数据缓存区填充数据之前，会有这样的一条语句skb_reserve(skb, 2)，这是因为以太网头长度为14B，再加上2B就正好16字节边界对齐，所以大多数以太网设备都会在数据包之前保留2B。</p>
+
+<p>当SKB在协议栈中向下传递时，每一层协议都把skb->data指针向上移动，然后复制本层首部，同时更新skb->len。这些操作都使用图3-15 中所示的函数完成。</p>
+
+<p><img src="/images/kernel/2015-04-01-3.jpg" alt="" /></p>
+
+<h4>2．skb_push()</h4>
+
+<p>skb_push()在数据缓存区的前头加入一块数据，与skb_reserve()类似，也并没有真正向数据缓存区中添加数据，而只是移动数据缓存区的头指针data和尾指针tail。数据由其他函数复制到数据缓存区中。</p>
+
+<p>函数执行步骤如下：</p>
+
+<p>1）当TCP发送数据时，会根据一些条件，如TCP最大分段长度MSS、是否支持聚合分散I/O等，分配一个SKB。</p>
+
+<p>2）TCP需在数据缓存区的头部预留足够的空间，用来填充各层首部。MAX_TCP_HEADER是各层首部长度的总和，它考虑了最坏的情况：由于TCP层不知道将要用哪个接口发送包，它为每一层预留了最大的首部长度，甚至还考虑了出现多个IP首部的可能性，因为在内核编译支持IP over IP的情况下，会遇到多个IP首部。</p>
+
+<p>3）把TCP负载复制到数据缓存区。需要注意的是，图3-16 只是一个例子，TCP负载可能会被组织成其他形式，例如分片，在后续章节中将会看到一个分片的数据缓存区是什么样的。</p>
+
+<p><img src="/images/kernel/2015-04-01-4.jpg" alt="" /></p>
+
+<p>4）TCP层添加TCP首部。</p>
+
+<p>5）SKB传递到IP层，IP层为数据包添加IP首部。</p>
+
+<p>6）SKB传递到链路层，链路层为数据包添加链路层首部。</p>
+
+<h4>3．skb_put()</h4>
+
+<p>skb_put()修改指向数据区末尾的指针tail，使之往下移len字节，即使数据区向下扩大len字节，并更新数据区长度len。调用skb_put()前后，SKB结构变化如图3-17所示。</p>
+
+<p><img src="/images/kernel/2015-04-01-5.jpg" alt="" /></p>
+
+<h4>4．skb_pull()</h4>
+
+<p>skb_pull()通过将data指针往下移动，在数据区首部忽略len字节长度的数据，通常用于接收到数据包后在各层间由下往上传递时，上层忽略下层的首部。调用skb_pull()前后，SKB结构变化如图3-18所示。</p>
+
+<p><img src="/images/kernel/2015-04-01-6.jpg" alt="" /></p>
+
+<hr />
+
+<h3>五、克隆和复制SKB</h3>
+
+<h4>1．skb_clone()</h4>
+
+<p>如果一个SKB会被不同的用户独立操作，而这些用户可能只是修改SKB描述符中的某些字段值，如h、nh，则内核没有必要为每个用户复制一份完整的SKB描述及其相应的数据缓存区，而会为了提高性能，只作克隆操作。克隆过程只复制SKB描述符，同时增加数据缓存区的引用计数，以免共享数据被提前释放。完成这些功能的是skb_clone()。一个使用包克隆的场景是，一个接收包程序要把该包传递给多个接收者，例如包处理函数或者一个或多个网络模块。原始的及克隆的SKB描述符的cloned值都会被设置为1，克隆SKB描述符的users值置为1，这样在第一次释放时就会释放掉。同时将数据缓存区引用计数dataref递增1，因为又多了一个克隆SKB描述符指向它。<br/>
+图3-19 演示的是已克隆的SKB。</p>
+
+<p><img src="/images/kernel/2015-04-01-7.jpg" alt="" /></p>
+
+<p>图3-19 所示是一个存在聚合分散I/O缓存区的例子，这个数据缓存区的一些数据保存在分片结构数组frags中。skb_share_check()用来检查SKB引用计数users，如果该字段表明SKB是被共享的，则克隆一个新的SKB。一个SKB被克隆后，该SKB数据缓存区中的内容就不能再被修改，这也意味着访问数据的函数没有必要加锁。skb_cloned()可以用来测试skb的克隆状态。</p>
+
+<pre><code>    432 struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)  
+    433 {  
+    434     struct sk_buff *n;  
+    435  
+    436     n = skb + 1;  
+    437     if (skb-&gt;fclone == SKB_FCLONE_ORIG &amp;&amp;  
+    438         n-&gt;fclone == SKB_FCLONE_UNAVAILABLE) {  
+    439         atomic_t *fclone_ref = (atomic_t *) (n + 1);  
+    440         n-&gt;fclone = SKB_FCLONE_CLONE;  
+    441         atomic_inc(fclone_ref);  
+    442     } else {  
+    443         n = kmem_cache_alloc(skbuff_head_cache, gfp_mask);  
+    444         if (!n)  
+    445             return NULL;  
+    446         n-&gt;fclone = SKB_FCLONE_UNAVAILABLE;  
+    447     }  
+    448  
+    449 #define C(x) n-&gt;x = skb-&gt;x  
+    450  
+    451     n-&gt;nnext = n-&gt;prev = NULL;  
+    452     n-&gt;sk = NULL;  
+    453     C(tstamp);  
+    454     C(dev);  
+    455     C(h);  
+    456     C(nh);  
+    457     C(mac);  
+    458     C(dst);  
+    459     dst_clone(skb-&gt;dst);  
+    460     C(sp);  
+    461 #ifdef CONFIG_INET  
+    462     secpath_get(skb-&gt;sp);  
+    463 #endif  
+    464     memcpy(n-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));  
+    465     C(len);  
+    466     C(data_len);  
+    467     C(csum);  
+    468     C(local_df);  
+    469     n-&gt;cloned = 1;  
+    470     n-&gt;nohdr = 0;  
+    471     C(pkt_type);  
+    472     C(ip_summed);  
+    473     C(priority);  
+    474 #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)  
+    475     C(ipvs_property);  
+    476 #endif  
+    477     C(protocol);  
+    478     n-&gt;destructor = NULL;  
+    479     C(mark);  
+    480 #ifdef CONFIG_NETFILTER  
+    481     C(nfct);  
+    482     nf_conntrack_get(skb-&gt;nfct);  
+    483     C(nfctinfo);  
+    484 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)  
+    485     C(nfct_reasm);  
+    486     nf_conntrack_get_reasm(skb-&gt;nfct_reasm);  
+    487 #endif  
+    488 #ifdef CONFIG_BRIDGE_NETFILTER  
+    489     C(nf_bridge);  
+    490     nf_bridge_get(skb-&gt;nf_bridge);  
+    491 #endif  
+    492 #endif /*CONFIG_NETFILTER*/  
+    493 #ifdef CONFIG_NET_SCHED  
+    494     C(tc_index);  
+    495 #ifdef CONFIG_NET_CLS_ACT  
+    496     n-&gt;tc_verd = SET_TC_VERD(skb-&gt;tc_verd,0);  
+    497     n-&gt;tc_verd = CLR_TC_OK2MUNGE(n-&gt;tc_verd);  
+    498     n-&gt;tc_verd = CLR_TC_MUNGED(n-&gt;tc_verd);  
+    499     C(input_dev);  
+    500 #endif  
+    501     skb_copy_secmark(n, skb);  
+    502 #endif  
+    503     C(truesize);  
+    504     atomic_set(&amp;n-&gt;users, 1);  
+    505     C(head);  
+    506     C(data);  
+    507     C(tail);  
+    508     C(end);  
+    509  
+    510     atomic_inc(&amp;(skb_shinfo(skb)-&gt;dataref));  
+    511     skb-&gt;cloned = 1;  
+    512  
+    513     return n;  
+    514 }
+</code></pre>
+
+<p>436-438 由fclone标志来决定从哪个缓冲池中分配SKB描述符。如果紧邻的两个父子SKB描述符，前一个的fclone为SKB_FCLONE_ORIG，后一个的fclone为SKB_FCLONE_ UNAVAILABLE，则说明这两个SKB描述符是从skbuff_fclone_cache缓冲池中分配的，且父SKB描述符还没有被克隆，即子SKB描述符还是空的。否则即从skbuff_head_cache缓冲池中分配一个新的SKB来用于克隆。</p>
+
+<p>451-508 将父SKB描述符各字段值赋给子SKB描述符的对应字段。</p>
+
+<p>504 设置子SKB描述符引用计数users为1。</p>
+
+<p>510 递增父SKB描述符中的数据区引用计数skb_shared_info结构的dataref。</p>
+
+<p>511 设置父SKB描述符的成员cloned为1，表示该SKB已被克隆。</p>
+
+<h4>2．pskb_copy()</h4>
+
+<p>当一个函数不仅要修改SKB描述符，而且还要修改数据缓存区中的数据时，就需要同时复制数据缓存区。在这种情况下，程序员有两个选择。如果所修改的数据在skb->head和skb->end之间，可使用pskb_copy()来复制这部分数据，如图3-20所示。</p>
+
+<p><img src="/images/kernel/2015-04-01-8.jpg" alt="" /></p>
+
+<h4>3．skb_copy()</h4>
+
+<p>如果同时需要修改聚合分散I/O存储区中的数据，就必须使用skb_copy()，如图3-21所示。从前面的章节中看到，skb_shared_info结构中也包含一个SKB链表frag_list。该链表在pskb_copy()和skb_copy()中的处理方式与frags数组处理方式相同。</p>
+
+<p><img src="/images/kernel/2015-04-01-9.jpg" alt="" /></p>
+
+<pre><code>    587 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)  
+    588 {  
+    589     int headerlen = skb-&gt;data - skb-&gt;head;  
+    590     /*  
+    591      *    Allocate the copy buffer  
+    592      */  
+    593     struct sk_buff *n = alloc_skb(skb-&gt;end - skb-&gt;head + skb-&gt;data_len,  
+    594                       gfp_mask);  
+    595     if (!n)  
+    596         return NULL;  
+    597  
+    598     /* Set the data pointer */  
+    599     skb_reserve(n, headerlen);  
+    600     /* Set the tail pointer and length */  
+    601     skb_put(n, skb-&gt;len);  
+    602     n-&gt;csum         = skb-&gt;csum;  
+    603     n-&gt;ip_summed = skb-&gt;ip_summed;  
+    604  
+    605     if (skb_copy_bits(skb, -headerlen, n-&gt;head, headerlen + skb-&gt;len))  
+    606         BUG();  
+    607  
+    608     copy_skb_header(n, skb);  
+    609     return n;  
+    610 }
+</code></pre>
+
+<p>589-599 分配一个新的SKB，即包括SKB描述符和数据缓存区，然后在指针head和data之间预留源数据缓存区headroom长度的空间。</p>
+
+<p>601 将新SKB的tail指针和数据区长度len设置为与源SKB的一样。</p>
+
+<p>605-608 复制数据。</p>
+
+<p>在讨论本书中不同主题时，有时会强调某个特定函数需要克隆或者复制一个SKB。在决定克隆或复制SKB时，各子系统程序员不能预测其他内核组件是否需要使用SKB中的原始数据。内核是模块化的，其状态变化是不可预测的，每个子系统都不知道其他子系统是如何操作数据缓存区的。因此，内核程序员需要记录各子系统对数据缓存区的修改，并且在修改数据缓存区前，复制一个新的数据缓存区，以免其他子系统需使用数据缓存区原始数据时出现错误。</p>
+]]></content>
+  </entry>
+  
+</feed>
