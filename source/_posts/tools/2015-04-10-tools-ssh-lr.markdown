@@ -60,7 +60,7 @@ A就能连上B
 ##### 1 远程机有公网IP
 只要在本地运行
 ```
-	ssh -qTfnN -D 7070 user@sshserver
+	ssh -p port -qTfnN -D 7070 user@sshserver
 ```
 然后在firefox的 首选项->高级->网络->设置 里面改成手动配置代理，只填"SOCKS"这一行即可。
 
@@ -69,8 +69,8 @@ A就能连上B
 ##### 2 若远程机为内网机
 先按前面端口转发的方法，在本机映射一个到远程机的端口localport，然后命令改成
 ```
-	ssh -qTfnN -D localport user@127.0.0.1
+	ssh -p localport -qTfnN -D 7070 user@127.0.0.1
 ```
-这样firefox下要填127.0.0.1和localport
+这样firefox下要填127.0.0.1和7070
 
 
