@@ -4,7 +4,7 @@
   <title><![CDATA[Category: debug | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/debug/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-04-10T16:02:28+08:00</updated>
+  <updated>2015-04-15T15:35:54+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,175 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[拥塞控制模块注意]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong/"/>
+    <updated>2015-04-15T14:24:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong</id>
+    <content type="html"><![CDATA[<h4>应用改变sock的拥塞控制算法</h4>
+
+<pre><code>    #define SOL_TCP 6
+    #define TCP_CONGESTION  13
+
+    strcpy(name, "cubic");
+    setsockopt (connfd, SOL_TCP, TCP_CONGESTION, name, strlen(name));
+</code></pre>
+
+<h5>net/socket.c</h5>
+
+<pre><code>    SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
+            char __user *, optval, int, optlen)
+    {
+        ...
+                err =
+                    sock-&gt;ops-&gt;setsockopt(sock, level, optname, optval,
+                              optlen);
+        ...
+    }
+</code></pre>
+
+<p>对于ipv4的tcp，sock->ops指向 net/ipv4/af_inet.c 中的 inet_stream_ops，所以setsockopt等于sock_common_setsockopt。</p>
+
+<h5>net/core/sock.c</h5>
+
+<pre><code>    int sock_common_setsockopt(struct socket *sock, int level, int optname,
+                   char __user *optval, unsigned int optlen)
+    {
+        struct sock *sk = sock-&gt;sk;
+
+        return sk-&gt;sk_prot-&gt;setsockopt(sk, level, optname, optval, optlen);
+    }
+</code></pre>
+
+<p>sk_prot 指向 net/ipv4/tcp_ipv4.c 中的 tcp_prot，所以setsockopt等于tcp_setsockopt</p>
+
+<h5>net/ipv4/tcp.c</h5>
+
+<pre><code>    int tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
+               unsigned int optlen)
+    {
+        struct inet_connection_sock *icsk = inet_csk(sk);
+
+        if (level != SOL_TCP)
+            return icsk-&gt;icsk_af_ops-&gt;setsockopt(sk, level, optname,
+                                 optval, optlen);
+        return do_tcp_setsockopt(sk, level, optname, optval, optlen);
+    }
+</code></pre>
+
+<p>因为level = SOL_TCP, optname = TCP_CONGESTION, 所以直接到do_tcp_setsockopt的第一个if里。</p>
+
+<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level,
+            int optname, char __user *optval, unsigned int optlen)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct inet_connection_sock *icsk = inet_csk(sk); 
+        int val;      
+        int err = 0;
+
+        /* This is a string value all the others are int's */
+        if (optname == TCP_CONGESTION) {      
+            char name[TCP_CA_NAME_MAX]; 
+
+            if (optlen &lt; 1)
+                return -EINVAL;
+
+            val = strncpy_from_user(name, optval,
+                        min_t(long, TCP_CA_NAME_MAX-1, optlen));
+            if (val &lt; 0)
+                return -EFAULT;
+            name[val] = 0;
+
+            lock_sock(sk);
+            err = tcp_set_congestion_control(sk, name);
+            release_sock(sk);
+            return err;
+        }
+
+    ...
+</code></pre>
+
+<h4>net/ipv4/tcp_cong.c</h4>
+
+<pre><code>    /* Change congestion control for socket */
+    int tcp_set_congestion_control(struct sock *sk, const char *name)
+    {
+        struct inet_connection_sock *icsk = inet_csk(sk);
+        struct tcp_congestion_ops *ca;
+        int err = 0;
+
+        rcu_read_lock();
+        ca = tcp_ca_find(name);
+
+        /* no change asking for existing value */
+        if (ca == icsk-&gt;icsk_ca_ops)
+            goto out;
+
+    #ifdef CONFIG_MODULES
+        /* not found attempt to autoload module */
+        if (!ca &amp;&amp; capable(CAP_NET_ADMIN)) {
+            rcu_read_unlock();
+            request_module("tcp_%s", name);
+            rcu_read_lock();
+            ca = tcp_ca_find(name);
+        }
+    #endif
+        if (!ca)
+            err = -ENOENT;
+
+        else if (!((ca-&gt;flags &amp; TCP_CONG_NON_RESTRICTED) || capable(CAP_NET_ADMIN)))
+            err = -EPERM;
+
+        else if (!try_module_get(ca-&gt;owner))
+            err = -EBUSY;
+
+        else {
+            tcp_cleanup_congestion_control(sk);
+            icsk-&gt;icsk_ca_ops = ca;
+
+            if (sk-&gt;sk_state != TCP_CLOSE &amp;&amp; icsk-&gt;icsk_ca_ops-&gt;init) // 如果sk-&gt;sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化
+                icsk-&gt;icsk_ca_ops-&gt;init(sk);
+        }
+     out:
+        rcu_read_unlock();
+        return err;
+    }
+</code></pre>
+
+<p>可以看到，如果sk->sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化。</p>
+
+<hr />
+
+<h4>那么什么时候sk->sk_state == TCP_CLOSE，并且还能调用setsockopt呢？</h4>
+
+<h5>举一种情况：当收到RST包的时候，tcp_rcv_established()->tcp_validate_incoming()->tcp_reset()->tcp_done()将sk置为TCP_CLOSE。</h5>
+
+<h5>如果拥塞控制模块中init有申请内存，release中释放内存。那么在上述情况下将会出现没有申请而直接释放的情况，导致panic。</h5>
+
+<pre><code>    BUG: unable to handle kernel paging request at ffffeba4000002a0
+
+    [&lt;ffffffff8115b17e&gt;] kfree+0x6e/0x240
+    [&lt;ffffffffa0068055&gt;] cong_release+0x35/0x50 [cong]
+    [&lt;ffffffff81467953&gt;] tcp_cleanup_congestion_control+0x23/0x40
+    [&lt;ffffffff81465bb9&gt;] tcp_v4_destroy_sock+0x29/0x2d0
+    [&lt;ffffffff8144e9e3&gt;] inet_csk_destroy_sock+0x53/0x140
+    [&lt;ffffffff814504c0&gt;] tcp_close+0x340/0x4a0
+    [&lt;ffffffff814748de&gt;] inet_release+0x5e/0x90
+    [&lt;ffffffff813f4359&gt;] sock_release+0x29/0x90
+    [&lt;ffffffff813f43d7&gt;] sock_close+0x17/0x40
+    [&lt;ffffffff81173ed3&gt;] __fput+0xf3/0x220
+    [&lt;ffffffff8117401c&gt;] fput+0x1c/0x30
+    [&lt;ffffffff8116df2d&gt;] filp_close+0x5d/0x90
+    [&lt;ffffffff8117090c&gt;] sys_close+0xac/0x110
+    [&lt;ffffffff8100af72&gt;] system_call_fastpath+0x16/0x1b
+</code></pre>
+
+<h4>测试代码</h4>
+
+<p><a href="/download/debug/congestion_mod_panic.tar.gz">congestion_mod_panic</a></p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[mod_timer会切换cpu]]></title>
@@ -171,53 +340,6 @@ Last time I looked (approx. 1.5 years ago) the main missing pieces were:</p>
 
 <p>HTH,<br/>
 Petr Tesarik</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[静态编译crash + xbt + bt -H]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2014/11/04/debug-crash-static/"/>
-    <updated>2014-11-04T18:23:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2014/11/04/debug-crash-static</id>
-    <content type="html"><![CDATA[<h5>要在centos6上编译，为了能在centos5用，用静态编译</h5>
-
-<h5>有两个显示函数参数的patch，但是不一定能起作用</h5>
-
-<h5>patch1:</h5>
-
-<p><a href="https://github.com/jhammond/xbt">https://github.com/jhammond/xbt</a>
-<a href="https://www.redhat.com/archives/crash-utility/2013-September/msg00010.html">https://www.redhat.com/archives/crash-utility/2013-September/msg00010.html</a></p>
-
-<h5>patch2:</h5>
-
-<p><a href="https://github.com/hziSot/crash-stack-parser">https://github.com/hziSot/crash-stack-parser</a>
-<a href="https://github.com/hziSot/crash-stack-parser/blob/master/crash-parse-stack-7.0.1.patch">https://github.com/hziSot/crash-stack-parser/blob/master/crash-parse-stack-7.0.1.patch</a></p>
-
-<h4>一、依赖包：</h4>
-
-<p>yum install bison zlib zlib-static glibc-static elfutils-devel elfutils-devel-static elfutils-libelf-devel-static ncurses ncurses-static crash-devel</p>
-
-<h4>二、patch1: xbt 显示参数</h4>
-
-<p>patch: <a href="https://github.com/hziSot/crash-stack-parser  ">https://github.com/hziSot/crash-stack-parser  </a>
-make CFLAGS+=&ndash;static LDFLAGS+=&ndash;static</p>
-
-<h4>三、patch2: bt -H 显示参数</h4>
-
-<pre><code>    依赖：有些没有静态包，要自己编译安装：
-    liblzma.a: http://tukaani.org/xz/xz-5.0.7.tar.bz2
-    libbz2.a:  http://www.bzip.org/1.0.6/bzip2-1.0.6.tar.gz
-    下载代码：git clone https://github.com/jhammond/xbt.git xbt.git
-    把xbt.git/xbt_crash.c中函数xbt_func前的static删了
-    把xbt.git/xbt_crash.c中函数xmod_init的register_extension删了
-    把 xbt 命令加到global_data.c        函数x86_64_exception_frame已经在其他库中定义了，所以要换个名字
-    编译xbt代码：make   ==  rm -rf *.so
-    把 xbt.git/xbt_crash.o  xbt.git/xbt_dwarf.o  xbt.git/xbt_dwfl.o  xbt.git/xbt_eval.o  xbt.git/xbt_frame_print.o 加到 Makefile 的 OBJECT_FILES= 中
-    make CFLAGS+=--static LDFLAGS+="--static -lc  -lm -ldl -ldw -lebl -lelf -lbz2 -llzma"
-
-
-    注意:-lelf -lebl要放在-ldw后面。
-</code></pre>
 ]]></content>
   </entry>
   

@@ -4,7 +4,7 @@
   <title><![CDATA[Category: 2015~04 | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/2015~04/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-04-10T16:02:28+08:00</updated>
+  <updated>2015-04-15T15:35:54+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,1292 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[拥塞控制模块注意]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong/"/>
+    <updated>2015-04-15T14:24:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong</id>
+    <content type="html"><![CDATA[<h4>应用改变sock的拥塞控制算法</h4>
+
+<pre><code>    #define SOL_TCP 6
+    #define TCP_CONGESTION  13
+
+    strcpy(name, "cubic");
+    setsockopt (connfd, SOL_TCP, TCP_CONGESTION, name, strlen(name));
+</code></pre>
+
+<h5>net/socket.c</h5>
+
+<pre><code>    SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
+            char __user *, optval, int, optlen)
+    {
+        ...
+                err =
+                    sock-&gt;ops-&gt;setsockopt(sock, level, optname, optval,
+                              optlen);
+        ...
+    }
+</code></pre>
+
+<p>对于ipv4的tcp，sock->ops指向 net/ipv4/af_inet.c 中的 inet_stream_ops，所以setsockopt等于sock_common_setsockopt。</p>
+
+<h5>net/core/sock.c</h5>
+
+<pre><code>    int sock_common_setsockopt(struct socket *sock, int level, int optname,
+                   char __user *optval, unsigned int optlen)
+    {
+        struct sock *sk = sock-&gt;sk;
+
+        return sk-&gt;sk_prot-&gt;setsockopt(sk, level, optname, optval, optlen);
+    }
+</code></pre>
+
+<p>sk_prot 指向 net/ipv4/tcp_ipv4.c 中的 tcp_prot，所以setsockopt等于tcp_setsockopt</p>
+
+<h5>net/ipv4/tcp.c</h5>
+
+<pre><code>    int tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
+               unsigned int optlen)
+    {
+        struct inet_connection_sock *icsk = inet_csk(sk);
+
+        if (level != SOL_TCP)
+            return icsk-&gt;icsk_af_ops-&gt;setsockopt(sk, level, optname,
+                                 optval, optlen);
+        return do_tcp_setsockopt(sk, level, optname, optval, optlen);
+    }
+</code></pre>
+
+<p>因为level = SOL_TCP, optname = TCP_CONGESTION, 所以直接到do_tcp_setsockopt的第一个if里。</p>
+
+<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level,
+            int optname, char __user *optval, unsigned int optlen)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct inet_connection_sock *icsk = inet_csk(sk); 
+        int val;      
+        int err = 0;
+
+        /* This is a string value all the others are int's */
+        if (optname == TCP_CONGESTION) {      
+            char name[TCP_CA_NAME_MAX]; 
+
+            if (optlen &lt; 1)
+                return -EINVAL;
+
+            val = strncpy_from_user(name, optval,
+                        min_t(long, TCP_CA_NAME_MAX-1, optlen));
+            if (val &lt; 0)
+                return -EFAULT;
+            name[val] = 0;
+
+            lock_sock(sk);
+            err = tcp_set_congestion_control(sk, name);
+            release_sock(sk);
+            return err;
+        }
+
+    ...
+</code></pre>
+
+<h4>net/ipv4/tcp_cong.c</h4>
+
+<pre><code>    /* Change congestion control for socket */
+    int tcp_set_congestion_control(struct sock *sk, const char *name)
+    {
+        struct inet_connection_sock *icsk = inet_csk(sk);
+        struct tcp_congestion_ops *ca;
+        int err = 0;
+
+        rcu_read_lock();
+        ca = tcp_ca_find(name);
+
+        /* no change asking for existing value */
+        if (ca == icsk-&gt;icsk_ca_ops)
+            goto out;
+
+    #ifdef CONFIG_MODULES
+        /* not found attempt to autoload module */
+        if (!ca &amp;&amp; capable(CAP_NET_ADMIN)) {
+            rcu_read_unlock();
+            request_module("tcp_%s", name);
+            rcu_read_lock();
+            ca = tcp_ca_find(name);
+        }
+    #endif
+        if (!ca)
+            err = -ENOENT;
+
+        else if (!((ca-&gt;flags &amp; TCP_CONG_NON_RESTRICTED) || capable(CAP_NET_ADMIN)))
+            err = -EPERM;
+
+        else if (!try_module_get(ca-&gt;owner))
+            err = -EBUSY;
+
+        else {
+            tcp_cleanup_congestion_control(sk);
+            icsk-&gt;icsk_ca_ops = ca;
+
+            if (sk-&gt;sk_state != TCP_CLOSE &amp;&amp; icsk-&gt;icsk_ca_ops-&gt;init) // 如果sk-&gt;sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化
+                icsk-&gt;icsk_ca_ops-&gt;init(sk);
+        }
+     out:
+        rcu_read_unlock();
+        return err;
+    }
+</code></pre>
+
+<p>可以看到，如果sk->sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化。</p>
+
+<hr />
+
+<h4>那么什么时候sk->sk_state == TCP_CLOSE，并且还能调用setsockopt呢？</h4>
+
+<h5>举一种情况：当收到RST包的时候，tcp_rcv_established()->tcp_validate_incoming()->tcp_reset()->tcp_done()将sk置为TCP_CLOSE。</h5>
+
+<h5>如果拥塞控制模块中init有申请内存，release中释放内存。那么在上述情况下将会出现没有申请而直接释放的情况，导致panic。</h5>
+
+<pre><code>    BUG: unable to handle kernel paging request at ffffeba4000002a0
+
+    [&lt;ffffffff8115b17e&gt;] kfree+0x6e/0x240
+    [&lt;ffffffffa0068055&gt;] cong_release+0x35/0x50 [cong]
+    [&lt;ffffffff81467953&gt;] tcp_cleanup_congestion_control+0x23/0x40
+    [&lt;ffffffff81465bb9&gt;] tcp_v4_destroy_sock+0x29/0x2d0
+    [&lt;ffffffff8144e9e3&gt;] inet_csk_destroy_sock+0x53/0x140
+    [&lt;ffffffff814504c0&gt;] tcp_close+0x340/0x4a0
+    [&lt;ffffffff814748de&gt;] inet_release+0x5e/0x90
+    [&lt;ffffffff813f4359&gt;] sock_release+0x29/0x90
+    [&lt;ffffffff813f43d7&gt;] sock_close+0x17/0x40
+    [&lt;ffffffff81173ed3&gt;] __fput+0xf3/0x220
+    [&lt;ffffffff8117401c&gt;] fput+0x1c/0x30
+    [&lt;ffffffff8116df2d&gt;] filp_close+0x5d/0x90
+    [&lt;ffffffff8117090c&gt;] sys_close+0xac/0x110
+    [&lt;ffffffff8100af72&gt;] system_call_fastpath+0x16/0x1b
+</code></pre>
+
+<h4>测试代码</h4>
+
+<p><a href="/download/debug/congestion_mod_panic.tar.gz">congestion_mod_panic</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[TCP校验和的原理和实现]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum/"/>
+    <updated>2015-04-15T14:07:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/11770647">http://blog.csdn.net/zhangskd/article/details/11770647</a></p>
+
+<h4>概述</h4>
+
+<p>TCP校验和是一个端到端的校验和，由发送端计算，然后由接收端验证。其目的是为了发现TCP首部和数据在发送端到接收端之间发生的任何改动。如果接收方检测到校验和有差错，则TCP段会被直接丢弃。</p>
+
+<p>TCP校验和覆盖TCP首部和TCP数据，而IP首部中的校验和只覆盖IP的首部，不覆盖IP数据报中的任何数据。</p>
+
+<p>TCP的校验和是必需的，而UDP的校验和是可选的。</p>
+
+<p>TCP和UDP计算校验和时，都要加上一个12字节的伪首部。</p>
+
+<h4>伪首部</h4>
+
+<p><img src="/images/kernel/2015-04-15-1.jpeg" alt="" /></p>
+
+<p>伪首部共有12字节，包含如下信息：源IP地址、目的IP地址、保留字节(置0)、传输层协议号(TCP是6)、TCP报文长度(报头+数据)。</p>
+
+<p>伪首部是为了增加TCP校验和的检错能力：如检查TCP报文是否收错了(目的IP地址)、传输层协议是否选对了(传输层协议号)等。</p>
+
+<h4>定义</h4>
+
+<h5>(1) RFC 793的TCP校验和定义</h5>
+
+<p>The checksum field is the 16 bit one&rsquo;s complement of the one&rsquo;s complement sum of all 16-bit words in the header and text. If a segment contains an odd number of header and text octets to be checksummed, the last octet is padded on the right with zeros to form a 16-bit word for checksum purposes. The pad is not transmitted as part of the segment. While computing the checksum, the checksum field itself is replaced with zeros.</p>
+
+<p>上述的定义说得很明确：<br/>
+首先，把伪首部、TCP报头、TCP数据分为16位的字，如果总长度为奇数个字节，则在最后增添一个位都为0的字节。把TCP报头中的校验和字段置为0（否则就陷入鸡生蛋还是蛋生鸡的问题）。</p>
+
+<p>其次，用反码相加法累加所有的16位字（进位也要累加）。</p>
+
+<p>最后，对计算结果取反，作为TCP的校验和。</p>
+
+<h5>(2) RFC 1071的IP校验和定义</h5>
+
+<p>1.Adjacent octets to be checksummed are paired to form 16-bit integers, and the 1&rsquo;s complement sum of these 16-bit integers is formed.</p>
+
+<p>2.To generate a checksum, the checksum field itself is cleared, the 16-bit 1&rsquo;s complement sum is computed over the octets concerned, and the 1&rsquo;s complement of this sum is placed in the checksum field.</p>
+
+<p>3.To check a checksum, the 1&rsquo;s complement sum is computed over the same set of octets, including the checksum field. If the result is all 1 bits (-0 in 1&rsquo;s complement arithmetic), the check succeeds.</p>
+
+<p>可以看到，TCP校验和、IP校验和的计算方法是基本一致的，除了计算的范围不同。</p>
+
+<h4>实现</h4>
+
+<p>基于2.6.18、x86_64。</p>
+
+<p>csum_tcpudp_nofold()按4字节累加伪首部到sum中。
+<code>
+    static inline unsigned long csum_tcpudp_nofold (unsigned long saddr, unsigned long daddr,  
+                                                    unsigned short len, unsigned short proto,  
+                                                    unsigned int sum)  
+    {  
+        asm("addl %1, %0\n"    /* 累加daddr */  
+            "adcl %2, %0\n"    /* 累加saddr */  
+            "adcl %3, %0\n"    /* 累加len(2字节), proto, 0*/  
+            "adcl $0, %0\n"    /*加上进位 */  
+            : "=r" (sum)  
+            : "g" (daddr), "g" (saddr), "g" ((ntohs(len) &lt;&lt; 16) + proto*256), "0" (sum));  
+        return sum;  
+    }   
+</code></p>
+
+<p>csum_tcpudp_magic()产生最终的校验和。</p>
+
+<p>首先，按4字节累加伪首部到sum中。</p>
+
+<p>其次，累加sum的低16位、sum的高16位，并且对累加的结果取反。</p>
+
+<p>最后，截取sum的高16位，作为校验和。
+```
+    static inline unsigned short int csum_tcpudp_magic(unsigned long saddr, unsigned long daddr,<br/>
+                                                       unsigned short len, unsigned short proto,<br/>
+                                                       unsigned int sum)<br/>
+    {<br/>
+        return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));<br/>
+    }</p>
+
+<pre><code>static inline unsigned int csum_fold(unsigned int sum)  
+{  
+    __asm__(  
+        "addl %1, %0\n"  
+        "adcl 0xffff, %0"  
+        : "=r" (sum)  
+        : "r" (sum &lt;&lt; 16), "0" (sum &amp; 0xffff0000)   
+
+        /* 将sum的低16位，作为寄存器1的高16位，寄存器1的低16位补0。 
+          * 将sum的高16位，作为寄存器0的高16位，寄存器0的低16位补0。 
+          * 这样，addl %1, %0就累加了sum的高16位和低16位。 
+          * 
+         * 还要考虑进位。如果有进位，adcl 0xfff, %0为：0x1 + 0xffff + %0，寄存器0的高16位加1。 
+          * 如果没有进位，adcl 0xffff, %0为：0xffff + %0，对寄存器0的高16位无影响。 
+          */  
+
+    );  
+
+    return (~sum) &gt;&gt; 16; /* 对sum取反，返回它的高16位，作为最终的校验和 */  
+}  
+</code></pre>
+
+<pre><code>
+#### 发送校验
+</code></pre>
+
+<pre><code>#define CHECKSUM_NONE 0 /* 不使用校验和，UDP可选 */  
+#define CHECKSUM_HW 1 /* 由硬件计算报头和首部的校验和 */  
+#define CHECKSUM_UNNECESSARY 2 /* 表示不需要校验，或者已经成功校验了 */  
+#define CHECKSUM_PARTIAL CHECKSUM_HW  
+#define CHECKSUM_COMPLETE CHECKSUM_HW  
+</code></pre>
+
+<pre><code>
+##### @tcp_transmit_skb()
+    icsk-&gt;icsk_af_ops-&gt;send_check(sk, skb-&gt;len, skb); /* 计算校验和 */
+</code></pre>
+
+<pre><code>void tcp_v4_send_check(struct sock *sk, int len, struct sk_buff *skb)  
+{  
+    struct inet_sock *inet = inet_sk(sk);  
+    struct tcphdr *th = skb-&gt;h.th;  
+
+    if (skb-&gt;ip_summed == CHECKSUM_HW) {  
+        /* 只计算伪首部，TCP报头和TCP数据的累加由硬件完成 */  
+        th-&gt;check = ~tcp_v4_check(th, len, inet-&gt;saddr, inet-&gt;daddr, 0);  
+        skb-&gt;csum = offsetof(struct tcphdr, check); /* 校验和值在TCP首部的偏移 */  
+
+    } else {  
+        /* tcp_v4_check累加伪首部，获取最终的校验和。 
+         * csum_partial累加TCP报头。 
+         * 那么skb-&gt;csum应该是TCP数据部分的累加，这是在从用户空间复制时顺便累加的。 
+         */  
+        th-&gt;check = tcp_v4_check(th, len, inet-&gt;saddr, inet-&gt;daddr,  
+                                 csum_partial((char *)th, th-&gt;doff &lt;&lt; 2, skb-&gt;csum));  
+    }  
+}  
+</code></pre>
+
+<p><code>
+</code>
+    unsigned csum_partial(const unsigned char *buff, unsigned len, unsigned sum)<br/>
+    {<br/>
+        return add32_with_carry(do_csum(buff, len), sum);<br/>
+    }</p>
+
+<pre><code>static inline unsigned add32_with_carry(unsigned a, unsigned b)  
+{  
+    asm("addl %2, %0\n\t"  
+             "adcl $0, %0"  
+             : "=r" (a)  
+             : "0" (a), "r" (b));  
+    return a;  
+}   
+</code></pre>
+
+<pre><code>
+do_csum()用于计算一段内存的校验和，这里用于累加TCP报头。
+
+具体计算时用到一些技巧：  
+1.反码累加时，按16位、32位、64位来累加的效果是一样的。  
+2.使用内存对齐，减少内存操作的次数。
+</code></pre>
+
+<pre><code>static __force_inline unsigned do_csum(const unsigned char *buff, unsigned len)  
+{  
+    unsigned odd, count;  
+    unsigned long result = 0;  
+
+    if (unlikely(len == 0))  
+        return result;  
+
+    /* 使起始地址为XXX0，接下来可按2字节对齐 */  
+    odd = 1 &amp; (unsigned long) buff;  
+    if (unlikely(odd)) {  
+        result = *buff &lt;&lt; 8; /* 因为机器是小端的 */  
+        len--;  
+        buff++;  
+    }  
+    count = len &gt;&gt; 1; /* nr of 16-bit words，这里可能余下1字节未算，最后会处理*/  
+
+    if (count) {  
+        /* 使起始地址为XX00，接下来可按4字节对齐 */  
+        if (2 &amp; (unsigned long) buff) {  
+            result += *(unsigned short *)buff;  
+            count--;  
+            len -= 2;  
+            buff += 2;  
+        }  
+        count &gt;&gt;= 1; /* nr of 32-bit words，这里可能余下2字节未算，最后会处理 */  
+
+        if (count) {  
+            unsigned long zero;  
+            unsigned count64;  
+            /* 使起始地址为X000，接下来可按8字节对齐 */  
+            if (4 &amp; (unsigned long)buff) {  
+                result += *(unsigned int *)buff;  
+                count--;  
+                len -= 4;  
+                buff += 4;  
+            }  
+            count &gt;&gt;= 1; /* nr of 64-bit words，这里可能余下4字节未算，最后会处理*/  
+
+            /* main loop using 64byte blocks */  
+            zero = 0;  
+            count64 = count &gt;&gt; 3; /* 64字节的块数，这里可能余下56字节未算，最后会处理 */  
+            while (count64) { /* 反码累加所有的64字节块 */  
+                asm ("addq 0*8(%[src]), %[res]\n\t"    /* b、w、l、q分别对应8、16、32、64位操作 */  
+                          "addq 1*8(%[src]), %[res]\n\t"    /* [src]为指定寄存器的别名，效果应该等同于0、1等 */  
+                          "adcq 2*8(%[src]), %[res]\n\t"  
+                          "adcq 3*8(%[src]), %[res]\n\t"  
+                          "adcq 4*8(%[src]), %[res]\n\t"  
+                          "adcq 5*8(%[src]), %[res]\n\t"  
+                          "adcq 6*8(%[src]), %[res]\n\t"  
+                          "adcq 7*8(%[src]), %[res]\n\t"  
+                          "adcq %[zero], %[res]"  
+                          : [res] "=r" (result)  
+                          : [src] "r" (buff), [zero] "r" (zero), "[res]" (result));  
+                buff += 64;  
+                count64--;  
+            }  
+
+            /* 从这里开始，反序处理之前可能漏算的字节 */  
+
+            /* last upto 7 8byte blocks，前面按8个8字节做计算单位，所以最多可能剩下7个8字节 */  
+            count %= 8;  
+            while (count) {  
+                asm ("addq %1, %0\n\t"  
+                     "adcq %2, %0\n"  
+                     : "=r" (result)  
+                     : "m" (*(unsigned long *)buff), "r" (zero), "0" (result));  
+                --count;  
+                buff += 8;  
+            }  
+
+            /* 带进位累加result的高32位和低32位 */  
+            result = add32_with_carry(result&gt;&gt;32, result&amp;0xffffffff);  
+
+            /* 之前始按8字节对齐，可能有4字节剩下 */  
+            if (len &amp; 4) {  
+                result += *(unsigned int *) buff;  
+                buff += 4;  
+            }  
+        }  
+
+       /* 更早前按4字节对齐，可能有2字节剩下 */  
+        if (len &amp; 2) {  
+            result += *(unsigned short *) buff;  
+            buff += 2;  
+        }  
+    }  
+
+    /* 最早之前按2字节对齐，可能有1字节剩下 */  
+    if (len &amp; 1)  
+        result += *buff;  
+
+    /* 再次带进位累加result的高32位和低32位 */  
+    result = add32_with_carry(result&gt;&gt;32, result &amp; 0xffffffff);   
+
+    /* 这里涉及到一个技巧，用于处理初始地址为奇数的情况 */  
+    if (unlikely(odd)) {  
+        result = from32to16(result); /* 累加到result的低16位 */  
+        /* result为：0 0 a b 
+         * 然后交换a和b，result变为：0 0 b a 
+         */  
+        result = ((result &gt;&gt; 8) &amp; 0xff) | ((result &amp; oxff) &lt;&lt; 8);  
+    }  
+
+    return result; /* 返回result的低32位 */  
+}  
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>static inline unsigned short from32to16(unsigned a)  
+{  
+    unsigned short b = a &gt;&gt; 16;  
+    asm ("addw %w2, %w0\n\t"  
+              "adcw $0, %w0\n"  
+              : "=r" (b)  
+              : "0" (b), "r" (a));  
+    return b;  
+}  
+</code></pre>
+
+<pre><code>
+csum_partial_copy_from_user()用于拷贝用户空间数据到内核空间，同时计算用户数据的校验和，结果保存到skb-&gt;csum中（X86_64）。
+</code></pre>
+
+<pre><code>/** 
+ * csum_partial_copy_from_user - Copy and checksum from user space. 
+ * @src: source address (user space) 
+ * @dst: destination address 
+ * @len: number of bytes to be copied. 
+ * @isum: initial sum that is added into the result (32bit unfolded) 
+ * @errp: set to -EFAULT for an bad source address. 
+ * 
+ * Returns an 32bit unfolded checksum of the buffer. 
+ * src and dst are best aligned to 64bits. 
+ */  
+
+unsigned int csum_partial_copy_from_user(const unsigned char __user *src,  
+                                  unsigned char *dst, int len, unsigned int isum, int *errp)  
+{  
+    might_sleep();  
+    *errp = 0;  
+
+    if (likely(access_ok(VERIFY_READ, src, len))) {  
+
+        /* Why 6, not 7? To handle odd addresses aligned we would need to do considerable 
+         * complications to fix the checksum which is defined as an 16bit accumulator. The fix 
+         * alignment code is primarily for performance compatibility with 32bit and that will handle 
+         * odd addresses slowly too. 
+         * 处理X010、X100、X110的起始地址。不处理X001，因为这会使复杂度大增加。 
+         */  
+        if (unlikely((unsigned long)src &amp; 6)) {  
+            while (((unsigned long)src &amp; 6) &amp;&amp; len &gt;= 2) {  
+                __u16 val16;  
+                *errp = __get_user(val16, (__u16 __user *)src);  
+                if (*errp)  
+                    return isum;  
+                *(__u16 *)dst = val16;  
+                isum = add32_with_carry(isum, val16);  
+                src += 2;  
+                dst += 2;  
+                len -= 2;  
+            }  
+        }  
+
+        /* 计算函数是用纯汇编实现的，应该是因为效率吧 */  
+        isum = csum_parial_copy_generic((__force void *)src, dst, len, isum, errp, NULL);  
+
+        if (likely(*errp == 0))  
+            return isum; /* 成功 */  
+    }  
+
+    *errp = -EFAULT;  
+    memset(dst, 0, len);  
+    return isum;  
+}  
+</code></pre>
+
+<pre><code>
+上述的实现比较复杂，来看下最简单的csum_partial_copy_from_user()实现（um）。
+</code></pre>
+
+<pre><code>unsigned int csum_partial_copy_from_user(const unsigned char *src,  
+                                         unsigned char *dst, int len, int sum,  
+                                         int *err_ptr)  
+{  
+    if (copy_from_user(dst, src, len)) { /* 拷贝用户空间数据到内核空间 */  
+        *err_ptr = -EFAULT; /* bad address */  
+        return (-1);  
+    }  
+
+    return csum_partial(dst, len, sum); /* 计算用户数据的校验和，会存到skb-&gt;csum中 */  
+}  
+</code></pre>
+
+<pre><code>
+#### 接收校验
+
+##### @tcp_v4_rcv
+    /* 检查校验和 */
+    if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY &amp;&amp; tcp_v4_checksum_init(skb))  
+        goto bad_packet;   
+
+
+接收校验的第一部分，主要是计算伪首部。
+</code></pre>
+
+<pre><code>static int tcp_v4_checksum_init(struct sk_buff *skb)  
+{  
+    /* 如果TCP报头、TCP数据的反码累加已经由硬件完成 */  
+    if (skb-&gt;ip_summed == CHECKSUM_HW) {  
+
+        /* 现在只需要再累加上伪首部，取反获取最终的校验和。 
+         * 校验和为0时，表示TCP数据报正确。 
+         */  
+        if (! tcp_v4_check(skb-&gt;h.th, skb-&gt;len, skb-&gt;nh.iph-&gt;saddr, skb-&gt;nh.iph-&gt;daddr, skb-&gt;csum)) {  
+            skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  
+            return 0; /* 校验成功 */  
+
+        } /* 没有else失败退出吗？*/  
+    }  
+
+    /* 对伪首部进行反码累加，主要用于软件方法 */  
+    skb-&gt;csum = csum_tcpudp_nofold(skb-&gt;nh.iph-&gt;saddr, skb-&gt;nh.iph-&gt;daddr, skb-&gt;len, IPPROTO_TCP, 0);  
+
+
+    /* 对于长度小于76字节的小包，接着累加TCP报头和报文，完成校验；否则，以后再完成检验。*/  
+    if (skb-&gt;len &lt;= 76) {  
+        return __skb_checksum_complete(skb);  
+    }  
+}  
+</code></pre>
+
+<pre><code>
+接收校验的第二部分，计算报头和报文。
+</code></pre>
+
+<p>tcp_v4_rcv、tcp_v4_do_rcv()</p>
+
+<pre><code>| --&gt; tcp_checksum_complete()
+
+            | --&gt; __tcp_checksum_complete()
+
+                        | --&gt; __skb_checksum_complete()
+</code></pre>
+
+<p>tcp_rcv_established()</p>
+
+<pre><code>| --&gt; tcp_checksum_complete_user()
+
+            | --&gt; __tcp_checksum_complete_user()
+
+                        | --&gt; __tcp_checksum_complete()
+
+                                    | --&gt; __skb_checksum_complete()
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>unsigned int __skb_checksum_complete(struct sk_buff *skb)  
+{  
+    unsigned int sum;  
+
+    sum = (u16) csum_fold(skb_checksum(skb, 0, skb-&gt;len, skb-&gt;csum));  
+
+    if (likely(!sum)) { /* sum为0表示成功了 */  
+        /* 硬件检测失败，软件检测成功了，说明硬件检测有误 */  
+        if (unlikely(skb-&gt;ip_summed == CHECKSUM_HW))  
+            netdev_rx_csum_fault(skb-&gt;dev);  
+        skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  
+    }  
+    return sum;  
+}  
+</code></pre>
+
+<pre><code>
+计算skb包的校验和时，可以指定相对于skb-&gt;data的偏移量offset。由于skb包可能由分页和分段，所以需要考虑skb-&gt;data + offset是位于此skb段的线性区中、还是此skb的分页中，或者位于其它分段中。这个函数逻辑比较复杂。
+</code></pre>
+
+<pre><code>/* Checksum skb data. */  
+unsigned int skb_checksum(const struct sk_buff *skb, int offset, int len, unsigned int csum)  
+{  
+    int start = skb_headlen(skb); /* 线性区域长度 */  
+    /* copy &gt; 0，说明offset在线性区域中。 
+     * copy &lt; 0，说明offset在此skb的分页数据中，或者在其它分段skb中。 
+     */  
+    int i, copy = start - offset;  
+    int pos = 0; /* 表示校验了多少数据 */  
+
+    /* Checksum header. */  
+    if (copy &gt; 0) { /* 说明offset在本skb的线性区域中 */  
+        if (copy &gt; len)  
+            copy = len; /* 不能超过指定的校验长度 */  
+
+        /* 累加copy长度的线性区校验 */  
+        csum = csum_partial(skb-&gt;data + offset, copy, csum);  
+
+        if ((len -= copy) == 0)  
+            return csum;  
+
+        offset += copy; /* 接下来从这里继续处理 */  
+        pos = copy; /* 已处理数据长 */  
+    }  
+
+    /* 累加本skb分页数据的校验和 */  
+    for (i = 0; i &lt; skb_shinfo(skb)-&gt;nr_frags; i++) {  
+        int end;  
+        BUG_TRAP(start &lt;= offset + len);  
+
+        end = start + skb_shinfo(skb)-&gt;frags[i].size;  
+
+        if ((copy = end - offset) &gt; 0) { /* 如果offset位于本页中，或者线性区中 */  
+            unsigned int csum2;  
+            u8 *vaddr; /* 8位够吗？*/  
+            skb_frag_t *frag = &amp;skb_shinfo(skb)-&gt;frags[i];  
+
+            if (copy &gt; len)  
+                copy = len;  
+
+            vaddr = kmap_skb_frag(frag); /* 把物理页映射到内核空间 */  
+            csum2 = csum_partial(vaddr + frag-&gt;page_offset + offset - start, copy, 0);  
+            kunmap_skb_frag(vaddr); /* 解除映射 */  
+
+            /* 如果pos为奇数，需要对csum2进行处理。 
+             * csum2：a, b, c, d =&gt; b, a, d, c 
+             */  
+            csum = csum_block_add(csum, csum2, pos);  
+
+            if (! (len -= copy))  
+                return csum;  
+
+            offset += copy;  
+            pos += copy;  
+        }  
+        start = end; /* 接下来从这里处理 */  
+    }  
+
+    /* 如果此skb是个大包，还有其它分段 */  
+    if (skb_shinfo(skb)-&gt;frag_list) {  
+        struct sk_buff *list = skb_shinfo(skb)-&gt;frag_list;  
+
+        for (; list; list = list-&gt;next) {  
+            int end;  
+            BUG_TRAP(start &lt;= offset + len);  
+
+            end = start + list-&gt;len;  
+
+            if ((copy = end - offset) &gt; 0) { /* 如果offset位于此skb分段中，或者分页，或者线性区 */  
+                unsigned int csum2;  
+                if (copy &gt; len)  
+                    copy = len;  
+
+                csum2 = skb_checksum(list, offset - start, copy, 0); /* 递归调用 */  
+                csum = csum_block_add(csum, csum2, pos);  
+                if ((len -= copy) == 0)  
+                    return csum;  
+
+                offset += copy;  
+                pos += copy;  
+            }  
+            start = end;  
+        }  
+    }  
+
+    BUG_ON(len);  
+    return csum;  
+}
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux网络编程：原始套接字 SOCK_RAW]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/14/kernel-net-sock-raw/"/>
+    <updated>2015-04-14T21:27:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/14/kernel-net-sock-raw</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-23069658-id-3280895.html">http://blog.chinaunix.net/uid-23069658-id-3280895.html</a></p>
+
+<h4>一、修改iphdr+tcphdr</h4>
+
+<p>对于TCP或UDP的程序开发，焦点在Data字段，我们没法直接对TCP或UDP头部字段进行赤裸裸的修改，当然还有IP头。换句话说，我们对它们头部操作的空间非常受限，只能使用它们已经开放给我们的诸如源、目的IP，源、目的端口等等。</p>
+
+<p>原始套接字的创建方法：
+<code>
+    socket(AF_INET, SOCK_RAW, protocol);
+</code>
+  重点在protocol字段，这里就不能简单的将其值为0了。在头文件netinet/in.h中定义了系统中该字段目前能取的值，注意：有些系统中不一定实现了netinet/in.h中的所有协议。源代码的linux/in.h中和netinet/in.h中的内容一样。我们常见的有IPPROTO_TCP，IPPROTO_UDP和IPPROTO_ICMP。</p>
+
+<p>用这种方式我就可以得到原始的IP包了，然后就可以自定义IP所承载的具体协议类型，如TCP，UDP或ICMP，并手动对每种承载在IP协议之上的报文进行填充。</p>
+
+<p>先简单复习一下TCP报文的格式</p>
+
+<p><img src="/images/kernel/2015-04-14-1.jpg" alt="" /></p>
+
+<p><img src="/images/kernel/2015-04-14-2.jpg" alt="" /></p>
+
+<p>原始套接字还提供了一个非常有用的参数IP_HDRINCL：</p>
+
+<p>1、当开启该参数时：我们可以从IP报文首部第一个字节开始依次构造整个IP报文的所有选项，但是IP报文头部中的标识字段(设置为0时)和IP首部校验和字段总是由内核自己维护的，不需要我们关心。</p>
+
+<p>2、如果不开启该参数：我们所构造的报文是从IP首部之后的第一个字节开始，IP首部由内核自己维护，首部中的协议字段被设置成调用socket()函数时我们所传递给它的第三个参数。</p>
+
+<p> 开启IP_HDRINCL特性的模板代码一般为：
+<code>
+    const int on =1;
+    if (setsockopt (sockfd, IPPROTO_IP, IP_HDRINCL, &amp;on, sizeof(on)) &lt; 0) {
+        printf("setsockopt error!\n");
+    }
+</code></p>
+
+<p>所以，我们还得复习一下IP报文的首部格式：</p>
+
+<p><img src="/images/kernel/2015-04-14-3.jpg" alt="" /></p>
+
+<p>同样，我们重点关注IP首部中的着色部分区段的填充情况。</p>
+
+<pre><code>    #include &lt;stdlib.h&gt;
+    #include &lt;stdio.h&gt;
+    #include &lt;errno.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;netdb.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;netinet/in.h&gt;
+    #include &lt;netinet/ip.h&gt;
+    #include &lt;arpa/inet.h&gt;
+    #include &lt;linux/tcp.h&gt;
+
+    #include &lt;linux/if_ether.h&gt;
+    #include &lt;linux/if_arp.h&gt;
+    #include &lt;linux/sockios.h&gt;
+
+    unsigned csum_tcpudp_nofold(unsigned saddr, unsigned daddr,
+                unsigned len, unsigned proto, unsigned sum)
+    {
+        unsigned long long s = (unsigned)sum;
+        s += (unsigned)saddr;
+        s += (unsigned)daddr;
+        s += (proto + len) &lt;&lt; 8;
+        s += (s &gt;&gt; 32);
+        return (unsigned)s;
+    }
+
+    unsigned short check_sum(unsigned short *addr, int len, unsigned sum)
+    {
+        int nleft = len;
+        unsigned short *w = addr;
+        unsigned short ret = 0;
+        while (nleft &gt; 1) {
+            sum += *w++;
+            nleft -= 2;
+        }
+        if (nleft == 1) {
+            *(unsigned char *)(&amp;ret) = *(unsigned char *)w;
+            sum += ret;
+        }
+
+        sum = (sum&gt;&gt;16) + (sum&amp;0xffff);
+        sum += (sum&gt;&gt;16);
+        ret = ~sum;
+        return ret;
+    }
+
+    //在该函数中构造整个IP报文，最后调用sendto函数将报文发送出去
+    void attack(int skfd, struct sockaddr_in *target, unsigned short srcport)
+    {
+        char buf[256] = {0};
+        struct ip *ip;
+        struct tcphdr *tcp;
+        int ip_len;
+        int op_len = 12;
+
+        //在我们TCP的报文中Data没有字段，所以整个IP报文的长度
+        ip_len = sizeof(struct ip) + sizeof(struct tcphdr) + op_len;
+
+        //开始填充IP首部
+        ip=(struct ip*)buf;
+        ip-&gt;ip_v = IPVERSION;
+        ip-&gt;ip_hl = sizeof(struct ip)&gt;&gt;2;
+        ip-&gt;ip_tos = 0;
+        ip-&gt;ip_len = htons(ip_len);
+        ip-&gt;ip_id = 0;
+        ip-&gt;ip_off = 0;
+        ip-&gt;ip_ttl = MAXTTL;
+        ip-&gt;ip_p = IPPROTO_TCP;
+        ip-&gt;ip_sum = 0;
+        ip-&gt;ip_dst = target-&gt;sin_addr;
+
+        //开始填充TCP首部
+        tcp = (struct tcphdr*)(buf+sizeof(struct ip));
+        tcp-&gt;source = htons(srcport);
+        tcp-&gt;dest = target-&gt;sin_port;
+        srand(time(NULL));
+        tcp-&gt;doff = (sizeof(struct tcphdr) + op_len) &gt;&gt; 2; // tcphdr + option
+        tcp-&gt;syn = 1;
+        tcp-&gt;check = 0;
+        tcp-&gt;window = ntohs(14600);
+
+        int i = ip_len - op_len;
+        // mss = 1460
+        buf[i++] = 0x02;
+        buf[i++] = 0x04;
+        buf[i++] = 0x05;
+        buf[i++] = 0xb4;
+        // sack
+        buf[i++] = 0x01;
+        buf[i++] = 0x01;
+        buf[i++] = 0x04;
+        buf[i++] = 0x02;
+        // wsscale = 7
+        buf[i++] = 0x01;
+        buf[i++] = 0x03;
+        buf[i++] = 0x03;
+        buf[i++] = 0x07;
+
+        int T = 1;
+        while(1) {
+            if (T == 0) break;
+            T--;
+            tcp-&gt;seq = random();
+            //源地址伪造，我们随便任意生成个地址，让服务器一直等待下去
+            //ip-&gt;ip_src.s_addr = random();
+            //自定义源地址192.168.204.136 = 0xc0a8cc88; 反转赋值
+            ip-&gt;ip_src.s_addr = 0x88cca8c0;
+            unsigned sum = csum_tcpudp_nofold(ip-&gt;ip_src.s_addr, ip-&gt;ip_dst.s_addr, sizeof(struct tcphdr)+op_len, IPPROTO_TCP, 0);
+            tcp-&gt;check = check_sum((unsigned short*)tcp, sizeof(struct tcphdr)+op_len, sum);
+    //      ip-&gt;ip_sum = check_sum((unsigned short*)ip, sizeof(struct ip), 0);
+            sendto(skfd, buf, ip_len, 0, (struct sockaddr*)target, sizeof(struct sockaddr_in));
+        }
+    }
+
+    int main(int argc, char** argv)
+    {
+        int skfd;
+        struct sockaddr_in target;
+        struct hostent *host;
+        const int on = 1;
+        unsigned short srcport;
+
+        if (argc != 4) {
+            printf("Usage:%s dstip dstport srcport\n", argv[0]);
+            exit(1);
+        }
+
+        bzero(&amp;target, sizeof(struct sockaddr_in));
+        target.sin_family = AF_INET;
+        target.sin_port = htons(atoi(argv[2]));
+
+        if (inet_aton(argv[1], &amp;target.sin_addr) == 0) {
+            host = gethostbyname(argv[1]);
+            if(host == NULL) {
+                printf("TargetName Error:%s\n", hstrerror(h_errno));
+                exit(1);
+            }
+            target.sin_addr = *(struct in_addr *)(host-&gt;h_addr_list[0]);
+        }
+
+        //将协议字段置为IPPROTO_TCP，来创建一个TCP的原始套接字
+        if (0 &gt; (skfd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP))) {
+            perror("Create Error");
+            exit(1);
+        }
+
+        //用模板代码来开启IP_HDRINCL特性，我们完全自己手动构造IP报文
+        if (0 &gt; setsockopt(skfd, IPPROTO_IP, IP_HDRINCL, &amp;on, sizeof(on))) {
+            perror("IP_HDRINCL failed");
+            exit(1);
+        }
+
+        //因为只有root用户才可以play with raw socket :)
+        setuid(getpid());
+        srcport = atoi(argv[3]);
+        attack(skfd, &amp;target, srcport);
+    }
+</code></pre>
+
+<ul>
+<li>原始套接字上也可以调用connet、bind之类的函数</li>
+</ul>
+
+
+<hr />
+
+<h4>修改mac+iphdr+tcphdr</h4>
+
+<p>blog.chinaunix.net/uid-23069658-id-3283534.html</p>
+
+<p>在Linux系统中要从链路层(MAC)直接收发数帧，比较普遍的做法就是用libpcap和libnet两个动态库来实现。但今天我们就要用原始套接字来实现这个功能。</p>
+
+<p><img src="/images/kernel/2015-04-14-4.jpg" alt="" /></p>
+
+<p>这里的2字节帧类型用来指示该数据帧所承载的上层协议是IP、ARP或其他。</p>
+
+<p>为了实现直接从链路层收发数据帧，我们要用到原始套接字的如下形式：
+<code>
+    socket(PF_PACKET, type, protocol)
+</code>
+1、其中type字段可取SOCK_RAW或SOCK_DGRAM。它们两个都使用一种与设备无关的标准物理层地址结构struct sockaddr_ll{}，但具体操作的报文格式不同：</p>
+
+<p>SOCK_RAW：直接向网络硬件驱动程序发送(或从网络硬件驱动程序接收)没有任何处理的完整数据报文(包括物理帧的帧头)，这就要求我们必须了解对应设备的物理帧帧头结构，才能正确地装载和分析报文。也就是说我们用这种套接字从网卡驱动上收上来的报文包含了MAC头部，如果我们要用这种形式的套接字直接向网卡发送数据帧，那么我们必须自己组装我们MAC头部。这正符合我们的需求。</p>
+
+<p>SOCK_DGRAM：这种类型的套接字对于收到的数据报文的物理帧帧头会被系统自动去掉，然后再将其往协议栈上层传递；同样地，在发送时数据时，系统将会根据sockaddr_ll结构中的目的地址信息为数据报文添加一个合适的MAC帧头。</p>
+
+<p>2、protocol字段，常见的，一般情况下该字段取ETH_P_IP，ETH_P_ARP，ETH_P_RARP或ETH_P_ALL，当然链路层协议很多，肯定不止我们说的这几个，但我们一般只关心这几个就够我们用了。这里简单提一下网络数据收发的一点基础。协议栈在组织数据收发流程时需要处理好两个方面的问题：“从上倒下”，即数据发送的任务；“从下到上”，即数据接收的任务。数据发送相对接收来说要容易些，因为对于数据接收而言，网卡驱动还要明确什么样的数据该接收、什么样的不该接收等问题。protocol字段可选的四个值及其意义如下：</p>
+
+<p>protocol        值        作用<br/>
+ETH_P_IP      0X0800   只接收发往目的MAC是本机的IP类型的数据帧<br/>
+ETH_P_ARP     0X0806   只接收发往目的MAC是本机的ARP类型的数据帧<br/>
+ETH_P_RARP    0X8035   只接受发往目的MAC是本机的RARP类型的数据帧<br/>
+ETH_P_ALL     0X0003   接收发往目的MAC是本机的所有类型(ip,arp,rarp)的数据帧，同时还可以接收从本机发出去的所有数据帧。在混杂模式打开的情况下，还会接收到发往目的MAC为非本地硬件地址的数据帧。</p>
+
+<p>protocol字段可取的所有协议参见/usr/include/linux/if_ether.h头文件里的定义。</p>
+
+<p>最后，格外需要留心一点的就是，发送数据的时候需要自己组织整个以太网数据帧。和地址相关的结构体就不能再用前面的struct sockaddr_in{}了，而是struct sockaddr_ll{}，如下：</p>
+
+<pre><code>    struct sockaddr_ll{
+        unsigned short sll_family; /* 总是 AF_PACKET */
+        unsigned short sll_protocol; /* 物理层的协议 */
+        int sll_ifindex; /* 接口号 */
+        unsigned short sll_hatype; /* 报头类型 */
+        unsigned char sll_pkttype; /* 分组类型 */
+        unsigned char sll_halen; /* 地址长度 */
+        unsigned char sll_addr[8]; /* 物理层地址 */
+    };
+</code></pre>
+
+<p>  sll_protocoll：取值在linux/if_ether.h中，可以指定我们所感兴趣的二层协议；</p>
+
+<p>  sll_ifindex：置为0表示处理所有接口，对于单网卡的机器就不存在“所有”的概念了。如果你有多网卡，该字段的值一般通过ioctl来搞定，模板代码如下，如果我们要获取eth0接口的序号，可以使用如下代码来获取：</p>
+
+<pre><code>    struct  sockaddr_ll  sll;
+    struct ifreq ifr;
+
+    strcpy(ifr.ifr_name, "eth0");
+    ioctl(sockfd, SIOCGIFINDEX, &amp;ifr);
+    sll.sll_ifindex = ifr.ifr_ifindex;
+</code></pre>
+
+<p>  sll_hatype：ARP硬件地址类型，定义在 linux/if_arp.h 中。 取ARPHRD_ETHER时表示为以太网。</p>
+
+<p>  sll_pkttype：包含分组类型。目前，有效的分组类型有：目标地址是本地主机的分组用的 PACKET_HOST，物理层广播分组用的 PACKET_BROADCAST ，发送到一个物理层多路广播地址的分组用的 PACKET_MULTICAST，在混杂(promiscuous)模式下的设备驱动器发向其他主机的分组用的 PACKET_OTHERHOST，源于本地主机的分组被环回到分组套接口用的 PACKET_OUTGOING。这些类型只对接收到的分组有意义。</p>
+
+<p>  sll_addr和sll_halen指示物理层(如以太网，802.3，802.4或802.5等)地址及其长度，严格依赖于具体的硬件设备。类似于获取接口索引sll_ifindex，要获取接口的物理地址，可以采用如下代码：</p>
+
+<pre><code>    struct ifreq ifr;
+
+    strcpy(ifr.ifr_name, "eth0");
+    ioctl(sockfd, SIOCGIFHWADDR, &amp;ifr);
+</code></pre>
+
+<p> 缺省情况下，从任何接口收到的符合指定协议的所有数据报文都会被传送到原始PACKET套接字口，而使用bind系统调用并以一个sochddr_ll结构体对象将PACKET套接字与某个网络接口相绑定，就可使我们的PACKET原始套接字只接收指定接口的数据报文。</p>
+
+<p> 接下来我们简单介绍一下网卡是怎么收报的，如果你对这部分已经很了解可以跳过这部分内容。网卡从线路上收到信号流，网卡的驱动程序会去检查数据帧开始的前6个字节，即目的主机的MAC地址，如果和自己的网卡地址一致它才会接收这个帧，不符合的一般都是直接无视。然后该数据帧会被网络驱动程序分解，IP报文将通过网络协议栈，最后传送到应用程序那里。往上层传递的过程就是一个校验和“剥头”的过程，由协议栈各层去实现。</p>
+
+<p>接下来我们来写个简单的抓包程序，将那些发给本机的IPv4报文全打印出来：</p>
+
+<pre><code>    #include &lt;stdio.h&gt;
+    #include &lt;stdlib.h&gt;
+    #include &lt;errno.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;netinet/in.h&gt;
+    #include &lt;netinet/ip.h&gt;
+    #include &lt;netinet/if_ether.h&gt;
+
+    int main(int argc, char **argv)
+    {
+        int sock, n;
+        char buffer[2048];
+        struct ethhdr *eth;
+        struct iphdr *iph;
+
+        if (0 &gt; (sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP)))) {
+            perror("socket");
+            exit(1);
+        }
+
+        while (1) {
+            printf("=====================================\n");
+            //注意：在这之前我没有调用bind函数，原因是什么呢？
+            n = recvfrom(sock, buffer, 2048, 0, NULL, NULL);
+            printf("%d bytes read\n", n);
+
+            //接收到的数据帧头6字节是目的MAC地址，紧接着6字节是源MAC地址。
+            eth = (struct ethhdr*)buffer;
+            printf("Dest MAC addr:%02x:%02x:%02x:%02x:%02x:%02x\n",eth-&gt;h_dest[0],eth-&gt;h_dest[1],eth-&gt;h_dest[2],eth-&gt;h_dest[3],eth-&gt;h_dest[4],eth-&gt;h_dest[5]);
+            printf("Source MAC addr:%02x:%02x:%02x:%02x:%02x:%02x\n",eth-&gt;h_source[0],eth-&gt;h_source[1],eth-&gt;h_source[2],eth-&gt;h_source[3],eth-&gt;h_source[4],eth-&gt;h_source[5]);
+
+            iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
+            //我们只对IPV4且没有选项字段的IPv4报文感兴趣
+            if(iph-&gt;version == 4 &amp;&amp; iph-&gt;ihl == 5){
+                unsigned char *sd, *dd;
+                sd = (unsigned char*)&amp;iph-&gt;saddr;
+                dd = (unsigned char*)&amp;iph-&gt;daddr;
+                printf("Source Host: %d.%d.%d.%d Dest host: %d.%d.%d.%d\n", sd[0], sd[1], sd[2], sd[3], dd[0], dd[1], dd[2], dd[3]);
+            //  printf("Source host:%s\n", inet_ntoa(iph-&gt;saddr));
+            //  printf("Dest host:%s\n", inet_ntoa(iph-&gt;daddr));
+            }
+        }
+        return 0;
+    }
+</code></pre>
+
+<p>构造mac源地址包，注意目标mac地址要正确，可以本机先抓包看看是什么</p>
+
+<pre><code>    #include &lt;stdlib.h&gt;
+    #include &lt;stdio.h&gt;
+    #include &lt;errno.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;netdb.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;netinet/in.h&gt;
+    #include &lt;netinet/ip.h&gt;
+    #include &lt;arpa/inet.h&gt;
+    #include &lt;linux/tcp.h&gt;
+
+    #include &lt;linux/if_ether.h&gt;
+    #include &lt;linux/if_arp.h&gt;
+    #include &lt;linux/sockios.h&gt;
+
+    unsigned csum_tcpudp_nofold(unsigned saddr, unsigned daddr,
+                unsigned len, unsigned proto, unsigned sum)
+    {
+        unsigned long long s = (unsigned)sum;
+        s += (unsigned)saddr;
+        s += (unsigned)daddr;
+        s += (proto + len) &lt;&lt; 8;
+        s += (s &gt;&gt; 32);
+        return (unsigned)s;
+    }
+
+    unsigned short check_sum(unsigned short *addr, int len, unsigned sum)
+    {
+        int nleft = len;
+        unsigned short *w = addr;
+        unsigned short ret = 0;
+        while (nleft &gt; 1) {
+            sum += *w++;
+            nleft -= 2;
+        }
+        if (nleft == 1) {
+            *(unsigned char *)(&amp;ret) = *(unsigned char *)w;
+            sum += ret;
+        }
+
+        sum = (sum&gt;&gt;16) + (sum&amp;0xffff);
+        sum += (sum&gt;&gt;16);
+        ret = ~sum;
+        return ret;
+    }
+
+    int change(char c)
+    {
+        if (c &gt;= 'a') return c-'a'+10;
+        if (c &gt;= 'A') return c-'A'+10;
+        return c-'0';
+    }
+
+    //在该函数中构造整个IP报文，最后调用sendto函数将报文发送出去
+    void attack(int skfd, struct sockaddr_ll *target, char **argv)
+    {
+        char buf[512]={0};
+        struct ethhdr *eth;
+        struct ip *ip;
+        struct tcphdr *tcp;
+        int pks_len;
+        int i;
+        int op_len = 12;
+        unsigned short dstport;
+        dstport = atoi(argv[3]);
+
+        //在我们TCP的报文中Data没有字段，所以整个IP报文的长度
+        pks_len = sizeof(struct ethhdr) + sizeof(struct ip) + sizeof(struct tcphdr) + op_len;
+        eth = (struct ethhdr *) buf;
+        /*
+        eth-&gt;h_dest[0] = 0x00;
+        eth-&gt;h_dest[1] = 0x50;
+        eth-&gt;h_dest[2] = 0x56;
+        eth-&gt;h_dest[3] = 0xee;
+        eth-&gt;h_dest[4] = 0x14;
+        eth-&gt;h_dest[5] = 0xa6;
+        */
+
+        for (i=0;i&lt;6;i++)
+            eth-&gt;h_dest[i] = change(argv[1][i*3])*16 + change(argv[1][i*3+1]);
+
+        /*
+        eth-&gt;h_source[0] = 0x00;
+        eth-&gt;h_source[1] = 0x0b;
+        eth-&gt;h_source[2] = 0x28;
+        eth-&gt;h_source[3] = 0xd7;
+        eth-&gt;h_source[4] = 0x26;
+        eth-&gt;h_source[5] = 0xa6;
+        */
+        eth-&gt;h_proto = ntohs(ETH_P_IP);
+
+        //开始填充IP首部
+        ip=(struct ip*)(buf + sizeof(struct ethhdr));
+        ip-&gt;ip_v = IPVERSION;
+        ip-&gt;ip_hl = sizeof(struct ip) &gt;&gt; 2;
+        ip-&gt;ip_tos = 0;
+        ip-&gt;ip_len = htons(pks_len - sizeof(struct ethhdr));
+        ip-&gt;ip_id = 0;
+        ip-&gt;ip_off = 0;
+        ip-&gt;ip_ttl = MAXTTL;
+        ip-&gt;ip_p = IPPROTO_TCP;
+        ip-&gt;ip_sum = 0;
+        ip-&gt;ip_dst.s_addr = inet_addr(argv[2]);
+
+        //开始填充TCP首部
+        srand(time(NULL));
+        tcp = (struct tcphdr*)(buf + sizeof(struct ethhdr) + sizeof(struct ip));
+        tcp-&gt;source = random()%50000+10000;
+        tcp-&gt;dest = ntohs(dstport);
+        tcp-&gt;seq = random();
+        tcp-&gt;doff = (sizeof(struct tcphdr) + op_len) &gt;&gt; 2;
+        tcp-&gt;syn = 1;
+        tcp-&gt;check = 0;
+        tcp-&gt;window = ntohs(14600);
+
+        i = pks_len - op_len;
+        // mss = 1460
+        buf[i++] = 0x02;
+        buf[i++] = 0x04;
+        buf[i++] = 0x05;
+        buf[i++] = 0xb4;
+        // sack
+        buf[i++] = 0x01;
+        buf[i++] = 0x01;
+        buf[i++] = 0x04;
+        buf[i++] = 0x02;
+        // wsscale = 7
+        buf[i++] = 0x01;
+        buf[i++] = 0x03;
+        buf[i++] = 0x03;
+        buf[i++] = 0x07;
+
+        int T = 1;
+        while(1) {
+            if (T == 0) break;
+            T--;
+            //源地址伪造，我们随便任意生成个地址，让服务器一直等待下去
+            ip-&gt;ip_src.s_addr = random();
+            //自定义源地址192.168.204.136 =&gt; 0xc0a8cc88
+            //ip-&gt;ip_src.s_addr = 0x8fcca8c0;
+            unsigned sum = csum_tcpudp_nofold(ip-&gt;ip_src.s_addr, ip-&gt;ip_dst.s_addr, sizeof(struct tcphdr)+op_len, IPPROTO_TCP, 0);
+            tcp-&gt;check = check_sum((unsigned short*)tcp, sizeof(struct tcphdr)+op_len, sum);
+            ip-&gt;ip_sum = check_sum((unsigned short*)ip, sizeof(struct ip), 0);
+            sendto(skfd, buf, pks_len, 0, (struct sockaddr*)target, sizeof(struct sockaddr_ll));
+        }
+    }
+
+    int main(int argc, char** argv)
+    {
+        int skfd;
+        struct sockaddr_ll target;
+        struct hostent *host;
+        const int on=1;
+
+        if (argc != 4) {
+            printf("Usage:%s dstmac dstip dstport\n", argv[0]);
+            exit(1);
+        }
+        if (strlen(argv[1]) != 17) {
+            printf("Usage: dstmac must be xx:xx:xx:xx:xx:xx\n");
+            exit(1);
+        }
+
+        //将协议字段置为IPPROTO_TCP，来创建一个TCP的原始套接字
+        if (0 &gt; (skfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP)))) {
+            perror("Create Error");
+            exit(1);
+        }
+
+        // mac
+        bzero(&amp;target, sizeof(struct sockaddr_ll));
+
+        struct ifreq ifr;
+        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
+        ioctl(skfd, SIOCGIFINDEX, &amp;ifr);
+        target.sll_ifindex = ifr.ifr_ifindex;
+        /*
+        target.sll_family = AF_PACKET;
+        target.sll_protocol = ntohs(80);
+        target.sll_hatype = ARPHRD_ETHER;
+        target.sll_pkttype = PACKET_OTHERHOST;
+        target.sll_halen = ETH_ALEN;
+        memset(target.sll_addr,0,8);
+        target.sll_addr[0] = 0x00;
+        target.sll_addr[1] = 0x0C;
+        target.sll_addr[2] = 0x29;
+        target.sll_addr[3] = 0x61;
+        target.sll_addr[4] = 0xB6;
+        target.sll_addr[5] = 0x43;
+        */
+
+
+        /*
+        //http://blog.chinaunix.net/uid-305141-id-2133781.html
+        struct sockaddr_ll sll;
+        struct ifreq ifstruct;
+        memset (&amp;sll, 0, sizeof (sll));
+        sll.sll_family = PF_PACKET;
+        sll.sll_protocol = htons (ETH_P_IP);
+
+        strcpy (ifstruct.ifr_name, "eth0");
+        ioctl (skfd, SIOCGIFINDEX, &amp;ifstruct);
+        sll.sll_ifindex = ifstruct.ifr_ifindex;
+
+        strcpy (ifstruct.ifr_name, "eth0");
+        ioctl (skfd, SIOCGIFHWADDR, &amp;ifstruct);
+        memcpy (sll.sll_addr, ifstruct.ifr_ifru.ifru_hwaddr.sa_data, ETH_ALEN);
+        sll.sll_halen = ETH_ALEN;
+
+        if (bind (skfd, (struct sockaddr *) &amp;sll, sizeof (sll)) == -1) {
+            printf ("bind:   ERROR\n");
+            return -1;
+        }
+
+        memset(&amp;ifstruct, 0, sizeof(ifstruct));
+        strcpy (ifstruct.ifr_name, "eth0");
+        if (ioctl (skfd, SIOCGIFFLAGS, &amp;ifstruct) == -1) {
+            perror ("iotcl()\n");
+            printf ("Fun:%s Line:%d\n", __func__, __LINE__);
+            return -1;
+        }
+
+        ifstruct.ifr_flags |= IFF_PROMISC;
+
+        if(ioctl(skfd, SIOCSIFFLAGS, &amp;ifstruct) == -1) {
+            perror("iotcl()\n");
+            printf ("Fun:%s Line:%d\n", __func__, __LINE__);
+            return -1;
+        } 
+    */
+        //因为只有root用户才可以play with raw socket :)
+        setuid(getpid());
+    //  attack(skfd, &amp;sll, srcport);
+        attack(skfd, &amp;target, argv);
+    }
+</code></pre>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[sk_buff详解]]></title>
@@ -450,368 +1736,6 @@
         goto out;
     }
 </code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux TCP数据包接收处理 tcp_v4_rcv]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-v4rcv/"/>
-    <updated>2015-04-10T15:23:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-v4rcv</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.sina.com.cn/s/blog_52355d840100b6sd.html">http://blog.sina.com.cn/s/blog_52355d840100b6sd.html</a></p>
-
-<h4>tcp_v4_rcv函数</h4>
-
-<pre><code class="">    int tcp_v4_rcv(struct sk_buff *skb)
-    {
-        const struct iphdr *iph;
-        struct tcphdr *th;
-        struct sock *sk;
-        int ret;
-
-        //如果不是发往本地的数据包，则直接丢弃
-        if (skb-&gt;pkt_type != PACKET_HOST)
-            goto discard_it;
-
-        TCP_INC_STATS_BH(TCP_MIB_INSEGS);
-
-        //包长是否大于TCP头的长度
-        if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
-            goto discard_it;
-
-        //取得TCP首部
-        th = tcp_hdr(skb);
-
-        //检查TCP首部的长度和TCP首部中的doff字段是否匹配
-        if (th-&gt;doff &lt; sizeof(struct tcphdr) / 4)
-            goto bad_packet;
-
-        //检查TCP首部到TCP数据之间的偏移是否越界
-        if (!pskb_may_pull(skb, th-&gt;doff * 4))
-            goto discard_it;
-
-        if (!skb_csum_unnecessary(skb) &amp;&amp; tcp_v4_checksum_init(skb))
-            goto bad_packet;
-
-         th = tcp_hdr(skb);
-        iph = ip_hdr(skb);
-        TCP_SKB_CB(skb)-&gt;seq = ntohl(th-&gt;seq);
-
-        //计算end_seq,实际上，end_seq是数据包的结束序列号，实际上是期待TCP确认
-        //包中ACK的数值，在数据传输过程中，确认包ACK的数值等于本次数据包SEQ
-        //号加上本数据包的有效载荷，即skb-&gt;len - th-&gt;doff * 4,但是在处理SYN报文或者
-        //FIN报文的时候，确认包的ACK等于本次处理数据包的SEQ+1,考虑到这种情况，
-        //期待下一个数据包的ACK就变成了TCP_SKB_CB(skb)-&gt;seq + th-&gt;syn + th-&gt;fin +
-        //skb-&gt;len - th-&gt;doff * 4
-
-        // TCP_SKB_CB宏会返回skb-&gt;cb[0],一个类型为tcp_skb_cb的结构指针，这个结
-        //构保存了TCP首部选项和其他的一些状态信息
-
-        TCP_SKB_CB(skb)-&gt;end_seq = (TCP_SKB_CB(skb)-&gt;seq + th-&gt;syn + th-&gt;fin +
-                        skb-&gt;len - th-&gt;doff * 4);
-        TCP_SKB_CB(skb)-&gt;ack_seq = ntohl(th-&gt;ack_seq);
-        TCP_SKB_CB(skb)-&gt;when   = 0;
-        TCP_SKB_CB(skb)-&gt;flags    = iph-&gt;tos;
-        TCP_SKB_CB(skb)-&gt;sacked = 0;
-
-        //根据四元组查找相应连接的sock结构，大体有两个步骤，
-        //首先用__inet_lookup_established函数查找已经处于establish状态的连接，
-        //如果查找不到的话，就调用__inet_lookup_listener函数查找是否存在四元组相
-        //匹配的处于listen状态的sock,这个时候实际上是被动的接收来自其他主机的连接
-        //请求
-
-        //如果查找不到匹配的sock,则直接丢弃数据包
-        sk = __inet_lookup(&amp;tcp_hashinfo, iph-&gt;saddr, th-&gt;source,
-                   iph-&gt;daddr, th-&gt;dest, inet_iif(skb));
-        if (!sk)
-            goto no_tcp_socket;
-
-        //检查sock是否处于半关闭状态
-        process:
-        if (sk-&gt;sk_state == TCP_TIME_WAIT)
-            goto do_time_wait;
-
-        //检查IPSEC规则
-        if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb))
-            goto discard_and_relse;
-        nf_reset(skb);
-
-        //检查BPF规则
-        if (sk_filter(sk, skb))
-            goto discard_and_relse;
-
-        skb-&gt;dev = NULL;
-
-        //这里主要是和release_sock函数实现互斥，release_sock中调用了
-        // spin_lock_bh(&amp;sk-&gt;sk_lock.slock);
-        bh_lock_sock_nested(sk);
-        ret = 0;
-
-        //查看是否有用户态进程对该sock进行了锁定
-        //如果sock_owned_by_user为真，则sock的状态不能进行更改
-        if (!sock_owned_by_user(sk)) {
-
-    #ifdef CONFIG_NET_DMA
-            struct tcp_sock *tp = tcp_sk(sk);
-            if (!tp-&gt;ucopy.dma_chan &amp;&amp; tp-&gt;ucopy.pinned_list)
-                tp-&gt;ucopy.dma_chan = get_softnet_dma();
-            if (tp-&gt;ucopy.dma_chan)
-                ret = tcp_v4_do_rcv(sk, skb);
-            else
-    #endif
-            {
-                //进入预备处理队列
-                if (!tcp_prequeue(sk, skb))
-                    ret = tcp_v4_do_rcv(sk, skb);
-            }
-        } else
-            //如果数据包被用户进程锁定，则数据包进入后备处理队列，并且该进程进入
-            //套接字的后备处理等待队列sk-&gt;lock.wq
-            sk_add_backlog(sk, skb);
-        bh_unlock_sock(sk);
-
-        sock_put(sk);
-        return ret;
-
-    no_tcp_socket:
-        if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
-            goto discard_it;
-
-        if (skb-&gt;len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete(skb)) {
-    bad_packet:
-            TCP_INC_STATS_BH(TCP_MIB_INERRS);
-        } else {
-            tcp_v4_send_reset(NULL, skb);
-        }
-
-    discard_it:
-        kfree_skb(skb);
-        return 0;
-
-    discard_and_relse:
-        sock_put(sk);
-        goto discard_it;
-
-    do_time_wait:
-        if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
-            inet_twsk_put(inet_twsk(sk));
-            goto discard_it;
-        }
-
-        if (skb-&gt;len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete(skb)) {
-            TCP_INC_STATS_BH(TCP_MIB_INERRS);
-            inet_twsk_put(inet_twsk(sk));
-            goto discard_it;
-        }
-        switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
-        case TCP_TW_SYN: {
-            struct sock *sk2 = inet_lookup_listener(&amp;tcp_hashinfo,
-                                iph-&gt;daddr, th-&gt;dest,
-                                inet_iif(skb));
-            if (sk2) {
-                inet_twsk_deschedule(inet_twsk(sk), &amp;tcp_death_row);
-                inet_twsk_put(inet_twsk(sk));
-                sk = sk2;
-                goto process;
-            }
-        }
-        case TCP_TW_ACK:
-            tcp_v4_timewait_ack(sk, skb);
-            break;
-        case TCP_TW_RST:
-            goto no_tcp_socket;
-        case TCP_TW_SUCCESS:;
-        }
-        goto discard_it;
-    }
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[SYN cookies机制下连接的建立]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-syncookie/"/>
-    <updated>2015-04-10T14:34:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-syncookie</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/justlinux2010/article/details/12619761">http://blog.csdn.net/justlinux2010/article/details/12619761</a></p>
-
-<p>  在正常情况下，服务器端接收到客户端发送的SYN包，会分配一个连接请求块（即request_sock结构），用于保存连接请求信息，并且发送SYN+ACK包给客户端，然后将连接请求块添加到半连接队列中。客户端接收到SYN+ACK包后，会发送ACK包对服务器端的包进行确认。服务器端收到客户端的确认后，根据保存的连接信息，构建一个新的连接，放到监听套接字的连接队列中，等待用户层accept连接。这是正常的情况，但是在并发过高或者遭受SYN flood攻击的情况下，半连接队列的槽位数量很快就会耗尽，会导致丢弃新的连接请求，SYN cookies技术可以使服务器在半连接队列已满的情况下仍能处理新的SYN请求。</p>
-
-<p>  如果开启了SYN cookies选项，在半连接队列满时，SYN cookies并不丢弃SYN请求，而是将源目的IP、源目的端口号、接收到的客户端初始序列号以及其他一些安全数值等信息进行hash运算，并加密后得到服务器端的初始序列号，称之为cookie。服务器端在发送初始序列号为cookie的SYN+ACK包后，会将分配的连接请求块释放。如果接收到客户端的ACK包，服务器端将客户端的ACK序列号减1得到的值，与上述要素hash运算得到的值比较，如果相等，直接完成三次握手，构建新的连接。SYN cookies机制的核心就是避免攻击造成的大量构造无用的连接请求块，导致内存耗尽，而无法处理正常的连接请求。</p>
-
-<p>  启用SYN cookies是通过在启动环境中设置以下命令完成：
-<code>
-    echo 1 &gt; /proc/sys/net/ipv4/tcp_syncookies
-</code>
-  注意，即使开启该机制并不意味着所有的连接都是用SYN cookies机制来完成连接的建立，只有在半连接队列已满的情况下才会触发SYN cookies机制。由于SYN cookies机制严重违背TCP协议，不允许使用TCP扩展，可能对某些服务造成严重的性能影响（如SMTP转发），对于防御SYN flood攻击的确有效。对于没有收到攻击的高负载服务器，不要开启此选项，可以通过修改tcp_max_syn_backlog、tcp_synack_retries和tcp_abort_on_overflow系统参数来调节。</p>
-
-<p>下面来看看内核中是怎么通过SYN cookie机制来完成连接的建立。</p>
-
-<p>  客户端的连接请求由
-<code>
-    tcp_v4_do_rcv()
-        tcp_rcv_state_process()
-            icsk-&gt;icsk_af_ops-&gt;conn_request()
-                tcp_v4_conn_request()
-</code>
-函数处理。tcp_v4_conn_request()中有一个局部变量want_cookie，用来标识是否使用SYN cookies机制。want_cookie的初始值为0，如果半连接队列已满，并且开启了tcp_syncookies系统参数，则将其值设置为1，如下所示：</p>
-
-<pre><code>    int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
-    {
-    #ifdef CONFIG_SYN_COOKIES
-        int want_cookie = 0;
-    #else
-    #define want_cookie 0 /* Argh, why doesn't gcc optimize this :( */
-    #endif
-
-    ...... 
-
-        /* TW buckets are converted to open requests without
-         * limitations, they conserve resources and peer is
-         * evidently real one.
-         */
-        if (inet_csk_reqsk_queue_is_full(sk) &amp;&amp; !isn) {
-    #ifdef CONFIG_SYN_COOKIES
-            if (sysctl_tcp_syncookies) {
-                want_cookie = 1;
-            } else
-    #endif
-
-            goto drop;
-        }
-    ......
-
-    drop:
-        return 0;
-    }
-</code></pre>
-
-<p>  如果没有开启SYN cookies机制，在半连接队列满时，会跳转到drop处，返回0。在调用tcp_v4_conn_request()的tcp_rcv_state_process()中会直接释放SKB包。</p>
-
-<p>  我们前面提高过，造成半连接队列满有两种情况（不考虑半连接队列很小的情况），一种是负载过高，正常的连接数过多；另一种是SYN flood攻击。如果是第一种情况，此时是否继续构建连接，则要取决于连接队列的情况及半连接队列的重传情况，如下所示：
-<code>
-    if (sk_acceptq_is_full(sk) &amp;&amp; inet_csk_reqsk_queue_young(sk) &gt; 1)
-        goto drop;
-</code>
-  sk_acceptq_is_full()函数很好理解，根据字面意思就可以看出，该函数是检查连接队列是否已满。inet_csk_reqsk_queue_young()函数返回半连接队列中未重传过SYN+ACK段的连接请求块数量。如果连接队列已满并且半连接队列中的连接请求块中未重传的数量大于1，则会跳转到drop处，丢弃SYN包。如果半连接队列中未重传的请求块数量大于1，则表示未来可能有2个完成的连接，这些新完成的连接要放到连接队列中，但此时连接队列已满。如果在接收到三次握手中最后的ACK后连接队列中没有空闲的位置，会忽略接收到的ACK包，连接建立会推迟，所以此时最好丢掉部分新的连接请求，空出资源以完成正在进行的连接建立过程。还要注意，这个判断并没有考虑半连接队列是否已满的问题。从这里可以看出，即使开启了SYN cookies机制并不意味着一定可以完成连接的建立。</p>
-
-<p>  如果可以继续连接的建立，调用inet_reqsk_alloc()分配连接请求块，如下所示：
-<code>
-    req = inet_reqsk_alloc(&amp;tcp_request_sock_ops);
-    if (!req)
-        goto drop;
-</code>
-  看到这里可能就有人疑惑，既然开启了SYN cookies机制，仍然分配连接请求块，那和正常的连接构建也没有什么区别了。这里之所以要分配连接请求块是用于发送SYN+ACK包给客户端，发送后会释放掉，并不会加入到半连接队列中。</p>
-
-<p>  接下来就是计算cookie的值，由cookie_v4_init_sequence()函数完成，如下所示：
-<code>
-    if (want_cookie) {
-    #ifdef CONFIG_SYN_COOKIES
-        syn_flood_warning(skb);
-        req-&gt;cookie_ts = tmp_opt.tstamp_ok;
-    #endif
-        isn = cookie_v4_init_sequence(sk, skb, &amp;req-&gt;mss);
-    }
-</code>
-  计算得到的cookie值会保存在连接请求块tcp_request_sock结构的snt_isn成员中，接着会调用__tcp_v4_send_synack()函数发送SYN+ACK包，然后释放前面分配的连接请求块，如下所示：
-<code>
-    if (__tcp_v4_send_synack(sk, req, dst) || want_cookie)
-        goto drop_and_free;
-</code>
-  在服务器端发送完SYN+ACK包后，我们看到在服务器端没有保存任何关于这个未完成连接的信息，所以在接收到客户端的ACK包后，只能根据前面发送的SYN+ACK包中的cookie值来决定是否继续构建连接。</p>
-
-<p>  我们接下来看接收到ACK包后的处理情况。ACK包在tcp_v4_do_rcv()函数中调用的tcp_v4_hnd_req()中处理，如下所示：
-```
-    static struct sock <em>tcp_v4_hnd_req(struct sock </em>sk, struct sk_buff *skb)
-    {
-        &hellip;&hellip;</p>
-
-<pre><code>#ifdef CONFIG_SYN_COOKIES
-    if (!th-&gt;rst &amp;&amp; !th-&gt;syn &amp;&amp; th-&gt;ack)
-        sk = cookie_v4_check(sk, skb, &amp;(IPCB(skb)-&gt;opt));
-#endif
-    return sk;
-}
-</code></pre>
-
-<p>```
-  由于在服务器端没有保存未完成连接的信息，所以在半连接队列或ehash散列表中都不会找到对应的sock结构。如果开启了SYN cookies机制，则会检查接收到的数据包是否是ACK包，如果是，在cookie_v4_check()中会调用cookie_check()函数检查ACK包中的cookie值是否有效。如果有效，则会分配request_sock结构，并根据ACK包初始化相应的成员，开始构建描述连接的sock结构。创建过程和正常的连接创建过程一样。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[SSH端口转发 及 SSH代理]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/09/tools-ssh-lr/"/>
-    <updated>2015-04-09T23:06:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/09/tools-ssh-lr</id>
-    <content type="html"><![CDATA[<h4>SSH端口转发</h4>
-
-<p>假设A、B为内网机，C为可登录公网机。那么A连B过程为：</p>
-
-<p>假设 A、B、C 的ssh端口分别为portA、portB、portC。</p>
-
-<h5>1. 远程转发-R, 远程机转发到本地机</h5>
-
-<p>在被连的B上先运行如下命令
-<code>
-    ssh -p portC -f -N -R 9000:localhost:portB userC@hostC-IP
-</code>
-这样到C机上9000端口的连接会被转发到B机的portB上。</p>
-
-<h5>2.本地转发-L, 本地机转发到远程机</h5>
-
-<p>在发起连接的A上运行如下命令
-<code>
-    ssh -p portC -f -N -L 9999:localhost:9000 userC@hostC-IP
-</code>
-这样到A机9999端口的连接会被转发到C机的9000上。而C的9000又会被转发到B的portB上。<br/>
-所以只要在A上运行：
-<code>
-    ssh -p 9999 userB@127.0.0.1
-</code>
-就相当于ssh到了B机的portB上。</p>
-
-<h5>参数</h5>
-
-<pre><code>    f  表示后台用户验证,这个选项很有用,没有shell的不可登陆账号也能使用.
-    N 表示不执行脚本或命令
-    -L 本地转发
-    -R 远程转发
-</code></pre>
-
-<h5>路由器设置省去C机</h5>
-
-<p>在路由器添加转发规则，端口为A机ssh监听端口，ip为A机内网IP。记下路由器公网IP。<br/>
-然后只要在B机上直接连路由器公网IP+转发端口
-<code>
-    ssh -p portA -f -N -R 9999:localhost:portB userA@routeA-IP
-</code></p>
-
-<p>然后在A机上直接
-<code>
-    ssh -p 9999 userB@127.0.0.1
-</code>
-A就能连上B</p>
-
-<h4>SSH代理&ndash;网站限制内网IP？代理一下就好了</h4>
-
-<h5>1 远程机有公网IP</h5>
-
-<p>只要在本地运行
-<code>
-    ssh -qTfnN -D 7070 user@sshserver
-</code>
-然后在firefox的 首选项->高级->网络->设置 里面改成手动配置代理，只填"SOCKS"这一行即可。</p>
-
-<p><img src="/images/tools/2015-04-10.png" alt="" /></p>
-
-<h5>2 若远程机为内网机</h5>
-
-<p>先按前面端口转发的方法，在本机映射一个到远程机的端口localport，然后命令改成
-<code>
-    ssh -qTfnN -D localport user@127.0.0.1
-</code>
-这样firefox下要填127.0.0.1和localport</p>
 ]]></content>
   </entry>
   
