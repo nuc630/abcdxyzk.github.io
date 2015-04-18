@@ -4,7 +4,7 @@
   <title><![CDATA[Category: 2015 | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/2015/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-04-15T15:35:54+08:00</updated>
+  <updated>2015-04-18T23:57:14+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,1728 +14,684 @@
 
   
   <entry>
-    <title type="html"><![CDATA[拥塞控制模块注意]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong/"/>
-    <updated>2015-04-15T14:24:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong</id>
-    <content type="html"><![CDATA[<h4>应用改变sock的拥塞控制算法</h4>
+    <title type="html"><![CDATA[Linux物理内存回收机制]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim2/"/>
+    <updated>2015-04-18T23:33:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim2</id>
+    <content type="html"><![CDATA[<p>blog.tek-life.com/认识linux物理内存回收机制/</p>
 
-<pre><code>    #define SOL_TCP 6
-    #define TCP_CONGESTION  13
+<h4>Introduction</h4>
 
-    strcpy(name, "cubic");
-    setsockopt (connfd, SOL_TCP, TCP_CONGESTION, name, strlen(name));
-</code></pre>
+<p>本文所讲的物理页面回收是指动态的回收：即，空闲的内存不够用的时候，系统采取相应的方法将正在使用的内存释放，补充空闲内存，以满足内存的分配。</p>
 
-<h5>net/socket.c</h5>
+<h3>Text</h3>
 
-<pre><code>    SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
-            char __user *, optval, int, optlen)
-    {
-        ...
-                err =
-                    sock-&gt;ops-&gt;setsockopt(sock, level, optname, optval,
-                              optlen);
-        ...
-    }
-</code></pre>
+<h4>1.All channels for page freeing。首先先简单看一下系统中的内存释放的三种渠道。</h4>
 
-<p>对于ipv4的tcp，sock->ops指向 net/ipv4/af_inet.c 中的 inet_stream_ops，所以setsockopt等于sock_common_setsockopt。</p>
+<p>  1-1>. 在用户进程退出的时候，释放内存。当用户进程退出的时候，会调用do_exit. do_exit最终会调用free_pagetables函数。该函数的作用是：遍历vma，根据vma中的虚拟地址找到实际的物理页，将其释放。在之前讲过，对于用户进程的虚拟地址区间，是以红黑树组织的。</p>
 
-<h5>net/core/sock.c</h5>
+<p>  1-2>. 手动的释放。在驱动中，分配内存使用alloc_pages()，释放内存用free_pages(这一点，类似于c语言中的malloc和free)。必须配对使用。否则会造成内存泄漏。</p>
 
-<pre><code>    int sock_common_setsockopt(struct socket *sock, int level, int optname,
-                   char __user *optval, unsigned int optlen)
-    {
-        struct sock *sk = sock-&gt;sk;
+<p>  1-3>. 按需求调用内存回收例程来释放内存。这个区别于前两种的最大不同：它是动态的，按需的。当内存不够的时候，系统会自动按照一定的方式，将某些正在使用的内存释放掉，放进buddy system中再利用。</p>
 
-        return sk-&gt;sk_prot-&gt;setsockopt(sk, level, optname, optval, optlen);
-    }
-</code></pre>
+<h4>2. Overview for page frame reclaiming。</h4>
 
-<p>sk_prot 指向 net/ipv4/tcp_ipv4.c 中的 tcp_prot，所以setsockopt等于tcp_setsockopt</p>
+<p>  2-1>. 先来看一下内存将会回收哪些页面<br/>
+  用户进程的页面都是通过page fault进行分配的。通过page fault进行分配的页面都是可以进行回收的。 这些页面总体可以划分为两种，分别是文件页(file cache)和匿名页(anonymous cache). 文件页，顾名思义，它是和外部存储设备上的某个文件相对应。匿名页，其内容不来自于外部存储设备，例如用户进程中的堆栈。这两种页面是内存回收的目标页面。</p>
 
-<h5>net/ipv4/tcp.c</h5>
+<p>  2-2>. 内存回收采用的主要算法是近似于LRU的算法。位于LRU链表前面的页是活跃的，位于LRU链表后面的页是不活跃的。为什么说是近似呢？<br/>
+   1. 页面在链表上排序并不是严格依据LRU不断移动的。他们挂上去后是不移动的。除非在进行页面回收的时候，有些页面从后面，可能会插入到前面；<br/>
+   2. Linux在LRU的基础上又引入了一个Referrenced标志。这种带Referenced标志的近似LRU的算法被有些人称之为Second-Chance Algorithm.</p>
 
-<pre><code>    int tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
-               unsigned int optlen)
-    {
-        struct inet_connection_sock *icsk = inet_csk(sk);
+<p>简单看一下Second-Chance Algorithm. 当一个页从一个LRU链表上除去的时候，需要再看一下Referenced标志。如果该标志设置了，就将其置为0，不能将该页移出。</p>
 
-        if (level != SOL_TCP)
-            return icsk-&gt;icsk_af_ops-&gt;setsockopt(sk, level, optname,
-                                 optval, optlen);
-        return do_tcp_setsockopt(sk, level, optname, optval, optlen);
-    }
-</code></pre>
+<p><img src="/images/kernel/2015-04-18-20.png" alt="" /><br/>
+图1</p>
 
-<p>因为level = SOL_TCP, optname = TCP_CONGESTION, 所以直接到do_tcp_setsockopt的第一个if里。</p>
+<p>以图一为例，当某个页面被访问后，Referenced标志被设置。当需要从该list上面回收某些页时，从后向前扫描该list上的页面。对于那些设置为1(Referenced标志被设置)，reset为0，不被移出链表。对于那些设置为0的页面，移出链表。</p>
 
-<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level,
-            int optname, char __user *optval, unsigned int optlen)
-    {
-        struct tcp_sock *tp = tcp_sk(sk);
-        struct inet_connection_sock *icsk = inet_csk(sk); 
-        int val;      
-        int err = 0;
+<p>  2-3>. Linux为了实现该算法，给每个zone都提供了5个LRU链表。这5个LRU链表分为3类，一类是活跃链表(active list)，活跃链表有两个：一个是链接file page cache的LRU list, 另一个是链接anonymous page cache的LRU list. 另一类是非活跃链表(inactive list)，非活跃链表也有两个：一个是链接file page cache 的LRU list, 另一个是链接anonymous page cache的LRU list. 内存回收例程从inactive list链表上获取页进行回收。第三类是unevictable链表，这个链表上挂载的是那些被mlock()或者locked的页面。Mlock(),是一个系统调用，用户程序通过该系统调用锁定某些页阻止系统将其换出。被Locked的页面通常是文件系统防止其他进程touch的页面。被锁定的页面都挂载unevictable链表上。</p>
 
-        /* This is a string value all the others are int's */
-        if (optname == TCP_CONGESTION) {      
-            char name[TCP_CA_NAME_MAX]; 
+<p>  加入到active list链表上的页其page->flags上都要设置PG_active标志。凡是设置了PG_unevictable标志的都要挂载unevictable LRU list上。没有设置PG_active/PG_unevictable标志的都处于inactive状态。处于相关状态的页面通过page->lru 链接到对应的链表上。</p>
 
-            if (optlen &lt; 1)
-                return -EINVAL;
+<p>  当某个页被访问后，提高该页面的活跃度。提高活跃度的方法是:或者对page->flags设置PG_referenced标志，或者对page->flags设置PG_active(同时该物理页面从inactive_list链表上转移到active_list链表上). 有PG_referenced和PG_active标志，可以得到页面的状态，该活跃度由低到高依次为：00->01->10->11</p>
 
-            val = strncpy_from_user(name, optval,
-                        min_t(long, TCP_CA_NAME_MAX-1, optlen));
-            if (val &lt; 0)
-                return -EFAULT;
-            name[val] = 0;
+<p>  2-4>. 对于一个可回收页面，按照LRU的算法，只有处于inactive状态的页并且没有设置PG_referenced标志位的页才能被回收。但实际上Linux在实现的时候并没有严格按照这中算法，PG_referenced位只是用来参考的。从下面的状态转换图中可以看出这一点。状态转换图一共有4种状态。</p>
 
-            lock_sock(sk);
-            err = tcp_set_congestion_control(sk, name);
-            release_sock(sk);
-            return err;
-        }
+<p><img src="/images/kernel/2015-04-18-21.png" alt="" /><br/>
+图2</p>
 
-    ...
-</code></pre>
+<p>当页面通过page fault被分配的时候，file page cache 被加入到非活动链表中(inactive list)， 匿名页(anonymous page cache)被加入到活动链表中(active list)。该状态迁移图所涉及的函数主要有以下几个：shrink_active_list，make_page_accessed，page_check_references。</p>
 
-<h4>net/ipv4/tcp_cong.c</h4>
+<p>1)当inactive链表上的页数不够的时候，会调用shrink_active_list，该函数会将active链表上的页move到inactive链表上。对应于上图标号为1的转移；</p>
 
-<pre><code>    /* Change congestion control for socket */
-    int tcp_set_congestion_control(struct sock *sk, const char *name)
-    {
-        struct inet_connection_sock *icsk = inet_csk(sk);
-        struct tcp_congestion_ops *ca;
-        int err = 0;
+<p>2). make_page_accessed().
+<code>
+    355 /*
+    356  * Mark a page as having seen activity.
+    357  *
+    358  * inactive,unreferenced        -&gt;      inactive,referenced
+    359  * inactive,referenced          -&gt;      active,unreferenced
+    360  * active,unreferenced         -&gt;      active,referenced
+    361  */
+    362 void mark_page_accessed(struct page *page)
+    363 {
+    364         if (!PageActive(page) &amp;&amp; !PageUnevictable(page) &amp;&amp;
+    365                         PageReferenced(page) &amp;&amp; PageLRU(page)) {
+    366                 activate_page(page);
+    367                 ClearPageReferenced(page);
+    368         } else if (!PageReferenced(page)) {
+    369                 SetPageReferenced(page);
+    370         }
+    371 }
+    372 EXPORT_SYMBOL(mark_page_accessed);
+</code>
+当通过read()系统调用或者读已经在cache中的页面时，会提高页面的活跃度。对应于上图标号为2的转移(00->01->10->11)；
+3) shrink_page_list->page_check_references()
+<code>
+    704 static enum page_references page_check_references(struct page *page,
+    705                                                   struct mem_cgroup_zone *mz,
+    706                                                   struct scan_control *sc)
+    707 {
+    708         int referenced_ptes, referenced_page;
+    709         unsigned long vm_flags;
+    710
+    711         referenced_ptes = page_referenced(page, 1, mz-&gt;mem_cgroup, &amp;vm_flags);
+    712         referenced_page = TestClearPageReferenced(page);
+    713
+    714         /* Lumpy reclaim – ignore references */
+    715         if (sc-&gt;reclaim_mode &amp; RECLAIM_MODE_LUMPYRECLAIM)
+    716                 return PAGEREF_RECLAIM;
+    717
+    718         /*
+    719          * Mlock lost the isolation race with us.  Let try_to_unmap()
+    720          * move the page to the unevictable list.
+    721          */
+    722         if (vm_flags &amp; VM_LOCKED)
+    723                 return PAGEREF_RECLAIM;
+    724
+    725         if (referenced_ptes) {
+    726                 if (PageAnon(page))
+    727                         return PAGEREF_ACTIVATE;
+    728                 /*
+    729                  * All mapped pages start out with page table
+    730                  * references from the instantiating fault, so we need
+    731                  * to look twice if a mapped file page is used more
+    732                  * than once.
+    733                  *
+    734                  * Mark it and spare it for another trip around the
+    735                  * inactive list.  Another page table reference will
+    736                  * lead to its activation.
+    737                  *
+    738                  * Note: the mark is set for activated pages as well
+    739                  * so that recently deactivated but used pages are
+    740                  * quickly recovered.
+    741                  */
+    742                 SetPageReferenced(page);
+    743
+    744                 if (referenced_page || referenced_ptes &gt; 1)
+    745                         return PAGEREF_ACTIVATE;
+    746
+    747                 /*
+    748                  * Activate file-backed executable pages after first usage.
+    749                  */
+    750                 if (vm_flags &amp; VM_EXEC)
+    751                         return PAGEREF_ACTIVATE;
+    752
+    753                 return PAGEREF_KEEP;
+    754         }
+    755
+    756         /* Reclaim if clean, defer dirty pages to writeback */
+    757         if (referenced_page &amp;&amp; !PageSwapBacked(page))
+    758                 return PAGEREF_RECLAIM_CLEAN;
+    759
+    760         return PAGEREF_RECLAIM;
+    761 }
+</code></p>
 
-        rcu_read_lock();
-        ca = tcp_ca_find(name);
+<p>该函数被真正的页面回收函数shrink_page_list调用。所处理的对象是处于inactive状态的页面。分以下几种情况：</p>
 
-        /* no change asking for existing value */
-        if (ca == icsk-&gt;icsk_ca_ops)
-            goto out;
+<p>  3-a). 如果是匿名页，并且最近被访问过(PTE_young置位)，对应3-a的转移(Line 726)。即(inactive+PG_referenced)->active，inactive->active. (01->10或者00->10).</p>
 
-    #ifdef CONFIG_MODULES
-        /* not found attempt to autoload module */
-        if (!ca &amp;&amp; capable(CAP_NET_ADMIN)) {
-            rcu_read_unlock();
-            request_module("tcp_%s", name);
-            rcu_read_lock();
-            ca = tcp_ca_find(name);
-        }
-    #endif
-        if (!ca)
-            err = -ENOENT;
+<p>  3-b). 如果是已经映射的文件页,最近被访问过(PTE_young置位)，如果PG_referenced置位或者被两个进程最近访问过(这一点不知道理解的对否)(Line 744~745)，对应于3-b的转移(01->11)。</p>
 
-        else if (!((ca-&gt;flags &amp; TCP_CONG_NON_RESTRICTED) || capable(CAP_NET_ADMIN)))
-            err = -EPERM;
+<p>  3-c). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 并且该page cache中的内容是可执行的(例如，用户进程的代码段)，则inactive->(active+PG_referenced).(00->11, 01->11)</p>
 
-        else if (!try_module_get(ca-&gt;owner))
-            err = -EBUSY;
+<p>  3-d). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 则，设置PG_referenced标志，仍旧保留inactive状态，不进行回收。(00->01,01-01)</p>
 
-        else {
-            tcp_cleanup_congestion_control(sk);
-            icsk-&gt;icsk_ca_ops = ca;
+<p>  3-e). 除了以上情况，均进行回收。即：最近没有被访问过(PTE_YOUNG没有设置)的匿名页和文件页。</p>
 
-            if (sk-&gt;sk_state != TCP_CLOSE &amp;&amp; icsk-&gt;icsk_ca_ops-&gt;init) // 如果sk-&gt;sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化
-                icsk-&gt;icsk_ca_ops-&gt;init(sk);
-        }
-     out:
-        rcu_read_unlock();
-        return err;
-    }
-</code></pre>
+<p>  对于page_check_references()中的返回值，简单介绍一下：<br/>
+   PAGEREF_RECLAIM：进行回收；<br/>
+   PAGEREF_RECLAIM_CLEAN：若该页是干净的(clean)，则进行回收；<br/>
+   PAGEREF_KEEP：仍然保持在inactive LRU list上，不进行回收。<br/>
+   PAGEREF_ACTIVATE：不进行回收，并将该页转移到active LRU list上。</p>
 
-<p>可以看到，如果sk->sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化。</p>
+<p>  2-5>. 由以上的状态转换图，简单了解一下一个可回收的物理页面可能的生命周期。</p>
 
-<hr />
+<p>Free->inactive->[active]&lt;–>inactive->reclaimable->free</p>
 
-<h4>那么什么时候sk->sk_state == TCP_CLOSE，并且还能调用setsockopt呢？</h4>
+<p>  对于一个文件页，其在buddy system中未被分配时，处于free状态。当被分配后，首先挂载在inactive LRU list上。若被进程访问，便会被active。当一段时间没有被访问后，就处于inactive状态，挂载在inactive 链表上等待回收。被回收例程回收后，就进入buddy system中，回归到free状态。</p>
 
-<h5>举一种情况：当收到RST包的时候，tcp_rcv_established()->tcp_validate_incoming()->tcp_reset()->tcp_done()将sk置为TCP_CLOSE。</h5>
+<p>Free->Active&lt;–>[inactive]->reclaimable->free</p>
 
-<h5>如果拥塞控制模块中init有申请内存，release中释放内存。那么在上述情况下将会出现没有申请而直接释放的情况，导致panic。</h5>
+<p>  对于一个匿名页，通过page fault被分配后，挂载在active链表上，然后经过deactive变为inactive然后被回收进buddy system中。</p>
 
-<pre><code>    BUG: unable to handle kernel paging request at ffffeba4000002a0
+<p>  对于匿名页和文件页，刚被分配后所设置的状态，可以得出：系统总是想尽快老化文件页面。在系统的眼中，文件页的换出成本要低于匿名页。</p>
 
-    [&lt;ffffffff8115b17e&gt;] kfree+0x6e/0x240
-    [&lt;ffffffffa0068055&gt;] cong_release+0x35/0x50 [cong]
-    [&lt;ffffffff81467953&gt;] tcp_cleanup_congestion_control+0x23/0x40
-    [&lt;ffffffff81465bb9&gt;] tcp_v4_destroy_sock+0x29/0x2d0
-    [&lt;ffffffff8144e9e3&gt;] inet_csk_destroy_sock+0x53/0x140
-    [&lt;ffffffff814504c0&gt;] tcp_close+0x340/0x4a0
-    [&lt;ffffffff814748de&gt;] inet_release+0x5e/0x90
-    [&lt;ffffffff813f4359&gt;] sock_release+0x29/0x90
-    [&lt;ffffffff813f43d7&gt;] sock_close+0x17/0x40
-    [&lt;ffffffff81173ed3&gt;] __fput+0xf3/0x220
-    [&lt;ffffffff8117401c&gt;] fput+0x1c/0x30
-    [&lt;ffffffff8116df2d&gt;] filp_close+0x5d/0x90
-    [&lt;ffffffff8117090c&gt;] sys_close+0xac/0x110
-    [&lt;ffffffff8100af72&gt;] system_call_fastpath+0x16/0x1b
-</code></pre>
+<h4>3. Synchronization Reclaiming</h4>
 
-<h4>测试代码</h4>
+<p>  当内存分配不足的时候，内存回收例程就会被调用了。相关的代码在<code>__alloc_pages</code>中。</p>
 
-<p><a href="/download/debug/congestion_mod_panic.tar.gz">congestion_mod_panic</a></p>
+<p><img src="/images/kernel/2015-04-18-22.png" alt="" /><br/>
+图3</p>
+
+<p>  若分配失败，就会进入到<code>__alloc_pages_slowpath</code>中。</p>
+
+<p><img src="/images/kernel/2015-04-18-23.png" alt="" /><br/>
+图4</p>
+
+<p>  该函数功能正如其名字所属，属于slow path。首先会唤醒各个node上的kswapd例程。kswapd是一个kernel thread,每一个node都有一个例程。该例程的函数体是kswapd().该例程会在第4节中降到。唤醒kwspad后，尝试重新调用get_page_from_freelist，分配内存。若失败，继续往下，如果需要分配内存的主儿在系统中的地位比较重要的话，会调用<code>__alloc_pages_high_priority()</code>. 该函数不会顾及系统设置的安全警告线(min water mark. 对于1GB左右的内存是min water mark是16MB)，分配内存。如果仍然失败；则会调用<code>__alloc_pages_direct_compat</code>来migrate内存来达到compat的目的。这个内存的compat类似于磁盘的压缩整理，把在物理内存中正在使用的分散内存，给迁移整合，以便腾出大的连续的物理内存，满足某些进程大页面的需求。需要注意的是，压缩内存需要在build kernel的时候enable CONFIG_COMPACTION。若仍然失败，就调用<code>__alloc_pages_direct_reclaim</code>来回收内存了。回收内存后，会继续调用get_page_from_freelist,尝试看是否能否分配成功。如果仍然失败，并且分配内存的时候要求不允许失败，那么就进入OOM中。OOM主要的功能是选择一个占用内存量比较大的用户进程，杀掉以释放内存。释放结束后，跳到<code>__alloc_pages_slowpath</code>函数的开头，重新执行一遍，以满足内存分配。如果，允许内存分配失败，则就不会OOM了。以分配失败返回给调用者。</p>
+
+<p>  <code>__alloc_pages_direct_reclaim</code>函数主要调用try_to_free_pages.</p>
+
+<p><img src="/images/kernel/2015-04-18-24.png" alt="" /><br/>
+图5</p>
+
+<p>  try_to_free_pages()做的事情是，按照自定义的优先级从12开始，递减循环（优先级越小代表级别越高，回收的程度越剧烈）从要分配内存的zone以及其fall-back zone list中回收可用内存释放到buddy system中。它通过调用shrink_zones来达到依次扫描zone以及fall-back zone list的目的。对各个zone进行回收结束后，对slab也进行回收（本文不对slab的回收做分析）。如果至此，已经回收了足够多的内存（32个页），那么就返回。如果没有回收到32个页，则是否需要唤醒pdflush进程，该进程的作用是唤醒块设备的读写进程将脏页写到块设备上。唤醒pdflush的条件是看是否扫描了超过48个页。之后，如果这是的扫描优先级已经小于10了，那么睡眠1/10HZ，即1S.然后递减优先级，进行下一遍的循环。</p>
+
+<p><img src="/images/kernel/2015-04-18-25.png" alt="" /><br/>
+图6</p>
+
+<p><img src="/images/kernel/2015-04-18-26.png" alt="" /><br/>
+图7</p>
+
+<p><img src="/images/kernel/2015-04-18-27.png" alt="" /><br/>
+图8</p>
+
+<p>关于swap cache的作用，请看下图（图9）。</p>
+
+<p><img src="/images/kernel/2015-04-18-28.png" alt="" /><br/>
+图9</p>
+
+<p>  有关对swap cache 作用的描述，最靠谱的分析是来自Understanding Linux Kernel. 摘录如下：<br/>
+Consider a page P that is shared among two processes, A and B. Initially, the Page Table entries of both processes contain a reference to the page frame, and the page has two owners; this case is illustrated in Figure 17-8(a). When the PFRA selects the page for reclaiming, shrink_list( ) inserts the page frame in the swap cache. As illustrated in Figure 17-8(b), now the page frame has three owners, while the page slot in the swap area is referenced only by the swap cache. Next, the PFRA invokes try_to_unmap( ) to remove the references to the page frame from the Page Table of the processes; once this function terminates, the page frame is referenced only by the swap cache, while the page slot is referenced by the two processes and the swap cache, as illustrated in Figure 17-8&copy;. Let’s suppose that, while the page’s contents are being written to disk, process B accesses the pagethat is, it tries to access a memory cell using a linear address inside the page. Then, the page fault handler finds the page frame in the swap cache and puts back its physical address in the Page Table entry of process B, as illustrated in Figure 17-8(d). Conversely, if the swap-out operation terminates without concurrent swap-in operations,the shrink_list( ) function removes the page frame from the swap cache and releases the page frame to the Buddy system, as illustrated in Figure 17-8(e).</p>
+
+<h5>Remark:</h5>
+
+<ol>
+<li> Figure 17-8 请对照图9.</li>
+<li> 上图的函数都是来自于2.6.11内核。本文所参考的内核是3.4.因此引用中的函数可能和本文所述的函数不匹配。</li>
+</ol>
+
+
+<h4>4. Asynchronization reclaiming.</h4>
+
+<h3>References</h3>
+
+<ol>
+<li>Understanding Linux Kernel (3rd).</li>
+<li>Understanding virtual memory manager (2nd).</li>
+<li>Professional Linux Kernel Architecture.</li>
+</ol>
+
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[TCP校验和的原理和实现]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum/"/>
-    <updated>2015-04-15T14:07:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/11770647">http://blog.csdn.net/zhangskd/article/details/11770647</a></p>
+    <title type="html"><![CDATA[Linux 虚拟内存和物理内存的理解]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-vm-rm/"/>
+    <updated>2015-04-18T23:01:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-vm-rm</id>
+    <content type="html"><![CDATA[<p>blog.csdn.net/dlutbrucezhang/article/details/9058583</p>
 
-<h4>概述</h4>
+<h4>虚拟内存</h4>
 
-<p>TCP校验和是一个端到端的校验和，由发送端计算，然后由接收端验证。其目的是为了发现TCP首部和数据在发送端到接收端之间发生的任何改动。如果接收方检测到校验和有差错，则TCP段会被直接丢弃。</p>
+<h5>一</h5>
 
-<p>TCP校验和覆盖TCP首部和TCP数据，而IP首部中的校验和只覆盖IP的首部，不覆盖IP数据报中的任何数据。</p>
+<ol>
+<li>每个进程都有自己独立的4G内存空间，各个进程的内存空间具有类似的结构</li>
+<li>一个新进程建立的时候，将会建立起自己的内存空间，此进程的数据，代码等从磁盘拷贝到自己的进程空间，哪些数据在哪里，都由进程控制表中的task_struct记录，task_struct中记录中一条链表，记录中内存空间的分配情况，哪些地址有数据，哪些地址无数据，哪些可读，哪些可写，都可以通过这个链表记录</li>
+<li>每个进程已经分配的内存空间，都与对应的磁盘空间映射</li>
+</ol>
 
-<p>TCP的校验和是必需的，而UDP的校验和是可选的。</p>
 
-<p>TCP和UDP计算校验和时，都要加上一个12字节的伪首部。</p>
+<p><img src="/images/kernel/2015-04-18-10.png" alt="" /></p>
 
-<h4>伪首部</h4>
+<h5>二</h5>
 
-<p><img src="/images/kernel/2015-04-15-1.jpeg" alt="" /></p>
+<ol>
+<li>每个进程的4G内存空间只是虚拟内存空间，每次访问内存空间的某个地址，都需要把地址翻译为实际物理内存地址</li>
+<li>所有进程共享同一物理内存，每个进程只把自己目前需要的虚拟内存空间映射并存储到物理内存上。</li>
+<li>进程要知道哪些内存地址上的数据在物理内存上，哪些不在，还有在物理内存上的哪里，需要用页表来记录</li>
+<li>页表的每一个表项分两部分，第一部分记录此页是否在物理内存上，第二部分记录物理内存页的地址（如果在的话）</li>
+<li>当进程访问某个虚拟地址，去看页表，如果发现对应的数据不在物理内存中，则缺页异常</li>
+<li>缺页异常的处理过程，就是把进程需要的数据从磁盘上拷贝到物理内存中，如果内存已经满了，没有空地方了，那就找一个页覆盖，当然如果被覆盖的页曾经被修改过，需要将此页写回磁盘</li>
+</ol>
 
-<p>伪首部共有12字节，包含如下信息：源IP地址、目的IP地址、保留字节(置0)、传输层协议号(TCP是6)、TCP报文长度(报头+数据)。</p>
 
-<p>伪首部是为了增加TCP校验和的检错能力：如检查TCP报文是否收错了(目的IP地址)、传输层协议是否选对了(传输层协议号)等。</p>
+<p><img src="/images/kernel/2015-04-18-11.png" alt="" /></p>
 
-<h4>定义</h4>
+<h5>总结</h5>
 
-<h5>(1) RFC 793的TCP校验和定义</h5>
+<p>优点：<br/>
+1.既然每个进程的内存空间都是一致而且固定的，所以链接器在链接可执行文件时，可以设定内存地址，而不用去管这些数据最终实际的内存地址，这是有独立内存空间的好处<br/>
+2.当不同的进程使用同样的代码时，比如库文件中的代码，物理内存中可以只存储一份这样的代码，不同的进程只需要把自己的虚拟内存映射过去就可以了，节省内存<br/>
+3.在程序需要分配连续的内存空间的时候，只需要在虚拟内存空间分配连续空间，而不需要实际物理内存的连续空间，可以利用碎片。</p>
 
-<p>The checksum field is the 16 bit one&rsquo;s complement of the one&rsquo;s complement sum of all 16-bit words in the header and text. If a segment contains an odd number of header and text octets to be checksummed, the last octet is padded on the right with zeros to form a 16-bit word for checksum purposes. The pad is not transmitted as part of the segment. While computing the checksum, the checksum field itself is replaced with zeros.</p>
+<p>另外，事实上，在每个进程创建加载时，内核只是为进程“创建”了虚拟内存的布局，具体就是初始化进程控制表中内存相关的链表，实际上并不立即就把虚拟内存对应位置的程序数据和代码（比如.text .data段）拷贝到物理内存中，只是建立好虚拟内存和磁盘文件之间的映射就好（叫做存储器映射），等到运行到对应的程序时，才会通过缺页异常，来拷贝数据。还有进程运行过程中，要动态分配内存，比如malloc时，也只是分配了虚拟内存，即为这块虚拟内存对应的页表项做相应设置，当进程真正访问到此数据时，才引发缺页异常。</p>
 
-<p>上述的定义说得很明确：<br/>
-首先，把伪首部、TCP报头、TCP数据分为16位的字，如果总长度为奇数个字节，则在最后增添一个位都为0的字节。把TCP报头中的校验和字段置为0（否则就陷入鸡生蛋还是蛋生鸡的问题）。</p>
+<h5>补充理解</h5>
 
-<p>其次，用反码相加法累加所有的16位字（进位也要累加）。</p>
+<p>虚拟存储器涉及三个概念： 虚拟存储空间，磁盘空间，内存空间</p>
 
-<p>最后，对计算结果取反，作为TCP的校验和。</p>
+<p><img src="/images/kernel/2015-04-18-12.png" alt="" /></p>
 
-<h5>(2) RFC 1071的IP校验和定义</h5>
+<p>可以认为虚拟空间都被映射到了磁盘空间中，（事实上也是按需要映射到磁盘空间上，通过mmap），并且由页表记录映射位置，当访问到某个地址的时候，通过页表中的有效位，可以得知此数据是否在内存中，如果不是，则通过缺页异常，将磁盘对应的数据拷贝到内存中，如果没有空闲内存，则选择牺牲页面，替换其他页面。</p>
 
-<p>1.Adjacent octets to be checksummed are paired to form 16-bit integers, and the 1&rsquo;s complement sum of these 16-bit integers is formed.</p>
+<p>mmap是用来建立从虚拟空间到磁盘空间的映射的，可以将一个虚拟空间地址映射到一个磁盘文件上，当不设置这个地址时，则由系统自动设置，函数返回对应的内存地址（虚拟地址），当访问这个地址的时候，就需要把磁盘上的内容拷贝到内存了，然后就可以读或者写，最后通过manmap可以将内存上的数据换回到磁盘，也就是解除虚拟空间和内存空间的映射，这也是一种读写磁盘文件的方法，也是一种进程共享数据的方法 共享内存</p>
 
-<p>2.To generate a checksum, the checksum field itself is cleared, the 16-bit 1&rsquo;s complement sum is computed over the octets concerned, and the 1&rsquo;s complement of this sum is placed in the checksum field.</p>
+<h4>物理内存</h4>
 
-<p>3.To check a checksum, the 1&rsquo;s complement sum is computed over the same set of octets, including the checksum field. If the result is all 1 bits (-0 in 1&rsquo;s complement arithmetic), the check succeeds.</p>
+<p>在内核态申请内存比在用户态申请内存要更为直接，它没有采用用户态那种延迟分配内存技术。内核认为一旦有内核函数申请内存，那么就必须立刻满足该申请内存的请求，并且这个请求一定是正确合理的。相反，对于用户态申请内存的请求，内核总是尽量延后分配物理内存，用户进程总是先获得一个虚拟内存区的使用权，最终通过缺页异常获得一块真正的物理内存。</p>
 
-<p>可以看到，TCP校验和、IP校验和的计算方法是基本一致的，除了计算的范围不同。</p>
+<h5>一、物理内存的内核映射</h5>
 
-<h4>实现</h4>
+<p>IA32架构中内核虚拟地址空间只有1GB大小（从3GB到4GB），因此可以直接将1GB大小的物理内存（即常规内存）映射到内核地址空间，但超出1GB大小的物理内存（即高端内存）就不能映射到内核空间。为此，内核采取了下面的方法使得内核可以使用所有的物理内存。</p>
 
-<p>基于2.6.18、x86_64。</p>
+<p>1). 高端内存不能全部映射到内核空间，也就是说这些物理内存没有对应的线性地址。不过，内核为每个物理页框都分配了对应的页框描述符，所有的页框描述符都保存在mem_map数组中，因此每个页框描述符的线性地址都是固定存在的。内核此时可以使用alloc_pages()和alloc_page()来分配高端内存，因为这些函数返回页框描述符的线性地址。</p>
 
-<p>csum_tcpudp_nofold()按4字节累加伪首部到sum中。
-<code>
-    static inline unsigned long csum_tcpudp_nofold (unsigned long saddr, unsigned long daddr,  
-                                                    unsigned short len, unsigned short proto,  
-                                                    unsigned int sum)  
-    {  
-        asm("addl %1, %0\n"    /* 累加daddr */  
-            "adcl %2, %0\n"    /* 累加saddr */  
-            "adcl %3, %0\n"    /* 累加len(2字节), proto, 0*/  
-            "adcl $0, %0\n"    /*加上进位 */  
-            : "=r" (sum)  
-            : "g" (daddr), "g" (saddr), "g" ((ntohs(len) &lt;&lt; 16) + proto*256), "0" (sum));  
-        return sum;  
-    }   
-</code></p>
+<p>2). 内核地址空间的后128MB专门用于映射高端内存，否则，没有线性地址的高端内存不能被内核所访问。这些高端内存的内核映射显然是暂时映射的，否则也只能映射128MB的高端内存。当内核需要访问高端内存时就临时在这个区域进行地址映射，使用完毕之后再用来进行其他高端内存的映射。</p>
 
-<p>csum_tcpudp_magic()产生最终的校验和。</p>
+<p>由于要进行高端内存的内核映射，因此直接能够映射的物理内存大小只有896MB，该值保存在high_memory中。内核地址空间的线性地址区间如下图所示：</p>
 
-<p>首先，按4字节累加伪首部到sum中。</p>
-
-<p>其次，累加sum的低16位、sum的高16位，并且对累加的结果取反。</p>
+<p><img src="/images/kernel/2015-04-18-13.png" alt="" /></p>
 
-<p>最后，截取sum的高16位，作为校验和。
-```
-    static inline unsigned short int csum_tcpudp_magic(unsigned long saddr, unsigned long daddr,<br/>
-                                                       unsigned short len, unsigned short proto,<br/>
-                                                       unsigned int sum)<br/>
-    {<br/>
-        return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));<br/>
-    }</p>
-
-<pre><code>static inline unsigned int csum_fold(unsigned int sum)  
-{  
-    __asm__(  
-        "addl %1, %0\n"  
-        "adcl 0xffff, %0"  
-        : "=r" (sum)  
-        : "r" (sum &lt;&lt; 16), "0" (sum &amp; 0xffff0000)   
-
-        /* 将sum的低16位，作为寄存器1的高16位，寄存器1的低16位补0。 
-          * 将sum的高16位，作为寄存器0的高16位，寄存器0的低16位补0。 
-          * 这样，addl %1, %0就累加了sum的高16位和低16位。 
-          * 
-         * 还要考虑进位。如果有进位，adcl 0xfff, %0为：0x1 + 0xffff + %0，寄存器0的高16位加1。 
-          * 如果没有进位，adcl 0xffff, %0为：0xffff + %0，对寄存器0的高16位无影响。 
-          */  
-
-    );  
-
-    return (~sum) &gt;&gt; 16; /* 对sum取反，返回它的高16位，作为最终的校验和 */  
-}  
-</code></pre>
-
-<pre><code>
-#### 发送校验
-</code></pre>
-
-<pre><code>#define CHECKSUM_NONE 0 /* 不使用校验和，UDP可选 */  
-#define CHECKSUM_HW 1 /* 由硬件计算报头和首部的校验和 */  
-#define CHECKSUM_UNNECESSARY 2 /* 表示不需要校验，或者已经成功校验了 */  
-#define CHECKSUM_PARTIAL CHECKSUM_HW  
-#define CHECKSUM_COMPLETE CHECKSUM_HW  
-</code></pre>
-
-<pre><code>
-##### @tcp_transmit_skb()
-    icsk-&gt;icsk_af_ops-&gt;send_check(sk, skb-&gt;len, skb); /* 计算校验和 */
-</code></pre>
-
-<pre><code>void tcp_v4_send_check(struct sock *sk, int len, struct sk_buff *skb)  
-{  
-    struct inet_sock *inet = inet_sk(sk);  
-    struct tcphdr *th = skb-&gt;h.th;  
-
-    if (skb-&gt;ip_summed == CHECKSUM_HW) {  
-        /* 只计算伪首部，TCP报头和TCP数据的累加由硬件完成 */  
-        th-&gt;check = ~tcp_v4_check(th, len, inet-&gt;saddr, inet-&gt;daddr, 0);  
-        skb-&gt;csum = offsetof(struct tcphdr, check); /* 校验和值在TCP首部的偏移 */  
-
-    } else {  
-        /* tcp_v4_check累加伪首部，获取最终的校验和。 
-         * csum_partial累加TCP报头。 
-         * 那么skb-&gt;csum应该是TCP数据部分的累加，这是在从用户空间复制时顺便累加的。 
-         */  
-        th-&gt;check = tcp_v4_check(th, len, inet-&gt;saddr, inet-&gt;daddr,  
-                                 csum_partial((char *)th, th-&gt;doff &lt;&lt; 2, skb-&gt;csum));  
-    }  
-}  
-</code></pre>
-
-<p><code>
-</code>
-    unsigned csum_partial(const unsigned char *buff, unsigned len, unsigned sum)<br/>
-    {<br/>
-        return add32_with_carry(do_csum(buff, len), sum);<br/>
-    }</p>
-
-<pre><code>static inline unsigned add32_with_carry(unsigned a, unsigned b)  
-{  
-    asm("addl %2, %0\n\t"  
-             "adcl $0, %0"  
-             : "=r" (a)  
-             : "0" (a), "r" (b));  
-    return a;  
-}   
-</code></pre>
-
-<pre><code>
-do_csum()用于计算一段内存的校验和，这里用于累加TCP报头。
-
-具体计算时用到一些技巧：  
-1.反码累加时，按16位、32位、64位来累加的效果是一样的。  
-2.使用内存对齐，减少内存操作的次数。
-</code></pre>
-
-<pre><code>static __force_inline unsigned do_csum(const unsigned char *buff, unsigned len)  
-{  
-    unsigned odd, count;  
-    unsigned long result = 0;  
-
-    if (unlikely(len == 0))  
-        return result;  
-
-    /* 使起始地址为XXX0，接下来可按2字节对齐 */  
-    odd = 1 &amp; (unsigned long) buff;  
-    if (unlikely(odd)) {  
-        result = *buff &lt;&lt; 8; /* 因为机器是小端的 */  
-        len--;  
-        buff++;  
-    }  
-    count = len &gt;&gt; 1; /* nr of 16-bit words，这里可能余下1字节未算，最后会处理*/  
-
-    if (count) {  
-        /* 使起始地址为XX00，接下来可按4字节对齐 */  
-        if (2 &amp; (unsigned long) buff) {  
-            result += *(unsigned short *)buff;  
-            count--;  
-            len -= 2;  
-            buff += 2;  
-        }  
-        count &gt;&gt;= 1; /* nr of 32-bit words，这里可能余下2字节未算，最后会处理 */  
-
-        if (count) {  
-            unsigned long zero;  
-            unsigned count64;  
-            /* 使起始地址为X000，接下来可按8字节对齐 */  
-            if (4 &amp; (unsigned long)buff) {  
-                result += *(unsigned int *)buff;  
-                count--;  
-                len -= 4;  
-                buff += 4;  
-            }  
-            count &gt;&gt;= 1; /* nr of 64-bit words，这里可能余下4字节未算，最后会处理*/  
-
-            /* main loop using 64byte blocks */  
-            zero = 0;  
-            count64 = count &gt;&gt; 3; /* 64字节的块数，这里可能余下56字节未算，最后会处理 */  
-            while (count64) { /* 反码累加所有的64字节块 */  
-                asm ("addq 0*8(%[src]), %[res]\n\t"    /* b、w、l、q分别对应8、16、32、64位操作 */  
-                          "addq 1*8(%[src]), %[res]\n\t"    /* [src]为指定寄存器的别名，效果应该等同于0、1等 */  
-                          "adcq 2*8(%[src]), %[res]\n\t"  
-                          "adcq 3*8(%[src]), %[res]\n\t"  
-                          "adcq 4*8(%[src]), %[res]\n\t"  
-                          "adcq 5*8(%[src]), %[res]\n\t"  
-                          "adcq 6*8(%[src]), %[res]\n\t"  
-                          "adcq 7*8(%[src]), %[res]\n\t"  
-                          "adcq %[zero], %[res]"  
-                          : [res] "=r" (result)  
-                          : [src] "r" (buff), [zero] "r" (zero), "[res]" (result));  
-                buff += 64;  
-                count64--;  
-            }  
-
-            /* 从这里开始，反序处理之前可能漏算的字节 */  
-
-            /* last upto 7 8byte blocks，前面按8个8字节做计算单位，所以最多可能剩下7个8字节 */  
-            count %= 8;  
-            while (count) {  
-                asm ("addq %1, %0\n\t"  
-                     "adcq %2, %0\n"  
-                     : "=r" (result)  
-                     : "m" (*(unsigned long *)buff), "r" (zero), "0" (result));  
-                --count;  
-                buff += 8;  
-            }  
-
-            /* 带进位累加result的高32位和低32位 */  
-            result = add32_with_carry(result&gt;&gt;32, result&amp;0xffffffff);  
-
-            /* 之前始按8字节对齐，可能有4字节剩下 */  
-            if (len &amp; 4) {  
-                result += *(unsigned int *) buff;  
-                buff += 4;  
-            }  
-        }  
-
-       /* 更早前按4字节对齐，可能有2字节剩下 */  
-        if (len &amp; 2) {  
-            result += *(unsigned short *) buff;  
-            buff += 2;  
-        }  
-    }  
-
-    /* 最早之前按2字节对齐，可能有1字节剩下 */  
-    if (len &amp; 1)  
-        result += *buff;  
-
-    /* 再次带进位累加result的高32位和低32位 */  
-    result = add32_with_carry(result&gt;&gt;32, result &amp; 0xffffffff);   
-
-    /* 这里涉及到一个技巧，用于处理初始地址为奇数的情况 */  
-    if (unlikely(odd)) {  
-        result = from32to16(result); /* 累加到result的低16位 */  
-        /* result为：0 0 a b 
-         * 然后交换a和b，result变为：0 0 b a 
-         */  
-        result = ((result &gt;&gt; 8) &amp; 0xff) | ((result &amp; oxff) &lt;&lt; 8);  
-    }  
-
-    return result; /* 返回result的低32位 */  
-}  
-</code></pre>
-
-<pre><code></code></pre>
-
-<pre><code>static inline unsigned short from32to16(unsigned a)  
-{  
-    unsigned short b = a &gt;&gt; 16;  
-    asm ("addw %w2, %w0\n\t"  
-              "adcw $0, %w0\n"  
-              : "=r" (b)  
-              : "0" (b), "r" (a));  
-    return b;  
-}  
-</code></pre>
-
-<pre><code>
-csum_partial_copy_from_user()用于拷贝用户空间数据到内核空间，同时计算用户数据的校验和，结果保存到skb-&gt;csum中（X86_64）。
-</code></pre>
-
-<pre><code>/** 
- * csum_partial_copy_from_user - Copy and checksum from user space. 
- * @src: source address (user space) 
- * @dst: destination address 
- * @len: number of bytes to be copied. 
- * @isum: initial sum that is added into the result (32bit unfolded) 
- * @errp: set to -EFAULT for an bad source address. 
- * 
- * Returns an 32bit unfolded checksum of the buffer. 
- * src and dst are best aligned to 64bits. 
- */  
-
-unsigned int csum_partial_copy_from_user(const unsigned char __user *src,  
-                                  unsigned char *dst, int len, unsigned int isum, int *errp)  
-{  
-    might_sleep();  
-    *errp = 0;  
-
-    if (likely(access_ok(VERIFY_READ, src, len))) {  
-
-        /* Why 6, not 7? To handle odd addresses aligned we would need to do considerable 
-         * complications to fix the checksum which is defined as an 16bit accumulator. The fix 
-         * alignment code is primarily for performance compatibility with 32bit and that will handle 
-         * odd addresses slowly too. 
-         * 处理X010、X100、X110的起始地址。不处理X001，因为这会使复杂度大增加。 
-         */  
-        if (unlikely((unsigned long)src &amp; 6)) {  
-            while (((unsigned long)src &amp; 6) &amp;&amp; len &gt;= 2) {  
-                __u16 val16;  
-                *errp = __get_user(val16, (__u16 __user *)src);  
-                if (*errp)  
-                    return isum;  
-                *(__u16 *)dst = val16;  
-                isum = add32_with_carry(isum, val16);  
-                src += 2;  
-                dst += 2;  
-                len -= 2;  
-            }  
-        }  
-
-        /* 计算函数是用纯汇编实现的，应该是因为效率吧 */  
-        isum = csum_parial_copy_generic((__force void *)src, dst, len, isum, errp, NULL);  
-
-        if (likely(*errp == 0))  
-            return isum; /* 成功 */  
-    }  
-
-    *errp = -EFAULT;  
-    memset(dst, 0, len);  
-    return isum;  
-}  
-</code></pre>
-
-<pre><code>
-上述的实现比较复杂，来看下最简单的csum_partial_copy_from_user()实现（um）。
-</code></pre>
-
-<pre><code>unsigned int csum_partial_copy_from_user(const unsigned char *src,  
-                                         unsigned char *dst, int len, int sum,  
-                                         int *err_ptr)  
-{  
-    if (copy_from_user(dst, src, len)) { /* 拷贝用户空间数据到内核空间 */  
-        *err_ptr = -EFAULT; /* bad address */  
-        return (-1);  
-    }  
-
-    return csum_partial(dst, len, sum); /* 计算用户数据的校验和，会存到skb-&gt;csum中 */  
-}  
-</code></pre>
-
-<pre><code>
-#### 接收校验
-
-##### @tcp_v4_rcv
-    /* 检查校验和 */
-    if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY &amp;&amp; tcp_v4_checksum_init(skb))  
-        goto bad_packet;   
-
-
-接收校验的第一部分，主要是计算伪首部。
-</code></pre>
-
-<pre><code>static int tcp_v4_checksum_init(struct sk_buff *skb)  
-{  
-    /* 如果TCP报头、TCP数据的反码累加已经由硬件完成 */  
-    if (skb-&gt;ip_summed == CHECKSUM_HW) {  
-
-        /* 现在只需要再累加上伪首部，取反获取最终的校验和。 
-         * 校验和为0时，表示TCP数据报正确。 
-         */  
-        if (! tcp_v4_check(skb-&gt;h.th, skb-&gt;len, skb-&gt;nh.iph-&gt;saddr, skb-&gt;nh.iph-&gt;daddr, skb-&gt;csum)) {  
-            skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  
-            return 0; /* 校验成功 */  
-
-        } /* 没有else失败退出吗？*/  
-    }  
-
-    /* 对伪首部进行反码累加，主要用于软件方法 */  
-    skb-&gt;csum = csum_tcpudp_nofold(skb-&gt;nh.iph-&gt;saddr, skb-&gt;nh.iph-&gt;daddr, skb-&gt;len, IPPROTO_TCP, 0);  
-
-
-    /* 对于长度小于76字节的小包，接着累加TCP报头和报文，完成校验；否则，以后再完成检验。*/  
-    if (skb-&gt;len &lt;= 76) {  
-        return __skb_checksum_complete(skb);  
-    }  
-}  
-</code></pre>
-
-<pre><code>
-接收校验的第二部分，计算报头和报文。
-</code></pre>
-
-<p>tcp_v4_rcv、tcp_v4_do_rcv()</p>
-
-<pre><code>| --&gt; tcp_checksum_complete()
-
-            | --&gt; __tcp_checksum_complete()
-
-                        | --&gt; __skb_checksum_complete()
-</code></pre>
-
-<p>tcp_rcv_established()</p>
-
-<pre><code>| --&gt; tcp_checksum_complete_user()
-
-            | --&gt; __tcp_checksum_complete_user()
-
-                        | --&gt; __tcp_checksum_complete()
-
-                                    | --&gt; __skb_checksum_complete()
-</code></pre>
-
-<pre><code></code></pre>
-
-<pre><code>unsigned int __skb_checksum_complete(struct sk_buff *skb)  
-{  
-    unsigned int sum;  
-
-    sum = (u16) csum_fold(skb_checksum(skb, 0, skb-&gt;len, skb-&gt;csum));  
-
-    if (likely(!sum)) { /* sum为0表示成功了 */  
-        /* 硬件检测失败，软件检测成功了，说明硬件检测有误 */  
-        if (unlikely(skb-&gt;ip_summed == CHECKSUM_HW))  
-            netdev_rx_csum_fault(skb-&gt;dev);  
-        skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  
-    }  
-    return sum;  
-}  
-</code></pre>
-
-<pre><code>
-计算skb包的校验和时，可以指定相对于skb-&gt;data的偏移量offset。由于skb包可能由分页和分段，所以需要考虑skb-&gt;data + offset是位于此skb段的线性区中、还是此skb的分页中，或者位于其它分段中。这个函数逻辑比较复杂。
-</code></pre>
-
-<pre><code>/* Checksum skb data. */  
-unsigned int skb_checksum(const struct sk_buff *skb, int offset, int len, unsigned int csum)  
-{  
-    int start = skb_headlen(skb); /* 线性区域长度 */  
-    /* copy &gt; 0，说明offset在线性区域中。 
-     * copy &lt; 0，说明offset在此skb的分页数据中，或者在其它分段skb中。 
-     */  
-    int i, copy = start - offset;  
-    int pos = 0; /* 表示校验了多少数据 */  
-
-    /* Checksum header. */  
-    if (copy &gt; 0) { /* 说明offset在本skb的线性区域中 */  
-        if (copy &gt; len)  
-            copy = len; /* 不能超过指定的校验长度 */  
-
-        /* 累加copy长度的线性区校验 */  
-        csum = csum_partial(skb-&gt;data + offset, copy, csum);  
-
-        if ((len -= copy) == 0)  
-            return csum;  
-
-        offset += copy; /* 接下来从这里继续处理 */  
-        pos = copy; /* 已处理数据长 */  
-    }  
-
-    /* 累加本skb分页数据的校验和 */  
-    for (i = 0; i &lt; skb_shinfo(skb)-&gt;nr_frags; i++) {  
-        int end;  
-        BUG_TRAP(start &lt;= offset + len);  
-
-        end = start + skb_shinfo(skb)-&gt;frags[i].size;  
-
-        if ((copy = end - offset) &gt; 0) { /* 如果offset位于本页中，或者线性区中 */  
-            unsigned int csum2;  
-            u8 *vaddr; /* 8位够吗？*/  
-            skb_frag_t *frag = &amp;skb_shinfo(skb)-&gt;frags[i];  
-
-            if (copy &gt; len)  
-                copy = len;  
-
-            vaddr = kmap_skb_frag(frag); /* 把物理页映射到内核空间 */  
-            csum2 = csum_partial(vaddr + frag-&gt;page_offset + offset - start, copy, 0);  
-            kunmap_skb_frag(vaddr); /* 解除映射 */  
-
-            /* 如果pos为奇数，需要对csum2进行处理。 
-             * csum2：a, b, c, d =&gt; b, a, d, c 
-             */  
-            csum = csum_block_add(csum, csum2, pos);  
-
-            if (! (len -= copy))  
-                return csum;  
-
-            offset += copy;  
-            pos += copy;  
-        }  
-        start = end; /* 接下来从这里处理 */  
-    }  
-
-    /* 如果此skb是个大包，还有其它分段 */  
-    if (skb_shinfo(skb)-&gt;frag_list) {  
-        struct sk_buff *list = skb_shinfo(skb)-&gt;frag_list;  
-
-        for (; list; list = list-&gt;next) {  
-            int end;  
-            BUG_TRAP(start &lt;= offset + len);  
-
-            end = start + list-&gt;len;  
-
-            if ((copy = end - offset) &gt; 0) { /* 如果offset位于此skb分段中，或者分页，或者线性区 */  
-                unsigned int csum2;  
-                if (copy &gt; len)  
-                    copy = len;  
-
-                csum2 = skb_checksum(list, offset - start, copy, 0); /* 递归调用 */  
-                csum = csum_block_add(csum, csum2, pos);  
-                if ((len -= copy) == 0)  
-                    return csum;  
-
-                offset += copy;  
-                pos += copy;  
-            }  
-            start = end;  
-        }  
-    }  
-
-    BUG_ON(len);  
-    return csum;  
-}
-</code></pre>
-
-<p>```</p>
+<p>从图中可以看出，内核采用了三种机制将高端内存映射到内核空间：永久内核映射，固定映射和vmalloc机制。</p>
+
+<h5>二、物理内存管理机制</h5>
+
+<p>基于物理内存在内核空间中的映射原理，物理内存的管理方式也有所不同。内核中物理内存的管理机制主要有伙伴算法，slab高速缓存和vmalloc机制。其中伙伴算法和slab高速缓存都在物理内存映射区分配物理内存，而vmalloc机制则在高端内存映射区分配物理内存。</p>
+
+<p>伙伴算法<br/>
+伙伴算法负责大块连续物理内存的分配和释放，以页框为基本单位。该机制可以避免外部碎片。</p>
+
+<p>per-CPU页框高速缓存<br/>
+内核经常请求和释放单个页框，该缓存包含预先分配的页框，用于满足本地CPU发出的单一页框请求。</p>
+
+<p>slab缓存<br/>
+slab缓存负责小块物理内存的分配，并且它也作为高速缓存，主要针对内核中经常分配并释放的对象。</p>
+
+<p>vmalloc机制<br/>
+vmalloc机制使得内核通过连续的线性地址来访问非连续的物理页框，这样可以最大限度的使用高端物理内存。</p>
+
+<h5>三、物理内存的分配</h5>
+
+<p>内核发出内存申请的请求时，根据内核函数调用接口将启用不同的内存分配器。</p>
+
+<h6>3.1 分区页框分配器</h6>
+
+<p>分区页框分配器 (zoned page frame allocator) ,处理对连续页框的内存分配请求。分区页框管理器分为两大部分:前端的管理区分配器和伙伴系统，如下图：</p>
+
+<p><img src="/images/kernel/2015-04-18-14.png" alt="" /></p>
+
+<p>管理区分配器负责搜索一个能满足请求页框块大小的管理区。在每个管理区中,具体的页框分配工作由伙伴系统负责。为了达到更好的系统性能,单个页框的申请工作直接通过per-CPU页框高速缓存完成。</p>
+
+<p>该分配器通过几个函数和宏来请求页框,它们之间的封装关系如下图所示。</p>
+
+<p><img src="/images/kernel/2015-04-18-15.png" alt="" /></p>
+
+<p>这些函数和宏将核心的分配函数<code>__alloc_pages_nodemask()</code>封装,形成满足不同分配需求的分配函数。其中，alloc_pages()系列函数返回物理内存首页框描述符，<code>__get_free_pages()</code>系列函数返回内存的线性地址。</p>
+
+<h6>3.2 slab分配器</h6>
+
+<p>slab 分配器最初是为了解决物理内存的内部碎片而提出的，它将内核中常用的数据结构看做对象。slab分配器为每一种对象建立高速缓存。内核对该对象的分配和释放均是在这块高速缓存中操作。一种对象的slab分配器结构图如下：</p>
+
+<p><img src="/images/kernel/2015-04-18-16.png" alt="" /></p>
+
+<p>可以看到每种对象的高速缓存是由若干个slab组成，每个slab是由若干个页框组成的。虽然slab分配器可以分配比单个页框更小的内存块，但它所需的所有内存都是通过伙伴算法分配的。</p>
+
+<p>slab高速缓存分专用缓存和通用缓存。专用缓存是对特定的对象，比如为内存描述符创建高速缓存。通用缓存则是针对一般情况，适合分配任意大小的物理内存，其接口即为kmalloc()。</p>
+
+<h6>3.3 非连续内存区内存的分配</h6>
+
+<p>  内核通过vmalloc()来申请非连续的物理内存，若申请成功，该函数返回连续内存区的起始地址，否则，返回NULL。vmalloc()和kmalloc()申请的内存有所不同，kmalloc()所申请内存的线性地址与物理地址都是连续的，而vmalloc()所申请的内存线性地址连续而物理地址则是离散的，两个地址之间通过内核页表进行映射。
+vmalloc()的工作方式理解起来很简单：<br/>
+1). 寻找一个新的连续线性地址空间；<br/>
+2). 依次分配一组非连续的页框；<br/>
+3). 为线性地址空间和非连续页框建立映射关系，即修改内核页表；</p>
+
+<p>  vmalloc()的内存分配原理与用户态的内存分配相似，都是通过连续的虚拟内存来访问离散的物理内存，并且虚拟地址和物理地址之间是通过页表进行连接的，通过这种方式可以有效的使用物理内存。但是应该注意的是，vmalloc()申请物理内存时是立即分配的，因为内核认为这种内存分配请求是正当而且紧急的；相反，用户态有内存请求时，内核总是尽可能的延后，毕竟用户态跟内核态不在一个特权级。</p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[Linux网络编程：原始套接字 SOCK_RAW]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/14/kernel-net-sock-raw/"/>
-    <updated>2015-04-14T21:27:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/14/kernel-net-sock-raw</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-23069658-id-3280895.html">http://blog.chinaunix.net/uid-23069658-id-3280895.html</a></p>
+    <title type="html"><![CDATA[Linux内存管理--内存回收]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim/"/>
+    <updated>2015-04-18T23:01:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim</id>
+    <content type="html"><![CDATA[<p>os.51cto.com/art/201310/412758_all.htm</p>
 
-<h4>一、修改iphdr+tcphdr</h4>
+<p>  内存的回收在Linux内存管理中占据非常重要的地位，系统的内存毕竟是有限的，跑的进程成百上千，系统内存越来越小，我们必须选择一些内存进行回收，以满足别的任务的需求。在内存回收过程中，有哪些内存可以回收，什么时候进行回收，回收内存时如何尽可能的减少对系统性能的影响，回收内存的策略，这些是我们着重要关注的问题，也是本文主要阐述的重点。</p>
 
-<p>对于TCP或UDP的程序开发，焦点在Data字段，我们没法直接对TCP或UDP头部字段进行赤裸裸的修改，当然还有IP头。换句话说，我们对它们头部操作的空间非常受限，只能使用它们已经开放给我们的诸如源、目的IP，源、目的端口等等。</p>
+<h4>1.1 内存回收的目标</h4>
 
-<p>原始套接字的创建方法：
-<code>
-    socket(AF_INET, SOCK_RAW, protocol);
-</code>
-  重点在protocol字段，这里就不能简单的将其值为0了。在头文件netinet/in.h中定义了系统中该字段目前能取的值，注意：有些系统中不一定实现了netinet/in.h中的所有协议。源代码的linux/in.h中和netinet/in.h中的内容一样。我们常见的有IPPROTO_TCP，IPPROTO_UDP和IPPROTO_ICMP。</p>
+<p>不是所有的物理内存都可以参与回收的，比如要是把内核代码段的内存给回收了，系统就无法正常运行了，一般内核代码段，数据段，内核kmalloc()出来的内存，内核线程占用的内存等都是不可以回收的，除此之外的内存都是我们要回收的目标。</p>
 
-<p>用这种方式我就可以得到原始的IP包了，然后就可以自定义IP所承载的具体协议类型，如TCP，UDP或ICMP，并手动对每种承载在IP协议之上的报文进行填充。</p>
+<p>回收的内存主要是由用户态进程占用的内存和内核自己在运行时所使用的一些内存组成。用户态进程占用的内存主要是我们常见的进程代码段，数据段，堆栈等，内核运行使用的内存主要是磁盘高速缓存(如索引节点，目录项高速缓存），页面高速缓存(访问文件时系统生成的页面cache)，mmap()文件时所用的有名映射所使用的物理内存。后面的这些内才能虽然也是内核管理使用的内存，但对其进行回收的时候，顶多影响内核的性能，而不会导致系统无法运行。</p>
 
-<p>先简单复习一下TCP报文的格式</p>
+<h4>1.2 内存回收的时机</h4>
 
-<p><img src="/images/kernel/2015-04-14-1.jpg" alt="" /></p>
+<p>1、内存紧缺回收：grow_buffers()无法获取缓冲区页，alloc_page_buffers()无法获取页临时缓冲区首部，__alloc_pages()无法再给定的内存区分配一组连续页框。</p>
 
-<p><img src="/images/kernel/2015-04-14-2.jpg" alt="" /></p>
+<p>2、周期回收：必要时，激活相应内核线程执行内存回收算法：kswapd()内核线程，检查某个内存管理区的空闲页框数是否已低于pages_high值的标高。events内核线程，一个工作者线程，回收位于高速内存缓存中的所有空闲的slab。</p>
 
-<p>原始套接字还提供了一个非常有用的参数IP_HDRINCL：</p>
+<h4>1.3 内存回收的策略</h4>
 
-<p>1、当开启该参数时：我们可以从IP报文首部第一个字节开始依次构造整个IP报文的所有选项，但是IP报文头部中的标识字段(设置为0时)和IP首部校验和字段总是由内核自己维护的，不需要我们关心。</p>
+<h5>1.3.1 内存回收的分类</h5>
 
-<p>2、如果不开启该参数：我们所构造的报文是从IP首部之后的第一个字节开始，IP首部由内核自己维护，首部中的协议字段被设置成调用socket()函数时我们所传递给它的第三个参数。</p>
+<p>内存回收主要是要回收两类内存：最近最少使用的内存以及高速内存缓存中空闲的slab。前者主要包括用户态进程的代码段，数据段，堆栈，文件映射内存，页高速内存，后者主要包括磁盘高速缓存及一些其他的空闲内存高速缓存。</p>
 
-<p> 开启IP_HDRINCL特性的模板代码一般为：
-<code>
-    const int on =1;
-    if (setsockopt (sockfd, IPPROTO_IP, IP_HDRINCL, &amp;on, sizeof(on)) &lt; 0) {
-        printf("setsockopt error!\n");
-    }
-</code></p>
+<p>最近最少使用内存存放在一个lru链表上，每个内存管理区zone都有一个lru结构，里面含有active和inactive两个链表头，active链表上记录当前的活跃的报文，inactive用来记录当前不活跃的报文。一般我们回首lru上的inactive链表上的内存页。同时，在内存回收的过程中，会从active链表向inactive链表上补充对应的最近最少使用内存页。每个内存页的内核数据结构page上有一个标记位PG_referenced,该标记位使得一个页从"不活动“状态转为”活动“状态的时间加倍，反之亦然。比如:一个页面可能1个小时内没人反应，不能因为偶然的一次访问就认为它是活跃的，得两次才认为它是一个活跃的页面。下面是页面在inactive和active链表上转移的变化图。</p>
 
-<p>所以，我们还得复习一下IP报文的首部格式：</p>
+<p>Slab内存高速缓存中经常会有一些完全空闲的slab，这些是我们回收的另一个目标。</p>
 
-<p><img src="/images/kernel/2015-04-14-3.jpg" alt="" /></p>
+<h5>1.3.2 反向映射</h5>
 
-<p>同样，我们重点关注IP首部中的着色部分区段的填充情况。</p>
+<p>对于可以通过用户态线性地址空间可以直接访问到的物理页来说，可以分为匿名页和文件映射页两类，匿名页指的是不与具体文件对应映射的物理页，比如代码段，堆栈等使用的物理页，映射页指的是映射到文件某一部分的物理页，通常使用mmap()来进行相关的映射。</p>
 
-<pre><code>    #include &lt;stdlib.h&gt;
-    #include &lt;stdio.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;string.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;netdb.h&gt;
-    #include &lt;sys/socket.h&gt;
-    #include &lt;sys/types.h&gt;
-    #include &lt;netinet/in.h&gt;
-    #include &lt;netinet/ip.h&gt;
-    #include &lt;arpa/inet.h&gt;
-    #include &lt;linux/tcp.h&gt;
+<p>对于匿名映射和文件映射来说，可能一段物理内存会在多个进程的页表中使用，比如对于匿名映射，fork()一个进程，一开始会共用父进程的物理内存，对于文件映射，多个进程可能同时映射到一个文件的同一部分文件。所以在页面回收时，需要将该页面在所有的页表引用中给去除掉。这种手段称为反向映射。想要找到使用这些物理页的页表项的话，需要先找到引用他们的页表，而页表的地址记录在每个进程的内存描述符里面，同时用来描述进程用户态地址空间的每个vm_area_struct都记录了一个指针，指向所属的内存描述符。因此只要通过物理页找到引用他们的vm_area_struct,就能找到内存描述符，从而找到页表，找到对应的页表项。</p>
 
-    #include &lt;linux/if_ether.h&gt;
-    #include &lt;linux/if_arp.h&gt;
-    #include &lt;linux/sockios.h&gt;
+<p>匿名页的反向映射：</p>
 
-    unsigned csum_tcpudp_nofold(unsigned saddr, unsigned daddr,
-                unsigned len, unsigned proto, unsigned sum)
-    {
-        unsigned long long s = (unsigned)sum;
-        s += (unsigned)saddr;
-        s += (unsigned)daddr;
-        s += (proto + len) &lt;&lt; 8;
-        s += (s &gt;&gt; 32);
-        return (unsigned)s;
-    }
+<p>对于匿名页来说，每个页面的mapping字段指向一个anon_vma描述符，anon_vma描述符中存在一个链表头，所有引用该页面的vm_area_struct都存放在里面。page,anon_vma,vm_area_struct这些数据结构的关系如下图所示：</p>
 
-    unsigned short check_sum(unsigned short *addr, int len, unsigned sum)
-    {
-        int nleft = len;
-        unsigned short *w = addr;
-        unsigned short ret = 0;
-        while (nleft &gt; 1) {
-            sum += *w++;
-            nleft -= 2;
-        }
-        if (nleft == 1) {
-            *(unsigned char *)(&amp;ret) = *(unsigned char *)w;
-            sum += ret;
-        }
+<p>对于匿名页来说，其被别的地址空间引用，基本上都是因为fork（）进程时，子进程复制父进程的地址空间，从而被引用的。各个vm_area_struct加入anon_vma的链表的过程如下：</p>
 
-        sum = (sum&gt;&gt;16) + (sum&amp;0xffff);
-        sum += (sum&gt;&gt;16);
-        ret = ~sum;
-        return ret;
-    }
+<p>假设当前一个进程p，后来fork出一个子进程c。</p>
 
-    //在该函数中构造整个IP报文，最后调用sendto函数将报文发送出去
-    void attack(int skfd, struct sockaddr_in *target, unsigned short srcport)
-    {
-        char buf[256] = {0};
-        struct ip *ip;
-        struct tcphdr *tcp;
-        int ip_len;
-        int op_len = 12;
+<p>1、当进程P为某个vm_area_struct加入第一个物理页时，比如说发生了缺页异常，动态分配一个anon_vma的数据结构，将vm_area_struct加入该anon_vma所管理的链表，vm_area_struct结构中的anon_vma字段指向该anon_vma,同时把该页面中的mapping字段赋值为该anon_vma.对于后续为该vm_area_struct申请的物理页面，其mapping字段都赋值为该anon_vma。</p>
 
-        //在我们TCP的报文中Data没有字段，所以整个IP报文的长度
-        ip_len = sizeof(struct ip) + sizeof(struct tcphdr) + op_len;
+<p>2、当该进程p执行fork()时，在fork的处理过程中，会调用dup_mmap()来复制进程p的线性地址空间，在dup_mmap()会复制进程p的每一个vm_area_struct，加入到自己的地址空间中，并将vm_area_struct加入到anon_vma所管理的链表中，参看anon_vma_link()。此时为进程p申请的页面被进程c共享，通过页面的mapping字段可以找到anon_vma，从anon_vma可以遍历进程p,c。</p>
 
-        //开始填充IP首部
-        ip=(struct ip*)buf;
-        ip-&gt;ip_v = IPVERSION;
-        ip-&gt;ip_hl = sizeof(struct ip)&gt;&gt;2;
-        ip-&gt;ip_tos = 0;
-        ip-&gt;ip_len = htons(ip_len);
-        ip-&gt;ip_id = 0;
-        ip-&gt;ip_off = 0;
-        ip-&gt;ip_ttl = MAXTTL;
-        ip-&gt;ip_p = IPPROTO_TCP;
-        ip-&gt;ip_sum = 0;
-        ip-&gt;ip_dst = target-&gt;sin_addr;
+<p>3、考虑一个问题，在进程c中才触发缺页异常被申请的内存页，其mmapping被赋值为所属vm_area_struct的vma_anon，但进程p并没有使用到该页，所以一个物理页mapping字段指向的vma_anon所下挂的vm_area_struct可能并不包含该物理页。</p>
 
-        //开始填充TCP首部
-        tcp = (struct tcphdr*)(buf+sizeof(struct ip));
-        tcp-&gt;source = htons(srcport);
-        tcp-&gt;dest = target-&gt;sin_port;
-        srand(time(NULL));
-        tcp-&gt;doff = (sizeof(struct tcphdr) + op_len) &gt;&gt; 2; // tcphdr + option
-        tcp-&gt;syn = 1;
-        tcp-&gt;check = 0;
-        tcp-&gt;window = ntohs(14600);
+<p>文件映射页的反向映射：</p>
 
-        int i = ip_len - op_len;
-        // mss = 1460
-        buf[i++] = 0x02;
-        buf[i++] = 0x04;
-        buf[i++] = 0x05;
-        buf[i++] = 0xb4;
-        // sack
-        buf[i++] = 0x01;
-        buf[i++] = 0x01;
-        buf[i++] = 0x04;
-        buf[i++] = 0x02;
-        // wsscale = 7
-        buf[i++] = 0x01;
-        buf[i++] = 0x03;
-        buf[i++] = 0x03;
-        buf[i++] = 0x07;
+<p>对于每个文件映射页，其page mapping字段指向的是对应文件的address_space数据结构，address_space中有个 struct prio_tree_root i_mmap 字段，指向一个优先树，优先树里面会把所有映射该文件内容的vm_area_struct 给组织起来。在该树中，其树的节点基地址和堆地址分别是映射的文件内容的起始地址和结束地址，要是多个进程同时映射该地址段，会用链表在该节点上将vm_area_struct串起来。</p>
 
-        int T = 1;
-        while(1) {
-            if (T == 0) break;
-            T--;
-            tcp-&gt;seq = random();
-            //源地址伪造，我们随便任意生成个地址，让服务器一直等待下去
-            //ip-&gt;ip_src.s_addr = random();
-            //自定义源地址192.168.204.136 = 0xc0a8cc88; 反转赋值
-            ip-&gt;ip_src.s_addr = 0x88cca8c0;
-            unsigned sum = csum_tcpudp_nofold(ip-&gt;ip_src.s_addr, ip-&gt;ip_dst.s_addr, sizeof(struct tcphdr)+op_len, IPPROTO_TCP, 0);
-            tcp-&gt;check = check_sum((unsigned short*)tcp, sizeof(struct tcphdr)+op_len, sum);
-    //      ip-&gt;ip_sum = check_sum((unsigned short*)ip, sizeof(struct ip), 0);
-            sendto(skfd, buf, ip_len, 0, (struct sockaddr*)target, sizeof(struct sockaddr_in));
-        }
-    }
+<h5>1.3.3 内存回收流程介绍</h5>
 
-    int main(int argc, char** argv)
-    {
-        int skfd;
-        struct sockaddr_in target;
-        struct hostent *host;
-        const int on = 1;
-        unsigned short srcport;
+<p>睡眠回收我们不关注，主要介绍内存紧缺回收及周期回收：</p>
 
-        if (argc != 4) {
-            printf("Usage:%s dstip dstport srcport\n", argv[0]);
-            exit(1);
-        }
+<p>1、内存紧缺回收主要函数是try_to_free_pages()，该函数会执行一个循环，按照优先级从12到0，依次调用shrink_caches()，shrink_slab()来回收页面，直到回收至少32个内存页面。</p>
 
-        bzero(&amp;target, sizeof(struct sockaddr_in));
-        target.sin_family = AF_INET;
-        target.sin_port = htons(atoi(argv[2]));
+<p>依次调用以下辅助函数：</p>
 
-        if (inet_aton(argv[1], &amp;target.sin_addr) == 0) {
-            host = gethostbyname(argv[1]);
-            if(host == NULL) {
-                printf("TargetName Error:%s\n", hstrerror(h_errno));
-                exit(1);
+<p>shrink_caches()：调用shrink_zone()对传入的zone链表中的每个zone，进行lru上面的页面回收。</p>
+
+<p>shrink_slab()：对磁盘索引节点cache和目录项索引节点等磁盘高速缓存进行回收，由于磁盘索引节点和目录项索引节点都是从slab高速缓存中分配的，这样就会导致空闲slab的产生，空闲slab后续会在周期性回收的cache_reap工作队列中被回收。估计也就是因为最终会清零空闲slab，才会起这么一个函数名。^_^</p>
+
+<p>shrink_zone()：对内存管理区上的lru链表中的非活跃页面进行回收，在非活跃页面不足的时候，调用refill_inactive_zone()对lru上的inactive链表补充非活跃页面,同时shrink_zone()调用shrink_cache()来进行页面的回收，该函数的具体解析可以参照下面的源码浅析。</p>
+
+<p>shrink_list()：该辅助函数在shrink_cache()中被调用，该函数对在shrink_cache（）中传入的非活跃page列表进行遍历，对每个页面进行回收工作，该函数的具体解析可以参考下面的源码解析。</p>
+
+<p>refill_inactie_zone()：该辅助函数根据一定的规则将处于lru active链表上的活跃页面移动到inactive链表上，以补充可以回收的页面，在lru链表里有两类页，一类是属于用户态空间的页，比如用户态进程的代码段，数据段，一类是在页高速缓存中的页，系统为了降低对应用程序的影响，将要优先将页高速缓存页进行回收，同时为了系统整体性能也会适当回收用户态进程页。按照如下经验公式进行选择：</p>
+
+<p>交换倾向值=映射比率/2+负荷值+交换值</p>
+
+<p>2、kswapd进程一般会在系统中睡眠，但当__alloc_page()发现各个管理区的剩余页面都低于警告值(由内存管理描述符的pages_low字段和protection字段推算出来)时，会激活kswapd进程进行页面回收，直到回收的页面使得管理区的剩余页面高于zone->pages_high时才停止回收，本质上也是调用了shrink_zone（）和shrink_slab()。</p>
+
+<p>3、cache_reap工作队列定期运行来回收slab高速缓存中空闲的slab占用的页。</p>
+
+<h4>1.4 相关源代码的浅析</h4>
+
+<pre><code>    static void 
+    shrink_zone(struct zone *zone, struct scan_control *sc) 
+    { 
+        unsigned long nr_active; 
+        unsigned long nr_inactive; 
+
+        //根据优先级，得到可以扫描的页面数，优先级越高， 
+        //代表越不急迫，可以扫描的页面数也最少 
+        zone-&gt;nr_scan_active += (zone-&gt;nr_active &gt;&gt; sc-&gt;priority) + 1; 
+        nr_active = zone-&gt;nr_scan_active; 
+        if (nr_active &gt;= SWAP_CLUSTER_MAX) 
+            zone-&gt;nr_scan_active = 0; 
+        else 
+            nr_active = 0; 
+
+        zone-&gt;nr_scan_inactive += (zone-&gt;nr_inactive &gt;&gt; sc-&gt;priority) + 1; 
+        nr_inactive = zone-&gt;nr_scan_inactive; 
+        //非活动页比较少的话，可以先忽略过去，将跳过的页面记录到nr_scan_inactive中 
+        //留待下一次再处理 
+        if (nr_inactive &gt;= SWAP_CLUSTER_MAX) 
+            zone-&gt;nr_scan_inactive = 0; 
+        else 
+            nr_inactive = 0; 
+
+        //设置需要回收的页面数为32个 
+        sc-&gt;nr_to_reclaim = SWAP_CLUSTER_MAX; 
+
+        //开始回收页面，每次扫描32个页面，多了不干噢!!! 
+        while (nr_active || nr_inactive) { 
+            if (nr_active) { 
+                //设置每次要扫描的非活动页面数，需要将其放 
+                //入到inactive list里面 
+                sc-&gt;nr_to_scan = min(nr_active, 
+                (unsigned long)SWAP_CLUSTER_MAX); 
+                nr_active -= sc-&gt;nr_to_scan; 
+                //补充inactive list中的页面 
+                refill_inactive_zone(zone, sc); 
+            } 
+
+            if (nr_inactive) { 
+                //设置每次将要扫描的页面，最多也就32个页面 
+                sc-&gt;nr_to_scan = min(nr_inactive, 
+                (unsigned long)SWAP_CLUSTER_MAX); 
+
+                nr_inactive -= sc-&gt;nr_to_scan; 
+                //开始正式回收inactive list中的页面 
+                shrink_cache(zone, sc); 
+                //32个页面被回收完毕，大功告成了!!! 
+                if (sc-&gt;nr_to_reclaim &lt;= 0) 
+                    break; 
             }
-            target.sin_addr = *(struct in_addr *)(host-&gt;h_addr_list[0]);
-        }
-
-        //将协议字段置为IPPROTO_TCP，来创建一个TCP的原始套接字
-        if (0 &gt; (skfd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP))) {
-            perror("Create Error");
-            exit(1);
-        }
-
-        //用模板代码来开启IP_HDRINCL特性，我们完全自己手动构造IP报文
-        if (0 &gt; setsockopt(skfd, IPPROTO_IP, IP_HDRINCL, &amp;on, sizeof(on))) {
-            perror("IP_HDRINCL failed");
-            exit(1);
-        }
-
-        //因为只有root用户才可以play with raw socket :)
-        setuid(getpid());
-        srcport = atoi(argv[3]);
-        attack(skfd, &amp;target, srcport);
-    }
-</code></pre>
-
-<ul>
-<li>原始套接字上也可以调用connet、bind之类的函数</li>
-</ul>
-
-
-<hr />
-
-<h4>修改mac+iphdr+tcphdr</h4>
-
-<p>blog.chinaunix.net/uid-23069658-id-3283534.html</p>
-
-<p>在Linux系统中要从链路层(MAC)直接收发数帧，比较普遍的做法就是用libpcap和libnet两个动态库来实现。但今天我们就要用原始套接字来实现这个功能。</p>
-
-<p><img src="/images/kernel/2015-04-14-4.jpg" alt="" /></p>
-
-<p>这里的2字节帧类型用来指示该数据帧所承载的上层协议是IP、ARP或其他。</p>
-
-<p>为了实现直接从链路层收发数据帧，我们要用到原始套接字的如下形式：
-<code>
-    socket(PF_PACKET, type, protocol)
-</code>
-1、其中type字段可取SOCK_RAW或SOCK_DGRAM。它们两个都使用一种与设备无关的标准物理层地址结构struct sockaddr_ll{}，但具体操作的报文格式不同：</p>
-
-<p>SOCK_RAW：直接向网络硬件驱动程序发送(或从网络硬件驱动程序接收)没有任何处理的完整数据报文(包括物理帧的帧头)，这就要求我们必须了解对应设备的物理帧帧头结构，才能正确地装载和分析报文。也就是说我们用这种套接字从网卡驱动上收上来的报文包含了MAC头部，如果我们要用这种形式的套接字直接向网卡发送数据帧，那么我们必须自己组装我们MAC头部。这正符合我们的需求。</p>
-
-<p>SOCK_DGRAM：这种类型的套接字对于收到的数据报文的物理帧帧头会被系统自动去掉，然后再将其往协议栈上层传递；同样地，在发送时数据时，系统将会根据sockaddr_ll结构中的目的地址信息为数据报文添加一个合适的MAC帧头。</p>
-
-<p>2、protocol字段，常见的，一般情况下该字段取ETH_P_IP，ETH_P_ARP，ETH_P_RARP或ETH_P_ALL，当然链路层协议很多，肯定不止我们说的这几个，但我们一般只关心这几个就够我们用了。这里简单提一下网络数据收发的一点基础。协议栈在组织数据收发流程时需要处理好两个方面的问题：“从上倒下”，即数据发送的任务；“从下到上”，即数据接收的任务。数据发送相对接收来说要容易些，因为对于数据接收而言，网卡驱动还要明确什么样的数据该接收、什么样的不该接收等问题。protocol字段可选的四个值及其意义如下：</p>
-
-<p>protocol        值        作用<br/>
-ETH_P_IP      0X0800   只接收发往目的MAC是本机的IP类型的数据帧<br/>
-ETH_P_ARP     0X0806   只接收发往目的MAC是本机的ARP类型的数据帧<br/>
-ETH_P_RARP    0X8035   只接受发往目的MAC是本机的RARP类型的数据帧<br/>
-ETH_P_ALL     0X0003   接收发往目的MAC是本机的所有类型(ip,arp,rarp)的数据帧，同时还可以接收从本机发出去的所有数据帧。在混杂模式打开的情况下，还会接收到发往目的MAC为非本地硬件地址的数据帧。</p>
-
-<p>protocol字段可取的所有协议参见/usr/include/linux/if_ether.h头文件里的定义。</p>
-
-<p>最后，格外需要留心一点的就是，发送数据的时候需要自己组织整个以太网数据帧。和地址相关的结构体就不能再用前面的struct sockaddr_in{}了，而是struct sockaddr_ll{}，如下：</p>
-
-<pre><code>    struct sockaddr_ll{
-        unsigned short sll_family; /* 总是 AF_PACKET */
-        unsigned short sll_protocol; /* 物理层的协议 */
-        int sll_ifindex; /* 接口号 */
-        unsigned short sll_hatype; /* 报头类型 */
-        unsigned char sll_pkttype; /* 分组类型 */
-        unsigned char sll_halen; /* 地址长度 */
-        unsigned char sll_addr[8]; /* 物理层地址 */
-    };
-</code></pre>
-
-<p>  sll_protocoll：取值在linux/if_ether.h中，可以指定我们所感兴趣的二层协议；</p>
-
-<p>  sll_ifindex：置为0表示处理所有接口，对于单网卡的机器就不存在“所有”的概念了。如果你有多网卡，该字段的值一般通过ioctl来搞定，模板代码如下，如果我们要获取eth0接口的序号，可以使用如下代码来获取：</p>
-
-<pre><code>    struct  sockaddr_ll  sll;
-    struct ifreq ifr;
-
-    strcpy(ifr.ifr_name, "eth0");
-    ioctl(sockfd, SIOCGIFINDEX, &amp;ifr);
-    sll.sll_ifindex = ifr.ifr_ifindex;
-</code></pre>
-
-<p>  sll_hatype：ARP硬件地址类型，定义在 linux/if_arp.h 中。 取ARPHRD_ETHER时表示为以太网。</p>
-
-<p>  sll_pkttype：包含分组类型。目前，有效的分组类型有：目标地址是本地主机的分组用的 PACKET_HOST，物理层广播分组用的 PACKET_BROADCAST ，发送到一个物理层多路广播地址的分组用的 PACKET_MULTICAST，在混杂(promiscuous)模式下的设备驱动器发向其他主机的分组用的 PACKET_OTHERHOST，源于本地主机的分组被环回到分组套接口用的 PACKET_OUTGOING。这些类型只对接收到的分组有意义。</p>
-
-<p>  sll_addr和sll_halen指示物理层(如以太网，802.3，802.4或802.5等)地址及其长度，严格依赖于具体的硬件设备。类似于获取接口索引sll_ifindex，要获取接口的物理地址，可以采用如下代码：</p>
-
-<pre><code>    struct ifreq ifr;
-
-    strcpy(ifr.ifr_name, "eth0");
-    ioctl(sockfd, SIOCGIFHWADDR, &amp;ifr);
-</code></pre>
-
-<p> 缺省情况下，从任何接口收到的符合指定协议的所有数据报文都会被传送到原始PACKET套接字口，而使用bind系统调用并以一个sochddr_ll结构体对象将PACKET套接字与某个网络接口相绑定，就可使我们的PACKET原始套接字只接收指定接口的数据报文。</p>
-
-<p> 接下来我们简单介绍一下网卡是怎么收报的，如果你对这部分已经很了解可以跳过这部分内容。网卡从线路上收到信号流，网卡的驱动程序会去检查数据帧开始的前6个字节，即目的主机的MAC地址，如果和自己的网卡地址一致它才会接收这个帧，不符合的一般都是直接无视。然后该数据帧会被网络驱动程序分解，IP报文将通过网络协议栈，最后传送到应用程序那里。往上层传递的过程就是一个校验和“剥头”的过程，由协议栈各层去实现。</p>
-
-<p>接下来我们来写个简单的抓包程序，将那些发给本机的IPv4报文全打印出来：</p>
-
-<pre><code>    #include &lt;stdio.h&gt;
-    #include &lt;stdlib.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;sys/socket.h&gt;
-    #include &lt;sys/types.h&gt;
-    #include &lt;netinet/in.h&gt;
-    #include &lt;netinet/ip.h&gt;
-    #include &lt;netinet/if_ether.h&gt;
-
-    int main(int argc, char **argv)
-    {
-        int sock, n;
-        char buffer[2048];
-        struct ethhdr *eth;
-        struct iphdr *iph;
-
-        if (0 &gt; (sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP)))) {
-            perror("socket");
-            exit(1);
-        }
-
-        while (1) {
-            printf("=====================================\n");
-            //注意：在这之前我没有调用bind函数，原因是什么呢？
-            n = recvfrom(sock, buffer, 2048, 0, NULL, NULL);
-            printf("%d bytes read\n", n);
-
-            //接收到的数据帧头6字节是目的MAC地址，紧接着6字节是源MAC地址。
-            eth = (struct ethhdr*)buffer;
-            printf("Dest MAC addr:%02x:%02x:%02x:%02x:%02x:%02x\n",eth-&gt;h_dest[0],eth-&gt;h_dest[1],eth-&gt;h_dest[2],eth-&gt;h_dest[3],eth-&gt;h_dest[4],eth-&gt;h_dest[5]);
-            printf("Source MAC addr:%02x:%02x:%02x:%02x:%02x:%02x\n",eth-&gt;h_source[0],eth-&gt;h_source[1],eth-&gt;h_source[2],eth-&gt;h_source[3],eth-&gt;h_source[4],eth-&gt;h_source[5]);
-
-            iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
-            //我们只对IPV4且没有选项字段的IPv4报文感兴趣
-            if(iph-&gt;version == 4 &amp;&amp; iph-&gt;ihl == 5){
-                unsigned char *sd, *dd;
-                sd = (unsigned char*)&amp;iph-&gt;saddr;
-                dd = (unsigned char*)&amp;iph-&gt;daddr;
-                printf("Source Host: %d.%d.%d.%d Dest host: %d.%d.%d.%d\n", sd[0], sd[1], sd[2], sd[3], dd[0], dd[1], dd[2], dd[3]);
-            //  printf("Source host:%s\n", inet_ntoa(iph-&gt;saddr));
-            //  printf("Dest host:%s\n", inet_ntoa(iph-&gt;daddr));
-            }
-        }
-        return 0;
-    }
-</code></pre>
-
-<p>构造mac源地址包，注意目标mac地址要正确，可以本机先抓包看看是什么</p>
-
-<pre><code>    #include &lt;stdlib.h&gt;
-    #include &lt;stdio.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;string.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;netdb.h&gt;
-    #include &lt;sys/socket.h&gt;
-    #include &lt;sys/types.h&gt;
-    #include &lt;netinet/in.h&gt;
-    #include &lt;netinet/ip.h&gt;
-    #include &lt;arpa/inet.h&gt;
-    #include &lt;linux/tcp.h&gt;
-
-    #include &lt;linux/if_ether.h&gt;
-    #include &lt;linux/if_arp.h&gt;
-    #include &lt;linux/sockios.h&gt;
-
-    unsigned csum_tcpudp_nofold(unsigned saddr, unsigned daddr,
-                unsigned len, unsigned proto, unsigned sum)
-    {
-        unsigned long long s = (unsigned)sum;
-        s += (unsigned)saddr;
-        s += (unsigned)daddr;
-        s += (proto + len) &lt;&lt; 8;
-        s += (s &gt;&gt; 32);
-        return (unsigned)s;
-    }
-
-    unsigned short check_sum(unsigned short *addr, int len, unsigned sum)
-    {
-        int nleft = len;
-        unsigned short *w = addr;
-        unsigned short ret = 0;
-        while (nleft &gt; 1) {
-            sum += *w++;
-            nleft -= 2;
-        }
-        if (nleft == 1) {
-            *(unsigned char *)(&amp;ret) = *(unsigned char *)w;
-            sum += ret;
-        }
-
-        sum = (sum&gt;&gt;16) + (sum&amp;0xffff);
-        sum += (sum&gt;&gt;16);
-        ret = ~sum;
-        return ret;
-    }
-
-    int change(char c)
-    {
-        if (c &gt;= 'a') return c-'a'+10;
-        if (c &gt;= 'A') return c-'A'+10;
-        return c-'0';
-    }
-
-    //在该函数中构造整个IP报文，最后调用sendto函数将报文发送出去
-    void attack(int skfd, struct sockaddr_ll *target, char **argv)
-    {
-        char buf[512]={0};
-        struct ethhdr *eth;
-        struct ip *ip;
-        struct tcphdr *tcp;
-        int pks_len;
-        int i;
-        int op_len = 12;
-        unsigned short dstport;
-        dstport = atoi(argv[3]);
-
-        //在我们TCP的报文中Data没有字段，所以整个IP报文的长度
-        pks_len = sizeof(struct ethhdr) + sizeof(struct ip) + sizeof(struct tcphdr) + op_len;
-        eth = (struct ethhdr *) buf;
-        /*
-        eth-&gt;h_dest[0] = 0x00;
-        eth-&gt;h_dest[1] = 0x50;
-        eth-&gt;h_dest[2] = 0x56;
-        eth-&gt;h_dest[3] = 0xee;
-        eth-&gt;h_dest[4] = 0x14;
-        eth-&gt;h_dest[5] = 0xa6;
-        */
-
-        for (i=0;i&lt;6;i++)
-            eth-&gt;h_dest[i] = change(argv[1][i*3])*16 + change(argv[1][i*3+1]);
-
-        /*
-        eth-&gt;h_source[0] = 0x00;
-        eth-&gt;h_source[1] = 0x0b;
-        eth-&gt;h_source[2] = 0x28;
-        eth-&gt;h_source[3] = 0xd7;
-        eth-&gt;h_source[4] = 0x26;
-        eth-&gt;h_source[5] = 0xa6;
-        */
-        eth-&gt;h_proto = ntohs(ETH_P_IP);
-
-        //开始填充IP首部
-        ip=(struct ip*)(buf + sizeof(struct ethhdr));
-        ip-&gt;ip_v = IPVERSION;
-        ip-&gt;ip_hl = sizeof(struct ip) &gt;&gt; 2;
-        ip-&gt;ip_tos = 0;
-        ip-&gt;ip_len = htons(pks_len - sizeof(struct ethhdr));
-        ip-&gt;ip_id = 0;
-        ip-&gt;ip_off = 0;
-        ip-&gt;ip_ttl = MAXTTL;
-        ip-&gt;ip_p = IPPROTO_TCP;
-        ip-&gt;ip_sum = 0;
-        ip-&gt;ip_dst.s_addr = inet_addr(argv[2]);
-
-        //开始填充TCP首部
-        srand(time(NULL));
-        tcp = (struct tcphdr*)(buf + sizeof(struct ethhdr) + sizeof(struct ip));
-        tcp-&gt;source = random()%50000+10000;
-        tcp-&gt;dest = ntohs(dstport);
-        tcp-&gt;seq = random();
-        tcp-&gt;doff = (sizeof(struct tcphdr) + op_len) &gt;&gt; 2;
-        tcp-&gt;syn = 1;
-        tcp-&gt;check = 0;
-        tcp-&gt;window = ntohs(14600);
-
-        i = pks_len - op_len;
-        // mss = 1460
-        buf[i++] = 0x02;
-        buf[i++] = 0x04;
-        buf[i++] = 0x05;
-        buf[i++] = 0xb4;
-        // sack
-        buf[i++] = 0x01;
-        buf[i++] = 0x01;
-        buf[i++] = 0x04;
-        buf[i++] = 0x02;
-        // wsscale = 7
-        buf[i++] = 0x01;
-        buf[i++] = 0x03;
-        buf[i++] = 0x03;
-        buf[i++] = 0x07;
-
-        int T = 1;
-        while(1) {
-            if (T == 0) break;
-            T--;
-            //源地址伪造，我们随便任意生成个地址，让服务器一直等待下去
-            ip-&gt;ip_src.s_addr = random();
-            //自定义源地址192.168.204.136 =&gt; 0xc0a8cc88
-            //ip-&gt;ip_src.s_addr = 0x8fcca8c0;
-            unsigned sum = csum_tcpudp_nofold(ip-&gt;ip_src.s_addr, ip-&gt;ip_dst.s_addr, sizeof(struct tcphdr)+op_len, IPPROTO_TCP, 0);
-            tcp-&gt;check = check_sum((unsigned short*)tcp, sizeof(struct tcphdr)+op_len, sum);
-            ip-&gt;ip_sum = check_sum((unsigned short*)ip, sizeof(struct ip), 0);
-            sendto(skfd, buf, pks_len, 0, (struct sockaddr*)target, sizeof(struct sockaddr_ll));
-        }
-    }
-
-    int main(int argc, char** argv)
-    {
-        int skfd;
-        struct sockaddr_ll target;
-        struct hostent *host;
-        const int on=1;
-
-        if (argc != 4) {
-            printf("Usage:%s dstmac dstip dstport\n", argv[0]);
-            exit(1);
-        }
-        if (strlen(argv[1]) != 17) {
-            printf("Usage: dstmac must be xx:xx:xx:xx:xx:xx\n");
-            exit(1);
-        }
-
-        //将协议字段置为IPPROTO_TCP，来创建一个TCP的原始套接字
-        if (0 &gt; (skfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP)))) {
-            perror("Create Error");
-            exit(1);
-        }
-
-        // mac
-        bzero(&amp;target, sizeof(struct sockaddr_ll));
-
-        struct ifreq ifr;
-        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
-        ioctl(skfd, SIOCGIFINDEX, &amp;ifr);
-        target.sll_ifindex = ifr.ifr_ifindex;
-        /*
-        target.sll_family = AF_PACKET;
-        target.sll_protocol = ntohs(80);
-        target.sll_hatype = ARPHRD_ETHER;
-        target.sll_pkttype = PACKET_OTHERHOST;
-        target.sll_halen = ETH_ALEN;
-        memset(target.sll_addr,0,8);
-        target.sll_addr[0] = 0x00;
-        target.sll_addr[1] = 0x0C;
-        target.sll_addr[2] = 0x29;
-        target.sll_addr[3] = 0x61;
-        target.sll_addr[4] = 0xB6;
-        target.sll_addr[5] = 0x43;
-        */
-
-
-        /*
-        //http://blog.chinaunix.net/uid-305141-id-2133781.html
-        struct sockaddr_ll sll;
-        struct ifreq ifstruct;
-        memset (&amp;sll, 0, sizeof (sll));
-        sll.sll_family = PF_PACKET;
-        sll.sll_protocol = htons (ETH_P_IP);
-
-        strcpy (ifstruct.ifr_name, "eth0");
-        ioctl (skfd, SIOCGIFINDEX, &amp;ifstruct);
-        sll.sll_ifindex = ifstruct.ifr_ifindex;
-
-        strcpy (ifstruct.ifr_name, "eth0");
-        ioctl (skfd, SIOCGIFHWADDR, &amp;ifstruct);
-        memcpy (sll.sll_addr, ifstruct.ifr_ifru.ifru_hwaddr.sa_data, ETH_ALEN);
-        sll.sll_halen = ETH_ALEN;
-
-        if (bind (skfd, (struct sockaddr *) &amp;sll, sizeof (sll)) == -1) {
-            printf ("bind:   ERROR\n");
-            return -1;
-        }
-
-        memset(&amp;ifstruct, 0, sizeof(ifstruct));
-        strcpy (ifstruct.ifr_name, "eth0");
-        if (ioctl (skfd, SIOCGIFFLAGS, &amp;ifstruct) == -1) {
-            perror ("iotcl()\n");
-            printf ("Fun:%s Line:%d\n", __func__, __LINE__);
-            return -1;
-        }
-
-        ifstruct.ifr_flags |= IFF_PROMISC;
-
-        if(ioctl(skfd, SIOCSIFFLAGS, &amp;ifstruct) == -1) {
-            perror("iotcl()\n");
-            printf ("Fun:%s Line:%d\n", __func__, __LINE__);
-            return -1;
         } 
-    */
-        //因为只有root用户才可以play with raw socket :)
-        setuid(getpid());
-    //  attack(skfd, &amp;sll, srcport);
-        attack(skfd, &amp;target, argv);
+    } 
+
+    static int shrink_list(struct list_head *page_list, struct scan_control *sc) 
+    { 
+        LIST_HEAD(ret_pages);
+        struct pagevec freed_pvec;
+        int pgactivate = 0;
+        int reclaimed = 0;
+        //有进程需要调度，先进行调度 
+        cond_resched();
+
+        pagevec_init(&amp;freed_pvec, 1); 
+        //对于page_list 链表上的每一个页面试图进行回收 
+        while (!list_empty(page_list)) { 
+            struct address_space *mapping; 
+            struct page *page; 
+            int may_enter_fs; 
+            int referenced; 
+
+            //获取一个页面 
+            page = lru_to_page(page_list); 
+            //从lru上摘除 
+            list_del(&amp;page-&gt;lru); 
+            //page被锁定，不能回收 
+            if (TestSetPageLocked(page))//page is locked? 
+                goto keep; 
+
+            BUG_ON(PageActive(page)); 
+            //page正在被writeback，不能回收 
+            if (PageWriteback(page))//page is writeback? 
+                goto keep_locked; 
+
+            sc-&gt;nr_scanned++; 
+            /* Double the slab pressure for mapped and swapcache pages */ 
+
+            if (page_mapped(page) || PageSwapCache(page)) 
+                sc-&gt;nr_scanned++; 
+            //查看最近该页面有无被访问过 
+            referenced = page_referenced(page, 1, sc-&gt;priority &lt;= 0); 
+            /* In active use or really unfreeable?  Activate it. */ 
+            //1页面被访问过，2页面在用户态空间，页面是文件映射页面， 
+            //页面在交换高速缓存中，同时满足这两个条件的话，页面不被回收 
+            if (referenced &amp;&amp; page_mapping_inuse(page)) 
+                goto activate_locked; 
+
+            #ifdef CONFIG_SWAP
+            //page is anon and page has not been add to swapcache 
+            //该页面是匿名映射的页面，且该页面不在swapcache中 
+            if (PageAnon(page) &amp;&amp; !PageSwapCache(page)) { 
+                //将页面加入到swap cache中 
+                if (!add_to_swap(page)) 
+                    goto activate_locked; 
+            }
+            #endif /* CONFIG_SWAP */ 
+            //得到对应的address_space，有可能是对应文件的address_space,或者是 
+            //swap cache的address_space 
+            mapping = page_mapping(page); 
+            may_enter_fs = (sc-&gt;gfp_mask &amp; __GFP_FS) || 
+                    (PageSwapCache(page) &amp;&amp; (sc-&gt;gfp_mask &amp; __GFP_IO)); 
+
+            //该页面被映射到某个用户页表中 
+            if (page_mapped(page) &amp;&amp; mapping) { 
+                //将该页面在用户页表中的页表项通通清除 
+                switch (try_to_unmap(page)) { 
+                    case SWAP_FAIL: 
+                    goto activate_locked; 
+                    case SWAP_AGAIN: 
+                    goto keep_locked; 
+                    case SWAP_SUCCESS: 
+                    ; /* try to free the page below */ 
+                } 
+            } 
+            //页面是脏的，哈哈，准备往文件或swapcache里面写硬盘吧 
+            if (PageDirty(page)) { 
+                if (referenced) 
+                    goto keep_locked; 
+                if (!may_enter_fs) 
+                    goto keep_locked; 
+                if (laptop_mode &amp;&amp; !sc-&gt;may_writepage) 
+                    goto keep_locked; 
+
+                /* Page is dirty, try to write it out here */ 
+                //往磁盘上写页面 
+                switch(pageout(page, mapping)) { 
+                    case PAGE_KEEP: 
+                        goto keep_locked; 
+                    case PAGE_ACTIVATE: 
+                        goto activate_locked; 
+                    case PAGE_SUCCESS: 
+                        if (PageWriteback(page) || PageDirty(page)) 
+                            goto keep; 
+
+                        if (TestSetPageLocked(page)) 
+                            goto keep; 
+                        if (PageDirty(page) || PageWriteback(page)) 
+                            goto keep_locked; 
+                        mapping = page_mapping(page); 
+                    case PAGE_CLEAN: 
+                        ; /* try to free the page below */ 
+                } 
+            }
+
+            //若页面是缓冲区页面，将对应的buffer_head给释放掉 
+            if (PagePrivate(page)) { 
+                if (!try_to_release_page(page, sc-&gt;gfp_mask)) 
+                    goto activate_locked; 
+                if (!mapping &amp;&amp; page_count(page) == 1) 
+                    goto free_it; 
+            } 
+
+            if (!mapping) 
+                goto keep_locked; 
+            /* truncate got there first */ 
+
+            spin_lock_irq(&amp;mapping-&gt;tree_lock); 
+
+            //页面为脏页面或者page的引用计数为2，都是不可以回收的  
+            if (page_count(page) != 2 || PageDirty(page)) { 
+                spin_unlock_irq(&amp;mapping-&gt;tree_lock); 
+                goto keep_locked; 
+            }
+
+            #ifdef CONFIG_SWAP 
+                //到达这里，说明该page只被swap cache或者页高速缓存及 
+                //fpra所共有，需要将其从swap cache上或者页高速缓存上删除。 
+            if (PageSwapCache(page)) { 
+                swp_entry_t swap = { .val = page-&gt;private }; 
+                //从swap cache上进行删除 
+                __delete_from_swap_cache(page); 
+                spin_unlock_irq(&amp;mapping-&gt;tree_lock); 
+                swap_free(swap); 
+                __put_page(page); 
+                /* The pagecache ref */ 
+                goto free_it; 
+            } 
+            #endif /* CONFIG_SWAP */ 
+
+            //从页面高速缓存中将该页面删除 
+            __remove_from_page_cache(page); 
+            spin_unlock_irq(&amp;mapping-&gt;tree_lock); 
+            __put_page(page); 
+
+            free_it: 
+                unlock_page(page); 
+                reclaimed++; 
+                if (!pagevec_add(&amp;freed_pvec, page)) 
+                    __pagevec_release_nonlru(&amp;freed_pvec); 
+                continue; 
+
+            activate_locked: 
+                //将页面设为active页面，等回去将其放入lru的active链表 
+                SetPageActive(page); 
+                pgactivate++; 
+            keep_locked: 
+                //保持页面的状态不变，放入对应的lru active或inactive链表中 
+                unlock_page(page); 
+            keep: 
+                //将该无法回收的页面，放入到ret_pages链表中 
+                list_add(&amp;page-&gt;lru, &amp;ret_pages); 
+                BUG_ON(PageLRU(page)); 
+        } 
+        //此处将无法回收的页面放入page_list中，在函数返回后，去其进行处理 
+        list_splice(&amp;ret_pages, page_list); 
+        //此处将可以释放的页面通通给释放掉，回收了^_^ 
+
+        if (pagevec_count(&amp;freed_pvec)) 
+            __pagevec_release_nonlru(&amp;freed_pvec); 
+        mod_page_state(pgactivate, pgactivate); 
+        sc-&gt;nr_reclaimed += reclaimed; 
+        return reclaimed; 
     }
 </code></pre>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[sk_buff详解]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-skbuff/"/>
-    <updated>2015-04-10T15:46:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-skbuff</id>
-    <content type="html"><![CDATA[<p><a href="/download/kernel/sk_buff%E8%AF%A6%E8%A7%A3.pdf">sk_buff详解</a></p>
+    <title type="html"><![CDATA[Linux物理内存页面分配]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-alloc/"/>
+    <updated>2015-04-18T22:38:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-alloc</id>
+    <content type="html"><![CDATA[<p><a href="/download/kernel/Linux_Physical_Memory_Page_Allocation.pdf">Linux_Physical_Memory_Page_Allocation.pdf</a></p>
+
+<p>转自 <a href="http://www.jtben.com/document/1266382">http://www.jtben.com/document/1266382</a></p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[Linux TCP数据包接收处理 tcp_recvmsg]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-rcvmsg/"/>
-    <updated>2015-04-10T15:29:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/10/kernel-net-rcvmsg</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/mrpre/article/details/33347221">http://blog.csdn.net/mrpre/article/details/33347221</a></p>
-
-<pre><code>    /* 
-     *  This routine copies from a sock struct into the user buffer.
-     *
-     *  Technical note: in 2.3 we work on _locked_ socket, so that
-     *  tricks with *seq access order and skb-&gt;users are not required.
-     *  Probably, code can be easily improved even more.
-     */
-
-    int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
-            size_t len, int nonblock, int flags, int *addr_len)
-    {
-        struct tcp_sock *tp = tcp_sk(sk);
-        int copied = 0;
-        u32 peek_seq;
-        u32 *seq;
-        unsigned long used;
-        int err;
-        int target;  /* Read at least this many bytes */
-        long timeo;
-        struct task_struct *user_recv = NULL;
-        int copied_early = 0;
-        struct sk_buff *skb;
-        u32 urg_hole = 0;
-
-        //功能：“锁住sk”，并非真正的加锁，而是执行sk-&gt;sk_lock.owned = 1 
-        //目的：这样软中断上下文能够通过owned ，判断该sk是否处于进程上下文。
-        //提供一种同步机制。
-        lock_sock(sk);
-
-        TCP_CHECK_TIMER(sk);
-
-        err = -ENOTCONN;
-        if (sk-&gt;sk_state == TCP_LISTEN)
-            goto out;
-
-        //获取延迟，如果用户设置为非阻塞，那么timeo ==0000 0000 0000 0000
-        //如果用户使用默认recv系统调用
-        //则为阻塞，此时timeo ==0111 1111 1111 1111
-        //timeo 就2个值
-        timeo = sock_rcvtimeo(sk, nonblock);
-
-        /* Urgent data needs to be handled specially. */
-        if (flags &amp; MSG_OOB)
-            goto recv_urg;
-
-        //待拷贝的下一个序列号
-        seq = &amp;tp-&gt;copied_seq;
-
-        //设置了MSG_PEEK，表示不让数据从缓冲区移除，目的是下一次调用recv函数
-        //仍然能够读到相同数据
-        if (flags &amp; MSG_PEEK) {
-            peek_seq = tp-&gt;copied_seq;
-            seq = &amp;peek_seq;
-        }
-
-        //如果设置了MSG_WAITALL，则target  ==len，即recv函数中的参数len
-        //如果没设置MSG_WAITALL，则target  == 1
-        target = sock_rcvlowat(sk, flags &amp; MSG_WAITALL, len);
-
-        //大循环
-        do {
-            u32 offset;
-
-            /* Are we at urgent data? Stop if we have read anything or have SIGURG pending. */
-            if (tp-&gt;urg_data &amp;&amp; tp-&gt;urg_seq == *seq) {
-                if (copied)
-                    break;
-                if (signal_pending(current)) {
-                    copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;
-                    break;
-                }
-            }
-
-            /* Next get a buffer. */
-
-            //小循环
-            skb_queue_walk(&amp;sk-&gt;sk_receive_queue, skb) {
-                /* Now that we have two receive queues this
-                    * shouldn't happen.
-                    */
-                if (WARN(before(*seq, TCP_SKB_CB(skb)-&gt;seq),
-                                    KERN_INFO "recvmsg bug: copied %X "
-                                                "seq %X rcvnxt %X fl %X\n", *seq,
-                                                TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt,
-                                                flags))
-                    break;
-
-                //如果用户的缓冲区(即用户malloc的buf)长度够大，offset一般是0。
-                //即 “下次准备拷贝数据的序列号”==此时获取报文的起始序列号
-                //什么情况下offset &gt;0呢？很简答，如果用户缓冲区12字节，而这个skb有120字节
-                //那么一次recv系统调用，只能获取skb中的前12个字节，下一次执行recv系统调用
-                //offset就是12了，offset表示从第12个字节开始读取数据，前12个字节已经读取了。
-                //那这个"已经读取12字节"这个消息，存在哪呢？
-                //在*seq = &amp;tp-&gt;copied_seq;中
-                offset = *seq - TCP_SKB_CB(skb)-&gt;seq;
-                if (tcp_hdr(skb)-&gt;syn)
-                    offset--;
-                if (offset &lt; skb-&gt;len)
-                    goto found_ok_skb;
-                if (tcp_hdr(skb)-&gt;fin)
-                    goto found_fin_ok;
-                WARN(!(flags &amp; MSG_PEEK), KERN_INFO "recvmsg bug 2: "
-                        "copied %X seq %X rcvnxt %X fl %X\n",
-                        *seq, TCP_SKB_CB(skb)-&gt;seq,
-                        tp-&gt;rcv_nxt, flags);
-            }
-
-            //执行到了这里，表明小循环中break了，既然break了，说明sk_receive_queue中
-            //已经没有skb可以读取了
-            //如果没有执行到这里说明前面的小循环中执行了goto，读到有用的skb，或者读到fin都会goto。
-            //没有skb可以读取，说明什么？
-            //可能性1：当用户第一次调用recv时，压根没有数据到来
-            //可能性2：skb-&gt;len一共20字节，假设用户调用一次 recv，读取12字节，再调用recv，
-            //读取12字节，此时skb由于上次已经被读取了12字节，只剩下8字节。
-            //于是代码的逻辑上，再会要求获取skb，来读取剩下的8字节。
-
-            //可能性1的情况下，copied == 0，肯定不会进这个if。后续将执行休眠
-            //可能性2的情况下，情况比较复杂。可能性2表明数据没有读够用户想要的len长度
-            //虽然进程上下文中，没有读够数据，但是可能我们在读数据的时候
-            //软中断把数据放到backlog队列中了，而backlog对队列中的数据或许恰好让我们读够数
-            //据。
-
-            //copied了数据的，copied肯定&gt;=1，而target 是1或者len
-            //copied只能取0(可能性1)，或者0~len(可能性2)
-            //copied &gt;= target 表示我们取得我们想要的数据了，何必进行休眠，直接return
-            //如果copied 没有达到我们想要的数据，则看看sk_backlog是否为空
-            //空的话，尽力了，只能尝试休眠
-            //非空的话，还有一线希望，我们去sk_backlog找找数据，看看是否能够达到我们想要的
-            //数据大小
-
-            //我觉得copied == target是会出现的，但是出现的话，也不会进现在这个流程
-            //，如有不对，请各位大神指正，告诉我
-            //说明情况下copied == target
-
-            /* Well, if we have backlog, try to process it now yet. */
-            if (copied &gt;= target &amp;&amp; !sk-&gt;sk_backlog.tail)
-                break;
-
-
-            if (copied) {
-                //可能性2，拷贝了数据，但是没有拷贝到指定大小
-                if (sk-&gt;sk_err ||
-                                sk-&gt;sk_state == TCP_CLOSE ||
-                                (sk-&gt;sk_shutdown &amp; RCV_SHUTDOWN) ||
-                                !timeo ||
-                                signal_pending(current))
-                    break;
-            } else {
-                //可能性1
-                if (sock_flag(sk, SOCK_DONE))
-                    break;
-
-                if (sk-&gt;sk_err) {
-                    copied = sock_error(sk);
-                    break;
-                }
-
-                if (sk-&gt;sk_shutdown &amp; RCV_SHUTDOWN)
-                    break;
-
-                if (sk-&gt;sk_state == TCP_CLOSE) {
-                    if (!sock_flag(sk, SOCK_DONE)) {
-                        /* This occurs when user tries to read
-                            * from never connected socket.
-                            */
-                        copied = -ENOTCONN;
-                        break;
-                    }
-                    break;
-                }
-
-                //是否是阻塞的，不是，就return了。
-                if (!timeo) {
-                    copied = -EAGAIN;
-                    break;
-                }
-
-                if (signal_pending(current)) {
-                    copied = sock_intr_errno(timeo);
-                    break;
-                }
-            }
-
-            tcp_cleanup_rbuf(sk, copied);
-
-            //sysctl_tcp_low_latency 默认0tp-&gt;ucopy.task == user_recv肯定也成立
-
-            if (!sysctl_tcp_low_latency &amp;&amp; tp-&gt;ucopy.task == user_recv) {
-                /* Install new reader */
-                if (!user_recv &amp;&amp; !(flags &amp; (MSG_TRUNC | MSG_PEEK))) {
-                    user_recv = current;
-                    tp-&gt;ucopy.task = user_recv;
-                    tp-&gt;ucopy.iov = msg-&gt;msg_iov;
-                }
-
-                tp-&gt;ucopy.len = len;
-
-                WARN_ON(tp-&gt;copied_seq != tp-&gt;rcv_nxt &amp;&amp;
-                    !(flags &amp; (MSG_PEEK | MSG_TRUNC)));
-
-                /* Ugly... If prequeue is not empty, we have to
-                    * process it before releasing socket, otherwise
-                    * order will be broken at second iteration.
-                    * More elegant solution is required!!!
-                    *
-                    * Look: we have the following (pseudo)queues:
-                    *
-                    * 1. packets in flight
-                    * 2. backlog
-                    * 3. prequeue
-                    * 4. receive_queue
-                    *
-                    * Each queue can be processed only if the next ones
-                    * are empty. At this point we have empty receive_queue.
-                    * But prequeue _can_ be not empty after 2nd iteration,
-                    * when we jumped to start of loop because backlog
-                    * processing added something to receive_queue.
-                    * We cannot release_sock(), because backlog contains
-                    * packets arrived _after_ prequeued ones.
-                    *
-                    * Shortly, algorithm is clear --- to process all
-                    * the queues in order. We could make it more directly,
-                    * requeueing packets from backlog to prequeue, if
-                    * is not empty. It is more elegant, but eats cycles,
-                    * unfortunately.
-                    */
-
-                if (!skb_queue_empty(&amp;tp-&gt;ucopy.prequeue))
-                    goto do_prequeue;
-
-                /* __ Set realtime policy in scheduler __ */
-            }
-
-            if (copied &gt;= target) {
-                /* Do not sleep, just process backlog. */
-                release_sock(sk);
-                lock_sock(sk);
-            } else
-                        sk_wait_data(sk, &amp;timeo); 
-            //在此处睡眠了，将在tcp_prequeue函数中调用wake_up_interruptible_poll唤醒
-
-            //软中断会判断用户是正在读取检查并且睡眠了，如果是的话，就直接把数据拷贝
-            //到prequeue队列，然后唤醒睡眠的进程。因为进程睡眠，表示没有读到想要的字节数
-            //此时，软中断有数据到来，直接给进程，这样进程就能以最快的速度被唤醒。
-
-
-            if (user_recv) {
-                int chunk;
-
-                /* __ Restore normal policy in scheduler __ */
-
-                if ((chunk = len - tp-&gt;ucopy.len) != 0) {
-                    NET_ADD_STATS_USER(sock_net(sk), LINUX_MIB_TCPDIRECTCOPYFROMBACKLOG, chunk);
-                    len -= chunk;
-                    copied += chunk;
-                }
-
-                if (tp-&gt;rcv_nxt == tp-&gt;copied_seq &amp;&amp;
-                                !skb_queue_empty(&amp;tp-&gt;ucopy.prequeue)) {
-    do_prequeue:
-                    tcp_prequeue_process(sk);
-
-                    if ((chunk = len - tp-&gt;ucopy.len) != 0) {
-                        NET_ADD_STATS_USER(sock_net(sk), LINUX_MIB_TCPDIRECTCOPYFROMPREQUEUE, chunk);
-                        len -= chunk;
-                        copied += chunk;
-                    }
-                }
-            }
-            if ((flags &amp; MSG_PEEK) &amp;&amp;
-                            (peek_seq - copied - urg_hole != tp-&gt;copied_seq)) {
-                if (net_ratelimit())
-                    printk(KERN_DEBUG "TCP(%s:%d): Application bug, race in MSG_PEEK.\n",
-                                                current-&gt;comm, task_pid_nr(current));
-                peek_seq = tp-&gt;copied_seq;
-            }
-            continue;
-
-        found_ok_skb:
-            /* Ok so how much can we use? */
-            //skb中还有多少聚聚没有拷贝。
-            //正如前面所说的，offset是上次已经拷贝了的，这次从offset开始接下去拷贝
-                    used = skb-&gt;len - offset;
-            //很有可能used的大小，即skb剩余长度，依然大于用户的缓冲区大小(len)。所以依然
-            //只能拷贝len长度。一般来说，用户还得执行一次recv系统调用。直到skb中的数据读完
-            if (len &lt; used)
-                used = len;
-
-            /* Do we have urgent data here? */
-            if (tp-&gt;urg_data) {
-                u32 urg_offset = tp-&gt;urg_seq - *seq;
-                if (urg_offset &lt; used) {
-                    if (!urg_offset) {
-                        if (!sock_flag(sk, SOCK_URGINLINE)) {
-                            ++*seq;
-                            urg_hole++;
-                            offset++;
-                            used--;
-                            if (!used)
-                                goto skip_copy;
-                        }
-                    } else
-                        used = urg_offset;
-                }
-            }
-
-            if (!(flags &amp; MSG_TRUNC)) {
-                {
-                    //一般都会进这个if，进行数据的拷贝，把能够读到的数据，放到用户的缓冲区
-                    err = skb_copy_datagram_iovec(skb, offset,
-                            msg-&gt;msg_iov, used);
-                    if (err) {
-                        /* Exception. Bailout! */
-                        if (!copied)
-                            copied = -EFAULT;
-                        break;
-                    }
-                }
-            }
-
-            //更新标志位，seq 是指针，指向了tp-&gt;copied_seq
-            //used是我们有能力拷贝的数据大小，即已经拷贝到用户缓冲区的大小
-            //正如前面所说，如果用户的缓冲区很小，一次recv拷贝不玩skb中的数据，
-            //我们需要保存已经拷贝了的大小，下次recv时，从这个大小处继续拷贝。
-            //所以需要更新copied_seq。
-            *seq += used;
-            copied += used;
-            len -= used;
-
-            tcp_rcv_space_adjust(sk);
-
-    skip_copy:
-            if (tp-&gt;urg_data &amp;&amp; after(tp-&gt;copied_seq, tp-&gt;urg_seq)) {
-                tp-&gt;urg_data = 0;
-                tcp_fast_path_check(sk);
-            }
-
-            //这个就是判断我们是否拷贝完了skb中的数据，如果没有continue
-            //这种情况下，len经过 len -= used; ，已经变成0，所以continue的效果相当于
-            //退出了这个大循环。可以理解，你只能拷贝len长度，拷贝完之后，那就return了。
-
-            //还有一种情况used + offset ==  skb-&gt;len，表示skb拷贝完了。这时我们只需要释放skb
-            //下面会讲到
-            if (used + offset &lt; skb-&gt;len)
-                continue;
-
-            //看看这个数据报文是否含有fin，含有fin，则goto到found_fin_ok
-            if (tcp_hdr(skb)-&gt;fin)
-                goto found_fin_ok;
-
-            //执行到这里，标明used + offset ==  skb-&gt;len，报文也拷贝完了，那就把skb摘链释放
-            if (!(flags &amp; MSG_PEEK)) {
-                sk_eat_skb(sk, skb, copied_early);
-                copied_early = 0;
-            }
-            //这个cintinue不一定是退出大循环，可能还会执行循环。
-            //假设用户设置缓冲区12字节，你skb-&gt;len长度20字节。
-            //第一次recv读取了12字节，skb剩下8，下一次调用recv再想读取12，
-            //但是只能读取到这8字节了。
-            //此时len 变量长度为4，那么这个continue依旧在这个循环中，
-            //函数还是再次从do开始，使用skb_queue_walk，找skb
-            //如果sk_receive_queue中skb仍旧有，那么继续读，直到len == 0
-            //如果没有skb了，我们怎么办？我们的len还有4字节怎么办？
-            //这得看用户设置的recv函数阻塞与否，即和timeo变量相关了。
-            continue;
-
-        found_fin_ok:
-            /* Process the FIN. */
-            ++*seq;
-            if (!(flags &amp; MSG_PEEK)) {
-                //把skb从sk_receive_queue中摘链
-                sk_eat_skb(sk, skb, copied_early);
-                copied_early = 0;
-            }
-            break;
-        } while (len &gt; 0);
-
-        //到这里是大循环退出
-        //休眠过的进程，然后退出大循环 ，才满足 if (user_recv) 条件
-        if (user_recv) {
-            if (!skb_queue_empty(&amp;tp-&gt;ucopy.prequeue)) {
-                int chunk;
-
-                tp-&gt;ucopy.len = copied &gt; 0 ? len : 0;
-
-                tcp_prequeue_process(sk);
-
-                if (copied &gt; 0 &amp;&amp; (chunk = len - tp-&gt;ucopy.len) != 0) {
-                    NET_ADD_STATS_USER(sock_net(sk), LINUX_MIB_TCPDIRECTCOPYFROMPREQUEUE, chunk);
-                    len -= chunk;
-                    copied += chunk;
-                }
-            }
-
-            //数据读取完毕，清零
-            tp-&gt;ucopy.task = NULL;
-            tp-&gt;ucopy.len = 0;
-        }
-
-        /* According to UNIX98, msg_name/msg_namelen are ignored
-            * on connected socket. I was just happy when found this 8) --ANK
-            */
-
-        /* Clean up data we have read: This will do ACK frames. */
-        //很重要，将更新缓存，并且适当的时候发送ack
-        tcp_cleanup_rbuf(sk, copied);
-
-        TCP_CHECK_TIMER(sk);
-        release_sock(sk);
-        return copied;
-
-    out:
-        TCP_CHECK_TIMER(sk);
-        release_sock(sk);
-        return err;
-
-    recv_urg:
-        err = tcp_recv_urg(sk, msg, len, flags);
-        goto out;
-    }
-</code></pre>
+    <title type="html"><![CDATA[Linux物理内存描述]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-descript/"/>
+    <updated>2015-04-18T22:37:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-descript</id>
+    <content type="html"><![CDATA[<p><a href="/download/kernel/Linux_Physical_Memory_Description.pdf">Linux_Physical_Memory_Description.pdf</a></p>
+
+<p>转自 <a href="http://ilinuxkernel.com/?p=1332">http://ilinuxkernel.com/?p=1332</a></p>
 ]]></content>
   </entry>
   
