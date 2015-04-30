@@ -236,41 +236,46 @@ close一个TCP socket的缺省行为时把该socket标记为以关闭，然后�
 	#include<netinet/in.h>
 	#include<unistd.h>
 	#include<arpa/inet.h>
+
 	#define MAXLINE 4096
+
 	int main(int argc, char** argv)
 	{
 		int listenfd, connfd;
 		struct sockaddr_in servaddr;
 		char buff[4096];
 		int n;
-		if( (listenfd = socket(AF_INET, SOCK_STREAM, 0)) ==-1 ){
-			printf("create socket error: %s(errno: %d)\n",strerror(errno),errno);
+
+		if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+			printf("create socket error: %s(errno: %d)\n", strerror(errno), errno);
 			exit(0);
 		}
 		memset(&servaddr, 0, sizeof(servaddr));
 		servaddr.sin_family = AF_INET;
 		servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
 		servaddr.sin_port = htons(6666);
-		if( bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) ==-1){
-			printf("bind socket error: %s(errno: %d)\n",strerror(errno),errno);
+		if (bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) == -1) {
+			printf("bind socket error: %s(errno: %d)\n", strerror(errno), errno);
 			exit(0);
 		}
-		if( listen(listenfd, 10) ==-1){
-			printf("listen socket error: %s(errno: %d)\n",strerror(errno),errno);
+		if (listen(listenfd, 10) == -1) {
+			printf("listen socket error: %s(errno: %d)\n", strerror(errno), errno);
 			exit(0);
 		}
 		printf("======waiting for client's request======\n");
-		while(1){
-			if( (connfd = accept(listenfd, (struct sockaddr*)NULL, NULL)) ==-1){
-				printf("accept socket error: %s(errno: %d)",strerror(errno),errno);
+		while (1) {
+			if ((connfd = accept(listenfd, (struct sockaddr*)NULL, NULL)) == -1){
+				printf("accept socket error: %s(errno: %d)", strerror(errno), errno);
 				continue;
 			}
+
 			n = recv(connfd, buff, MAXLINE, 0);
 			buff[n] ='\0';
 			printf("recv msg from client: %s\n", buff);
 			close(connfd);
 		}
 		close(listenfd);
+		return 0;
 	}
 ```
 ##### 客户端代码：
@@ -284,40 +289,41 @@ close一个TCP socket的缺省行为时把该socket标记为以关闭，然后�
 	#include<netinet/in.h>
 	#include<unistd.h>
 	#include<arpa/inet.h>
+
 	#define MAXLINE 4096
+
 	int main(int argc, char** argv)
 	{
 		int sockfd, n;
 		char recvline[4096], sendline[4096];
 		struct sockaddr_in servaddr;
-		if( argc !=2){
+		if (argc != 2) {
 			printf("usage: ./client <ipaddress>\n");
 			exit(0);
 		}
-		if( (sockfd = socket(AF_INET, SOCK_STREAM, 0)) <0){
-			printf("create socket error: %s(errno: %d)\n", strerror(errno),errno);
+		if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+			printf("create socket error: %s(errno: %d)\n", strerror(errno), errno);
 			exit(0);
 		}
 		memset(&servaddr, 0, sizeof(servaddr));
 		servaddr.sin_family = AF_INET;
 		servaddr.sin_port = htons(6666);
-		if( inet_pton(AF_INET, argv[1], &servaddr.sin_addr) <=0){
-			printf("inet_pton error for %s\n",argv[1]);
+		if (inet_pton(AF_INET, argv[1], &servaddr.sin_addr) <= 0) {
+			printf("inet_pton error for %s\n", argv[1]);
 			exit(0);
 		}
-		if( connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) <0){
-			printf("connect error: %s(errno: %d)\n",strerror(errno),errno);
+		if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+			printf("connect error: %s(errno: %d)\n", strerror(errno), errno);
 			exit(0);
 		}
 		printf("send msg to server: \n");
 		fgets(sendline, 4096, stdin);
-		if( send(sockfd, sendline, strlen(sendline), 0) <0)
-		{
+		if (send(sockfd, sendline, strlen(sendline), 0) < 0) {
 			printf("send msg error: %s(errno: %d)\n", strerror(errno), errno);
 			exit(0);
 		}
 		close(sockfd);
-		exit(0);
+		return 0;
 	}
 ```
 当然上面的代码很简单，也有很多缺点，这就只是简单的演示socket的基本函数使用。其实不管有多复杂的网络程序，都使用的这些基本函数。上面的服务器使用的是迭代模式的，即只有处理完一个客户端请求才会去处理下一个客户端的请求，这样的服务器处理能力是很弱的，现实中的服务器都需要有并发处理能力！为了需要并发处理，服务器需要fork()一个新的进程或者线程去处理请求等。
