@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~04
 - kernel
-- kernel~net
+- kernel~mm
 tags:
 ---
 

@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~04
 - kernel
-- kernel~net
+- kernel~mm
 tags:
 ---
 os.51cto.com/art/201310/412758_all.htm

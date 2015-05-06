@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~04
 - kernel
-- kernel~net
+- kernel~mm
 tags:
 ---
 blog.tek-life.com/认识linux物理内存回收机制/
