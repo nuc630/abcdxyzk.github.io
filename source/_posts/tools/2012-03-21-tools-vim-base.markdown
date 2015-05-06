@@ -17,6 +17,7 @@ set shiftwidth=8
 set autoindent
 set cindent
 set nu
+set hlsearch
 ```
 恢复文件关闭之前光标的位置  
 Vim的全局配置/etc/vim/vimrc，被注释的这么几行：取消注释，g后面的'改成`，改好如下
@@ -24,6 +25,23 @@ Vim的全局配置/etc/vim/vimrc，被注释的这么几行：取消注释，g�
 if has("autocmd")
  au BufReadPost * if line("'\"") > 1 && line("'\"") <= line("$") | exe "normal! g`\"" | endif
 endif
+```
+
+添加vim状态栏
+```
+	set laststatus=2
+	set statusline=
+	set statusline+=%n\                            " buffer number
+	set statusline+=%f\                            " filename
+	set statusline+=%h%m%r%w                       " status flags
+	set statusline+=\[%{strlen(&ft)?&ft:'none'}]\  " file type
+	set statusline+=%P\                            " file position
+	set statusline+=%(%l,%c%V%)\                   " line, character
+	set statusline+=%=                             " right align remainder
+	set statusline+=0x%-8B                         " character value
+	set statusline+=%-8{&fenc}\  
+	set statusline+=%{getcwd()}\  
+	set statusline+=%<%{$USER}@%{hostname()}\  
 ```
 
 ##### 解决vi/vim中粘贴会在行首多很多缩进和空格的问题
