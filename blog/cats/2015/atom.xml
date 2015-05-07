@@ -4,7 +4,7 @@
   <title><![CDATA[Category: 2015 | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/2015/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-04-18T23:57:14+08:00</updated>
+  <updated>2015-05-07T16:25:21+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,684 +14,1404 @@
 
   
   <entry>
-    <title type="html"><![CDATA[Linux物理内存回收机制]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim2/"/>
-    <updated>2015-04-18T23:33:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim2</id>
-    <content type="html"><![CDATA[<p>blog.tek-life.com/认识linux物理内存回收机制/</p>
+    <title type="html"><![CDATA[中断子系统之（八）：softirq]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-softirq/"/>
+    <updated>2015-05-07T16:04:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-softirq</id>
+    <content type="html"><![CDATA[<p><a href="http://www.wowotech.net/linux_kenrel/soft-irq.html">http://www.wowotech.net/linux_kenrel/soft-irq.html</a></p>
 
-<h4>Introduction</h4>
+<h3>一、前言</h3>
 
-<p>本文所讲的物理页面回收是指动态的回收：即，空闲的内存不够用的时候，系统采取相应的方法将正在使用的内存释放，补充空闲内存，以满足内存的分配。</p>
+<p>对于中断处理而言，linux将其分成了两个部分，一个叫做中断handler（top half），是全程关闭中断的，另外一部分是deferable task（bottom half），属于不那么紧急需要处理的事情。在执行bottom half的时候，是开中断的。有多种bottom half的机制，例如：softirq、tasklet、workqueue或是直接创建一个kernel thread来执行bottom half（这在旧的kernel驱动中常见，现在，一个理智的driver厂商是不会这么做的）。本文主要讨论softirq机制。由于tasklet是基于softirq的，因此本文也会提及tasklet，但主要是从需求层面考虑，不会涉及其具体的代码实现。</p>
 
-<h3>Text</h3>
+<p>在普通的驱动中一般是不会用到softirq，但是由于驱动经常使用的tasklet是基于softirq的，因此，了解softirq机制有助于撰写更优雅的driver。softirq不能动态分配，都是静态定义的。内核已经定义了若干种softirq number，例如网络数据的收发、block设备的数据访问（数据量大，通信带宽高），timer的deferable task（时间方面要求高）。本文的第二章讨论了softirq和tasklet这两种机制有何不同，分别适用于什么样的场景。第三章描述了一些context的概念，这是要理解后续内容的基础。第四章是进入softirq的实现，对比hard irq来解析soft irq的注册、触发，调度的过程。</p>
 
-<h4>1.All channels for page freeing。首先先简单看一下系统中的内存释放的三种渠道。</h4>
+<ul>
+<li>注：本文中的linux kernel的版本是3.14</li>
+</ul>
 
-<p>  1-1>. 在用户进程退出的时候，释放内存。当用户进程退出的时候，会调用do_exit. do_exit最终会调用free_pagetables函数。该函数的作用是：遍历vma，根据vma中的虚拟地址找到实际的物理页，将其释放。在之前讲过，对于用户进程的虚拟地址区间，是以红黑树组织的。</p>
 
-<p>  1-2>. 手动的释放。在驱动中，分配内存使用alloc_pages()，释放内存用free_pages(这一点，类似于c语言中的malloc和free)。必须配对使用。否则会造成内存泄漏。</p>
+<h3>二、为何有softirq和tasklet</h3>
 
-<p>  1-3>. 按需求调用内存回收例程来释放内存。这个区别于前两种的最大不同：它是动态的，按需的。当内存不够的时候，系统会自动按照一定的方式，将某些正在使用的内存释放掉，放进buddy system中再利用。</p>
+<h4>1、为何有top half和bottom half</h4>
 
-<h4>2. Overview for page frame reclaiming。</h4>
+<p>中断处理模块是任何OS中最重要的一个模块，对系统的性能会有直接的影响。想像一下：如果在通过U盘进行大量数据拷贝的时候，你按下一个key，需要半秒的时间才显示出来，这个场景是否让你崩溃？因此，对于那些复杂的、需要大量数据处理的硬件中断，我们不能让handler中处理完一切再恢复现场（handler是全程关闭中断的），而是仅仅在handler中处理一部分，具体包括：<br/>
+（1）有实时性要求的<br/>
+（2）和硬件相关的。例如ack中断，read HW FIFO to ram等<br/>
+（3）如果是共享中断，那么获取硬件中断状态以便判断是否是本中断发生</p>
 
-<p>  2-1>. 先来看一下内存将会回收哪些页面<br/>
-  用户进程的页面都是通过page fault进行分配的。通过page fault进行分配的页面都是可以进行回收的。 这些页面总体可以划分为两种，分别是文件页(file cache)和匿名页(anonymous cache). 文件页，顾名思义，它是和外部存储设备上的某个文件相对应。匿名页，其内容不来自于外部存储设备，例如用户进程中的堆栈。这两种页面是内存回收的目标页面。</p>
+<p>除此之外，其他的内容都是放到bottom half中处理。在把中断处理过程划分成top half和bottom half之后，关中断的top half被瘦身，可以非常快速的执行完毕，大大减少了系统关中断的时间，提高了系统的性能。</p>
 
-<p>  2-2>. 内存回收采用的主要算法是近似于LRU的算法。位于LRU链表前面的页是活跃的，位于LRU链表后面的页是不活跃的。为什么说是近似呢？<br/>
-   1. 页面在链表上排序并不是严格依据LRU不断移动的。他们挂上去后是不移动的。除非在进行页面回收的时候，有些页面从后面，可能会插入到前面；<br/>
-   2. Linux在LRU的基础上又引入了一个Referrenced标志。这种带Referenced标志的近似LRU的算法被有些人称之为Second-Chance Algorithm.</p>
+<p>我们可以基于下面的系统进一步的进行讨论：</p>
 
-<p>简单看一下Second-Chance Algorithm. 当一个页从一个LRU链表上除去的时候，需要再看一下Referenced标志。如果该标志设置了，就将其置为0，不能将该页移出。</p>
+<p><img src="/images/kernel/2015-05-07-11.gif" alt="" /></p>
 
-<p><img src="/images/kernel/2015-04-18-20.png" alt="" /><br/>
-图1</p>
+<p>当网卡控制器的FIFO收到的来自以太网的数据的时候（例如半满的时候，可以软件设定），可以将该事件通过irq signal送达Interrupt Controller。Interrupt Controller可以把中断分发给系统中的Processor A or B。</p>
 
-<p>以图一为例，当某个页面被访问后，Referenced标志被设置。当需要从该list上面回收某些页时，从后向前扫描该list上的页面。对于那些设置为1(Referenced标志被设置)，reset为0，不被移出链表。对于那些设置为0的页面，移出链表。</p>
-
-<p>  2-3>. Linux为了实现该算法，给每个zone都提供了5个LRU链表。这5个LRU链表分为3类，一类是活跃链表(active list)，活跃链表有两个：一个是链接file page cache的LRU list, 另一个是链接anonymous page cache的LRU list. 另一类是非活跃链表(inactive list)，非活跃链表也有两个：一个是链接file page cache 的LRU list, 另一个是链接anonymous page cache的LRU list. 内存回收例程从inactive list链表上获取页进行回收。第三类是unevictable链表，这个链表上挂载的是那些被mlock()或者locked的页面。Mlock(),是一个系统调用，用户程序通过该系统调用锁定某些页阻止系统将其换出。被Locked的页面通常是文件系统防止其他进程touch的页面。被锁定的页面都挂载unevictable链表上。</p>
-
-<p>  加入到active list链表上的页其page->flags上都要设置PG_active标志。凡是设置了PG_unevictable标志的都要挂载unevictable LRU list上。没有设置PG_active/PG_unevictable标志的都处于inactive状态。处于相关状态的页面通过page->lru 链接到对应的链表上。</p>
-
-<p>  当某个页被访问后，提高该页面的活跃度。提高活跃度的方法是:或者对page->flags设置PG_referenced标志，或者对page->flags设置PG_active(同时该物理页面从inactive_list链表上转移到active_list链表上). 有PG_referenced和PG_active标志，可以得到页面的状态，该活跃度由低到高依次为：00->01->10->11</p>
-
-<p>  2-4>. 对于一个可回收页面，按照LRU的算法，只有处于inactive状态的页并且没有设置PG_referenced标志位的页才能被回收。但实际上Linux在实现的时候并没有严格按照这中算法，PG_referenced位只是用来参考的。从下面的状态转换图中可以看出这一点。状态转换图一共有4种状态。</p>
-
-<p><img src="/images/kernel/2015-04-18-21.png" alt="" /><br/>
-图2</p>
-
-<p>当页面通过page fault被分配的时候，file page cache 被加入到非活动链表中(inactive list)， 匿名页(anonymous page cache)被加入到活动链表中(active list)。该状态迁移图所涉及的函数主要有以下几个：shrink_active_list，make_page_accessed，page_check_references。</p>
-
-<p>1)当inactive链表上的页数不够的时候，会调用shrink_active_list，该函数会将active链表上的页move到inactive链表上。对应于上图标号为1的转移；</p>
-
-<p>2). make_page_accessed().
+<p>NIC的中断处理过程大概包括：
 <code>
-    355 /*
-    356  * Mark a page as having seen activity.
-    357  *
-    358  * inactive,unreferenced        -&gt;      inactive,referenced
-    359  * inactive,referenced          -&gt;      active,unreferenced
-    360  * active,unreferenced         -&gt;      active,referenced
-    361  */
-    362 void mark_page_accessed(struct page *page)
-    363 {
-    364         if (!PageActive(page) &amp;&amp; !PageUnevictable(page) &amp;&amp;
-    365                         PageReferenced(page) &amp;&amp; PageLRU(page)) {
-    366                 activate_page(page);
-    367                 ClearPageReferenced(page);
-    368         } else if (!PageReferenced(page)) {
-    369                 SetPageReferenced(page);
-    370         }
-    371 }
-    372 EXPORT_SYMBOL(mark_page_accessed);
+    mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;handle Data in the ram---&gt;unmask interrupt controller
 </code>
-当通过read()系统调用或者读已经在cache中的页面时，会提高页面的活跃度。对应于上图标号为2的转移(00->01->10->11)；
-3) shrink_page_list->page_check_references()
+我们先假设Processor A处理了这个网卡中断事件，于是NIC的中断handler在Processor A上欢快的执行，这时候，Processor A的本地中断是disable的。NIC的中断handler在执行的过程中，网络数据仍然源源不断的到来，但是，如果NIC的中断handler不操作NIC的寄存器来ack这个中断的话，NIC是不会触发下一次中断的。还好，我们的NIC interrupt handler总是在最开始就会ack，因此，这不会导致性能问题。ack之后，NIC已经具体再次trigger中断的能力。当Processor A上的handler 在处理接收来自网络的数据的时候，NIC的FIFO很可能又收到新的数据，并trigger了中断，这时候，Interrupt controller还没有umask，因此，即便还有Processor B（也就是说有处理器资源），中断控制器也无法把这个中断送达处理器系统。因此，只能眼睁睁的看着NIC FIFO填满数据，数据溢出，或者向对端发出拥塞信号，无论如何，整体的系统性能是受到严重的影响。</p>
+
+<p>注意：对于新的interrupt controller，可能没有mask和umask操作，但是原理是一样的，只不过NIC的handler执行完毕要发生EOI而已。</p>
+
+<p>要解决上面的问题，最重要的是尽快的执行完中断handler，打开中断，unmask IRQ（或者发送EOI），方法就是把耗时的handle Data in the ram这个步骤踢出handler，让其在bottom half中执行。</p>
+
+<h4>2、为何有softirq和tasklet</h4>
+
+<p>OK，linux kernel已经把中断处理分成了top half和bottom half，看起来已经不错了，那为何还要提供softirq、tasklet和workqueue这些bottom half机制，linux kernel本来就够复杂了，bottom half还来添乱。实际上，在早期的linux kernel还真是只有一个bottom half机制，简称BH，简单好用，但是性能不佳。后来，linux kernel的开发者开发了task queue机制，试图来替代BH，当然，最后task queue也消失在内核代码中了。现在的linux kernel提供了三种bottom half的机制，来应对不同的需求。</p>
+
+<p>workqueue和softirq、tasklet有本质的区别：workqueue运行在process context，而softirq和tasklet运行在interrupt context。因此，出现workqueue是不奇怪的，在有sleep需求的场景中，defering task必须延迟到kernel thread中执行，也就是说必须使用workqueue机制。softirq和tasklet是怎么回事呢？从本质上将，bottom half机制的设计有两方面的需求，一个是性能，一个是易用性。设计一个通用的bottom half机制来满足这两个需求非常的困难，因此，内核提供了softirq和tasklet两种机制。softirq更倾向于性能，而tasklet更倾向于易用性。</p>
+
+<p>我们还是进入实际的例子吧，还是使用上一节的系统图。在引入softirq之后，网络数据的处理如下：</p>
+
+<p>关中断：
 <code>
-    704 static enum page_references page_check_references(struct page *page,
-    705                                                   struct mem_cgroup_zone *mz,
-    706                                                   struct scan_control *sc)
-    707 {
-    708         int referenced_ptes, referenced_page;
-    709         unsigned long vm_flags;
-    710
-    711         referenced_ptes = page_referenced(page, 1, mz-&gt;mem_cgroup, &amp;vm_flags);
-    712         referenced_page = TestClearPageReferenced(page);
-    713
-    714         /* Lumpy reclaim – ignore references */
-    715         if (sc-&gt;reclaim_mode &amp; RECLAIM_MODE_LUMPYRECLAIM)
-    716                 return PAGEREF_RECLAIM;
-    717
-    718         /*
-    719          * Mlock lost the isolation race with us.  Let try_to_unmap()
-    720          * move the page to the unevictable list.
-    721          */
-    722         if (vm_flags &amp; VM_LOCKED)
-    723                 return PAGEREF_RECLAIM;
-    724
-    725         if (referenced_ptes) {
-    726                 if (PageAnon(page))
-    727                         return PAGEREF_ACTIVATE;
-    728                 /*
-    729                  * All mapped pages start out with page table
-    730                  * references from the instantiating fault, so we need
-    731                  * to look twice if a mapped file page is used more
-    732                  * than once.
-    733                  *
-    734                  * Mark it and spare it for another trip around the
-    735                  * inactive list.  Another page table reference will
-    736                  * lead to its activation.
-    737                  *
-    738                  * Note: the mark is set for activated pages as well
-    739                  * so that recently deactivated but used pages are
-    740                  * quickly recovered.
-    741                  */
-    742                 SetPageReferenced(page);
-    743
-    744                 if (referenced_page || referenced_ptes &gt; 1)
-    745                         return PAGEREF_ACTIVATE;
-    746
-    747                 /*
-    748                  * Activate file-backed executable pages after first usage.
-    749                  */
-    750                 if (vm_flags &amp; VM_EXEC)
-    751                         return PAGEREF_ACTIVATE;
-    752
-    753                 return PAGEREF_KEEP;
-    754         }
-    755
-    756         /* Reclaim if clean, defer dirty pages to writeback */
-    757         if (referenced_page &amp;&amp; !PageSwapBacked(page))
-    758                 return PAGEREF_RECLAIM_CLEAN;
-    759
-    760         return PAGEREF_RECLAIM;
-    761 }
+    mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;raise softirq---&gt;unmask interrupt controller
+</code>
+开中断：在softirq上下文中进行handle Data in the ram的动作</p>
+
+<p>同样的，我们先假设Processor A处理了这个网卡中断事件，很快的完成了基本的HW操作后，raise softirq。在返回中断现场前，会检查softirq的触发情况，因此，后续网络数据处理的softirq在processor A上执行。在执行过程中，NIC硬件再次触发中断，Interrupt controller将该中断分发给processor B，执行动作和Processor A是类似的，因此，最后，网络数据处理的softirq在processor B上执行。</p>
+
+<p>为了性能，同一类型的softirq有可能在不同的CPU上并发执行，这给使用者带来了极大的痛苦，因为驱动工程师在撰写softirq的回调函数的时候要考虑重入，考虑并发，要引入同步机制。但是，为了性能，我们必须如此。</p>
+
+<p>当网络数据处理的softirq同时在Processor A和B上运行的时候，网卡中断又来了（可能是10G的网卡吧）。这时候，中断分发给processor A，这时候，processor A上的handler仍然会raise softirq，但是并不会调度该softirq。也就是说，softirq在一个CPU上是串行执行的。这种情况下，系统性能瓶颈是CPU资源，需要增加更多的CPU来解决该问题。</p>
+
+<p>如果是tasklet的情况会如何呢？为何tasklet性能不如softirq呢？如果一个tasklet在processor A上被调度执行，那么它永远也不会同时在processor B上执行，也就是说，tasklet是串行执行的（注：不同的tasklet还是会并发的），不需要考虑重入的问题。我们还是用网卡这个例子吧（注意：这个例子仅仅是用来对比，实际上，网络数据是使用softirq机制的），同样是上面的系统结构图。假设使用tasklet，网络数据的处理如下：</p>
+
+<p>关中断：
+<code>
+    mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;schedule tasklet---&gt;unmask interrupt controller
+</code>
+开中断：在softirq上下文中（一般使用TASKLET_SOFTIRQ这个softirq）进行handle Data in the ram的动作</p>
+
+<p>同样的，我们先假设Processor A处理了这个网卡中断事件，很快的完成了基本的HW操作后，schedule tasklet（同时也就raise TASKLET_SOFTIRQ softirq）。在返回中断现场前，会检查softirq的触发情况，因此，在TASKLET_SOFTIRQ softirq的handler中，获取tasklet相关信息并在processor A上执行该tasklet的handler。在执行过程中，NIC硬件再次触发中断，Interrupt controller将该中断分发给processor B，执行动作和Processor A是类似的，虽然TASKLET_SOFTIRQ softirq在processor B上可以执行，但是，在检查tasklet的状态的时候，如果发现该tasklet在其他processor上已经正在运行，那么该tasklet不会被处理，一直等到在processor A上的tasklet处理完，在processor B上的这个tasklet才能被执行。这样的串行化操作虽然对驱动工程师是一个福利，但是对性能而言是极大的损伤。</p>
+
+<h3>三、理解softirq需要的基础知识（各种context）</h3>
+
+<h4>1、preempt_count</h4>
+
+<p>为了更好的理解下面的内容，我们需要先看看一些基础知识：一个task的thread info数据结构定义如下（只保留和本场景相关的内容）：
+<code>
+    struct thread_info {
+        ......
+        int preempt_count;    /* 0 =&gt; preemptable, &lt;0 =&gt; bug */
+        ......
+    };
+</code>
+preempt_count这个成员被用来判断当前进程是否可以被抢占。如果preempt_count不等于0（可能是代码调用preempt_disable显式的禁止了抢占，也可能是处于中断上下文等），说明当前不能进行抢占，如果preempt_count等于0，说明已经具备了抢占的条件（当然具体是否要抢占当前进程还是要看看thread info中的flag成员是否设定了_TIF_NEED_RESCHED这个标记，可能是当前的进程的时间片用完了，也可能是由于中断唤醒了优先级更高的进程）。 具体preempt_count的数据格式可以参考下图：</p>
+
+<p><img src="/images/kernel/2015-05-07-12.gif" alt="" /></p>
+
+<p>preemption count用来记录当前被显式的禁止抢占的次数，也就是说，每调用一次preempt_disable，preemption count就会加一，调用preempt_enable，该区域的数值会减去一。preempt_disable和preempt_enable必须成对出现，可以嵌套，最大嵌套的深度是255。</p>
+
+<p>hardirq count描述当前中断handler嵌套的深度。对于ARM平台的linux kernel，其中断部分的代码如下：
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void handle_IRQ(unsigned int irq, struct pt_regs &lt;em&gt;regs)
+</span><span class='line'>{
+</span><span class='line'>    struct pt_regs &lt;/em&gt;old_regs = set_irq_regs(regs);&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    irq_enter(); 
+</span><span class='line'>generic_handle_irq(irq);
+</span><span class='line'>
+</span><span class='line'>irq_exit();
+</span><span class='line'>set_irq_regs(old_regs);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;通用的IRQ handler被irq_enter和irq_exit这两个函数包围。irq_enter说明进入到IRQ context，而irq_exit则说明退出IRQ context。在irq_enter函数中会调用preempt_count_add(HARDIRQ_OFFSET)，为hardirq count的bit field增加1。在irq_exit函数中，会调用preempt_count_sub(HARDIRQ_OFFSET)，为hardirq count的bit field减去1。hardirq count占用了4个bit，说明硬件中断handler最大可以嵌套15层。在旧的内核中，hardirq count占用了12个bit，支持4096个嵌套。当然，在旧的kernel中还区分fast interrupt handler和slow interrupt handler，中断handler最大可以嵌套的次数理论上等于系统IRQ的个数。在实际中，这个数目不可能那么大（内核栈就受不了），因此，即使系统支持了非常大的中断个数，也不可能各个中断依次嵌套，达到理论的上限。基于这样的考虑，后来内核减少了hardirq count占用bit数目，改成了10个bit（在general arch的代码中修改为10，实际上，各个arch可以redefine自己的hardirq count的bit数）。但是，当内核大佬们决定废弃slow interrupt handler的时候，实际上，中断的嵌套已经不会发生了。因此，理论上，hardirq count要么是0，要么是1。不过呢，不能总拿理论说事，实际上，万一有写奇葩或者老古董driver在handler中打开中断，那么这时候中断嵌套还是会发生的，但是，应该不会太多（一个系统中怎么可能有那么多奇葩呢？呵呵），因此，目前hardirq count占用了4个bit，应付15个奇葩driver是妥妥的。
+</span><span class='line'>
+</span><span class='line'>对softirq count进行操作有两个场景：
+</span><span class='line'>
+</span><span class='line'>（1）也是在进入soft irq handler之前给 softirq count加一，退出soft irq handler之后给 softirq count减去一。由于soft irq handler在一个CPU上是不会并发的，总是串行执行，因此，这个场景下只需要一个bit就够了，也就是上图中的bit 8。通过该bit可以知道当前task是否在sofirq context。
+</span><span class='line'>
+</span><span class='line'>（2）由于内核同步的需求，进程上下文需要禁止softirq。这时候，kernel提供了local_bf_enable和local_bf_disable这样的接口函数。这部分的概念是和preempt disable/enable类似的，占用了bit9～15，最大可以支持127次嵌套。
+</span><span class='line'>
+</span><span class='line'>#### 2、一个task的各种上下文
+</span><span class='line'>
+</span><span class='line'>看完了preempt_count之后，我们来介绍各种context：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define in_irq()        (hardirq_count())
+</span><span class='line'>#define in_softirq()        (softirq_count())
+</span><span class='line'>#define in_interrupt()        (irq_count())
+</span><span class='line'>
+</span><span class='line'>#define in_serving_softirq()    (softirq_count() &amp; SOFTIRQ_OFFSET)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;这里首先要介绍的是一个叫做IRQ context的术语。这里的IRQ context其实就是hard irq context，也就是说明当前正在执行中断handler（top half），只要preempt_count中的hardirq count大于0（＝1是没有中断嵌套，如果大于1，说明有中断嵌套），那么就是IRQ context。
+</span><span class='line'>
+</span><span class='line'>softirq context并没有那么的直接，一般人会认为当sofirq handler正在执行的时候就是softirq context。这样说当然没有错，sofirq handler正在执行的时候，会增加softirq count，当然是softirq context。不过，在其他context的情况下，例如进程上下文中，有有可能因为同步的要求而调用local_bh_disable，这时候，通过local_bh_disable/enable保护起来的代码也是执行在softirq context中。当然，这时候其实并没有正在执行softirq handler。如果你确实想知道当前是否正在执行softirq handler，in_serving_softirq可以完成这个使命，这是通过操作preempt_count的bit 8来完成的。
+</span><span class='line'>
+</span><span class='line'>所谓中断上下文，就是IRQ context ＋ softirq context＋NMI context。
+</span><span class='line'>
+</span><span class='line'>### 四、softirq机制
+</span><span class='line'>
+</span><span class='line'>softirq和hardirq（就是硬件中断啦）是对应的，因此softirq的机制可以参考hardirq对应理解，当然softirq是纯软件的，不需要硬件参与。
+</span><span class='line'>
+</span><span class='line'>#### 1、softirq number
+</span><span class='line'>
+</span><span class='line'>和IRQ number一样，对于软中断，linux kernel也是用一个softirq number唯一标识一个softirq，具体定义如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;enum
+</span><span class='line'>{
+</span><span class='line'>HI_SOFTIRQ=0,
+</span><span class='line'>TIMER_SOFTIRQ,
+</span><span class='line'>NET_TX_SOFTIRQ,
+</span><span class='line'>NET_RX_SOFTIRQ,
+</span><span class='line'>BLOCK_SOFTIRQ,
+</span><span class='line'>BLOCK_IOPOLL_SOFTIRQ,
+</span><span class='line'>TASKLET_SOFTIRQ,
+</span><span class='line'>SCHED_SOFTIRQ,
+</span><span class='line'>HRTIMER_SOFTIRQ,
+</span><span class='line'>RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+</span><span class='line'>
+</span><span class='line'>NR_SOFTIRQS
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;HI_SOFTIRQ用于高优先级的tasklet，TASKLET_SOFTIRQ用于普通的tasklet。TIMER_SOFTIRQ是for software timer的（所谓software timer就是说该timer是基于系统tick的）。NET_TX_SOFTIRQ和NET_RX_SOFTIRQ是用于网卡数据收发的。BLOCK_SOFTIRQ和BLOCK_IOPOLL_SOFTIRQ是用于block device的。SCHED_SOFTIRQ用于多CPU之间的负载均衡的。HRTIMER_SOFTIRQ用于高精度timer的。RCU_SOFTIRQ是处理RCU的。这些具体使用情景分析会在各自的子系统中分析，本文只是描述softirq的工作原理。
+</span><span class='line'>
+</span><span class='line'>#### 2、softirq描述符
+</span><span class='line'>
+</span><span class='line'>我们前面已经说了，softirq是静态定义的，也就是说系统中有一个定义softirq描述符的数组，而softirq number就是这个数组的index。这个概念和早期的静态分配的中断描述符概念是类似的。具体定义如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct softirq_action
+</span><span class='line'>{
+</span><span class='line'>void    (*action)(struct softirq_action *);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;系统支持多少个软中断，静态定义的数组就会有多少个entry。`____cacheline_aligned`保证了在SMP的情况下，softirq_vec是对齐到cache line的。softirq描述符非常简单，只有一个action成员，表示如果触发了该softirq，那么应该调用action回调函数来处理这个soft irq。对于硬件中断而言，其mask、ack等都是和硬件寄存器相关并封装在irq chip函数中，对于softirq，没有硬件寄存器，只有“软件寄存器”，定义如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;typedef struct {
+</span><span class='line'>unsigned int __softirq_pending;
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>unsigned int ipi_irqs[NR_IPI];
+</span><span class='line'>#endif
+</span><span class='line'>} ____cacheline_aligned irq_cpustat_t;
+</span><span class='line'>
+</span><span class='line'>irq_cpustat_t irq_stat[NR_CPUS] ____cacheline_aligned;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;ipi_irqs这个成员用于处理器之间的中断，我们留到下一个专题来描述。`__softirq_pending`就是这个“软件寄存器”。softirq采用谁触发，谁负责处理的。例如：当一个驱动的硬件中断被分发给了指定的CPU，并且在该中断handler中触发了一个softirq，那么该CPU负责调用该softirq number对应的action callback来处理该软中断。因此，这个“软件寄存器”应该是每个CPU拥有一个（专业术语叫做banked register）。为了性能，irq_stat中的每一个entry被定义对齐到cache line。
+</span><span class='line'>
+</span><span class='line'>#### 3、如何注册一个softirq
+</span><span class='line'>
+</span><span class='line'>通过调用open_softirq接口函数可以注册softirq的action callback函数，具体如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void open_softirq(int nr, void (*action)(struct softirq_action *))
+</span><span class='line'>{
+</span><span class='line'>softirq_vec[nr].action = action;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册都是在系统初始化的时候完成的，那时候，系统是串行执行的。此外，softirq是静态定义的，每个entry（或者说每个softirq number）都是固定分配的，因此，不需要保护。
+</span><span class='line'>
+</span><span class='line'>#### 4、如何触发softirq？
+</span><span class='line'>
+</span><span class='line'>在linux kernel中，可以调用raise_softirq这个接口函数来触发本地CPU上的softirq，具体如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void raise_softirq(unsigned int nr)
+</span><span class='line'>{
+</span><span class='line'>unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>local_irq_save(flags);
+</span><span class='line'>raise_softirq_irqoff(nr);
+</span><span class='line'>local_irq_restore(flags);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;虽然大部分的使用场景都是在中断handler中（也就是说关闭本地CPU中断）来执行softirq的触发动作，但是，这不是全部，在其他的上下文中也可以调用raise_softirq。因此，触发softirq的接口函数有两个版本，一个是raise_softirq，有关中断的保护，另外一个是raise_softirq_irqoff，调用者已经关闭了中断，不需要关中断来保护“soft irq status register”。
+</span><span class='line'>
+</span><span class='line'>所谓trigger softirq，就是在`__softirq_pending`（也就是上面说的soft irq status register）的某个bit置一。从上面的定义可知，`__softirq_pending`是per cpu的，因此不需要考虑多个CPU的并发，只要disable本地中断，就可以确保对，`__softirq_pending`操作的原子性。
+</span><span class='line'>
+</span><span class='line'>具体raise_softirq_irqoff的代码如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;inline void raise_softirq_irqoff(unsigned int nr)
+</span><span class='line'>{
+</span><span class='line'>__raise_softirq_irqoff(nr); ---------- （1）
+</span><span class='line'>
+</span><span class='line'>if (!in_interrupt())
+</span><span class='line'>    wakeup_softirqd();      ---------- （2）
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;（1）`__raise_softirq_irqoff`函数设定本CPU上的`__softirq_pending`的某个bit等于1，具体的bit是由soft irq number（nr参数）指定的。
+</span><span class='line'>
+</span><span class='line'>（2）如果在中断上下文，我们只要set `__softirq_pending`的某个bit就OK了，在中断返回的时候自然会进行软中断的处理。但是，如果在context上下文调用这个函数的时候，我们必须要调用wakeup_softirqd函数用来唤醒本CPU上的softirqd这个内核线程。具体softirqd的内容请参考下一个章节。
+</span><span class='line'>
+</span><span class='line'>#### 5、disable/enable softirq
+</span><span class='line'>
+</span><span class='line'>在linux kernel中，可以使用local_irq_disable和local_irq_enable来disable和enable本CPU中断。和硬件中断一样，软中断也可以disable，接口函数是local_bh_disable和local_bh_enable。虽然和想像的local_softirq_enable/disable有些出入，不过bh这个名字更准确反应了该接口函数的意涵，因为local_bh_disable/enable函数就是用来disable/enable bottom half的，这里就包括softirq和tasklet。
+</span><span class='line'>
+</span><span class='line'>先看disable吧，毕竟禁止bottom half比较简单：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void local_bh_disable(void)
+</span><span class='line'>{
+</span><span class='line'>__local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+</span><span class='line'>{
+</span><span class='line'>preempt_count_add(cnt);
+</span><span class='line'>barrier();
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;看起来disable bottom half比较简单，就是讲current thread info上的preempt_count成员中的softirq count的bit field9～15加上一就OK了。barrier是优化屏障（Optimization barrier），会在内核同步系列文章中描述。
+</span><span class='line'>
+</span><span class='line'>enable函数比较复杂，如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void local_bh_enable(void)
+</span><span class='line'>{
+</span><span class='line'>__local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
+</span><span class='line'>{
+</span><span class='line'>WARN_ON_ONCE(in_irq() || irqs_disabled()); --------- （1）
+</span><span class='line'>
+</span><span class='line'>preempt_count_sub(cnt - 1);                --------- （2）
+</span><span class='line'>
+</span><span class='line'>if (unlikely(!in_interrupt() &amp;&amp; local_softirq_pending())) {  ------- （3）
+</span><span class='line'>    do_softirq();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>preempt_count_dec();                       --------- （4）
+</span><span class='line'>preempt_check_resched();
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;（1）disable/enable bottom half是一种内核同步机制。在硬件中断的handler（top half）中，不应该调用disable/enable bottom half函数来保护共享数据，因为bottom half其实是不可能抢占top half的。同样的，soft irq也不会抢占另外一个soft irq的执行，也就是说，一旦一个softirq handler被调度执行（无论在哪一个processor上），那么，本地的softirq handler都无法抢占其运行，要等到当前的softirq handler运行完毕后，才能执行下一个soft irq handler。注意：上面我们说的是本地，是local，softirq handler是可以在多个CPU上同时运行的，但是，linux kernel中没有disable all softirq的接口函数（就好像没有disable all CPU interrupt的接口一样，注意体会local_bh_enable/disable中的local的含义）。
+</span><span class='line'>
+</span><span class='line'>说了这么多，一言以蔽之，local_bh_enable/disable是给进程上下文使用的，用于防止softirq handler抢占local_bh_enable/disable之间的临界区的。
+</span><span class='line'>
+</span><span class='line'>irqs_disabled接口函数可以获知当前本地CPU中断是否是disable的，如果返回1，那么当前是disable 本地CPU的中断的。如果irqs_disabled返回1，有可能是下面这样的代码造成的：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;local_irq_disable();
+</span><span class='line'>......
+</span><span class='line'>local_bh_disable();
+</span><span class='line'>
+</span><span class='line'>......
+</span><span class='line'>
+</span><span class='line'>local_bh_enable();
+</span><span class='line'>......
+</span><span class='line'>local_irq_enable();
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;本质上，关本地中断是一种比关本地bottom half更强劲的锁，关本地中断实际上是禁止了top half和bottom half抢占当前进程上下文的运行。也许你会说：这也没有什么，就是有些浪费，至少代码逻辑没有问题。但事情没有这么简单，在`local_bh_enable---&gt;do_softirq---&gt;__do_softirq`中，有一条无条件打开当前中断的操作，也就是说，原本想通过local_irq_disable/local_irq_enable保护的临界区被破坏了，其他的中断handler可以插入执行，从而无法保证local_irq_disable/local_irq_enable保护的临界区的原子性，从而破坏了代码逻辑。
+</span><span class='line'>
+</span><span class='line'>in_irq()这个函数如果不等于0的话，说明local_bh_enable被irq_enter和irq_exit包围，也就是说在中断handler中调用了local_bh_enable/disable。这道理是和上面类似的，这里就不再详细描述了。
+</span><span class='line'>
+</span><span class='line'>（2）在local_bh_disable中我们为preempt_count增加了SOFTIRQ_DISABLE_OFFSET，在local_bh_enable函数中应该减掉同样的数值。这一步，我们首先减去了（SOFTIRQ_DISABLE_OFFSET-1），为何不一次性的减去SOFTIRQ_DISABLE_OFFSET呢？考虑下面运行在进程上下文的代码场景：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;......
+</span><span class='line'>
+</span><span class='line'>local_bh_disable
+</span><span class='line'>
+</span><span class='line'>...需要被保护的临界区...
+</span><span class='line'>
+</span><span class='line'>local_bh_enable
+</span><span class='line'>......
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;在临界区内，有进程context 和softirq共享的数据，因此，在进程上下文中使用local_bh_enable/disable进行保护。假设在临界区代码执行的时候，发生了中断，由于代码并没有阻止top half的抢占，因此中断handler会抢占当前正在执行的thread。在中断handler中，我们raise了softirq，在返回中断现场的时候，由于disable了bottom half，因此虽然触发了softirq，但是不会调度执行。因此，代码返回临界区继续执行，直到local_bh_enable。一旦enable了bottom half，那么之前raise的softirq就需要调度执行了，因此，这也是为什么在local_bh_enable会调用do_softirq函数。
+</span><span class='line'>
+</span><span class='line'>调用do_softirq函数来处理pending的softirq的时候，当前的task是不能被抢占的，因为一旦被抢占，下一次该task被调度运行的时候很可能在其他的CPU上去了（还记得吗？softirq的pending 寄存器是per cpu的）。因此，我们不能一次性的全部减掉，那样的话有可能preempt_count等于0，那样就允许抢占了。因此，这里减去了（SOFTIRQ_DISABLE_OFFSET-1），既保证了softirq count的bit field9~15被减去了1，又保持了preempt disable的状态。
+</span><span class='line'>
+</span><span class='line'>（3）如果当前不是interrupt context的话，并且有pending的softirq，那么调用do_softirq函数来处理软中断。
+</span><span class='line'>
+</span><span class='line'>（4）该来的总会来，在step 2中我们少减了1，这里补上，其实也就是preempt count-1。
+</span><span class='line'>
+</span><span class='line'>（5）在softirq handler中很可能wakeup了高优先级的任务，这里最好要检查一下，看看是否需要进行调度，确保高优先级的任务得以调度执行。
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>#### 5、如何处理一个被触发的soft irq
+</span><span class='line'>
+</span><span class='line'>我们说softirq是一种defering task的机制，也就是说top half没有做的事情，需要延迟到bottom half中来执行。那么具体延迟到什么时候呢？这是本节需要讲述的内容，也就是说soft irq是如何调度执行的。
+</span><span class='line'>
+</span><span class='line'>在上一节已经描述一个softirq被调度执行的场景，本节主要关注在中断返回现场时候调度softirq的场景。我们来看中断退出的代码，具体如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void irq_exit(void)
+</span><span class='line'>{
+</span><span class='line'>......
+</span><span class='line'>if (!in_interrupt() &amp;&amp; local_softirq_pending())
+</span><span class='line'>    invoke_softirq();
+</span><span class='line'>
+</span><span class='line'>......
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;代码中“!in_interrupt()”这个条件可以确保下面的场景不会触发sotfirq的调度：
+</span><span class='line'>
+</span><span class='line'>（1）中断handler是嵌套的。也就是说本次irq_exit是退出到上一个中断handler。当然，在新的内核中，这种情况一般不会发生，因为中断handler都是关中断执行的。
+</span><span class='line'>
+</span><span class='line'>（2）本次中断是中断了softirq handler的执行。也就是说本次irq_exit是不是退出到进程上下文，而是退出到上一个softirq context。这一点也保证了在一个CPU上的softirq是串行执行的（注意：多个CPU上还是有可能并发的）
+</span><span class='line'>
+</span><span class='line'>我们继续看invoke_softirq的代码：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void invoke_softirq(void)
+</span><span class='line'>{
+</span><span class='line'>if (!force_irqthreads) {
+</span><span class='line'>#ifdef CONFIG_HAVE_IRQ_EXIT_ON_IRQ_STACK
+</span><span class='line'>    __do_softirq();
+</span><span class='line'>#else
+</span><span class='line'>    do_softirq_own_stack();
+</span><span class='line'>#endif
+</span><span class='line'>} else {
+</span><span class='line'>    wakeup_softirqd();
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;force_irqthreads是和强制线程化相关的，主要用于interrupt handler的调试（一般而言，在线程环境下比在中断上下文中更容易收集调试数据）。如果系统选择了对所有的interrupt handler进行线程化处理，那么softirq也没有理由在中断上下文中处理（中断handler都在线程中执行了，softirq怎么可能在中断上下文中执行）。本身invoke_softirq这个函数是在中断上下文中被调用的，如果强制线程化，那么系统中所有的软中断都在sofirq的daemon进程中被调度执行。
+</span><span class='line'>
+</span><span class='line'>如果没有强制线程化，softirq的处理也分成两种情况，主要是和softirq执行的时候使用的stack相关。如果arch支持单独的IRQ STACK，这时候，由于要退出中断，因此irq stack已经接近全空了（不考虑中断栈嵌套的情况，因此新内核下，中断不会嵌套），因此直接调用`__do_softirq()`处理软中断就OK了，否则就调用do_softirq_own_stack函数在softirq自己的stack上执行。当然对ARM而言，softirq的处理就是在当前的内核栈上执行的，因此do_softirq_own_stack的调用就是调用`__do_softirq()`，代码如下（删除了部分无关代码）：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;asmlinkage void __do_softirq(void)
+</span><span class='line'>{
+</span><span class='line'>......
+</span><span class='line'>pending = local_softirq_pending();  ----------- 获取softirq pending的状态
+</span><span class='line'>__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET); ---- 标识下面的代码是正在处理softirq
+</span><span class='line'>cpu = smp_processor_id();
+</span><span class='line'>restart:
+</span><span class='line'>set_softirq_pending(0);  ------------- 清除pending标志
+</span><span class='line'>local_irq_enable();      ------------- 打开中断，softirq handler是开中断执行的
+</span><span class='line'>h = softirq_vec;         ------------- 获取软中断描述符指针
+</span><span class='line'>
+</span><span class='line'>while ((softirq_bit = ffs(pending))) { --------- 寻找pending中第一个被设定为1的bit
+</span><span class='line'>    unsigned int vec_nr;
+</span><span class='line'>    int prev_count;
+</span><span class='line'>
+</span><span class='line'>    h += softirq_bit - 1; ----------- 指向pending的那个软中断描述符
+</span><span class='line'>    vec_nr = h - softirq_vec; ------- 获取soft irq number
+</span><span class='line'>    h-&gt;action(h);         ----------- 指向softirq handler
+</span><span class='line'>    h++;
+</span><span class='line'>    pending &gt;&gt;= softirq_bit;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>local_irq_disable();      ----------- 打开中断
+</span><span class='line'>
+</span><span class='line'>pending = local_softirq_pending(); ------ （注1）
+</span><span class='line'>if (pending) {
+</span><span class='line'>    if (time_before(jiffies, end) &amp;&amp; !need_resched() &amp;&amp;
+</span><span class='line'>        --max_restart)
+</span><span class='line'>        goto restart;
+</span><span class='line'>
+</span><span class='line'>    wakeup_softirqd();
+</span><span class='line'>}
+</span><span class='line'>__local_bh_enable(SOFTIRQ_OFFSET); ----------- 标识softirq处理完毕
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```
+</span><span class='line'>（注1）再次检查softirq pending，有可能上面的softirq handler在执行过程中，发生了中断，又raise了softirq。如果的确如此，那么我们需要跳转到restart那里重新处理soft irq。当然，也不能总是在这里不断的loop，因此linux kernel设定了下面的条件：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;（1）softirq的处理时间没有超过2个ms&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;（2）上次的softirq中没有设定TIF_NEED_RESCHED，也就是说没有有高优先级任务需要调度&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;（3）loop的次数小于 10次&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因此，只有同时满足上面三个条件，程序才会跳转到restart那里重新处理soft irq。否则wakeup_softirqd就OK了。这样的设计也是一个平衡的方案。一方面照顾了调度延迟：本来，发生一个中断，系统期望在限定的时间内调度某个进程来处理这个中断，如果softirq handler不断触发，其实linux kernel是无法保证调度延迟时间的。另外一方面，也照顾了硬件的thoughput：已经预留了一定的时间来处理softirq。&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[内核源码分析之linux内核栈]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack2/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-07T15:54:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack2&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.cnblogs.com/liangning/p/3879177.html"&gt;http://www.cnblogs.com/liangning/p/3879177.html&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;基于3.16-rc4&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在3.16-rc4内核源码中，内核给每个进程分配的内核栈大小为8KB。这个内核栈被称为异常栈，在进程的内核空间运行时或者执行异常处理程序时，使用的都是异常栈，看下异常栈的代码（include/linux/sched.h）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>union thread_union {
+</span><span class='line'>    struct thread_info thread_info;
+</span><span class='line'>    unsigned long stack[THREAD_SIZE/sizeof(long)];
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>THREAD_SIZE值为8KB，因此内核为进程的异常栈（内核栈）分配了两个页框大小（页框大小4KB）。另外，进程的thread_info结构体保存在栈顶部。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;此外，内核为每个cpu分配一个硬中断栈和一个软中断栈（这两个栈也是内核栈），用来执行中断服务例程和下半部（软中断），看看代码（arch/x86/kernel/irq_32.c）。这两个栈属于cpu，不属于进程，这和异常栈是有区别的。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>DEFINE_PER_CPU(struct irq_stack *, hardirq_stack);
+</span><span class='line'>DEFINE_PER_CPU(struct irq_stack *, softirq_stack);
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>定义了两个数组hardirq_stack和softirq_stack，每个数组元素对应一个cpu，指向了该cpu的硬中断栈或者软中断栈。再来看下struct irq_stack结构体（arch/x86/include/asm/processor.h）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>struct irq_stack {
+</span><span class='line'>    u32                     stack[THREAD_SIZE/sizeof(u32)];
+</span><span class='line'>} __aligned(THREAD_SIZE);
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>可见，硬中断栈和软中断栈的大小均为8KB。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;内核在执行中断处理程序时，在do_IRQ函数中会调用handle_irq函数，在handle_irq函数中要进行堆栈切换，代码如下（arch/x86/kernel/irq_32.c）：</span></code></pre></td></tr></table></div></figure>
+    bool handle_irq(unsigned irq, struct pt_regs <em>regs)
+    {
+        struct irq_desc </em>desc;
+        int overflow;</p>
+
+<pre><code>    overflow = check_stack_overflow();
+
+    desc = irq_to_desc(irq);
+    if (unlikely(!desc))
+    return false;
+
+    if (user_mode_vm(regs) || !execute_on_irq_stack(overflow, desc, irq)) {
+        if (unlikely(overflow))
+            print_stack_overflow();
+        desc-&gt;handle_irq(irq, desc);
+    }
+
+    return true;
+}
+</code></pre>
+
+<pre><code>
+第12行中执行execute_on_irq_stack函数来判断是否需要堆栈切换，如果不需要，则执行if体的中断服务例程，即在当前堆栈中执行中断服务例程，如果需要切换堆栈，则在execute_on_irq_stack函数中切换堆栈并在该函数中（新堆栈中）执行中断服务例程。下面看下execute_on_irq_stack代码（arch/x86/kernel/irq_32.c）：
+</code></pre>
+
+<pre><code>static inline int
+execute_on_irq_stack(int overflow, struct irq_desc *desc, int irq)
+{
+    struct irq_stack *curstk, *irqstk;
+    u32 *isp, *prev_esp, arg1, arg2;
+
+    curstk = (struct irq_stack *) current_stack();
+    irqstk = __this_cpu_read(hardirq_stack);
+
+    /*
+     * this is where we switch to the IRQ stack. However, if we are
+     * already using the IRQ stack (because we interrupted a hardirq
+     * handler) we can't do that and just have to keep using the
+     * current stack (which is the irq stack already after all)
+     */
+    if (unlikely(curstk == irqstk))
+        return 0;
+
+    isp = (u32 *) ((char *)irqstk + sizeof(*irqstk));
+
+    /* Save the next esp at the bottom of the stack */
+    prev_esp = (u32 *)irqstk;
+    *prev_esp = current_stack_pointer;
+
+    if (unlikely(overflow))
+        call_on_stack(print_stack_overflow, isp);
+
+    asm volatile("xchgl    %%ebx,%%esp    \n"
+             "call    *%%edi        \n"
+             "movl    %%ebx,%%esp    \n"
+             : "=a" (arg1), "=d" (arg2), "=b" (isp)
+             :  "0" (irq),   "1" (desc),  "2" (isp),
+            "D" (desc-&gt;handle_irq)
+             : "memory", "cc", "ecx");
+    return 1;
+}
+</code></pre>
+
+<p>```</p>
+
+<p>第7行获取当前堆栈的指针，第8行获取本地cpu的硬中断栈指针，第16行对二者进行比较，如果相等，则不需要切换堆栈（说明当前堆栈就是硬中断栈，也说明是在中断处理程序中时又发生了中断）。如果不相等，就要进行堆栈切换，第22-23行将当前堆栈指针保存在将要切换到的堆栈中（用于返回）。第28行，交换ebx和esp寄存器的值（实现了堆栈切换，将中断栈指针给了esp），第29行跳转到相应的中断服务例程，第30行从中断服务例程返回后，又将原来的堆栈指针赋给esp，切换到原先堆栈。第33行将中断服务例程函数名存放在%edi中。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[中断栈溢出后的结果]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack/"/>
+    <updated>2015-05-07T15:54:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack</id>
+    <content type="html"><![CDATA[<p><a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a></p>
+
+<p>说一下上文中最开始提到的“某个问题”：如果一台主机网卡比较多，然后每个网卡分队列又比较多，总之结果就是系统里的网卡设备的中断号比较多（关于超过256个中断数的情况，请见参考1，2，3），一旦所有这些中断都绑定到同一个CPU，那么如果网卡收到数据包进而触发中断，而众多硬中断一嵌套就非常容易出现中断栈溢出。一旦中断栈溢出，那么将会导致怎样的结果，这曾在之前的文章里隐含的提到过，这里再重新整理一遍。</p>
+
+<p>在继续下面的描述之前，先看两个知识点：</p>
+
+<h5>1，Linux 2.4.x的中断栈：</h5>
+
+<p>a)，由硬中断/软中断共同使用同一个中断栈<br/>
+b)，中断栈与内核栈共享一个栈<br/>
+c)，中断执行的时候使用的栈就是当前进程的内核栈</p>
+
+<h5>2，Linux 2.6.x的中断栈：</h5>
+
+<p>a)，硬中断与软中断分离使用不同的中断栈<br/>
+b)，中断栈与内核栈分离<br/>
+c)，X86_64 double fault、NMI还可以有额外的栈（64bit特性：IST(Interrupt Stack Table)）</p>
+
+<p>可以看到，对于Linux 2.4.x内核而言，因为中断处理函数使用内核栈作为中断栈，所以导致更加容易发生内核栈溢出（因内核函数本身用栈过多导致溢出，或内核函数本身还未导致内核栈溢出，但此时来了一个中断，因中断函数使用栈而导致溢出，即中断函数成了压死骆驼的最后一根稻草），而内核栈溢出的直接结果就是踩坏task结构体，从而无法正常执行对应的task进程而出现oops宕机。</p>
+
+<p>由于“中断执行的时候使用的栈就是当前进程的内核栈”，所以如果是执行到中断函数后才溢出，那么导致oops里提示的进程信息可能每次都不一样，因此如果出现这种情况，需要考虑是中断函数导致内核栈溢出，否则需怀疑普通的内核函数导致栈溢出即可。</p>
+
+<p>对于Linux 2.6.x内核而言，因为其中断/内核栈分离、软/硬中断栈分离，即每个CPU私有两个栈（见下面注释）分别处理软中断和硬中断，因此出现内核栈溢出，特别是中断栈溢出的概率大大降低。</p>
+
+<p>注释：这个说法来之书本《Understanding.the.Linux.Kernel.3rd.Edition》4.6.1.4. Multiple Kernel Mode stacks，而这本书针对的内核版本是2.6.11，且主要是指32位架构，所以与现在的新版内核源码有些许出入（比如现在情况的栈大小可能是占用2页），但这些细微改变与本文的具体问题相关不大（无非是溢出的难易程度问题），这里不再深入研究，具体情况请参考源代码自行斟酌。
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>The hard IRQ stack is used when handling interrupts. There is one hard IRQ stack for each CPU in the system, and each stack is contained in a single page frame.&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;The soft IRQ stack is used when handling deferrable functions (softirqs or tasklets; see the later section “Softirqs and Tasklets”). There is one soft IRQ stack for each CPU in the system, and each stack is contained in a single page frame. 
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;回到本文的主题，在之前的文章里提到过，即如果中断/异常处理函数本身在处理的过程中出现异常，那么就有可能发生double fault，比如中断栈溢出。中断栈溢出导致的最终结果有两种情况，这由所使用的具体Linux内核版本来决定，更具体点说是由double fault异常的栈是否单独来决定（见参考1）。
+</span><span class='line'>
+</span><span class='line'>1，double fault的栈被单独出来  
+</span><span class='line'>这意味着double fault的处理函数还能正常执行，因此打印oops，宕机。
+</span><span class='line'>
+</span><span class='line'>2，double fault的栈没有被单独出来  
+</span><span class='line'>这意味着double fault的处理函数也无法正常执行，进而触发triple fault，机器直接重启。
+</span><span class='line'>
+</span><span class='line'>对于86-64架构下的Linux 2.6.x内核，因为IST(Interrupt Stack Table)的帮助，所以中断栈溢出导致的最终结果就是打印oops，宕机。
+</span><span class='line'>
+</span><span class='line'>下面来看内核源码文档kernel-stacks，  
+</span><span class='line'>1，每一个活动线程都有一个内核栈，大小为2页。  
+</span><span class='line'>2，每一个cpu有一些专门的栈，只有当cpu执行在内核态时，这些栈才有用；一旦cpu回退到用户态，这些特定栈就不再包含任何有用数据。  
+</span><span class='line'>3，主要的特定栈有：  
+</span><span class='line'>a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提供给中断处理函数更多的栈空间。  
+</span><span class='line'>这里还提到，在2.6.x-i386下，如果设置内核栈只有4K，即CONFIG_4KSTACKS，那么中断栈也是单独开的。备注：这个已有修改，2010-06-29 x86: Always use irq stacks，即不管设置的内核栈是否只有4K，中断栈都是独立的了。  
+</span><span class='line'>
+</span><span class='line'>另外，这里有个说法与前面的引用有点出入：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;The interrupt stack is also used when processing a softirq. 
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```
+</span><span class='line'>即软中断和硬中断一样，也是使用这个中断栈。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;b，x86_64所特有的（也就是i386没有，即同时2.6.30.8内核，32位的Linux就不具备下面所说的这个特性），为double fault或NMI单独准备的栈，这个特性被称为Interrupt Stack Table(IST)。每个cpu最多支持7个IST。关于IST的具体原理与实现暂且不说，直接来看当前已经分配的IST独立栈：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;ul&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;STACKFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>12号中断Stack Fault Exception (#SS)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;DOUBLEFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>8号中断Double Fault Exception (#DF)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;NMI_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>2号中断non-maskable interrupts (NMI)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;DEBUG_STACK. DEBUG_STKSZ&lt;br/&gt;
+</span><span class='line'>1号中断硬件调试和3号中断软件调试使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;MCE_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>18号中断Machine Check Exception (#MC)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;/ul&gt;
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;正因为double fault异常处理函数所使用的栈被单独了出来，所以在出现中断栈溢出时，double fault异常的处理函数还能正常执行，顺利打印出oops信息。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后的最后，有补丁移除IST功能（貌似是因为如果没有IST功能，那么kvm可以得到更好的优化，具体请见参考5），但通过对比补丁修改与实际源码（2.6.30.8以及3.6.11）来看，这个补丁并没有合入mainline主线。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;参考资料：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1，where is hardware timer interrupt?&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt"&gt;http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2，The MSI Driver Guide HOWTO&lt;br/&gt;
+</span><span class='line'>&lt;a href="https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  "&gt;https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  &lt;/a&gt;
+</span><span class='line'>对应的翻译版：&lt;a href="http://blog.csdn.net/reviver/article/details/6802347"&gt;http://blog.csdn.net/reviver/article/details/6802347&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3，[PATCH] x86: 64bit support more than 256 irq v2&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html"&gt;http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;4，How is an Interrupt handled in Linux?&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux"&gt;http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;5，Remove interrupt stack table usage from x86_64 kernel (v2)&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://lwn.net/Articles/313029/  "&gt;http://lwn.net/Articles/313029/  &lt;/a&gt;
+</span><span class='line'>&lt;a href="http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741"&gt;http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;6，Interrupt Descriptor Table&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://wiki.osdev.org/IDT"&gt;http://wiki.osdev.org/IDT&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;转载请保留地址：&lt;a href="http://www.lenky.info/archives/2013/03/2247"&gt;http://www.lenky.info/archives/2013/03/2247&lt;/a&gt; 或 &lt;a href="http://lenky.info/?p=2247"&gt;http://lenky.info/?p=2247&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[对Linux x86-64架构上硬中断的重新认识]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-irq/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-07T15:48:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-irq&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.lenky.info/archives/2013/03/2245"&gt;http://www.lenky.info/archives/2013/03/2245&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;对于x86硬中断的概念，一直都落在理论的认识之上，直到这两天才（因某个问题）发现Linux的实现却并非如此，这里纠正一下（注意：Linux内核源码更新太快，一个说法的时效性太短，所以需注意我提到的香草内核版本，并且以x86-64架构为基准）。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;以前的认识：Linux对硬中断（本文如无特殊说明，都是指普通意义上的可屏蔽硬件中断）的处理有优先级概念，高优先级硬中断可以打断低优先级硬中断。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;重新认识：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1，对于x86硬件而言，在文档325462.pdf卷3章节6.9 PRIORITY AMONG SIMULTANEOUS EXCEPTIONS AND INTERRUPTS 提到一个表格，是指如果在同一时刻有多个异常或中断到达，那么CPU会按照一个指定的优先级顺序对它们进行响应和服务，而并不是我之前所想的判断是否可相互打断执行的高低级别。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2，对于Linux系统而言，硬中断之间并没有优先级的概念（虽然Intel CPU提供支持，请参考文档325462.pdf卷3章节10.8.3 Interrupt, Task, and Processor Priority），或者说优先级只有两个，全部关闭或全部开启，如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;blockquote&gt;&lt;blockquote&gt;&lt;p&gt;Regardless of what the hardware might support, typical UNIX-type systems only make use of two levels: the minimum (all interrupts enabled) and the maximum (all interrupts disabled).&lt;/p&gt;&lt;/blockquote&gt;&lt;/blockquote&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这意味着，如果一个硬中断处理函数正在执行，只要当前是处于开启中断的情况，那么此时发生的任何另外一个中断都可以打断当前处理函数，从而出现中断嵌套的情况。
+</span><span class='line'>值得注意的是，Linux提供对单个中断开启/禁止的接口（以软件实现为主，比如给对应中断描述符desc的status打上IRQ_DISABLED旗标）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>void disable_irq(unsigned int irq)
+</span><span class='line'>void enable_irq(unsigned int irq)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>下面来看看Linux的实际处理，其硬中断的一般处理流程（具体可见参考1、2、3以及源代码，以2.6.30.8为例）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>硬件中断 -&gt; common_interrupt -&gt; do_IRQ -&gt; handle_irq -&gt; generic_handle_irq_desc -&gt; desc-&gt;handle_irq或__do_IRQ。
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;其中desc-&gt;handle_irq是一个回调函数，会根据不同中断类型（I/O APIC、MSI）有不同的指向，比如：handle_fasteoi_irq()、handle_edge_irq()，这可以参考设置函数ioapic_register_intr()和setup_msi_irq()。通过/proc/interrupts可以看到各个中断的具体类型：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>[root@localhost ~]# cat /proc/interrupts
+</span><span class='line'>           CPU0       CPU1      
+</span><span class='line'>  0:        888          0   IO-APIC-edge      timer
+</span><span class='line'>  1:         96        112   IO-APIC-edge      i8042
+</span><span class='line'>  3:          1          0   IO-APIC-edge   
+</span><span class='line'>  4:          1          0   IO-APIC-edge   
+</span><span class='line'>  7:          0          0   IO-APIC-edge      parport0
+</span><span class='line'>  8:          1          0   IO-APIC-edge      rtc0
+</span><span class='line'>  9:          0          0   IO-APIC-fasteoi   acpi
+</span><span class='line'> 12:        204          0   IO-APIC-edge      i8042
+</span><span class='line'> 14:          0          0   IO-APIC-edge      ata_piix
+</span><span class='line'> 15:     460641        900   IO-APIC-edge      ata_piix
+</span><span class='line'> 16:          0          0   IO-APIC-fasteoi   Ensoniq AudioPCI
+</span><span class='line'> 17:     118347          0   IO-APIC-fasteoi   ehci_hcd:usb1, ioc0
+</span><span class='line'> 18:         70          0   IO-APIC-fasteoi   uhci_hcd:usb2
+</span><span class='line'> 19:     115143          0   IO-APIC-fasteoi   eth0
+</span><span class='line'> 24:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 25:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 26:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 27:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 28:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'>...
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>不管是desc-&gt;handle_irq还是__do_IRQ，它们都会调入到另外一个函数handle_IRQ_event()。重点：从CPU接收到中断信号并开始处理，到这个函数为止，都是处于中断禁止状态。为什么？很简单，因为Intel开发者手册上是这么说的，在文档325462.pdf卷3章节6.8.1 Masking Maskable Hardware Interrupts提到：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>When an interrupt is handled through an interrupt gate, the IF flag is automati-
+</span><span class='line'>cally cleared, which disables maskable hardware interrupts. (If an interrupt is
+</span><span class='line'>handled through a trap gate, the IF flag is not cleared.)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>在CPU开始处理一个硬中断到进入函数handle_IRQ_event()为止的这段时间里，因为处于中断禁止状态，所以不会出现被其它中断打断的情况。但是，在进入到函数handle_IRQ_event()后，立马有了这么两句：</span></code></pre></td></tr></table></div></figure>
+    irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
+    {
+        irqreturn_t ret, retval = IRQ_NONE;
+        unsigned int status = 0;</p>
+
+<pre><code>    if (!(action-&gt;flags &amp; IRQF_DISABLED))
+        local_irq_enable_in_hardirq();
+...
+</code></pre>
+
+<pre><code>函数local_irq_enable_in_hardirq()的定义如下：
+</code></pre>
+
+<pre><code>#ifdef CONFIG_LOCKDEP
+# define local_irq_enable_in_hardirq()  do { } while (0)
+#else
+# define local_irq_enable_in_hardirq()  local_irq_enable()
+#endif
+</code></pre>
+
+<pre><code>宏CONFIG_LOCKDEP用于表示当前是否开启内核Lockdep功能，这是一个调试功能，用于检测潜在的死锁类风险，如果开启，那么函数local_irq_enable_in_hardirq()为空，即继续保持中断禁止状态，为什么Lockdep功能需要保持中断禁止待后文再述，这里考虑一般情况，即不开启Lockdep功能，那么执行函数local_irq_enable_in_hardirq()就会开启中断。
+看函数handle_IRQ_event()里的代码，如果没有带上IRQF_DISABLED旗标，那么就会执行函数local_irq_enable_in_hardirq()，从而启用中断。旗标IRQF_DISABLED可在利用函数request_irq()注册中断处理回调时设置，比如：
+</code></pre>
+
+<pre><code>if (request_irq(uart-&gt;port.irq, bfin_serial_rx_int, IRQF_DISABLED,
+     "BFIN_UART_RX", uart)) {
+</code></pre>
+
+<pre><code>如果没有设置，那么到函数handle_IRQ_event()这里的代码后，因为中断已经开启，当前中断的后续处理就可能被其它中断打断，从而出现中断嵌套的情况。
+
+3，如果新来的中断类型与当前正在执行的中断类型相同，那么会暂时挂起。主要实现代码在函数__do_IRQ()（handle_fasteoi_irq()、handle_edge_irq()类似）内：
+</code></pre>
+
+<pre><code>/*
+ * If the IRQ is disabled for whatever reason, we cannot
+ * use the action we have.
+ */
+action = NULL;
+if (likely(!(status &amp; (IRQ_DISABLED | IRQ_INPROGRESS)))) {
+    action = desc-&gt;action;
+    status &amp;= ~IRQ_PENDING; /* we commit to handling */
+    status |= IRQ_INPROGRESS; /* we are handling it */
+}
+desc-&gt;status = status;
+
+/*
+ * If there is no IRQ handler or it was disabled, exit early.
+ * Since we set PENDING, if another processor is handling
+ * a different instance of this same irq, the other processor
+ * will take care of it.
+ */
+if (unlikely(!action))
+    goto out;
+</code></pre>
+
+<pre><code>逻辑很简单，如果当前中断被禁止（IRQ_DISABLED）或正在执行（IRQ_INPROGRESS），那么goto cot，所以同种类型中断不会相互嵌套。
+
+4，从这个补丁开始，Linux内核已经全面禁止硬中断嵌套了，即从2.6.35开始，默认就是：
+</code></pre>
+
+<pre><code>run the irq handlers with interrupts disabled.
+</code></pre>
+
+<pre><code>因为这个补丁，所以旗标IRQF_DISABLED没用了，mainline内核在逐步删除它。
+
+我仔细检查了一下，对于2.6.34以及以前的内核，如果要合入这个补丁，那么有略微影响的主要是两个慢速驱动，分别为rtc-twl4030和twl4030-usb，需要按照类似开启Lockdep功能一样：
+</code></pre>
+
+<pre><code>#ifdef CONFIG_LOCKDEP
+/* WORKAROUND for lockdep forcing IRQF_DISABLED on us, which
+ * we don't want and can't tolerate.  Although it might be
+ * friendlier not to borrow this thread context...
+ */
+local_irq_enable();
+#endif
+</code></pre>
+
+<p>```
+进行主动启用中断。还有另个一个慢速驱动IDE，其驱动中调用的是函数local_irq_enable_in_hardirq()，即它在开启Lockdep功能的情况下并没有明确要求启用中断，所以它应该不受补丁合入影响。嘛，我只是理论分析研究一下，仅供参考，如有风险，请实际操作者自行承担，:)。其它请看参考4，5，6。</p>
+
+<h4>参考：</h4>
+
+<p>1，Linux下386中断处理<br/>
+2，Linux中断基础构架<br/>
+3，linux源码entry_32.S中interrupt数组的分析<br/>
+4，<a href="http://lwn.net/Articles/321663/  ">http://lwn.net/Articles/321663/  </a>
+5，<a href="http://lwn.net/Articles/380931/  ">http://lwn.net/Articles/380931/  </a>
+6，<a href="http://thread.gmane.org/gmane.linux.kernel/801267">http://thread.gmane.org/gmane.linux.kernel/801267</a></p>
+
+<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a> 或 <a href="http://lenky.info/?p=2245">http://lenky.info/?p=2245</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux 中的零拷贝技术 splice]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-mm-splice/"/>
+    <updated>2015-05-07T15:26:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/07/kernel-mm-splice</id>
+    <content type="html"><![CDATA[<p><a href="http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415">http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415</a></p>
+
+<p>linux下如何实现文件对拷呢？</p>
+
+<p>最容易想到的方法就是，申请一份内存buf，read 源文件一段数据到buf，然后将此buf write到目标文件，示例代码如下：
+<code>
+    char buf[max_read];
+    off_t size = stat_buf.st_size;
+    while ( off_in &lt; size ) {
+        int len = size - off_in &gt; max_read ? max_read : size - off_in;
+        len = read(f_in, buf, len);
+        off_in += len;
+        write(f_out, buf, len);
+    }
 </code></p>
 
-<p>该函数被真正的页面回收函数shrink_page_list调用。所处理的对象是处于inactive状态的页面。分以下几种情况：</p>
-
-<p>  3-a). 如果是匿名页，并且最近被访问过(PTE_young置位)，对应3-a的转移(Line 726)。即(inactive+PG_referenced)->active，inactive->active. (01->10或者00->10).</p>
-
-<p>  3-b). 如果是已经映射的文件页,最近被访问过(PTE_young置位)，如果PG_referenced置位或者被两个进程最近访问过(这一点不知道理解的对否)(Line 744~745)，对应于3-b的转移(01->11)。</p>
-
-<p>  3-c). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 并且该page cache中的内容是可执行的(例如，用户进程的代码段)，则inactive->(active+PG_referenced).(00->11, 01->11)</p>
-
-<p>  3-d). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 则，设置PG_referenced标志，仍旧保留inactive状态，不进行回收。(00->01,01-01)</p>
-
-<p>  3-e). 除了以上情况，均进行回收。即：最近没有被访问过(PTE_YOUNG没有设置)的匿名页和文件页。</p>
-
-<p>  对于page_check_references()中的返回值，简单介绍一下：<br/>
-   PAGEREF_RECLAIM：进行回收；<br/>
-   PAGEREF_RECLAIM_CLEAN：若该页是干净的(clean)，则进行回收；<br/>
-   PAGEREF_KEEP：仍然保持在inactive LRU list上，不进行回收。<br/>
-   PAGEREF_ACTIVATE：不进行回收，并将该页转移到active LRU list上。</p>
-
-<p>  2-5>. 由以上的状态转换图，简单了解一下一个可回收的物理页面可能的生命周期。</p>
-
-<p>Free->inactive->[active]&lt;–>inactive->reclaimable->free</p>
-
-<p>  对于一个文件页，其在buddy system中未被分配时，处于free状态。当被分配后，首先挂载在inactive LRU list上。若被进程访问，便会被active。当一段时间没有被访问后，就处于inactive状态，挂载在inactive 链表上等待回收。被回收例程回收后，就进入buddy system中，回归到free状态。</p>
-
-<p>Free->Active&lt;–>[inactive]->reclaimable->free</p>
-
-<p>  对于一个匿名页，通过page fault被分配后，挂载在active链表上，然后经过deactive变为inactive然后被回收进buddy system中。</p>
-
-<p>  对于匿名页和文件页，刚被分配后所设置的状态，可以得出：系统总是想尽快老化文件页面。在系统的眼中，文件页的换出成本要低于匿名页。</p>
-
-<h4>3. Synchronization Reclaiming</h4>
-
-<p>  当内存分配不足的时候，内存回收例程就会被调用了。相关的代码在<code>__alloc_pages</code>中。</p>
-
-<p><img src="/images/kernel/2015-04-18-22.png" alt="" /><br/>
-图3</p>
-
-<p>  若分配失败，就会进入到<code>__alloc_pages_slowpath</code>中。</p>
-
-<p><img src="/images/kernel/2015-04-18-23.png" alt="" /><br/>
-图4</p>
-
-<p>  该函数功能正如其名字所属，属于slow path。首先会唤醒各个node上的kswapd例程。kswapd是一个kernel thread,每一个node都有一个例程。该例程的函数体是kswapd().该例程会在第4节中降到。唤醒kwspad后，尝试重新调用get_page_from_freelist，分配内存。若失败，继续往下，如果需要分配内存的主儿在系统中的地位比较重要的话，会调用<code>__alloc_pages_high_priority()</code>. 该函数不会顾及系统设置的安全警告线(min water mark. 对于1GB左右的内存是min water mark是16MB)，分配内存。如果仍然失败；则会调用<code>__alloc_pages_direct_compat</code>来migrate内存来达到compat的目的。这个内存的compat类似于磁盘的压缩整理，把在物理内存中正在使用的分散内存，给迁移整合，以便腾出大的连续的物理内存，满足某些进程大页面的需求。需要注意的是，压缩内存需要在build kernel的时候enable CONFIG_COMPACTION。若仍然失败，就调用<code>__alloc_pages_direct_reclaim</code>来回收内存了。回收内存后，会继续调用get_page_from_freelist,尝试看是否能否分配成功。如果仍然失败，并且分配内存的时候要求不允许失败，那么就进入OOM中。OOM主要的功能是选择一个占用内存量比较大的用户进程，杀掉以释放内存。释放结束后，跳到<code>__alloc_pages_slowpath</code>函数的开头，重新执行一遍，以满足内存分配。如果，允许内存分配失败，则就不会OOM了。以分配失败返回给调用者。</p>
-
-<p>  <code>__alloc_pages_direct_reclaim</code>函数主要调用try_to_free_pages.</p>
-
-<p><img src="/images/kernel/2015-04-18-24.png" alt="" /><br/>
-图5</p>
-
-<p>  try_to_free_pages()做的事情是，按照自定义的优先级从12开始，递减循环（优先级越小代表级别越高，回收的程度越剧烈）从要分配内存的zone以及其fall-back zone list中回收可用内存释放到buddy system中。它通过调用shrink_zones来达到依次扫描zone以及fall-back zone list的目的。对各个zone进行回收结束后，对slab也进行回收（本文不对slab的回收做分析）。如果至此，已经回收了足够多的内存（32个页），那么就返回。如果没有回收到32个页，则是否需要唤醒pdflush进程，该进程的作用是唤醒块设备的读写进程将脏页写到块设备上。唤醒pdflush的条件是看是否扫描了超过48个页。之后，如果这是的扫描优先级已经小于10了，那么睡眠1/10HZ，即1S.然后递减优先级，进行下一遍的循环。</p>
-
-<p><img src="/images/kernel/2015-04-18-25.png" alt="" /><br/>
-图6</p>
-
-<p><img src="/images/kernel/2015-04-18-26.png" alt="" /><br/>
-图7</p>
-
-<p><img src="/images/kernel/2015-04-18-27.png" alt="" /><br/>
-图8</p>
-
-<p>关于swap cache的作用，请看下图（图9）。</p>
-
-<p><img src="/images/kernel/2015-04-18-28.png" alt="" /><br/>
-图9</p>
-
-<p>  有关对swap cache 作用的描述，最靠谱的分析是来自Understanding Linux Kernel. 摘录如下：<br/>
-Consider a page P that is shared among two processes, A and B. Initially, the Page Table entries of both processes contain a reference to the page frame, and the page has two owners; this case is illustrated in Figure 17-8(a). When the PFRA selects the page for reclaiming, shrink_list( ) inserts the page frame in the swap cache. As illustrated in Figure 17-8(b), now the page frame has three owners, while the page slot in the swap area is referenced only by the swap cache. Next, the PFRA invokes try_to_unmap( ) to remove the references to the page frame from the Page Table of the processes; once this function terminates, the page frame is referenced only by the swap cache, while the page slot is referenced by the two processes and the swap cache, as illustrated in Figure 17-8&copy;. Let’s suppose that, while the page’s contents are being written to disk, process B accesses the pagethat is, it tries to access a memory cell using a linear address inside the page. Then, the page fault handler finds the page frame in the swap cache and puts back its physical address in the Page Table entry of process B, as illustrated in Figure 17-8(d). Conversely, if the swap-out operation terminates without concurrent swap-in operations,the shrink_list( ) function removes the page frame from the swap cache and releases the page frame to the Buddy system, as illustrated in Figure 17-8(e).</p>
-
-<h5>Remark:</h5>
-
-<ol>
-<li> Figure 17-8 请对照图9.</li>
-<li> 上图的函数都是来自于2.6.11内核。本文所参考的内核是3.4.因此引用中的函数可能和本文所述的函数不匹配。</li>
-</ol>
-
-
-<h4>4. Asynchronization reclaiming.</h4>
-
-<h3>References</h3>
-
-<ol>
-<li>Understanding Linux Kernel (3rd).</li>
-<li>Understanding virtual memory manager (2nd).</li>
-<li>Professional Linux Kernel Architecture.</li>
-</ol>
-
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux 虚拟内存和物理内存的理解]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-vm-rm/"/>
-    <updated>2015-04-18T23:01:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-vm-rm</id>
-    <content type="html"><![CDATA[<p>blog.csdn.net/dlutbrucezhang/article/details/9058583</p>
-
-<h4>虚拟内存</h4>
-
-<h5>一</h5>
-
-<ol>
-<li>每个进程都有自己独立的4G内存空间，各个进程的内存空间具有类似的结构</li>
-<li>一个新进程建立的时候，将会建立起自己的内存空间，此进程的数据，代码等从磁盘拷贝到自己的进程空间，哪些数据在哪里，都由进程控制表中的task_struct记录，task_struct中记录中一条链表，记录中内存空间的分配情况，哪些地址有数据，哪些地址无数据，哪些可读，哪些可写，都可以通过这个链表记录</li>
-<li>每个进程已经分配的内存空间，都与对应的磁盘空间映射</li>
-</ol>
-
-
-<p><img src="/images/kernel/2015-04-18-10.png" alt="" /></p>
-
-<h5>二</h5>
-
-<ol>
-<li>每个进程的4G内存空间只是虚拟内存空间，每次访问内存空间的某个地址，都需要把地址翻译为实际物理内存地址</li>
-<li>所有进程共享同一物理内存，每个进程只把自己目前需要的虚拟内存空间映射并存储到物理内存上。</li>
-<li>进程要知道哪些内存地址上的数据在物理内存上，哪些不在，还有在物理内存上的哪里，需要用页表来记录</li>
-<li>页表的每一个表项分两部分，第一部分记录此页是否在物理内存上，第二部分记录物理内存页的地址（如果在的话）</li>
-<li>当进程访问某个虚拟地址，去看页表，如果发现对应的数据不在物理内存中，则缺页异常</li>
-<li>缺页异常的处理过程，就是把进程需要的数据从磁盘上拷贝到物理内存中，如果内存已经满了，没有空地方了，那就找一个页覆盖，当然如果被覆盖的页曾经被修改过，需要将此页写回磁盘</li>
-</ol>
-
-
-<p><img src="/images/kernel/2015-04-18-11.png" alt="" /></p>
-
-<h5>总结</h5>
-
-<p>优点：<br/>
-1.既然每个进程的内存空间都是一致而且固定的，所以链接器在链接可执行文件时，可以设定内存地址，而不用去管这些数据最终实际的内存地址，这是有独立内存空间的好处<br/>
-2.当不同的进程使用同样的代码时，比如库文件中的代码，物理内存中可以只存储一份这样的代码，不同的进程只需要把自己的虚拟内存映射过去就可以了，节省内存<br/>
-3.在程序需要分配连续的内存空间的时候，只需要在虚拟内存空间分配连续空间，而不需要实际物理内存的连续空间，可以利用碎片。</p>
-
-<p>另外，事实上，在每个进程创建加载时，内核只是为进程“创建”了虚拟内存的布局，具体就是初始化进程控制表中内存相关的链表，实际上并不立即就把虚拟内存对应位置的程序数据和代码（比如.text .data段）拷贝到物理内存中，只是建立好虚拟内存和磁盘文件之间的映射就好（叫做存储器映射），等到运行到对应的程序时，才会通过缺页异常，来拷贝数据。还有进程运行过程中，要动态分配内存，比如malloc时，也只是分配了虚拟内存，即为这块虚拟内存对应的页表项做相应设置，当进程真正访问到此数据时，才引发缺页异常。</p>
-
-<h5>补充理解</h5>
-
-<p>虚拟存储器涉及三个概念： 虚拟存储空间，磁盘空间，内存空间</p>
-
-<p><img src="/images/kernel/2015-04-18-12.png" alt="" /></p>
-
-<p>可以认为虚拟空间都被映射到了磁盘空间中，（事实上也是按需要映射到磁盘空间上，通过mmap），并且由页表记录映射位置，当访问到某个地址的时候，通过页表中的有效位，可以得知此数据是否在内存中，如果不是，则通过缺页异常，将磁盘对应的数据拷贝到内存中，如果没有空闲内存，则选择牺牲页面，替换其他页面。</p>
-
-<p>mmap是用来建立从虚拟空间到磁盘空间的映射的，可以将一个虚拟空间地址映射到一个磁盘文件上，当不设置这个地址时，则由系统自动设置，函数返回对应的内存地址（虚拟地址），当访问这个地址的时候，就需要把磁盘上的内容拷贝到内存了，然后就可以读或者写，最后通过manmap可以将内存上的数据换回到磁盘，也就是解除虚拟空间和内存空间的映射，这也是一种读写磁盘文件的方法，也是一种进程共享数据的方法 共享内存</p>
-
-<h4>物理内存</h4>
-
-<p>在内核态申请内存比在用户态申请内存要更为直接，它没有采用用户态那种延迟分配内存技术。内核认为一旦有内核函数申请内存，那么就必须立刻满足该申请内存的请求，并且这个请求一定是正确合理的。相反，对于用户态申请内存的请求，内核总是尽量延后分配物理内存，用户进程总是先获得一个虚拟内存区的使用权，最终通过缺页异常获得一块真正的物理内存。</p>
-
-<h5>一、物理内存的内核映射</h5>
-
-<p>IA32架构中内核虚拟地址空间只有1GB大小（从3GB到4GB），因此可以直接将1GB大小的物理内存（即常规内存）映射到内核地址空间，但超出1GB大小的物理内存（即高端内存）就不能映射到内核空间。为此，内核采取了下面的方法使得内核可以使用所有的物理内存。</p>
-
-<p>1). 高端内存不能全部映射到内核空间，也就是说这些物理内存没有对应的线性地址。不过，内核为每个物理页框都分配了对应的页框描述符，所有的页框描述符都保存在mem_map数组中，因此每个页框描述符的线性地址都是固定存在的。内核此时可以使用alloc_pages()和alloc_page()来分配高端内存，因为这些函数返回页框描述符的线性地址。</p>
-
-<p>2). 内核地址空间的后128MB专门用于映射高端内存，否则，没有线性地址的高端内存不能被内核所访问。这些高端内存的内核映射显然是暂时映射的，否则也只能映射128MB的高端内存。当内核需要访问高端内存时就临时在这个区域进行地址映射，使用完毕之后再用来进行其他高端内存的映射。</p>
-
-<p>由于要进行高端内存的内核映射，因此直接能够映射的物理内存大小只有896MB，该值保存在high_memory中。内核地址空间的线性地址区间如下图所示：</p>
-
-<p><img src="/images/kernel/2015-04-18-13.png" alt="" /></p>
-
-<p>从图中可以看出，内核采用了三种机制将高端内存映射到内核空间：永久内核映射，固定映射和vmalloc机制。</p>
-
-<h5>二、物理内存管理机制</h5>
-
-<p>基于物理内存在内核空间中的映射原理，物理内存的管理方式也有所不同。内核中物理内存的管理机制主要有伙伴算法，slab高速缓存和vmalloc机制。其中伙伴算法和slab高速缓存都在物理内存映射区分配物理内存，而vmalloc机制则在高端内存映射区分配物理内存。</p>
-
-<p>伙伴算法<br/>
-伙伴算法负责大块连续物理内存的分配和释放，以页框为基本单位。该机制可以避免外部碎片。</p>
-
-<p>per-CPU页框高速缓存<br/>
-内核经常请求和释放单个页框，该缓存包含预先分配的页框，用于满足本地CPU发出的单一页框请求。</p>
-
-<p>slab缓存<br/>
-slab缓存负责小块物理内存的分配，并且它也作为高速缓存，主要针对内核中经常分配并释放的对象。</p>
-
-<p>vmalloc机制<br/>
-vmalloc机制使得内核通过连续的线性地址来访问非连续的物理页框，这样可以最大限度的使用高端物理内存。</p>
-
-<h5>三、物理内存的分配</h5>
-
-<p>内核发出内存申请的请求时，根据内核函数调用接口将启用不同的内存分配器。</p>
-
-<h6>3.1 分区页框分配器</h6>
-
-<p>分区页框分配器 (zoned page frame allocator) ,处理对连续页框的内存分配请求。分区页框管理器分为两大部分:前端的管理区分配器和伙伴系统，如下图：</p>
-
-<p><img src="/images/kernel/2015-04-18-14.png" alt="" /></p>
-
-<p>管理区分配器负责搜索一个能满足请求页框块大小的管理区。在每个管理区中,具体的页框分配工作由伙伴系统负责。为了达到更好的系统性能,单个页框的申请工作直接通过per-CPU页框高速缓存完成。</p>
-
-<p>该分配器通过几个函数和宏来请求页框,它们之间的封装关系如下图所示。</p>
-
-<p><img src="/images/kernel/2015-04-18-15.png" alt="" /></p>
-
-<p>这些函数和宏将核心的分配函数<code>__alloc_pages_nodemask()</code>封装,形成满足不同分配需求的分配函数。其中，alloc_pages()系列函数返回物理内存首页框描述符，<code>__get_free_pages()</code>系列函数返回内存的线性地址。</p>
-
-<h6>3.2 slab分配器</h6>
-
-<p>slab 分配器最初是为了解决物理内存的内部碎片而提出的，它将内核中常用的数据结构看做对象。slab分配器为每一种对象建立高速缓存。内核对该对象的分配和释放均是在这块高速缓存中操作。一种对象的slab分配器结构图如下：</p>
-
-<p><img src="/images/kernel/2015-04-18-16.png" alt="" /></p>
-
-<p>可以看到每种对象的高速缓存是由若干个slab组成，每个slab是由若干个页框组成的。虽然slab分配器可以分配比单个页框更小的内存块，但它所需的所有内存都是通过伙伴算法分配的。</p>
-
-<p>slab高速缓存分专用缓存和通用缓存。专用缓存是对特定的对象，比如为内存描述符创建高速缓存。通用缓存则是针对一般情况，适合分配任意大小的物理内存，其接口即为kmalloc()。</p>
-
-<h6>3.3 非连续内存区内存的分配</h6>
-
-<p>  内核通过vmalloc()来申请非连续的物理内存，若申请成功，该函数返回连续内存区的起始地址，否则，返回NULL。vmalloc()和kmalloc()申请的内存有所不同，kmalloc()所申请内存的线性地址与物理地址都是连续的，而vmalloc()所申请的内存线性地址连续而物理地址则是离散的，两个地址之间通过内核页表进行映射。
-vmalloc()的工作方式理解起来很简单：<br/>
-1). 寻找一个新的连续线性地址空间；<br/>
-2). 依次分配一组非连续的页框；<br/>
-3). 为线性地址空间和非连续页框建立映射关系，即修改内核页表；</p>
-
-<p>  vmalloc()的内存分配原理与用户态的内存分配相似，都是通过连续的虚拟内存来访问离散的物理内存，并且虚拟地址和物理地址之间是通过页表进行连接的，通过这种方式可以有效的使用物理内存。但是应该注意的是，vmalloc()申请物理内存时是立即分配的，因为内核认为这种内存分配请求是正当而且紧急的；相反，用户态有内存请求时，内核总是尽可能的延后，毕竟用户态跟内核态不在一个特权级。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux内存管理--内存回收]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim/"/>
-    <updated>2015-04-18T23:01:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-reclaim</id>
-    <content type="html"><![CDATA[<p>os.51cto.com/art/201310/412758_all.htm</p>
-
-<p>  内存的回收在Linux内存管理中占据非常重要的地位，系统的内存毕竟是有限的，跑的进程成百上千，系统内存越来越小，我们必须选择一些内存进行回收，以满足别的任务的需求。在内存回收过程中，有哪些内存可以回收，什么时候进行回收，回收内存时如何尽可能的减少对系统性能的影响，回收内存的策略，这些是我们着重要关注的问题，也是本文主要阐述的重点。</p>
-
-<h4>1.1 内存回收的目标</h4>
-
-<p>不是所有的物理内存都可以参与回收的，比如要是把内核代码段的内存给回收了，系统就无法正常运行了，一般内核代码段，数据段，内核kmalloc()出来的内存，内核线程占用的内存等都是不可以回收的，除此之外的内存都是我们要回收的目标。</p>
-
-<p>回收的内存主要是由用户态进程占用的内存和内核自己在运行时所使用的一些内存组成。用户态进程占用的内存主要是我们常见的进程代码段，数据段，堆栈等，内核运行使用的内存主要是磁盘高速缓存(如索引节点，目录项高速缓存），页面高速缓存(访问文件时系统生成的页面cache)，mmap()文件时所用的有名映射所使用的物理内存。后面的这些内才能虽然也是内核管理使用的内存，但对其进行回收的时候，顶多影响内核的性能，而不会导致系统无法运行。</p>
-
-<h4>1.2 内存回收的时机</h4>
-
-<p>1、内存紧缺回收：grow_buffers()无法获取缓冲区页，alloc_page_buffers()无法获取页临时缓冲区首部，__alloc_pages()无法再给定的内存区分配一组连续页框。</p>
-
-<p>2、周期回收：必要时，激活相应内核线程执行内存回收算法：kswapd()内核线程，检查某个内存管理区的空闲页框数是否已低于pages_high值的标高。events内核线程，一个工作者线程，回收位于高速内存缓存中的所有空闲的slab。</p>
-
-<h4>1.3 内存回收的策略</h4>
-
-<h5>1.3.1 内存回收的分类</h5>
-
-<p>内存回收主要是要回收两类内存：最近最少使用的内存以及高速内存缓存中空闲的slab。前者主要包括用户态进程的代码段，数据段，堆栈，文件映射内存，页高速内存，后者主要包括磁盘高速缓存及一些其他的空闲内存高速缓存。</p>
-
-<p>最近最少使用内存存放在一个lru链表上，每个内存管理区zone都有一个lru结构，里面含有active和inactive两个链表头，active链表上记录当前的活跃的报文，inactive用来记录当前不活跃的报文。一般我们回首lru上的inactive链表上的内存页。同时，在内存回收的过程中，会从active链表向inactive链表上补充对应的最近最少使用内存页。每个内存页的内核数据结构page上有一个标记位PG_referenced,该标记位使得一个页从"不活动“状态转为”活动“状态的时间加倍，反之亦然。比如:一个页面可能1个小时内没人反应，不能因为偶然的一次访问就认为它是活跃的，得两次才认为它是一个活跃的页面。下面是页面在inactive和active链表上转移的变化图。</p>
-
-<p>Slab内存高速缓存中经常会有一些完全空闲的slab，这些是我们回收的另一个目标。</p>
-
-<h5>1.3.2 反向映射</h5>
-
-<p>对于可以通过用户态线性地址空间可以直接访问到的物理页来说，可以分为匿名页和文件映射页两类，匿名页指的是不与具体文件对应映射的物理页，比如代码段，堆栈等使用的物理页，映射页指的是映射到文件某一部分的物理页，通常使用mmap()来进行相关的映射。</p>
-
-<p>对于匿名映射和文件映射来说，可能一段物理内存会在多个进程的页表中使用，比如对于匿名映射，fork()一个进程，一开始会共用父进程的物理内存，对于文件映射，多个进程可能同时映射到一个文件的同一部分文件。所以在页面回收时，需要将该页面在所有的页表引用中给去除掉。这种手段称为反向映射。想要找到使用这些物理页的页表项的话，需要先找到引用他们的页表，而页表的地址记录在每个进程的内存描述符里面，同时用来描述进程用户态地址空间的每个vm_area_struct都记录了一个指针，指向所属的内存描述符。因此只要通过物理页找到引用他们的vm_area_struct,就能找到内存描述符，从而找到页表，找到对应的页表项。</p>
-
-<p>匿名页的反向映射：</p>
-
-<p>对于匿名页来说，每个页面的mapping字段指向一个anon_vma描述符，anon_vma描述符中存在一个链表头，所有引用该页面的vm_area_struct都存放在里面。page,anon_vma,vm_area_struct这些数据结构的关系如下图所示：</p>
-
-<p>对于匿名页来说，其被别的地址空间引用，基本上都是因为fork（）进程时，子进程复制父进程的地址空间，从而被引用的。各个vm_area_struct加入anon_vma的链表的过程如下：</p>
-
-<p>假设当前一个进程p，后来fork出一个子进程c。</p>
-
-<p>1、当进程P为某个vm_area_struct加入第一个物理页时，比如说发生了缺页异常，动态分配一个anon_vma的数据结构，将vm_area_struct加入该anon_vma所管理的链表，vm_area_struct结构中的anon_vma字段指向该anon_vma,同时把该页面中的mapping字段赋值为该anon_vma.对于后续为该vm_area_struct申请的物理页面，其mapping字段都赋值为该anon_vma。</p>
-
-<p>2、当该进程p执行fork()时，在fork的处理过程中，会调用dup_mmap()来复制进程p的线性地址空间，在dup_mmap()会复制进程p的每一个vm_area_struct，加入到自己的地址空间中，并将vm_area_struct加入到anon_vma所管理的链表中，参看anon_vma_link()。此时为进程p申请的页面被进程c共享，通过页面的mapping字段可以找到anon_vma，从anon_vma可以遍历进程p,c。</p>
-
-<p>3、考虑一个问题，在进程c中才触发缺页异常被申请的内存页，其mmapping被赋值为所属vm_area_struct的vma_anon，但进程p并没有使用到该页，所以一个物理页mapping字段指向的vma_anon所下挂的vm_area_struct可能并不包含该物理页。</p>
-
-<p>文件映射页的反向映射：</p>
-
-<p>对于每个文件映射页，其page mapping字段指向的是对应文件的address_space数据结构，address_space中有个 struct prio_tree_root i_mmap 字段，指向一个优先树，优先树里面会把所有映射该文件内容的vm_area_struct 给组织起来。在该树中，其树的节点基地址和堆地址分别是映射的文件内容的起始地址和结束地址，要是多个进程同时映射该地址段，会用链表在该节点上将vm_area_struct串起来。</p>
-
-<h5>1.3.3 内存回收流程介绍</h5>
-
-<p>睡眠回收我们不关注，主要介绍内存紧缺回收及周期回收：</p>
-
-<p>1、内存紧缺回收主要函数是try_to_free_pages()，该函数会执行一个循环，按照优先级从12到0，依次调用shrink_caches()，shrink_slab()来回收页面，直到回收至少32个内存页面。</p>
-
-<p>依次调用以下辅助函数：</p>
-
-<p>shrink_caches()：调用shrink_zone()对传入的zone链表中的每个zone，进行lru上面的页面回收。</p>
-
-<p>shrink_slab()：对磁盘索引节点cache和目录项索引节点等磁盘高速缓存进行回收，由于磁盘索引节点和目录项索引节点都是从slab高速缓存中分配的，这样就会导致空闲slab的产生，空闲slab后续会在周期性回收的cache_reap工作队列中被回收。估计也就是因为最终会清零空闲slab，才会起这么一个函数名。^_^</p>
-
-<p>shrink_zone()：对内存管理区上的lru链表中的非活跃页面进行回收，在非活跃页面不足的时候，调用refill_inactive_zone()对lru上的inactive链表补充非活跃页面,同时shrink_zone()调用shrink_cache()来进行页面的回收，该函数的具体解析可以参照下面的源码浅析。</p>
-
-<p>shrink_list()：该辅助函数在shrink_cache()中被调用，该函数对在shrink_cache（）中传入的非活跃page列表进行遍历，对每个页面进行回收工作，该函数的具体解析可以参考下面的源码解析。</p>
-
-<p>refill_inactie_zone()：该辅助函数根据一定的规则将处于lru active链表上的活跃页面移动到inactive链表上，以补充可以回收的页面，在lru链表里有两类页，一类是属于用户态空间的页，比如用户态进程的代码段，数据段，一类是在页高速缓存中的页，系统为了降低对应用程序的影响，将要优先将页高速缓存页进行回收，同时为了系统整体性能也会适当回收用户态进程页。按照如下经验公式进行选择：</p>
-
-<p>交换倾向值=映射比率/2+负荷值+交换值</p>
-
-<p>2、kswapd进程一般会在系统中睡眠，但当__alloc_page()发现各个管理区的剩余页面都低于警告值(由内存管理描述符的pages_low字段和protection字段推算出来)时，会激活kswapd进程进行页面回收，直到回收的页面使得管理区的剩余页面高于zone->pages_high时才停止回收，本质上也是调用了shrink_zone（）和shrink_slab()。</p>
-
-<p>3、cache_reap工作队列定期运行来回收slab高速缓存中空闲的slab占用的页。</p>
-
-<h4>1.4 相关源代码的浅析</h4>
-
-<pre><code>    static void 
-    shrink_zone(struct zone *zone, struct scan_control *sc) 
-    { 
-        unsigned long nr_active; 
-        unsigned long nr_inactive; 
-
-        //根据优先级，得到可以扫描的页面数，优先级越高， 
-        //代表越不急迫，可以扫描的页面数也最少 
-        zone-&gt;nr_scan_active += (zone-&gt;nr_active &gt;&gt; sc-&gt;priority) + 1; 
-        nr_active = zone-&gt;nr_scan_active; 
-        if (nr_active &gt;= SWAP_CLUSTER_MAX) 
-            zone-&gt;nr_scan_active = 0; 
-        else 
-            nr_active = 0; 
-
-        zone-&gt;nr_scan_inactive += (zone-&gt;nr_inactive &gt;&gt; sc-&gt;priority) + 1; 
-        nr_inactive = zone-&gt;nr_scan_inactive; 
-        //非活动页比较少的话，可以先忽略过去，将跳过的页面记录到nr_scan_inactive中 
-        //留待下一次再处理 
-        if (nr_inactive &gt;= SWAP_CLUSTER_MAX) 
-            zone-&gt;nr_scan_inactive = 0; 
-        else 
-            nr_inactive = 0; 
-
-        //设置需要回收的页面数为32个 
-        sc-&gt;nr_to_reclaim = SWAP_CLUSTER_MAX; 
-
-        //开始回收页面，每次扫描32个页面，多了不干噢!!! 
-        while (nr_active || nr_inactive) { 
-            if (nr_active) { 
-                //设置每次要扫描的非活动页面数，需要将其放 
-                //入到inactive list里面 
-                sc-&gt;nr_to_scan = min(nr_active, 
-                (unsigned long)SWAP_CLUSTER_MAX); 
-                nr_active -= sc-&gt;nr_to_scan; 
-                //补充inactive list中的页面 
-                refill_inactive_zone(zone, sc); 
-            } 
-
-            if (nr_inactive) { 
-                //设置每次将要扫描的页面，最多也就32个页面 
-                sc-&gt;nr_to_scan = min(nr_inactive, 
-                (unsigned long)SWAP_CLUSTER_MAX); 
-
-                nr_inactive -= sc-&gt;nr_to_scan; 
-                //开始正式回收inactive list中的页面 
-                shrink_cache(zone, sc); 
-                //32个页面被回收完毕，大功告成了!!! 
-                if (sc-&gt;nr_to_reclaim &lt;= 0) 
-                    break; 
-            }
-        } 
-    } 
-
-    static int shrink_list(struct list_head *page_list, struct scan_control *sc) 
-    { 
-        LIST_HEAD(ret_pages);
-        struct pagevec freed_pvec;
-        int pgactivate = 0;
-        int reclaimed = 0;
-        //有进程需要调度，先进行调度 
-        cond_resched();
-
-        pagevec_init(&amp;freed_pvec, 1); 
-        //对于page_list 链表上的每一个页面试图进行回收 
-        while (!list_empty(page_list)) { 
-            struct address_space *mapping; 
-            struct page *page; 
-            int may_enter_fs; 
-            int referenced; 
-
-            //获取一个页面 
-            page = lru_to_page(page_list); 
-            //从lru上摘除 
-            list_del(&amp;page-&gt;lru); 
-            //page被锁定，不能回收 
-            if (TestSetPageLocked(page))//page is locked? 
-                goto keep; 
-
-            BUG_ON(PageActive(page)); 
-            //page正在被writeback，不能回收 
-            if (PageWriteback(page))//page is writeback? 
-                goto keep_locked; 
-
-            sc-&gt;nr_scanned++; 
-            /* Double the slab pressure for mapped and swapcache pages */ 
-
-            if (page_mapped(page) || PageSwapCache(page)) 
-                sc-&gt;nr_scanned++; 
-            //查看最近该页面有无被访问过 
-            referenced = page_referenced(page, 1, sc-&gt;priority &lt;= 0); 
-            /* In active use or really unfreeable?  Activate it. */ 
-            //1页面被访问过，2页面在用户态空间，页面是文件映射页面， 
-            //页面在交换高速缓存中，同时满足这两个条件的话，页面不被回收 
-            if (referenced &amp;&amp; page_mapping_inuse(page)) 
-                goto activate_locked; 
-
-            #ifdef CONFIG_SWAP
-            //page is anon and page has not been add to swapcache 
-            //该页面是匿名映射的页面，且该页面不在swapcache中 
-            if (PageAnon(page) &amp;&amp; !PageSwapCache(page)) { 
-                //将页面加入到swap cache中 
-                if (!add_to_swap(page)) 
-                    goto activate_locked; 
-            }
-            #endif /* CONFIG_SWAP */ 
-            //得到对应的address_space，有可能是对应文件的address_space,或者是 
-            //swap cache的address_space 
-            mapping = page_mapping(page); 
-            may_enter_fs = (sc-&gt;gfp_mask &amp; __GFP_FS) || 
-                    (PageSwapCache(page) &amp;&amp; (sc-&gt;gfp_mask &amp; __GFP_IO)); 
-
-            //该页面被映射到某个用户页表中 
-            if (page_mapped(page) &amp;&amp; mapping) { 
-                //将该页面在用户页表中的页表项通通清除 
-                switch (try_to_unmap(page)) { 
-                    case SWAP_FAIL: 
-                    goto activate_locked; 
-                    case SWAP_AGAIN: 
-                    goto keep_locked; 
-                    case SWAP_SUCCESS: 
-                    ; /* try to free the page below */ 
-                } 
-            } 
-            //页面是脏的，哈哈，准备往文件或swapcache里面写硬盘吧 
-            if (PageDirty(page)) { 
-                if (referenced) 
-                    goto keep_locked; 
-                if (!may_enter_fs) 
-                    goto keep_locked; 
-                if (laptop_mode &amp;&amp; !sc-&gt;may_writepage) 
-                    goto keep_locked; 
-
-                /* Page is dirty, try to write it out here */ 
-                //往磁盘上写页面 
-                switch(pageout(page, mapping)) { 
-                    case PAGE_KEEP: 
-                        goto keep_locked; 
-                    case PAGE_ACTIVATE: 
-                        goto activate_locked; 
-                    case PAGE_SUCCESS: 
-                        if (PageWriteback(page) || PageDirty(page)) 
-                            goto keep; 
-
-                        if (TestSetPageLocked(page)) 
-                            goto keep; 
-                        if (PageDirty(page) || PageWriteback(page)) 
-                            goto keep_locked; 
-                        mapping = page_mapping(page); 
-                    case PAGE_CLEAN: 
-                        ; /* try to free the page below */ 
-                } 
-            }
-
-            //若页面是缓冲区页面，将对应的buffer_head给释放掉 
-            if (PagePrivate(page)) { 
-                if (!try_to_release_page(page, sc-&gt;gfp_mask)) 
-                    goto activate_locked; 
-                if (!mapping &amp;&amp; page_count(page) == 1) 
-                    goto free_it; 
-            } 
-
-            if (!mapping) 
-                goto keep_locked; 
-            /* truncate got there first */ 
-
-            spin_lock_irq(&amp;mapping-&gt;tree_lock); 
-
-            //页面为脏页面或者page的引用计数为2，都是不可以回收的  
-            if (page_count(page) != 2 || PageDirty(page)) { 
-                spin_unlock_irq(&amp;mapping-&gt;tree_lock); 
-                goto keep_locked; 
-            }
-
-            #ifdef CONFIG_SWAP 
-                //到达这里，说明该page只被swap cache或者页高速缓存及 
-                //fpra所共有，需要将其从swap cache上或者页高速缓存上删除。 
-            if (PageSwapCache(page)) { 
-                swp_entry_t swap = { .val = page-&gt;private }; 
-                //从swap cache上进行删除 
-                __delete_from_swap_cache(page); 
-                spin_unlock_irq(&amp;mapping-&gt;tree_lock); 
-                swap_free(swap); 
-                __put_page(page); 
-                /* The pagecache ref */ 
-                goto free_it; 
-            } 
-            #endif /* CONFIG_SWAP */ 
-
-            //从页面高速缓存中将该页面删除 
-            __remove_from_page_cache(page); 
-            spin_unlock_irq(&amp;mapping-&gt;tree_lock); 
-            __put_page(page); 
-
-            free_it: 
-                unlock_page(page); 
-                reclaimed++; 
-                if (!pagevec_add(&amp;freed_pvec, page)) 
-                    __pagevec_release_nonlru(&amp;freed_pvec); 
-                continue; 
-
-            activate_locked: 
-                //将页面设为active页面，等回去将其放入lru的active链表 
-                SetPageActive(page); 
-                pgactivate++; 
-            keep_locked: 
-                //保持页面的状态不变，放入对应的lru active或inactive链表中 
-                unlock_page(page); 
-            keep: 
-                //将该无法回收的页面，放入到ret_pages链表中 
-                list_add(&amp;page-&gt;lru, &amp;ret_pages); 
-                BUG_ON(PageLRU(page)); 
-        } 
-        //此处将无法回收的页面放入page_list中，在函数返回后，去其进行处理 
-        list_splice(&amp;ret_pages, page_list); 
-        //此处将可以释放的页面通通给释放掉，回收了^_^ 
-
-        if (pagevec_count(&amp;freed_pvec)) 
-            __pagevec_release_nonlru(&amp;freed_pvec); 
-        mod_page_state(pgactivate, pgactivate); 
-        sc-&gt;nr_reclaimed += reclaimed; 
-        return reclaimed; 
+<p>还有一种大家都知道的方式，就是通过mmap实现，示例代码如下：
+<code>
+    size_t filesize = stat_buf.st_size;
+    source = mmap(0, filesize, PROT_READ, MAP_SHARED, f_in, 0);
+    target = mmap(0, filesize, PROT_WRITE, MAP_SHARED, f_out, 0);
+    memcpy(target, source, filesize);
+</code>
+因为mmap不需要内核态和用户态的内存拷贝，效率大大提高。</p>
+
+<p>本文还想介绍另外一种，是今天无意google到的，就是如标题所述，基于splice实现，splice是Linux 2.6.17新加入的系统调用，官方文档的描述是，用于在两个文件间移动数据，而无需内核态和用户态的内存拷贝，但需要借助管道（pipe）实现。大概原理就是通过pipe buffer实现一组内核内存页（pages of kernel memory）的引用计数指针（reference-counted pointers），数据拷贝过程中并不真正拷贝数据，而是创建一个新的指向内存页的指针。也就是说拷贝过程实质是指针的拷贝。示例代码如下：
+<code>
+    int pipefd[2];
+    pipe( pipefd );
+    int max_read = 4096;
+    off_t size = stat_buf.st_size;
+    while ( off_in &lt; size ) {
+        int len = size - off_in &gt; max_read ? max_read : size - off_in;
+        len = splice(f_in, &amp;off_in, pipefd[1], NULL, len, SPLICE_F_MORE |SPLICE_F_MOVE);
+        splice(pipefd[0], NULL, f_out, &amp;off_out, len, SPLICE_F_MORE |SPLICE_F_MOVE);
+    }
+</code>
+使用splice一定要注意，因为其借助管道实现，而管道有众所周知的空间限制问题，超过了限制就会hang住，所以每次写入管道的数据量好严格控制，保守的建议值是一个内存页大小，即4k。另外，off_in和off_out传递的是指针，其值splice会做一定变动，使用时应注意。</p>
+
+<p>splice kernel bug: <a href="https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae">https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae</a></p>
+
+<hr />
+
+<p><a href="http://ogris.de/howtos/splice.html">http://ogris.de/howtos/splice.html</a></p>
+
+<p><a href="http://blog.csdn.net/eroswang/article/details/1999034">http://blog.csdn.net/eroswang/article/details/1999034</a></p>
+
+<p><a href="http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file">http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file</a></p>
+
+<pre><code>   EINVAL Target  file  system  doesn't  support  splicing; target file is
+          opened in append mode; neither of the descriptors  refers  to  a
+          pipe; or offset given for non-seekable device.
+</code></pre>
+
+<hr />
+
+<h4>file to file sample</h4>
+
+<pre><code>    #define _GNU_SOURCE
+    #include &lt;fcntl.h&gt;
+    #include &lt;stdio.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;errno.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;time.h&gt;
+
+    int main(int argc, char **argv)
+    {
+        int pipefd[2];
+        int result;
+        FILE *in_file;
+        FILE *out_file;
+        char buff[65537];
+
+        if (argc != 3) {
+            printf("usage: ./client infile outfile\n");
+            exit(0);
+        }
+        result = pipe(pipefd);
+
+        in_file = fopen(argv[1], "rb");
+        out_file = fopen(argv[2], "wb");
+
+        off_t off_in = 0, off_out = 0;
+        int len = 1024*1024*30;
+        while (len &gt; 0) {
+            int size = 65536;
+            if (len &lt; size) size = len;
+            len -= size;
+
+            result = splice(fileno(in_file), &amp;off_in, pipefd[1], NULL, size, SPLICE_F_MORE | SPLICE_F_MOVE);
+            result = splice(pipefd[0], NULL, fileno(out_file), &amp;off_out, size, SPLICE_F_MORE | SPLICE_F_MOVE);
+            //printf("%d\n", result);
+
+    //        read(fileno(in_file), buff, size);
+    //        write(fileno(out_file), buff, size);
+        }
+        close(pipefd[0]);
+        close(pipefd[1]);
+        fclose(in_file);
+        fclose(out_file);
+
+        return 0;
     }
 </code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux物理内存页面分配]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-alloc/"/>
-    <updated>2015-04-18T22:38:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-alloc</id>
-    <content type="html"><![CDATA[<p><a href="/download/kernel/Linux_Physical_Memory_Page_Allocation.pdf">Linux_Physical_Memory_Page_Allocation.pdf</a></p>
 
-<p>转自 <a href="http://www.jtben.com/document/1266382">http://www.jtben.com/document/1266382</a></p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux物理内存描述]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-descript/"/>
-    <updated>2015-04-18T22:37:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-mm-descript</id>
-    <content type="html"><![CDATA[<p><a href="/download/kernel/Linux_Physical_Memory_Description.pdf">Linux_Physical_Memory_Description.pdf</a></p>
+<h4>more sample</h4>
 
-<p>转自 <a href="http://ilinuxkernel.com/?p=1332">http://ilinuxkernel.com/?p=1332</a></p>
+<p><a href="/download/kernel/splice_sample.tar.gz">splice sample</a></p>
+
+<p>like:<br/>
+file to socket<br/>
+socket to file<br/>
+socket to socket</p>
 ]]></content>
   </entry>
   

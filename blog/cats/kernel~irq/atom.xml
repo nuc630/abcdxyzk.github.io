@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~irq | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~irq/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-04-18T23:57:14+08:00</updated>
+  <updated>2015-05-07T16:25:21+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,21 +14,99 @@
 
   
   <entry>
-    <title type="html"><![CDATA[linux软中断机制分析]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/01/23/kernel-irq-mark3/"/>
-    <updated>2015-01-23T14:29:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/01/23/kernel-irq-mark3</id>
-    <content type="html"><![CDATA[<h3>软中断分析</h3>
+    <title type="html"><![CDATA[中断子系统之（八）：softirq]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-softirq/"/>
+    <updated>2015-05-07T16:04:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-softirq</id>
+    <content type="html"><![CDATA[<p><a href="http://www.wowotech.net/linux_kenrel/soft-irq.html">http://www.wowotech.net/linux_kenrel/soft-irq.html</a></p>
 
-<h4>1. 为什么要软中断</h4>
+<h3>一、前言</h3>
 
-<p>编写驱动的时候，一个中断产生之后，内核在中断处理函数中可能需要完成很多工作。但是中断处理函数的处理是关闭了中断的。也就是说在响应中断时，系统不能再次响应外部的其它中断。这样的后果会造成有可能丢失外部中断。于是，linux内核设计出了一种架构，中断函数需要处理的任务分为两部分，一部分在中断处理函数中执行，这时系统关闭中断。另外一部分在软件中断中执行，这个时候开启中断，系统可以响应外部中断。</p>
+<p>对于中断处理而言，linux将其分成了两个部分，一个叫做中断handler（top half），是全程关闭中断的，另外一部分是deferable task（bottom half），属于不那么紧急需要处理的事情。在执行bottom half的时候，是开中断的。有多种bottom half的机制，例如：softirq、tasklet、workqueue或是直接创建一个kernel thread来执行bottom half（这在旧的kernel驱动中常见，现在，一个理智的driver厂商是不会这么做的）。本文主要讨论softirq机制。由于tasklet是基于softirq的，因此本文也会提及tasklet，但主要是从需求层面考虑，不会涉及其具体的代码实现。</p>
 
-<p>关于软件中断的理论各种书籍都有介绍，不多叙述。而要真正体会软件中断的作用就必须从代码的角度来分析。我们做工作时候讲求的是professional，当一个人在某个领域一无所知的时候，我们称他为小白，偶，非苹果电脑。小白的脑子里充满了各种问题。慢慢的当这些疑惑解释完之后，小白就脱白了。此时，我们对这个领域的基本框架有了解，但这和professional还有一定的差距。再加以时日，逐渐融会贯通该领域才能达到专业的境界。</p>
+<p>在普通的驱动中一般是不会用到softirq，但是由于驱动经常使用的tasklet是基于softirq的，因此，了解softirq机制有助于撰写更优雅的driver。softirq不能动态分配，都是静态定义的。内核已经定义了若干种softirq number，例如网络数据的收发、block设备的数据访问（数据量大，通信带宽高），timer的deferable task（时间方面要求高）。本文的第二章讨论了softirq和tasklet这两种机制有何不同，分别适用于什么样的场景。第三章描述了一些context的概念，这是要理解后续内容的基础。第四章是进入softirq的实现，对比hard irq来解析soft irq的注册、触发，调度的过程。</p>
 
-<h4>2. 什么时候触发处理软件中断</h4>
+<ul>
+<li>注：本文中的linux kernel的版本是3.14</li>
+</ul>
 
-<p>说了这么多废话，赶快步入正题。初识软中断，脑子里肯定有不少的疑问，首先就是软件中断在什么地方被触发处理？这个问题的答案就是：一个硬件中断处理完成之后。下面的函数在处理完硬件中断之后推出中断处理函数，在irq_exit中会触发软件中断的处理。
+
+<h3>二、为何有softirq和tasklet</h3>
+
+<h4>1、为何有top half和bottom half</h4>
+
+<p>中断处理模块是任何OS中最重要的一个模块，对系统的性能会有直接的影响。想像一下：如果在通过U盘进行大量数据拷贝的时候，你按下一个key，需要半秒的时间才显示出来，这个场景是否让你崩溃？因此，对于那些复杂的、需要大量数据处理的硬件中断，我们不能让handler中处理完一切再恢复现场（handler是全程关闭中断的），而是仅仅在handler中处理一部分，具体包括：<br/>
+（1）有实时性要求的<br/>
+（2）和硬件相关的。例如ack中断，read HW FIFO to ram等<br/>
+（3）如果是共享中断，那么获取硬件中断状态以便判断是否是本中断发生</p>
+
+<p>除此之外，其他的内容都是放到bottom half中处理。在把中断处理过程划分成top half和bottom half之后，关中断的top half被瘦身，可以非常快速的执行完毕，大大减少了系统关中断的时间，提高了系统的性能。</p>
+
+<p>我们可以基于下面的系统进一步的进行讨论：</p>
+
+<p><img src="/images/kernel/2015-05-07-11.gif" alt="" /></p>
+
+<p>当网卡控制器的FIFO收到的来自以太网的数据的时候（例如半满的时候，可以软件设定），可以将该事件通过irq signal送达Interrupt Controller。Interrupt Controller可以把中断分发给系统中的Processor A or B。</p>
+
+<p>NIC的中断处理过程大概包括：
+<code>
+    mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;handle Data in the ram---&gt;unmask interrupt controller
+</code>
+我们先假设Processor A处理了这个网卡中断事件，于是NIC的中断handler在Processor A上欢快的执行，这时候，Processor A的本地中断是disable的。NIC的中断handler在执行的过程中，网络数据仍然源源不断的到来，但是，如果NIC的中断handler不操作NIC的寄存器来ack这个中断的话，NIC是不会触发下一次中断的。还好，我们的NIC interrupt handler总是在最开始就会ack，因此，这不会导致性能问题。ack之后，NIC已经具体再次trigger中断的能力。当Processor A上的handler 在处理接收来自网络的数据的时候，NIC的FIFO很可能又收到新的数据，并trigger了中断，这时候，Interrupt controller还没有umask，因此，即便还有Processor B（也就是说有处理器资源），中断控制器也无法把这个中断送达处理器系统。因此，只能眼睁睁的看着NIC FIFO填满数据，数据溢出，或者向对端发出拥塞信号，无论如何，整体的系统性能是受到严重的影响。</p>
+
+<p>注意：对于新的interrupt controller，可能没有mask和umask操作，但是原理是一样的，只不过NIC的handler执行完毕要发生EOI而已。</p>
+
+<p>要解决上面的问题，最重要的是尽快的执行完中断handler，打开中断，unmask IRQ（或者发送EOI），方法就是把耗时的handle Data in the ram这个步骤踢出handler，让其在bottom half中执行。</p>
+
+<h4>2、为何有softirq和tasklet</h4>
+
+<p>OK，linux kernel已经把中断处理分成了top half和bottom half，看起来已经不错了，那为何还要提供softirq、tasklet和workqueue这些bottom half机制，linux kernel本来就够复杂了，bottom half还来添乱。实际上，在早期的linux kernel还真是只有一个bottom half机制，简称BH，简单好用，但是性能不佳。后来，linux kernel的开发者开发了task queue机制，试图来替代BH，当然，最后task queue也消失在内核代码中了。现在的linux kernel提供了三种bottom half的机制，来应对不同的需求。</p>
+
+<p>workqueue和softirq、tasklet有本质的区别：workqueue运行在process context，而softirq和tasklet运行在interrupt context。因此，出现workqueue是不奇怪的，在有sleep需求的场景中，defering task必须延迟到kernel thread中执行，也就是说必须使用workqueue机制。softirq和tasklet是怎么回事呢？从本质上将，bottom half机制的设计有两方面的需求，一个是性能，一个是易用性。设计一个通用的bottom half机制来满足这两个需求非常的困难，因此，内核提供了softirq和tasklet两种机制。softirq更倾向于性能，而tasklet更倾向于易用性。</p>
+
+<p>我们还是进入实际的例子吧，还是使用上一节的系统图。在引入softirq之后，网络数据的处理如下：</p>
+
+<p>关中断：
+<code>
+    mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;raise softirq---&gt;unmask interrupt controller
+</code>
+开中断：在softirq上下文中进行handle Data in the ram的动作</p>
+
+<p>同样的，我们先假设Processor A处理了这个网卡中断事件，很快的完成了基本的HW操作后，raise softirq。在返回中断现场前，会检查softirq的触发情况，因此，后续网络数据处理的softirq在processor A上执行。在执行过程中，NIC硬件再次触发中断，Interrupt controller将该中断分发给processor B，执行动作和Processor A是类似的，因此，最后，网络数据处理的softirq在processor B上执行。</p>
+
+<p>为了性能，同一类型的softirq有可能在不同的CPU上并发执行，这给使用者带来了极大的痛苦，因为驱动工程师在撰写softirq的回调函数的时候要考虑重入，考虑并发，要引入同步机制。但是，为了性能，我们必须如此。</p>
+
+<p>当网络数据处理的softirq同时在Processor A和B上运行的时候，网卡中断又来了（可能是10G的网卡吧）。这时候，中断分发给processor A，这时候，processor A上的handler仍然会raise softirq，但是并不会调度该softirq。也就是说，softirq在一个CPU上是串行执行的。这种情况下，系统性能瓶颈是CPU资源，需要增加更多的CPU来解决该问题。</p>
+
+<p>如果是tasklet的情况会如何呢？为何tasklet性能不如softirq呢？如果一个tasklet在processor A上被调度执行，那么它永远也不会同时在processor B上执行，也就是说，tasklet是串行执行的（注：不同的tasklet还是会并发的），不需要考虑重入的问题。我们还是用网卡这个例子吧（注意：这个例子仅仅是用来对比，实际上，网络数据是使用softirq机制的），同样是上面的系统结构图。假设使用tasklet，网络数据的处理如下：</p>
+
+<p>关中断：
+<code>
+    mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;schedule tasklet---&gt;unmask interrupt controller
+</code>
+开中断：在softirq上下文中（一般使用TASKLET_SOFTIRQ这个softirq）进行handle Data in the ram的动作</p>
+
+<p>同样的，我们先假设Processor A处理了这个网卡中断事件，很快的完成了基本的HW操作后，schedule tasklet（同时也就raise TASKLET_SOFTIRQ softirq）。在返回中断现场前，会检查softirq的触发情况，因此，在TASKLET_SOFTIRQ softirq的handler中，获取tasklet相关信息并在processor A上执行该tasklet的handler。在执行过程中，NIC硬件再次触发中断，Interrupt controller将该中断分发给processor B，执行动作和Processor A是类似的，虽然TASKLET_SOFTIRQ softirq在processor B上可以执行，但是，在检查tasklet的状态的时候，如果发现该tasklet在其他processor上已经正在运行，那么该tasklet不会被处理，一直等到在processor A上的tasklet处理完，在processor B上的这个tasklet才能被执行。这样的串行化操作虽然对驱动工程师是一个福利，但是对性能而言是极大的损伤。</p>
+
+<h3>三、理解softirq需要的基础知识（各种context）</h3>
+
+<h4>1、preempt_count</h4>
+
+<p>为了更好的理解下面的内容，我们需要先看看一些基础知识：一个task的thread info数据结构定义如下（只保留和本场景相关的内容）：
+<code>
+    struct thread_info {
+        ......
+        int preempt_count;    /* 0 =&gt; preemptable, &lt;0 =&gt; bug */
+        ......
+    };
+</code>
+preempt_count这个成员被用来判断当前进程是否可以被抢占。如果preempt_count不等于0（可能是代码调用preempt_disable显式的禁止了抢占，也可能是处于中断上下文等），说明当前不能进行抢占，如果preempt_count等于0，说明已经具备了抢占的条件（当然具体是否要抢占当前进程还是要看看thread info中的flag成员是否设定了_TIF_NEED_RESCHED这个标记，可能是当前的进程的时间片用完了，也可能是由于中断唤醒了优先级更高的进程）。 具体preempt_count的数据格式可以参考下图：</p>
+
+<p><img src="/images/kernel/2015-05-07-12.gif" alt="" /></p>
+
+<p>preemption count用来记录当前被显式的禁止抢占的次数，也就是说，每调用一次preempt_disable，preemption count就会加一，调用preempt_enable，该区域的数值会减去一。preempt_disable和preempt_enable必须成对出现，可以嵌套，最大嵌套的深度是255。</p>
+
+<p>hardirq count描述当前中断handler嵌套的深度。对于ARM平台的linux kernel，其中断部分的代码如下：
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -368,890 +446,1104 @@
 <span class='line-number'>337</span>
 <span class='line-number'>338</span>
 <span class='line-number'>339</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>asmlinkage void __exception asm_do_IRQ(unsigned int irq, struct pt_regs &lt;em&gt;regs)
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void handle_IRQ(unsigned int irq, struct pt_regs &lt;em&gt;regs)
 </span><span class='line'>{
 </span><span class='line'>    struct pt_regs &lt;/em&gt;old_regs = set_irq_regs(regs);&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    irq_enter();
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'> * Some hardware gives randomly wrong interrupts.  Rather
-</span><span class='line'> * than crashing, do something sensible.
-</span><span class='line'> */ 
-</span><span class='line'>if (irq &gt;= NR_IRQS)
-</span><span class='line'>    handle_bad_irq(irq, &amp;bad_irq_desc);
-</span><span class='line'>else 
-</span><span class='line'>    generic_handle_irq(irq);
-</span><span class='line'>
-</span><span class='line'>/* AT91 specific workaround */ 
-</span><span class='line'>irq_finish(irq);
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    irq_enter(); 
+</span><span class='line'>generic_handle_irq(irq);
 </span><span class='line'>
 </span><span class='line'>irq_exit();
 </span><span class='line'>set_irq_regs(old_regs);
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;这里要注意，invoke_softirq必须满足两个条件才能被调用到，一个就是不是在硬件中断处理过程中或者在软件中断处理中，第二个就是必须有软件中断处于pending状态。第二个好理解，有软件中断产生才去处理，没有就不处理。第一个就不好理解了。
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;通用的IRQ handler被irq_enter和irq_exit这两个函数包围。irq_enter说明进入到IRQ context，而irq_exit则说明退出IRQ context。在irq_enter函数中会调用preempt_count_add(HARDIRQ_OFFSET)，为hardirq count的bit field增加1。在irq_exit函数中，会调用preempt_count_sub(HARDIRQ_OFFSET)，为hardirq count的bit field减去1。hardirq count占用了4个bit，说明硬件中断handler最大可以嵌套15层。在旧的内核中，hardirq count占用了12个bit，支持4096个嵌套。当然，在旧的kernel中还区分fast interrupt handler和slow interrupt handler，中断handler最大可以嵌套的次数理论上等于系统IRQ的个数。在实际中，这个数目不可能那么大（内核栈就受不了），因此，即使系统支持了非常大的中断个数，也不可能各个中断依次嵌套，达到理论的上限。基于这样的考虑，后来内核减少了hardirq count占用bit数目，改成了10个bit（在general arch的代码中修改为10，实际上，各个arch可以redefine自己的hardirq count的bit数）。但是，当内核大佬们决定废弃slow interrupt handler的时候，实际上，中断的嵌套已经不会发生了。因此，理论上，hardirq count要么是0，要么是1。不过呢，不能总拿理论说事，实际上，万一有写奇葩或者老古董driver在handler中打开中断，那么这时候中断嵌套还是会发生的，但是，应该不会太多（一个系统中怎么可能有那么多奇葩呢？呵呵），因此，目前hardirq count占用了4个bit，应付15个奇葩driver是妥妥的。
+</span><span class='line'>
+</span><span class='line'>对softirq count进行操作有两个场景：
+</span><span class='line'>
+</span><span class='line'>（1）也是在进入soft irq handler之前给 softirq count加一，退出soft irq handler之后给 softirq count减去一。由于soft irq handler在一个CPU上是不会并发的，总是串行执行，因此，这个场景下只需要一个bit就够了，也就是上图中的bit 8。通过该bit可以知道当前task是否在sofirq context。
+</span><span class='line'>
+</span><span class='line'>（2）由于内核同步的需求，进程上下文需要禁止softirq。这时候，kernel提供了local_bf_enable和local_bf_disable这样的接口函数。这部分的概念是和preempt disable/enable类似的，占用了bit9～15，最大可以支持127次嵌套。
+</span><span class='line'>
+</span><span class='line'>#### 2、一个task的各种上下文
+</span><span class='line'>
+</span><span class='line'>看完了preempt_count之后，我们来介绍各种context：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;/*
-</span><span class='line'>* Exit an interrupt context. Process softirqs if needed and possible:
-</span><span class='line'>*/ 
-</span><span class='line'>void irq_exit(void)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define in_irq()        (hardirq_count())
+</span><span class='line'>#define in_softirq()        (softirq_count())
+</span><span class='line'>#define in_interrupt()        (irq_count())
+</span><span class='line'>
+</span><span class='line'>#define in_serving_softirq()    (softirq_count() &amp; SOFTIRQ_OFFSET)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;这里首先要介绍的是一个叫做IRQ context的术语。这里的IRQ context其实就是hard irq context，也就是说明当前正在执行中断handler（top half），只要preempt_count中的hardirq count大于0（＝1是没有中断嵌套，如果大于1，说明有中断嵌套），那么就是IRQ context。
+</span><span class='line'>
+</span><span class='line'>softirq context并没有那么的直接，一般人会认为当sofirq handler正在执行的时候就是softirq context。这样说当然没有错，sofirq handler正在执行的时候，会增加softirq count，当然是softirq context。不过，在其他context的情况下，例如进程上下文中，有有可能因为同步的要求而调用local_bh_disable，这时候，通过local_bh_disable/enable保护起来的代码也是执行在softirq context中。当然，这时候其实并没有正在执行softirq handler。如果你确实想知道当前是否正在执行softirq handler，in_serving_softirq可以完成这个使命，这是通过操作preempt_count的bit 8来完成的。
+</span><span class='line'>
+</span><span class='line'>所谓中断上下文，就是IRQ context ＋ softirq context＋NMI context。
+</span><span class='line'>
+</span><span class='line'>### 四、softirq机制
+</span><span class='line'>
+</span><span class='line'>softirq和hardirq（就是硬件中断啦）是对应的，因此softirq的机制可以参考hardirq对应理解，当然softirq是纯软件的，不需要硬件参与。
+</span><span class='line'>
+</span><span class='line'>#### 1、softirq number
+</span><span class='line'>
+</span><span class='line'>和IRQ number一样，对于软中断，linux kernel也是用一个softirq number唯一标识一个softirq，具体定义如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;enum
 </span><span class='line'>{
-</span><span class='line'>account_system_vtime(current);
-</span><span class='line'>trace_hardirq_exit();
-</span><span class='line'>sub_preempt_count(IRQ_EXIT_OFFSET);
+</span><span class='line'>HI_SOFTIRQ=0,
+</span><span class='line'>TIMER_SOFTIRQ,
+</span><span class='line'>NET_TX_SOFTIRQ,
+</span><span class='line'>NET_RX_SOFTIRQ,
+</span><span class='line'>BLOCK_SOFTIRQ,
+</span><span class='line'>BLOCK_IOPOLL_SOFTIRQ,
+</span><span class='line'>TASKLET_SOFTIRQ,
+</span><span class='line'>SCHED_SOFTIRQ,
+</span><span class='line'>HRTIMER_SOFTIRQ,
+</span><span class='line'>RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+</span><span class='line'>
+</span><span class='line'>NR_SOFTIRQS
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;HI_SOFTIRQ用于高优先级的tasklet，TASKLET_SOFTIRQ用于普通的tasklet。TIMER_SOFTIRQ是for software timer的（所谓software timer就是说该timer是基于系统tick的）。NET_TX_SOFTIRQ和NET_RX_SOFTIRQ是用于网卡数据收发的。BLOCK_SOFTIRQ和BLOCK_IOPOLL_SOFTIRQ是用于block device的。SCHED_SOFTIRQ用于多CPU之间的负载均衡的。HRTIMER_SOFTIRQ用于高精度timer的。RCU_SOFTIRQ是处理RCU的。这些具体使用情景分析会在各自的子系统中分析，本文只是描述softirq的工作原理。
+</span><span class='line'>
+</span><span class='line'>#### 2、softirq描述符
+</span><span class='line'>
+</span><span class='line'>我们前面已经说了，softirq是静态定义的，也就是说系统中有一个定义softirq描述符的数组，而softirq number就是这个数组的index。这个概念和早期的静态分配的中断描述符概念是类似的。具体定义如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct softirq_action
+</span><span class='line'>{
+</span><span class='line'>void    (*action)(struct softirq_action *);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;系统支持多少个软中断，静态定义的数组就会有多少个entry。`____cacheline_aligned`保证了在SMP的情况下，softirq_vec是对齐到cache line的。softirq描述符非常简单，只有一个action成员，表示如果触发了该softirq，那么应该调用action回调函数来处理这个soft irq。对于硬件中断而言，其mask、ack等都是和硬件寄存器相关并封装在irq chip函数中，对于softirq，没有硬件寄存器，只有“软件寄存器”，定义如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;typedef struct {
+</span><span class='line'>unsigned int __softirq_pending;
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>unsigned int ipi_irqs[NR_IPI];
+</span><span class='line'>#endif
+</span><span class='line'>} ____cacheline_aligned irq_cpustat_t;
+</span><span class='line'>
+</span><span class='line'>irq_cpustat_t irq_stat[NR_CPUS] ____cacheline_aligned;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;ipi_irqs这个成员用于处理器之间的中断，我们留到下一个专题来描述。`__softirq_pending`就是这个“软件寄存器”。softirq采用谁触发，谁负责处理的。例如：当一个驱动的硬件中断被分发给了指定的CPU，并且在该中断handler中触发了一个softirq，那么该CPU负责调用该softirq number对应的action callback来处理该软中断。因此，这个“软件寄存器”应该是每个CPU拥有一个（专业术语叫做banked register）。为了性能，irq_stat中的每一个entry被定义对齐到cache line。
+</span><span class='line'>
+</span><span class='line'>#### 3、如何注册一个softirq
+</span><span class='line'>
+</span><span class='line'>通过调用open_softirq接口函数可以注册softirq的action callback函数，具体如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void open_softirq(int nr, void (*action)(struct softirq_action *))
+</span><span class='line'>{
+</span><span class='line'>softirq_vec[nr].action = action;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册都是在系统初始化的时候完成的，那时候，系统是串行执行的。此外，softirq是静态定义的，每个entry（或者说每个softirq number）都是固定分配的，因此，不需要保护。
+</span><span class='line'>
+</span><span class='line'>#### 4、如何触发softirq？
+</span><span class='line'>
+</span><span class='line'>在linux kernel中，可以调用raise_softirq这个接口函数来触发本地CPU上的softirq，具体如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void raise_softirq(unsigned int nr)
+</span><span class='line'>{
+</span><span class='line'>unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>local_irq_save(flags);
+</span><span class='line'>raise_softirq_irqoff(nr);
+</span><span class='line'>local_irq_restore(flags);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;虽然大部分的使用场景都是在中断handler中（也就是说关闭本地CPU中断）来执行softirq的触发动作，但是，这不是全部，在其他的上下文中也可以调用raise_softirq。因此，触发softirq的接口函数有两个版本，一个是raise_softirq，有关中断的保护，另外一个是raise_softirq_irqoff，调用者已经关闭了中断，不需要关中断来保护“soft irq status register”。
+</span><span class='line'>
+</span><span class='line'>所谓trigger softirq，就是在`__softirq_pending`（也就是上面说的soft irq status register）的某个bit置一。从上面的定义可知，`__softirq_pending`是per cpu的，因此不需要考虑多个CPU的并发，只要disable本地中断，就可以确保对，`__softirq_pending`操作的原子性。
+</span><span class='line'>
+</span><span class='line'>具体raise_softirq_irqoff的代码如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;inline void raise_softirq_irqoff(unsigned int nr)
+</span><span class='line'>{
+</span><span class='line'>__raise_softirq_irqoff(nr); ---------- （1）
+</span><span class='line'>
+</span><span class='line'>if (!in_interrupt())
+</span><span class='line'>    wakeup_softirqd();      ---------- （2）
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;（1）`__raise_softirq_irqoff`函数设定本CPU上的`__softirq_pending`的某个bit等于1，具体的bit是由soft irq number（nr参数）指定的。
+</span><span class='line'>
+</span><span class='line'>（2）如果在中断上下文，我们只要set `__softirq_pending`的某个bit就OK了，在中断返回的时候自然会进行软中断的处理。但是，如果在context上下文调用这个函数的时候，我们必须要调用wakeup_softirqd函数用来唤醒本CPU上的softirqd这个内核线程。具体softirqd的内容请参考下一个章节。
+</span><span class='line'>
+</span><span class='line'>#### 5、disable/enable softirq
+</span><span class='line'>
+</span><span class='line'>在linux kernel中，可以使用local_irq_disable和local_irq_enable来disable和enable本CPU中断。和硬件中断一样，软中断也可以disable，接口函数是local_bh_disable和local_bh_enable。虽然和想像的local_softirq_enable/disable有些出入，不过bh这个名字更准确反应了该接口函数的意涵，因为local_bh_disable/enable函数就是用来disable/enable bottom half的，这里就包括softirq和tasklet。
+</span><span class='line'>
+</span><span class='line'>先看disable吧，毕竟禁止bottom half比较简单：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void local_bh_disable(void)
+</span><span class='line'>{
+</span><span class='line'>__local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+</span><span class='line'>{
+</span><span class='line'>preempt_count_add(cnt);
+</span><span class='line'>barrier();
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;看起来disable bottom half比较简单，就是讲current thread info上的preempt_count成员中的softirq count的bit field9～15加上一就OK了。barrier是优化屏障（Optimization barrier），会在内核同步系列文章中描述。
+</span><span class='line'>
+</span><span class='line'>enable函数比较复杂，如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void local_bh_enable(void)
+</span><span class='line'>{
+</span><span class='line'>__local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
+</span><span class='line'>{
+</span><span class='line'>WARN_ON_ONCE(in_irq() || irqs_disabled()); --------- （1）
+</span><span class='line'>
+</span><span class='line'>preempt_count_sub(cnt - 1);                --------- （2）
+</span><span class='line'>
+</span><span class='line'>if (unlikely(!in_interrupt() &amp;&amp; local_softirq_pending())) {  ------- （3）
+</span><span class='line'>    do_softirq();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>preempt_count_dec();                       --------- （4）
+</span><span class='line'>preempt_check_resched();
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;（1）disable/enable bottom half是一种内核同步机制。在硬件中断的handler（top half）中，不应该调用disable/enable bottom half函数来保护共享数据，因为bottom half其实是不可能抢占top half的。同样的，soft irq也不会抢占另外一个soft irq的执行，也就是说，一旦一个softirq handler被调度执行（无论在哪一个processor上），那么，本地的softirq handler都无法抢占其运行，要等到当前的softirq handler运行完毕后，才能执行下一个soft irq handler。注意：上面我们说的是本地，是local，softirq handler是可以在多个CPU上同时运行的，但是，linux kernel中没有disable all softirq的接口函数（就好像没有disable all CPU interrupt的接口一样，注意体会local_bh_enable/disable中的local的含义）。
+</span><span class='line'>
+</span><span class='line'>说了这么多，一言以蔽之，local_bh_enable/disable是给进程上下文使用的，用于防止softirq handler抢占local_bh_enable/disable之间的临界区的。
+</span><span class='line'>
+</span><span class='line'>irqs_disabled接口函数可以获知当前本地CPU中断是否是disable的，如果返回1，那么当前是disable 本地CPU的中断的。如果irqs_disabled返回1，有可能是下面这样的代码造成的：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;local_irq_disable();
+</span><span class='line'>......
+</span><span class='line'>local_bh_disable();
+</span><span class='line'>
+</span><span class='line'>......
+</span><span class='line'>
+</span><span class='line'>local_bh_enable();
+</span><span class='line'>......
+</span><span class='line'>local_irq_enable();
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;本质上，关本地中断是一种比关本地bottom half更强劲的锁，关本地中断实际上是禁止了top half和bottom half抢占当前进程上下文的运行。也许你会说：这也没有什么，就是有些浪费，至少代码逻辑没有问题。但事情没有这么简单，在`local_bh_enable---&gt;do_softirq---&gt;__do_softirq`中，有一条无条件打开当前中断的操作，也就是说，原本想通过local_irq_disable/local_irq_enable保护的临界区被破坏了，其他的中断handler可以插入执行，从而无法保证local_irq_disable/local_irq_enable保护的临界区的原子性，从而破坏了代码逻辑。
+</span><span class='line'>
+</span><span class='line'>in_irq()这个函数如果不等于0的话，说明local_bh_enable被irq_enter和irq_exit包围，也就是说在中断handler中调用了local_bh_enable/disable。这道理是和上面类似的，这里就不再详细描述了。
+</span><span class='line'>
+</span><span class='line'>（2）在local_bh_disable中我们为preempt_count增加了SOFTIRQ_DISABLE_OFFSET，在local_bh_enable函数中应该减掉同样的数值。这一步，我们首先减去了（SOFTIRQ_DISABLE_OFFSET-1），为何不一次性的减去SOFTIRQ_DISABLE_OFFSET呢？考虑下面运行在进程上下文的代码场景：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;......
+</span><span class='line'>
+</span><span class='line'>local_bh_disable
+</span><span class='line'>
+</span><span class='line'>...需要被保护的临界区...
+</span><span class='line'>
+</span><span class='line'>local_bh_enable
+</span><span class='line'>......
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;在临界区内，有进程context 和softirq共享的数据，因此，在进程上下文中使用local_bh_enable/disable进行保护。假设在临界区代码执行的时候，发生了中断，由于代码并没有阻止top half的抢占，因此中断handler会抢占当前正在执行的thread。在中断handler中，我们raise了softirq，在返回中断现场的时候，由于disable了bottom half，因此虽然触发了softirq，但是不会调度执行。因此，代码返回临界区继续执行，直到local_bh_enable。一旦enable了bottom half，那么之前raise的softirq就需要调度执行了，因此，这也是为什么在local_bh_enable会调用do_softirq函数。
+</span><span class='line'>
+</span><span class='line'>调用do_softirq函数来处理pending的softirq的时候，当前的task是不能被抢占的，因为一旦被抢占，下一次该task被调度运行的时候很可能在其他的CPU上去了（还记得吗？softirq的pending 寄存器是per cpu的）。因此，我们不能一次性的全部减掉，那样的话有可能preempt_count等于0，那样就允许抢占了。因此，这里减去了（SOFTIRQ_DISABLE_OFFSET-1），既保证了softirq count的bit field9~15被减去了1，又保持了preempt disable的状态。
+</span><span class='line'>
+</span><span class='line'>（3）如果当前不是interrupt context的话，并且有pending的softirq，那么调用do_softirq函数来处理软中断。
+</span><span class='line'>
+</span><span class='line'>（4）该来的总会来，在step 2中我们少减了1，这里补上，其实也就是preempt count-1。
+</span><span class='line'>
+</span><span class='line'>（5）在softirq handler中很可能wakeup了高优先级的任务，这里最好要检查一下，看看是否需要进行调度，确保高优先级的任务得以调度执行。
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>#### 5、如何处理一个被触发的soft irq
+</span><span class='line'>
+</span><span class='line'>我们说softirq是一种defering task的机制，也就是说top half没有做的事情，需要延迟到bottom half中来执行。那么具体延迟到什么时候呢？这是本节需要讲述的内容，也就是说soft irq是如何调度执行的。
+</span><span class='line'>
+</span><span class='line'>在上一节已经描述一个softirq被调度执行的场景，本节主要关注在中断返回现场时候调度softirq的场景。我们来看中断退出的代码，具体如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void irq_exit(void)
+</span><span class='line'>{
+</span><span class='line'>......
 </span><span class='line'>if (!in_interrupt() &amp;&amp; local_softirq_pending())
 </span><span class='line'>    invoke_softirq();
 </span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_NO_HZ
-</span><span class='line'>/* Make sure that timer wheel updates are propagated */ 
-</span><span class='line'>rcu_irq_exit();
-</span><span class='line'>if (idle_cpu(smp_processor_id()) &amp;&amp; !in_interrupt() &amp;&amp; !need_resched())
-</span><span class='line'>    tick_nohz_stop_sched_tick(0);
-</span><span class='line'>#endif 
-</span><span class='line'>preempt_enable_no_resched();
+</span><span class='line'>......
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;在linux系统的进程数据结构里，有这么一个数据结构
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;代码中“!in_interrupt()”这个条件可以确保下面的场景不会触发sotfirq的调度：
+</span><span class='line'>
+</span><span class='line'>（1）中断handler是嵌套的。也就是说本次irq_exit是退出到上一个中断handler。当然，在新的内核中，这种情况一般不会发生，因为中断handler都是关中断执行的。
+</span><span class='line'>
+</span><span class='line'>（2）本次中断是中断了softirq handler的执行。也就是说本次irq_exit是不是退出到进程上下文，而是退出到上一个softirq context。这一点也保证了在一个CPU上的softirq是串行执行的（注意：多个CPU上还是有可能并发的）
+</span><span class='line'>
+</span><span class='line'>我们继续看invoke_softirq的代码：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define preempt_count() (current_thread_info()-&gt;preempt_count)，
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;利用preempt_count可以表示是否处于中断处理或者软件中断处理过程中。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define PREEMPT_MASK    (__IRQ_MASK(PREEMPT_BITS) &lt;&lt; PREEMPT_SHIFT)
-</span><span class='line'>#define SOFTIRQ_MASK    (__IRQ_MASK(SOFTIRQ_BITS) &lt;&lt; SOFTIRQ_SHIFT)
-</span><span class='line'>#define HARDIRQ_MASK    (__IRQ_MASK(HARDIRQ_BITS) &lt;&lt; HARDIRQ_SHIFT)
-</span><span class='line'>
-</span><span class='line'>#define PREEMPT_OFFSET    (1UL &lt;&lt; PREEMPT_SHIFT)
-</span><span class='line'>#define SOFTIRQ_OFFSET    (1UL &lt;&lt; SOFTIRQ_SHIFT)
-</span><span class='line'>#define HARDIRQ_OFFSET    (1UL &lt;&lt; HARDIRQ_SHIFT)
-</span><span class='line'>
-</span><span class='line'>sub_preempt_count(IRQ_EXIT_OFFSET);
-</span><span class='line'>
-</span><span class='line'>#define in_interrupt() (irq_count())
-</span><span class='line'>
-</span><span class='line'>#define irq_count() (preempt_count() &amp; (HARDIRQ_MASK | SOFTIRQ_MASK))
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>![](/images/kernel/2015-01-23-1.png)
-</span><span class='line'>
-</span><span class='line'>preempt_count的8～23位记录中断处理和软件中断处理过程的计数。如果有计数，表示系统在硬件中断或者软件中断处理过程中。系统这么设计是为了避免软件中断在中断嵌套中被调用，并且达到在单个CPU上软件中断不能被重入的目的。对于ARM架构的CPU不存在中断嵌套中调用软件中断的问题，因为ARM架构的CPU在处理硬件中断的过程中是关闭掉中断的。只有在进入了软中断处理过程中之后才会开启硬件中断，如果在软件中断处理过程中有硬件中断嵌套，也不会再次调用软中断，because硬件中断是软件中断处理过程中再次进入的，此时preempt_count已经记录了软件中断！对于其它架构的CPU，有可能在触发调用软件中断前，也就是还在处理硬件中断的时候，就已经开启了硬件中断，可能会发生中断嵌套，在中断嵌套中是不允许调用软件中断处理的。Why？我的理解是，在发生中断嵌套的时候，表明这个时候是系统突发繁忙的时候，内核第一要务就是赶紧把中断中的事情处理完成，退出中断嵌套。避免多次嵌套，哪里有时间处理软件中断，所以把软件中断推迟到了所有中断处理完成的时候才能触发软件中断。
-</span><span class='line'>
-</span><span class='line'>#### 3. 软件中断的处理过程
-</span><span class='line'>
-</span><span class='line'>之前我已经说到，软中断的一个很大的目的就是避免中断处理中，处理的操作过多而丢失中断。同时中断还需要考虑到一件事情就是中断处理过程过长就会影响系统响应时间。如果一个中断处理一秒钟，那你一定能感受到串口卡住的现象。从另外一方面说呢，我们又必须考虑中断处理的操作一定的优先度，毕竟是硬件触发的事务，关系到网络、块设备的效率问题。Linux内核就中断方面就必须考虑平衡这三个方面的问题。而下面我要分析的__do_softirq函数就恰似在这三者之间打太极，游刃有余，面面俱到！
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;/*
-</span><span class='line'>* We restart softirq processing MAX_SOFTIRQ_RESTART times,
-</span><span class='line'>* and we fall back to softirqd after that.
-</span><span class='line'>*
-</span><span class='line'>* This number has been established via experimentation.
-</span><span class='line'>* The two things to balance is latency against fairness -
-</span><span class='line'>* we want to handle softirqs as soon as possible, but they
-</span><span class='line'>* should not be able to lock up the box.
-</span><span class='line'>*/ 
-</span><span class='line'>#define MAX_SOFTIRQ_RESTART 10 
-</span><span class='line'>
-</span><span class='line'>asmlinkage void __do_softirq(void)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void invoke_softirq(void)
 </span><span class='line'>{
-</span><span class='line'>struct softirq_action *h;
-</span><span class='line'>__u32 pending;
-</span><span class='line'>int max_restart = MAX_SOFTIRQ_RESTART;
-</span><span class='line'>int cpu;
+</span><span class='line'>if (!force_irqthreads) {
+</span><span class='line'>#ifdef CONFIG_HAVE_IRQ_EXIT_ON_IRQ_STACK
+</span><span class='line'>    __do_softirq();
+</span><span class='line'>#else
+</span><span class='line'>    do_softirq_own_stack();
+</span><span class='line'>#endif
+</span><span class='line'>} else {
+</span><span class='line'>    wakeup_softirqd();
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>pending = local_softirq_pending();
-</span><span class='line'>account_system_vtime(current);
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;force_irqthreads是和强制线程化相关的，主要用于interrupt handler的调试（一般而言，在线程环境下比在中断上下文中更容易收集调试数据）。如果系统选择了对所有的interrupt handler进行线程化处理，那么softirq也没有理由在中断上下文中处理（中断handler都在线程中执行了，softirq怎么可能在中断上下文中执行）。本身invoke_softirq这个函数是在中断上下文中被调用的，如果强制线程化，那么系统中所有的软中断都在sofirq的daemon进程中被调度执行。
 </span><span class='line'>
-</span><span class='line'>__local_bh_disable((unsigned long)__builtin_return_address(0));
-</span><span class='line'>trace_softirq_enter();
+</span><span class='line'>如果没有强制线程化，softirq的处理也分成两种情况，主要是和softirq执行的时候使用的stack相关。如果arch支持单独的IRQ STACK，这时候，由于要退出中断，因此irq stack已经接近全空了（不考虑中断栈嵌套的情况，因此新内核下，中断不会嵌套），因此直接调用`__do_softirq()`处理软中断就OK了，否则就调用do_softirq_own_stack函数在softirq自己的stack上执行。当然对ARM而言，softirq的处理就是在当前的内核栈上执行的，因此do_softirq_own_stack的调用就是调用`__do_softirq()`，代码如下（删除了部分无关代码）：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;asmlinkage void __do_softirq(void)
+</span><span class='line'>{
+</span><span class='line'>......
+</span><span class='line'>pending = local_softirq_pending();  ----------- 获取softirq pending的状态
+</span><span class='line'>__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET); ---- 标识下面的代码是正在处理softirq
 </span><span class='line'>cpu = smp_processor_id();
 </span><span class='line'>restart:
-</span><span class='line'>/* Reset the pending bitmask before enabling irqs */ 
-</span><span class='line'>set_softirq_pending(0);
+</span><span class='line'>set_softirq_pending(0);  ------------- 清除pending标志
+</span><span class='line'>local_irq_enable();      ------------- 打开中断，softirq handler是开中断执行的
+</span><span class='line'>h = softirq_vec;         ------------- 获取软中断描述符指针
 </span><span class='line'>
-</span><span class='line'>local_irq_enable();
+</span><span class='line'>while ((softirq_bit = ffs(pending))) { --------- 寻找pending中第一个被设定为1的bit
+</span><span class='line'>    unsigned int vec_nr;
+</span><span class='line'>    int prev_count;
 </span><span class='line'>
-</span><span class='line'>h = softirq_vec;
-</span><span class='line'>
-</span><span class='line'>do 
-</span><span class='line'>{
-</span><span class='line'>    if (pending &amp; 1)
-</span><span class='line'>    {
-</span><span class='line'>        int prev_count = preempt_count();
-</span><span class='line'>
-</span><span class='line'>        h-&gt;action(h);
-</span><span class='line'>
-</span><span class='line'>        if (unlikely(prev_count != preempt_count()))
-</span><span class='line'>        {
-</span><span class='line'>            printk(KERN_ERR "huh, entered softirq %td %p" 
-</span><span class='line'>                   "with preempt_count %08x," 
-</span><span class='line'>                   " exited with %08x?\n", h - softirq_vec,
-</span><span class='line'>                   h-&gt;action, prev_count, preempt_count());
-</span><span class='line'>            preempt_count() = prev_count;
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        rcu_bh_qsctr_inc(cpu);
-</span><span class='line'>    }
+</span><span class='line'>    h += softirq_bit - 1; ----------- 指向pending的那个软中断描述符
+</span><span class='line'>    vec_nr = h - softirq_vec; ------- 获取soft irq number
+</span><span class='line'>    h-&gt;action(h);         ----------- 指向softirq handler
 </span><span class='line'>    h++;
-</span><span class='line'>    pending &gt;&gt;= 1;
+</span><span class='line'>    pending &gt;&gt;= softirq_bit;
 </span><span class='line'>}
-</span><span class='line'>while (pending);
 </span><span class='line'>
-</span><span class='line'>local_irq_disable();
+</span><span class='line'>local_irq_disable();      ----------- 打开中断
 </span><span class='line'>
-</span><span class='line'>pending = local_softirq_pending();
-</span><span class='line'>if (pending &amp;&amp; --max_restart)
-</span><span class='line'>    goto restart;
+</span><span class='line'>pending = local_softirq_pending(); ------ （注1）
+</span><span class='line'>if (pending) {
+</span><span class='line'>    if (time_before(jiffies, end) &amp;&amp; !need_resched() &amp;&amp;
+</span><span class='line'>        --max_restart)
+</span><span class='line'>        goto restart;
 </span><span class='line'>
-</span><span class='line'>if (pending)
 </span><span class='line'>    wakeup_softirqd();
-</span><span class='line'>
-</span><span class='line'>trace_softirq_exit();
-</span><span class='line'>
-</span><span class='line'>account_system_vtime(current);
-</span><span class='line'>_local_bh_enable();
+</span><span class='line'>}
+</span><span class='line'>__local_bh_enable(SOFTIRQ_OFFSET); ----------- 标识softirq处理完毕
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>__do_softirq函数处理软件中断过程如下图流程分析
+</span><span class='line'>&lt;p&gt;```
+</span><span class='line'>（注1）再次检查softirq pending，有可能上面的softirq handler在执行过程中，发生了中断，又raise了softirq。如果的确如此，那么我们需要跳转到restart那里重新处理soft irq。当然，也不能总是在这里不断的loop，因此linux kernel设定了下面的条件：&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>4. 首先调用local_softirq_pending函数取得目前有哪些位存在软件中断
+</span><span class='line'>&lt;p&gt;（1）softirq的处理时间没有超过2个ms&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>5. 调用__local_bh_disable关闭软中断，其实就是设置正在处理软件中断标记，在同一个CPU上使得不能重入__do_softirq函数
+</span><span class='line'>&lt;p&gt;（2）上次的softirq中没有设定TIF_NEED_RESCHED，也就是说没有有高优先级任务需要调度&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>6. 重新设置软中断标记为0，set_softirq_pending重新设置软中断标记为0，这样在之后重新开启中断之后硬件中断中又可以设置软件中断位。
+</span><span class='line'>&lt;p&gt;（3）loop的次数小于 10次&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>7. 开启硬件中断
-</span><span class='line'>
-</span><span class='line'>8. 之后在一个循环中，遍历pending标志的每一位，如果这一位设置就会调用软件中断的处理函数。在这个过程中硬件中断是开启的，随时可以打断软件中断。这样保证硬件中断不会丢失。
-</span><span class='line'>
-</span><span class='line'>9. 之后关闭硬件中断，查看是否又有软件中断处于pending状态，如果是，并且在本次调用__do_softirq函数过程中没有累计重复进入软件中断处理的次数超过10次，就可以重新调用软件中断处理。如果超过了10次，就调用wakeup_softirqd();唤醒内核的一个进程来处理软件中断。设立10次的限制，也是为了避免影响系统响应时间。
-</span><span class='line'>
-</span><span class='line'>![](/images/kernel/2015-01-23-2.png)
-</span><span class='line'>
-</span><span class='line'>#### 4. 处理软中断内核线程
-</span><span class='line'>
-</span><span class='line'>之前我说到不能让CPU长时间来处理中断事务，这样会影响系统的响应时间，严重影响用户和系统之间的交互式体验。所以在之前的__do_softirq中最多将循环执行10次，那么当执行了10次仍然有软中断在pending状态，这个时候应该怎么处理呢？系统将唤醒一个软件中断处理的内核进程，在内核进程中处理pending中的软件中断。这里要注意，之前我们分析的触发软件中断的位置其实是中断上下文中，而在软中断的内核线程中实际已经是进程的上下文。
-</span><span class='line'>
-</span><span class='line'>这里说的软中断上下文指的就是系统为每个CPU建立的ksoftirqd进程。
-</span><span class='line'>
-</span><span class='line'>看完这个函数，我不得不佩服这个函数设计的精巧！而我更多的从中体会到其中蕴藏的一种做人的道理。那就是做人要霸道一点，太谦和太恭维不行，但是又不能横行霸道，原则的问题要公平讲理，一定的时候顾及别人的利益，好处不能一个人独吞。这就跟下面ksoftirqd处理过程一样，该狠的时候禁止抢占，其它进程别想调度到哦，但是自己占用CPU时间过长的话，也自觉的问一问是不是该释放CPU给其它进程了。
-</span><span class='line'>
-</span><span class='line'>下面我们就来分析一下这个处理过程怎么就体现了上面的这种说法呢？软中断的内核进程中主要有两个大循环，外层的循环处理有软件中断就处理，没有软件中断就休眠。内层的循环处理软件中断，并每循环一次都试探一次是否过长时间占据了CPU，需要调度释放CPU给其它进程。具体的操作在注释中做了解释。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int ksoftirqd(void *__bind_cpu)
-</span><span class='line'>{
-</span><span class='line'>set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>
-</span><span class='line'>while (!kthread_should_stop())
-</span><span class='line'>{
-</span><span class='line'>    /*不管三七二十一首先禁止抢占，我掌握CPU，并全凭我自己掌握调度*/ 
-</span><span class='line'>    preempt_disable();
-</span><span class='line'>    if (!local_softirq_pending())
-</span><span class='line'>    {
-</span><span class='line'>        preempt_enable_no_resched();
-</span><span class='line'>        /*如果没有软中断在pending，那就让出CPU来吧*/ 
-</span><span class='line'>        schedule();
-</span><span class='line'>       /*我被唤醒了，首先掌握CPU，不让自己被抢占，自己决定自己的是否要调度*/ 
-</span><span class='line'>        preempt_disable();
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    __set_current_state(TASK_RUNNING);
-</span><span class='line'>
-</span><span class='line'>    while (local_softirq_pending())
-</span><span class='line'>    {
-</span><span class='line'>        /* Preempt disable stops cpu going offline.
-</span><span class='line'>           If already offline, we'll be on wrong CPU:
-</span><span class='line'>           don't process */ 
-</span><span class='line'>        if (cpu_is_offline((long)__bind_cpu))
-</span><span class='line'>            goto wait_to_die;
-</span><span class='line'>        /*处理软中断*/ 
-</span><span class='line'>        do_softirq();
-</span><span class='line'>        /*虽然我自己掌握是否要调度，虽然我可以一直不调度，但是我是
-</span><span class='line'>        个正直的人，运行一段时间后我会看看是否需要调度，还其它进程运行*/ 
-</span><span class='line'>        preempt_enable_no_resched();
-</span><span class='line'>        cond_resched();
-</span><span class='line'>        preempt_disable();
-</span><span class='line'>        rcu_qsctr_inc((long)__bind_cpu);
-</span><span class='line'>    }
-</span><span class='line'>    preempt_enable();
-</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>}
-</span><span class='line'>__set_current_state(TASK_RUNNING);
-</span><span class='line'>return 0;
-</span><span class='line'>
-</span><span class='line'>wait_to_die:
-</span><span class='line'>preempt_enable();
-</span><span class='line'>/* Wait for kthread_stop */ 
-</span><span class='line'>set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>while (!kthread_should_stop())
-</span><span class='line'>{
-</span><span class='line'>    schedule();
-</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>}
-</span><span class='line'>__set_current_state(TASK_RUNNING);
-</span><span class='line'>return 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;因此，只有同时满足上面三个条件，程序才会跳转到restart那里重新处理soft irq。否则wakeup_softirqd就OK了。这样的设计也是一个平衡的方案。一方面照顾了调度延迟：本来，发生一个中断，系统期望在限定的时间内调度某个进程来处理这个中断，如果softirq handler不断触发，其实linux kernel是无法保证调度延迟时间的。另外一方面，也照顾了硬件的thoughput：已经预留了一定的时间来处理softirq。&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[中断机制]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/01/23/kernel-irq-mark2/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-01-23T14:03:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/01/23/kernel-irq-mark2&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;h4&gt;1、&lt;/h4&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[内核源码分析之linux内核栈]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack2/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-07T15:54:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack2&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.cnblogs.com/liangning/p/3879177.html"&gt;http://www.cnblogs.com/liangning/p/3879177.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;cpu的中断管理和指令执行（运算器）是两套硬件，他们互相独立又有关联。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;基于3.16-rc4&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2、&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;无论中断是否允许，运算器都按自己的节奏工作，无须花时间去查询是否由中断到达。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;3、&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;中断管理器则不断地探测是否有中断信号到达，若有且中断允许，则保存当前执行状态信息，然后打断当前取指序列，强行转到特定地址（中断向量）取指令，整个过程运算器并不知道，它只是忠实地执行取指电路取得的指令。&lt;br/&gt;
-</span><span class='line'>  因此，只要没有中断信号到达，就不存在cpu边走边看的问题。
-</span><span class='line'>  为保证正确访问临界数据区和正确执行临界代码段，操作系统一般有：关中断、关调度、信号量，还有些操作系统提供原子变量的方法，linux中广为人知的锁其实是用信号量实现的。那么，这么多的方法中，什么情况适用哪一种方法呢？是有规律的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;1、原子变量&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  原子变量可以保证一个变量单次操作的正确性，其保护甚至比信号量还完善，信号量只能保护全局数据不被其他线程破坏，而原子变量能保证全局数据不被中断破坏。
+</span><span class='line'>&lt;p&gt;在3.16-rc4内核源码中，内核给每个进程分配的内核栈大小为8KB。这个内核栈被称为异常栈，在进程的内核空间运行时或者执行异常处理程序时，使用的都是异常栈，看下异常栈的代码（include/linux/sched.h）：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>example1：
-</span><span class='line'>    atomic int a;
-</span><span class='line'>int b,c;
-</span><span class='line'>a = a + b + c;
+</span><span class='line'>union thread_union {
+</span><span class='line'>    struct thread_info thread_info;
+</span><span class='line'>    unsigned long stack[THREAD_SIZE/sizeof(long)];
+</span><span class='line'>};
 </span><span class='line'>&lt;/code&gt;
-</span><span class='line'>上述代码中，cpu对a有一个读、修改、写的过程，这个过程如果被打断，并在其他线程中修改了a值，执行结果将出现错误，而原子变量将保证不会发生这样的错误。
-</span><span class='line'>原子变量不能保护一系列操作的原子性，若把上述代码改为
+</span><span class='line'>THREAD_SIZE值为8KB，因此内核为进程的异常栈（内核栈）分配了两个页框大小（页框大小4KB）。另外，进程的thread_info结构体保存在栈顶部。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;此外，内核为每个cpu分配一个硬中断栈和一个软中断栈（这两个栈也是内核栈），用来执行中断服务例程和下半部（软中断），看看代码（arch/x86/kernel/irq_32.c）。这两个栈属于cpu，不属于进程，这和异常栈是有区别的。
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>example2：
-</span><span class='line'>atomic int a;
-</span><span class='line'>int b,c;
-</span><span class='line'>a = a + b; //L1
-</span><span class='line'>a = a + c; //L2
+</span><span class='line'>DEFINE_PER_CPU(struct irq_stack *, hardirq_stack);
+</span><span class='line'>DEFINE_PER_CPU(struct irq_stack *, softirq_stack);
 </span><span class='line'>&lt;/code&gt;
-</span><span class='line'>原子变量不能保证L1和L2两行程序间a不被其他线程修改，因此example2不一定能得到正确的结果。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;2、信号量&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  稍微完善一点的操作系统都提供信号量机制，用于保护临界代码。上述example2就应该用下列代码替代L1和L2：
+</span><span class='line'>定义了两个数组hardirq_stack和softirq_stack，每个数组元素对应一个cpu，指向了该cpu的硬中断栈或者软中断栈。再来看下struct irq_stack结构体（arch/x86/include/asm/processor.h）：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>获取信号量；
-</span><span class='line'>a = a + b; //L1
-</span><span class='line'>a = a + c; //L2
-</span><span class='line'>释放信号量；
+</span><span class='line'>struct irq_stack {
+</span><span class='line'>    u32                     stack[THREAD_SIZE/sizeof(u32)];
+</span><span class='line'>} __aligned(THREAD_SIZE);
 </span><span class='line'>&lt;/code&gt;
-</span><span class='line'>当一个全局变量可能被多个线程操作时，就应该用信号量保护，注意，不能在中断中访问用信号量保护的变量。&lt;/p&gt;
+</span><span class='line'>可见，硬中断栈和软中断栈的大小均为8KB。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;3、关调度&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  关调度是一种比较粗暴的方式，关调度后，操作系统不会再进行线程上下文切换，而是专心执行一个线程，但是中断仍然开着。关调度可以起到替代信号量保护全局变量的作用，但一般不这样用，太粗暴了。但是如果某一段代码的执行时间有要求，希望cpu全速执行不被打断，但又不希望关中断时，可用关调度的方法。注意，从逻辑上，关调度能替换信号量，但不能替换原子变量。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4、关中断&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  关中断是最粗暴的一种方式，用于保证最严格的时序执行，比如某段代码要在IO上输出两个高精度脉冲，脉冲宽度2uS，间隔2uS，这种需求只能通过用精确的指令延时来实现，延时过程中，如果被中断，或者发生线程切换，将不能正确输出脉冲。从逻辑上，前面所讲的三种保护，都可以用关中断实现，只是，太粗暴了。&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[NMI 看门狗]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/01/14/kernel-nmi-irq/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-01-14T23:34:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/01/14/kernel-nmi-irq&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/arethe/article/details/6153143"&gt;http://blog.csdn.net/arethe/article/details/6153143&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;[X86和X86-64体系结构均支持NMI看门狗]&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  你的系统是不是会经常被锁住（Lock up）？直至解锁，系统不再响应键盘？你希望帮助我们解决类似的问题吗？如果你对所有的问题都回答“yes”，那么此文档正是为你而写。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在很多X86/X86-64结构的硬件上，我们都可以使用一种被称为“看门狗NMI中断”的机制。（NMI：Non Maskable Interrupt. 这种中断即使在系统被锁住时，也能被响应）。这种机制可以被用来调试内核锁住现象。通过周期性地执行NMI中断，内核能够监测到是否有CPU被锁住。当有处理器被锁住时，打印调试信息。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  为了使用NMI看门狗，首先需要在内核中支持APIC。对于SMP内核，APIC的相关支持已自动地被编译进内核。对于UP内核，需要在内核配置中使能CONFIG_X86_UP_APIC (Processor type and features -&gt; Local APIC support on uniprocessors) 或 CONFIG_X86_UP_IOAPIC (Processor type and features -&gt; IO-APIC support on uniprocessors)。在没有IO-APIC的单处理器系统中，配置CONFIG_X86_UP_APIC。在有IO-APIC的单处理器系统中，则需配置CONFIG_X86_UP_IOAPIC。[注意：某些与内核调试相关选项可能会禁用NMI看门狗。如：Kernel Stack Meter或Kernel Tracer]。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  对于X86-64系统，APIC已被编进内核。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  使用本地APIC（nmi_watchdog=2）时，需要占用第一个性能寄存器，因而此寄存器不能再被另作它用（如高精度的性能分析）。Oprofile与perfctr的驱动已自动地禁用了本地APIC的NMI看门狗。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  可以通过启动参数“nmi_watchdog=N”使能NMI看门狗。即在lilo.conf的相关项中添加如下语句：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>  append=”nmi_watchdog=1”
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  对于具有IO-APIC的SMP与UP机器，设置nmi_watchdog=1。对于没有IO-APIC的UP机器，设置nmi_watchdog=2，但仅在某些处理器上可以起作用。如果有疑问，在用nmi_watchdog=1启动后，再查看/proc/interrupts文件中的NMI项，如果该项为0，那么便用nmi_watchdog=2重新启动，并再次检查NMI项。如果还是0，问题就比较严重了，你的处理器很可能不支持NMI。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  “锁住（Lockup）”是指如下的情况：如果系统中的任何一个CPU不能处理周期性的本地时钟中断，并持续5秒钟以上，那么NMI的处理函数将产生一个oops并杀死当前进程。这是一种“可控崩溃”（Controlled Crash，所谓可控，是指发生崩溃时，能够输出内核信息），可以用此机制来调试“锁住”现象。那么，无论什么时候发生“锁住”，5秒钟之后都会自动地输出oops。如果内核没有输出信息，说明此时发生的崩溃过于严重（如：hardware-wise），以至于NMI中断都无法被响应，或者此次崩溃使得内核无法打印信息。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在使用本地APIC时要注意，NMI中断被触发的频率依赖于系统的当前负载。由于缺乏更好的时钟源，本地APIC中的NMI看门狗使用的是“有效周期（Cycle unhalted，这个词的翻译似乎不太确切，如果某位朋友有更佳的建议，请告知在下。）”事件。也许你已经猜到了，当CPU处于halted（空等）状态时，该时钟是不计数的。处理器处于空闲状态的时候，常出现这样的情况。如果你的系统在被锁住时，执行的不是hlt指令，看门狗中断很快就会被触发，因为每个时钟周期都会发生“有效周期”事件。如果不幸，处理器在被锁住时，执行的恰是“hlt”指令，那么“有效周期”事件永远都不会发生，看门狗自然也不会被触发。这是本地APIC看门狗的缺陷，在倒霉的时候，永远不会进行时钟计数。而I/O APIC中的看门狗由于采用外部时钟进行驱动，便不存在这个缺陷。但是，它的NMI频率非常高，会显著地影响系统的性能。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  X86的nmi_watchdog在默认情况下是禁用的，因此你需要在系统启动的时候使能它。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在系统运行期间，可以禁用NMI看门狗，只要向文件“/proc/sys/kernel/nmi_watchdog”中写“0”即可。向该文件写“1”，将重新使能看门狗。即使如此，你仍然需要在启动时使用参数“nmi_watchdog=”。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  注意：在2.4.2-ac18之前的内核中，X86 SMP平台会无条件地使能NMI-oopser。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;hr /&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;www.2cto.com/kf/201311/260704.html</span></code></pre></td></tr></table></div></figure>
-    //  使能hard lockup探测
-    //  调用路径：watchdog_enable->watchdog_nmi_enable
-    //  函数任务：
-    //      1.初始化hard lockup检测事件
-    //          2.hard lockup阈值为10s
-    //      2.向performance monitoring子系统注册hard lockup检测事件
-    //      3.使能hard lockup检测事件
-    //  注：
-    //      performance monitoring，x86中的硬件设备，当cpu clock经过了指定个周期后发出一个NMI中断。
-    1.1 static int watchdog_nmi_enable(unsigned int cpu)
+</span><span class='line'>&lt;p&gt;内核在执行中断处理程序时，在do_IRQ函数中会调用handle_irq函数，在handle_irq函数中要进行堆栈切换，代码如下（arch/x86/kernel/irq_32.c）：</span></code></pre></td></tr></table></div></figure>
+    bool handle_irq(unsigned irq, struct pt_regs <em>regs)
     {
-        //hard lockup事件
-        struct perf_event_attr <em>wd_attr;
-        struct perf_event </em>event = per_cpu(watchdog_ev, cpu);
-        &hellip;.
-        wd_attr = &amp;wd_hw_attr;
-        //hard lockup检测周期，10s
-        wd_attr->sample_period = hw_nmi_get_sample_period(watchdog_thresh);
-        //向performance monitoring注册hard lockup检测事件
-        event = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
-        &hellip;.
-        //使能hard lockup的检测
-        per_cpu(watchdog_ev, cpu) = event;
-        perf_event_enable(per_cpu(watchdog_ev, cpu));
+        struct irq_desc </em>desc;
+        int overflow;</p>
+
+<pre><code>    overflow = check_stack_overflow();
+
+    desc = irq_to_desc(irq);
+    if (unlikely(!desc))
+    return false;
+
+    if (user_mode_vm(regs) || !execute_on_irq_stack(overflow, desc, irq)) {
+        if (unlikely(overflow))
+            print_stack_overflow();
+        desc-&gt;handle_irq(irq, desc);
+    }
+
+    return true;
+}
+</code></pre>
+
+<pre><code>
+第12行中执行execute_on_irq_stack函数来判断是否需要堆栈切换，如果不需要，则执行if体的中断服务例程，即在当前堆栈中执行中断服务例程，如果需要切换堆栈，则在execute_on_irq_stack函数中切换堆栈并在该函数中（新堆栈中）执行中断服务例程。下面看下execute_on_irq_stack代码（arch/x86/kernel/irq_32.c）：
+</code></pre>
+
+<pre><code>static inline int
+execute_on_irq_stack(int overflow, struct irq_desc *desc, int irq)
+{
+    struct irq_stack *curstk, *irqstk;
+    u32 *isp, *prev_esp, arg1, arg2;
+
+    curstk = (struct irq_stack *) current_stack();
+    irqstk = __this_cpu_read(hardirq_stack);
+
+    /*
+     * this is where we switch to the IRQ stack. However, if we are
+     * already using the IRQ stack (because we interrupted a hardirq
+     * handler) we can't do that and just have to keep using the
+     * current stack (which is the irq stack already after all)
+     */
+    if (unlikely(curstk == irqstk))
         return 0;
-    }</p>
 
-<pre><code>//  换算hard lockup检测周期到cpu频率
-1.2 u64 hw_nmi_get_sample_period(int watchdog_thresh)
-{
-    return (u64)(cpu_khz) * 1000 * watchdog_thresh;
-}
+    isp = (u32 *) ((char *)irqstk + sizeof(*irqstk));
 
-//  hard lockup检测事件发生时的nmi回调函数
-//  函数任务：
-//      1.判断是否发生了hard lockup
-//          1.1 dump hard lockup信息
-1.3 static void watchdog_overflow_callback(struct perf_event *event,
-     struct perf_sample_data *data,
-     struct pt_regs *regs)
-{
-    //判断是否发生hard lockup
-    if (is_hardlockup()) {
-        int this_cpu = smp_processor_id();
+    /* Save the next esp at the bottom of the stack */
+    prev_esp = (u32 *)irqstk;
+    *prev_esp = current_stack_pointer;
 
-        //打印hard lockup信息
-        if (hardlockup_panic)
-            panic("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
-        else
-            WARN(1, "Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+    if (unlikely(overflow))
+        call_on_stack(print_stack_overflow, isp);
 
-        return;
-    }
-    return;
-}
-
-//  判断是否发生hard lockup
-//  注：
-//      如果时钟中断在指定阈值范围内为运行，核心认为可屏蔽中断被屏蔽时间过长
-1.4 static int is_hardlockup(void)
-{
-    //获取watchdog timer的运行次数
-    unsigned long hrint = __this_cpu_read(hrtimer_interrupts);
-    //在一个hard lockup检测时间阈值内，如果watchdog timer未运行，说明cpu中断被屏蔽时间超过阈值
-    if (__this_cpu_read(hrtimer_interrupts_saved) == hrint)
-        return 1;
-    //记录watchdog timer运行的次数
-    __this_cpu_write(hrtimer_interrupts_saved, hrint);
-    return 0;
-}
-
-//  关闭hard lockup检测机制
-//  函数任务：
-//      1.向performance monitoring子系统注销hard lockup检测控制块
-//      2.清空per-cpu hard lockup检测控制块
-//      3.释放hard lock检测控制块
-2.1 static void watchdog_nmi_disable(unsigned int cpu)
-{
-    struct perf_event *event = per_cpu(watchdog_ev, cpu);
-    if (event) {
-        //向performance monitoring子系统注销hard lockup检测控制块
-        perf_event_disable(event);
-        //清空per-cpu hard lockup检测控制块
-        per_cpu(watchdog_ev, cpu) = NULL;
-        //释放hard lock检测控制块
-        perf_event_release_kernel(event);
-    }
-    return;
+    asm volatile("xchgl    %%ebx,%%esp    \n"
+             "call    *%%edi        \n"
+             "movl    %%ebx,%%esp    \n"
+             : "=a" (arg1), "=d" (arg2), "=b" (isp)
+             :  "0" (irq),   "1" (desc),  "2" (isp),
+            "D" (desc-&gt;handle_irq)
+             : "memory", "cc", "ecx");
+    return 1;
 }
 </code></pre>
 
 <p>```</p>
+
+<p>第7行获取当前堆栈的指针，第8行获取本地cpu的硬中断栈指针，第16行对二者进行比较，如果相等，则不需要切换堆栈（说明当前堆栈就是硬中断栈，也说明是在中断处理程序中时又发生了中断）。如果不相等，就要进行堆栈切换，第22-23行将当前堆栈指针保存在将要切换到的堆栈中（用于返回）。第28行，交换ebx和esp寄存器的值（实现了堆栈切换，将中断栈指针给了esp），第29行跳转到相应的中断服务例程，第30行从中断服务例程返回后，又将原来的堆栈指针赋给esp，切换到原先堆栈。第33行将中断服务例程函数名存放在%edi中。</p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[中断，进程]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/01/03/kernel-irq-mark/"/>
-    <updated>2015-01-03T15:45:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/01/03/kernel-irq-mark</id>
-    <content type="html"><![CDATA[<p>blog.chinaunix.net/uid-20806345-id-3203602.html</p>
+    <title type="html"><![CDATA[中断栈溢出后的结果]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack/"/>
+    <updated>2015-05-07T15:54:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-stack</id>
+    <content type="html"><![CDATA[<p><a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a></p>
 
-<p>  中断不是进程，不受内核调度器的管辖。在系统处理进程的过程中，对于某个cpu来说，如果有内部中断或外部中断到来，则切换到中断处理程序，切换首先要将进程由用户态要切到进程的内核态，然后再将cpu切换到中断态，待处理完中断返回进程的内核态，再返回进程的用户态，如果中断时进程刚好处于内核态中不用由用户态切到内核态了。<br/>
-  中断处理时是不分优先级的，处理中断的过程中如果有任意中断到来，都会抢占当前的中断处理过程。所以对于要及时响应的中断，需要通过关中断来屏蔽其他中断。通常所说的中断优先级是指中断控制器端的优先级，当有多个中断触发时，首先选择优先级高的中断发出请求给处理器。中断优先级只是对中断控制器而言的，所有的中断对cpu来说都是一样的，没有优先级高低之分。<br/>
-  关中断是关闭所有的外部可屏蔽中断，和优先级没有关系，如果在某中断处理程序中关中断，则不会被任何可屏蔽中断抢占，但是会被任意的不可屏蔽中断抢占。关中断是中断处理程序可选的。</p>
+<p>说一下上文中最开始提到的“某个问题”：如果一台主机网卡比较多，然后每个网卡分队列又比较多，总之结果就是系统里的网卡设备的中断号比较多（关于超过256个中断数的情况，请见参考1，2，3），一旦所有这些中断都绑定到同一个CPU，那么如果网卡收到数据包进而触发中断，而众多硬中断一嵌套就非常容易出现中断栈溢出。一旦中断栈溢出，那么将会导致怎样的结果，这曾在之前的文章里隐含的提到过，这里再重新整理一遍。</p>
 
-<p>bbs.chinaunix.net/thread-2306027-1-8.html</p>
+<p>在继续下面的描述之前，先看两个知识点：</p>
 
-<p>软中断做的是一些可延迟的费时间的事，当然不能在中断里执行了。<br/>
-  <code>__do_softirq</code>代码，可以看到在执行可延迟函数第一件事就是开中断。但在开始之前，禁用了下半部中断（<code>__local_bh_disable</code>）。这样就算被中断了，返回内核时也不会被抢占，还是执行这里的代码。也不会被调度。<br/>
-  那么这样的后果就是软中断上下文里的会一直执行下去，直到到达了限定次数，然后唤醒守护进程。<br/>
-  因为软中断切换了栈，不再使用进程上下文，那么如果在软中断上下文直接或简洁调用了shedule，那么只有死翘翘了！！因为schedule调度回来的时候是依赖进程内核栈的thread_info。</p>
+<h5>1，Linux 2.4.x的中断栈：</h5>
 
-<p>  内核抢占点之一就是中断返回的时候检查是否可以抢占，检查的内容之一就是preempt_count是否等于0，因为禁用了下半部中断，那么肯定就不会等于0的，所以不会被抢占。也就是说返回的时候不会发生调度。</p>
+<p>a)，由硬中断/软中断共同使用同一个中断栈<br/>
+b)，中断栈与内核栈共享一个栈<br/>
+c)，中断执行的时候使用的栈就是当前进程的内核栈</p>
 
-<p>  个人理解 中断上下文 最大的特征 禁掉了某种中断（硬中断和软中断），所以导致 不能阻塞。<br/>
-  softirq 有可能在两种方式下被调用，一是中断处理程序退出时，开放硬件中断之后，会去调用do_softirq()。
-  do_softirq()会禁掉后半部抢占，并且现在执行流使用的是被中断的进程的栈，所以无法阻塞。<br/>
-  softirq的另一种调用方式是ksoftirq内核线程，同样do_softirq()被调用，后半部中断被禁掉，同样禁止阻塞。<br/>
-  工作队列，可以被任何中断或者软中断中断，运行在进程上下文，有自己的栈，可以阻塞。</p>
+<h5>2，Linux 2.6.x的中断栈：</h5>
 
-<p>看一下__do_softirq()的代码,新的硬中断确实可能触发更高优先级的软中断，但是这个软中断并不会在被中断的软中断之前得到执行，软中断始终是顺序执行的。从代码看来，新一批的软中断，无论优先级多高，也得等到前一批的软中断被处理完成之后才能得到处理。而优先级只能帮助软中断在对应的批次中优先得到处理。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[硬中断和软中断]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/01/03/kernel-irq/"/>
-    <updated>2015-01-03T15:15:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/01/03/kernel-irq</id>
-    <content type="html"><![CDATA[<p>关闭硬中断： spin_lock_irq和spin_unlock_irq以及spin_lock_irqsave和spin_unlock_irqrestore<br/>
-关闭软中断： spin_lock_bh和spin_unlock_bh</p>
+<p>a)，硬中断与软中断分离使用不同的中断栈<br/>
+b)，中断栈与内核栈分离<br/>
+c)，X86_64 double fault、NMI还可以有额外的栈（64bit特性：IST(Interrupt Stack Table)）</p>
 
-<hr />
+<p>可以看到，对于Linux 2.4.x内核而言，因为中断处理函数使用内核栈作为中断栈，所以导致更加容易发生内核栈溢出（因内核函数本身用栈过多导致溢出，或内核函数本身还未导致内核栈溢出，但此时来了一个中断，因中断函数使用栈而导致溢出，即中断函数成了压死骆驼的最后一根稻草），而内核栈溢出的直接结果就是踩坏task结构体，从而无法正常执行对应的task进程而出现oops宕机。</p>
 
-<p>netfilter：<br/>
-有些netfilter hooks可以从系统调用的context到达， 比如socket的send_msg()是可以到达LOCAL_OUT/POST_ROUTING的， <br/>
-这样，也就是说，在这些情况下操作conntrack链表的时候，是进程上下文，而不是软中断上下文， 因此，是需要关闭bh的。</p>
+<p>由于“中断执行的时候使用的栈就是当前进程的内核栈”，所以如果是执行到中断函数后才溢出，那么导致oops里提示的进程信息可能每次都不一样，因此如果出现这种情况，需要考虑是中断函数导致内核栈溢出，否则需怀疑普通的内核函数导致栈溢出即可。</p>
 
-<p>PRE_ROUTING上的按道理说，它只能从软中断到达，因此只需要spin_lock()就可以了。</p>
+<p>对于Linux 2.6.x内核而言，因为其中断/内核栈分离、软/硬中断栈分离，即每个CPU私有两个栈（见下面注释）分别处理软中断和硬中断，因此出现内核栈溢出，特别是中断栈溢出的概率大大降低。</p>
 
-<hr />
+<p>注释：这个说法来之书本《Understanding.the.Linux.Kernel.3rd.Edition》4.6.1.4. Multiple Kernel Mode stacks，而这本书针对的内核版本是2.6.11，且主要是指32位架构，所以与现在的新版内核源码有些许出入（比如现在情况的栈大小可能是占用2页），但这些细微改变与本文的具体问题相关不大（无非是溢出的难易程度问题），这里不再深入研究，具体情况请参考源代码自行斟酌。
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>The hard IRQ stack is used when handling interrupts. There is one hard IRQ stack for each CPU in the system, and each stack is contained in a single page frame.&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;The soft IRQ stack is used when handling deferrable functions (softirqs or tasklets; see the later section “Softirqs and Tasklets”). There is one soft IRQ stack for each CPU in the system, and each stack is contained in a single page frame. 
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;回到本文的主题，在之前的文章里提到过，即如果中断/异常处理函数本身在处理的过程中出现异常，那么就有可能发生double fault，比如中断栈溢出。中断栈溢出导致的最终结果有两种情况，这由所使用的具体Linux内核版本来决定，更具体点说是由double fault异常的栈是否单独来决定（见参考1）。
+</span><span class='line'>
+</span><span class='line'>1，double fault的栈被单独出来  
+</span><span class='line'>这意味着double fault的处理函数还能正常执行，因此打印oops，宕机。
+</span><span class='line'>
+</span><span class='line'>2，double fault的栈没有被单独出来  
+</span><span class='line'>这意味着double fault的处理函数也无法正常执行，进而触发triple fault，机器直接重启。
+</span><span class='line'>
+</span><span class='line'>对于86-64架构下的Linux 2.6.x内核，因为IST(Interrupt Stack Table)的帮助，所以中断栈溢出导致的最终结果就是打印oops，宕机。
+</span><span class='line'>
+</span><span class='line'>下面来看内核源码文档kernel-stacks，  
+</span><span class='line'>1，每一个活动线程都有一个内核栈，大小为2页。  
+</span><span class='line'>2，每一个cpu有一些专门的栈，只有当cpu执行在内核态时，这些栈才有用；一旦cpu回退到用户态，这些特定栈就不再包含任何有用数据。  
+</span><span class='line'>3，主要的特定栈有：  
+</span><span class='line'>a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提供给中断处理函数更多的栈空间。  
+</span><span class='line'>这里还提到，在2.6.x-i386下，如果设置内核栈只有4K，即CONFIG_4KSTACKS，那么中断栈也是单独开的。备注：这个已有修改，2010-06-29 x86: Always use irq stacks，即不管设置的内核栈是否只有4K，中断栈都是独立的了。  
+</span><span class='line'>
+</span><span class='line'>另外，这里有个说法与前面的引用有点出入：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;The interrupt stack is also used when processing a softirq. 
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```
+</span><span class='line'>即软中断和硬中断一样，也是使用这个中断栈。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;b，x86_64所特有的（也就是i386没有，即同时2.6.30.8内核，32位的Linux就不具备下面所说的这个特性），为double fault或NMI单独准备的栈，这个特性被称为Interrupt Stack Table(IST)。每个cpu最多支持7个IST。关于IST的具体原理与实现暂且不说，直接来看当前已经分配的IST独立栈：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;ul&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;STACKFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>12号中断Stack Fault Exception (#SS)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;DOUBLEFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>8号中断Double Fault Exception (#DF)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;NMI_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>2号中断non-maskable interrupts (NMI)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;DEBUG_STACK. DEBUG_STKSZ&lt;br/&gt;
+</span><span class='line'>1号中断硬件调试和3号中断软件调试使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;&lt;p&gt;MCE_STACK. EXCEPTION_STKSZ (PAGE_SIZE)&lt;br/&gt;
+</span><span class='line'>18号中断Machine Check Exception (#MC)使用&lt;/p&gt;&lt;/li&gt;
+</span><span class='line'>&lt;/ul&gt;
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;正因为double fault异常处理函数所使用的栈被单独了出来，所以在出现中断栈溢出时，double fault异常的处理函数还能正常执行，顺利打印出oops信息。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后的最后，有补丁移除IST功能（貌似是因为如果没有IST功能，那么kvm可以得到更好的优化，具体请见参考5），但通过对比补丁修改与实际源码（2.6.30.8以及3.6.11）来看，这个补丁并没有合入mainline主线。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;参考资料：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1，where is hardware timer interrupt?&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt"&gt;http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2，The MSI Driver Guide HOWTO&lt;br/&gt;
+</span><span class='line'>&lt;a href="https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  "&gt;https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  &lt;/a&gt;
+</span><span class='line'>对应的翻译版：&lt;a href="http://blog.csdn.net/reviver/article/details/6802347"&gt;http://blog.csdn.net/reviver/article/details/6802347&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3，[PATCH] x86: 64bit support more than 256 irq v2&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html"&gt;http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;4，How is an Interrupt handled in Linux?&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux"&gt;http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;5，Remove interrupt stack table usage from x86_64 kernel (v2)&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://lwn.net/Articles/313029/  "&gt;http://lwn.net/Articles/313029/  &lt;/a&gt;
+</span><span class='line'>&lt;a href="http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741"&gt;http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;6，Interrupt Descriptor Table&lt;br/&gt;
+</span><span class='line'>&lt;a href="http://wiki.osdev.org/IDT"&gt;http://wiki.osdev.org/IDT&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;转载请保留地址：&lt;a href="http://www.lenky.info/archives/2013/03/2247"&gt;http://www.lenky.info/archives/2013/03/2247&lt;/a&gt; 或 &lt;a href="http://lenky.info/?p=2247"&gt;http://lenky.info/?p=2247&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[对Linux x86-64架构上硬中断的重新认识]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-irq/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-07T15:48:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/07/kernel-irq-irq&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.lenky.info/archives/2013/03/2245"&gt;http://www.lenky.info/archives/2013/03/2245&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;对于x86硬中断的概念，一直都落在理论的认识之上，直到这两天才（因某个问题）发现Linux的实现却并非如此，这里纠正一下（注意：Linux内核源码更新太快，一个说法的时效性太短，所以需注意我提到的香草内核版本，并且以x86-64架构为基准）。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;以前的认识：Linux对硬中断（本文如无特殊说明，都是指普通意义上的可屏蔽硬件中断）的处理有优先级概念，高优先级硬中断可以打断低优先级硬中断。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;重新认识：&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1，对于x86硬件而言，在文档325462.pdf卷3章节6.9 PRIORITY AMONG SIMULTANEOUS EXCEPTIONS AND INTERRUPTS 提到一个表格，是指如果在同一时刻有多个异常或中断到达，那么CPU会按照一个指定的优先级顺序对它们进行响应和服务，而并不是我之前所想的判断是否可相互打断执行的高低级别。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2，对于Linux系统而言，硬中断之间并没有优先级的概念（虽然Intel CPU提供支持，请参考文档325462.pdf卷3章节10.8.3 Interrupt, Task, and Processor Priority），或者说优先级只有两个，全部关闭或全部开启，如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;blockquote&gt;&lt;blockquote&gt;&lt;p&gt;Regardless of what the hardware might support, typical UNIX-type systems only make use of two levels: the minimum (all interrupts enabled) and the maximum (all interrupts disabled).&lt;/p&gt;&lt;/blockquote&gt;&lt;/blockquote&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这意味着，如果一个硬中断处理函数正在执行，只要当前是处于开启中断的情况，那么此时发生的任何另外一个中断都可以打断当前处理函数，从而出现中断嵌套的情况。
+</span><span class='line'>值得注意的是，Linux提供对单个中断开启/禁止的接口（以软件实现为主，比如给对应中断描述符desc的status打上IRQ_DISABLED旗标）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>void disable_irq(unsigned int irq)
+</span><span class='line'>void enable_irq(unsigned int irq)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>下面来看看Linux的实际处理，其硬中断的一般处理流程（具体可见参考1、2、3以及源代码，以2.6.30.8为例）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>硬件中断 -&gt; common_interrupt -&gt; do_IRQ -&gt; handle_irq -&gt; generic_handle_irq_desc -&gt; desc-&gt;handle_irq或__do_IRQ。
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;其中desc-&gt;handle_irq是一个回调函数，会根据不同中断类型（I/O APIC、MSI）有不同的指向，比如：handle_fasteoi_irq()、handle_edge_irq()，这可以参考设置函数ioapic_register_intr()和setup_msi_irq()。通过/proc/interrupts可以看到各个中断的具体类型：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>[root@localhost ~]# cat /proc/interrupts
+</span><span class='line'>           CPU0       CPU1      
+</span><span class='line'>  0:        888          0   IO-APIC-edge      timer
+</span><span class='line'>  1:         96        112   IO-APIC-edge      i8042
+</span><span class='line'>  3:          1          0   IO-APIC-edge   
+</span><span class='line'>  4:          1          0   IO-APIC-edge   
+</span><span class='line'>  7:          0          0   IO-APIC-edge      parport0
+</span><span class='line'>  8:          1          0   IO-APIC-edge      rtc0
+</span><span class='line'>  9:          0          0   IO-APIC-fasteoi   acpi
+</span><span class='line'> 12:        204          0   IO-APIC-edge      i8042
+</span><span class='line'> 14:          0          0   IO-APIC-edge      ata_piix
+</span><span class='line'> 15:     460641        900   IO-APIC-edge      ata_piix
+</span><span class='line'> 16:          0          0   IO-APIC-fasteoi   Ensoniq AudioPCI
+</span><span class='line'> 17:     118347          0   IO-APIC-fasteoi   ehci_hcd:usb1, ioc0
+</span><span class='line'> 18:         70          0   IO-APIC-fasteoi   uhci_hcd:usb2
+</span><span class='line'> 19:     115143          0   IO-APIC-fasteoi   eth0
+</span><span class='line'> 24:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 25:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 26:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 27:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 28:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'>...
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>不管是desc-&gt;handle_irq还是__do_IRQ，它们都会调入到另外一个函数handle_IRQ_event()。重点：从CPU接收到中断信号并开始处理，到这个函数为止，都是处于中断禁止状态。为什么？很简单，因为Intel开发者手册上是这么说的，在文档325462.pdf卷3章节6.8.1 Masking Maskable Hardware Interrupts提到：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>When an interrupt is handled through an interrupt gate, the IF flag is automati-
+</span><span class='line'>cally cleared, which disables maskable hardware interrupts. (If an interrupt is
+</span><span class='line'>handled through a trap gate, the IF flag is not cleared.)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>在CPU开始处理一个硬中断到进入函数handle_IRQ_event()为止的这段时间里，因为处于中断禁止状态，所以不会出现被其它中断打断的情况。但是，在进入到函数handle_IRQ_event()后，立马有了这么两句：</span></code></pre></td></tr></table></div></figure>
+    irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
+    {
+        irqreturn_t ret, retval = IRQ_NONE;
+        unsigned int status = 0;</p>
 
-<p><a href="http://blog.csdn.net/zhangskd/article/details/21992933">http://blog.csdn.net/zhangskd/article/details/21992933</a></p>
-
-<h4>概述</h4>
-
-<p>从本质上来讲，中断是一种电信号，当设备有某种事件发生时，它就会产生中断，通过总线把电信号发送给中断控制器。
-如果中断的线是激活的，中断控制器就把电信号发送给处理器的某个特定引脚。处理器于是立即停止自己正在做的事，
-跳到中断处理程序的入口点，进行中断处理。</p>
-
-<h5>(1) 硬中断</h5>
-
-<p>由与系统相连的外设(比如网卡、硬盘)自动产生的。主要是用来通知操作系统系统外设状态的变化。比如当网卡收到数据包的时候，就会发出一个中断。我们通常所说的中断指的是硬中断(hardirq)。</p>
-
-<h5>(2) 软中断</h5>
-
-<p>为了满足实时系统的要求，中断处理应该是越快越好。linux为了实现这个特点，当中断发生的时候，硬中断处理那些短时间就可以完成的工作，而将那些处理事件比较长的工作，放到中断之后来完成，也就是软中断(softirq)来完成。</p>
-
-<h5>(3) 中断嵌套</h5>
-
-<p>Linux下硬中断是可以嵌套的，但是没有优先级的概念，也就是说任何一个新的中断都可以打断正在执行的中断，但同种中断除外。软中断不能嵌套，但相同类型的软中断可以在不同CPU上并行执行。</p>
-
-<h5>(4) 软中断指令</h5>
-
-<p>int是软中断指令。<br/>
-中断向量表是中断号和中断处理函数地址的对应表。<br/>
-int n - 触发软中断n。相应的中断处理函数的地址为：中断向量表地址 + 4 * n。</p>
-
-<h5>(5)硬中断和软中断的区别</h5>
-
-<p>软中断是执行中断指令产生的，而硬中断是由外设引发的。<br/>
-硬中断的中断号是由中断控制器提供的，软中断的中断号由指令直接指出，无需使用中断控制器。<br/>
-硬中断是可屏蔽的，软中断不可屏蔽。<br/>
-硬中断处理程序要确保它能快速地完成任务，这样程序执行时才不会等待较长时间，称为上半部。<br/>
-软中断处理硬中断未完成的工作，是一种推后执行的机制，属于下半部。</p>
-
-<h4>开关</h4>
-
-<h5>(1) 硬中断的开关</h5>
-
-<p>简单禁止和激活当前处理器上的本地中断：
-<code>
-    local_irq_disable();
-    local_irq_enable();
-</code>
-保存本地中断系统状态下的禁止和激活：
-<code>
-    unsigned long flags;
-    local_irq_save(flags);
-    local_irq_restore(flags);
-</code></p>
-
-<h5>(2) 软中断的开关</h5>
-
-<p>禁止下半部，如softirq、tasklet和workqueue等：
-<code>
-    local_bh_disable();
-    local_bh_enable();
-</code>
-需要注意的是，禁止下半部时仍然可以被硬中断抢占。</p>
-
-<h5>(3) 判断中断状态</h5>
-
-<pre><code>    #define in_interrupt() (irq_count()) // 是否处于中断状态(硬中断或软中断)
-    #define in_irq() (hardirq_count()) // 是否处于硬中断
-    #define in_softirq() (softirq_count()) // 是否处于软中断
+<pre><code>    if (!(action-&gt;flags &amp; IRQF_DISABLED))
+        local_irq_enable_in_hardirq();
+...
 </code></pre>
 
-<h4>硬中断</h4>
+<pre><code>函数local_irq_enable_in_hardirq()的定义如下：
+</code></pre>
 
-<h5>(1) 注册中断处理函数</h5>
+<pre><code>#ifdef CONFIG_LOCKDEP
+# define local_irq_enable_in_hardirq()  do { } while (0)
+#else
+# define local_irq_enable_in_hardirq()  local_irq_enable()
+#endif
+</code></pre>
 
-<p>注册中断处理函数：
+<pre><code>宏CONFIG_LOCKDEP用于表示当前是否开启内核Lockdep功能，这是一个调试功能，用于检测潜在的死锁类风险，如果开启，那么函数local_irq_enable_in_hardirq()为空，即继续保持中断禁止状态，为什么Lockdep功能需要保持中断禁止待后文再述，这里考虑一般情况，即不开启Lockdep功能，那么执行函数local_irq_enable_in_hardirq()就会开启中断。
+看函数handle_IRQ_event()里的代码，如果没有带上IRQF_DISABLED旗标，那么就会执行函数local_irq_enable_in_hardirq()，从而启用中断。旗标IRQF_DISABLED可在利用函数request_irq()注册中断处理回调时设置，比如：
+</code></pre>
+
+<pre><code>if (request_irq(uart-&gt;port.irq, bfin_serial_rx_int, IRQF_DISABLED,
+     "BFIN_UART_RX", uart)) {
+</code></pre>
+
+<pre><code>如果没有设置，那么到函数handle_IRQ_event()这里的代码后，因为中断已经开启，当前中断的后续处理就可能被其它中断打断，从而出现中断嵌套的情况。
+
+3，如果新来的中断类型与当前正在执行的中断类型相同，那么会暂时挂起。主要实现代码在函数__do_IRQ()（handle_fasteoi_irq()、handle_edge_irq()类似）内：
+</code></pre>
+
+<pre><code>/*
+ * If the IRQ is disabled for whatever reason, we cannot
+ * use the action we have.
+ */
+action = NULL;
+if (likely(!(status &amp; (IRQ_DISABLED | IRQ_INPROGRESS)))) {
+    action = desc-&gt;action;
+    status &amp;= ~IRQ_PENDING; /* we commit to handling */
+    status |= IRQ_INPROGRESS; /* we are handling it */
+}
+desc-&gt;status = status;
+
+/*
+ * If there is no IRQ handler or it was disabled, exit early.
+ * Since we set PENDING, if another processor is handling
+ * a different instance of this same irq, the other processor
+ * will take care of it.
+ */
+if (unlikely(!action))
+    goto out;
+</code></pre>
+
+<pre><code>逻辑很简单，如果当前中断被禁止（IRQ_DISABLED）或正在执行（IRQ_INPROGRESS），那么goto cot，所以同种类型中断不会相互嵌套。
+
+4，从这个补丁开始，Linux内核已经全面禁止硬中断嵌套了，即从2.6.35开始，默认就是：
+</code></pre>
+
+<pre><code>run the irq handlers with interrupts disabled.
+</code></pre>
+
+<pre><code>因为这个补丁，所以旗标IRQF_DISABLED没用了，mainline内核在逐步删除它。
+
+我仔细检查了一下，对于2.6.34以及以前的内核，如果要合入这个补丁，那么有略微影响的主要是两个慢速驱动，分别为rtc-twl4030和twl4030-usb，需要按照类似开启Lockdep功能一样：
+</code></pre>
+
+<pre><code>#ifdef CONFIG_LOCKDEP
+/* WORKAROUND for lockdep forcing IRQF_DISABLED on us, which
+ * we don't want and can't tolerate.  Although it might be
+ * friendlier not to borrow this thread context...
+ */
+local_irq_enable();
+#endif
+</code></pre>
+
+<p>```
+进行主动启用中断。还有另个一个慢速驱动IDE，其驱动中调用的是函数local_irq_enable_in_hardirq()，即它在开启Lockdep功能的情况下并没有明确要求启用中断，所以它应该不受补丁合入影响。嘛，我只是理论分析研究一下，仅供参考，如有风险，请实际操作者自行承担，:)。其它请看参考4，5，6。</p>
+
+<h4>参考：</h4>
+
+<p>1，Linux下386中断处理<br/>
+2，Linux中断基础构架<br/>
+3，linux源码entry_32.S中interrupt数组的分析<br/>
+4，<a href="http://lwn.net/Articles/321663/  ">http://lwn.net/Articles/321663/  </a>
+5，<a href="http://lwn.net/Articles/380931/  ">http://lwn.net/Articles/380931/  </a>
+6，<a href="http://thread.gmane.org/gmane.linux.kernel/801267">http://thread.gmane.org/gmane.linux.kernel/801267</a></p>
+
+<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a> 或 <a href="http://lenky.info/?p=2245">http://lenky.info/?p=2245</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux软中断机制分析]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/01/23/kernel-irq-mark3/"/>
+    <updated>2015-01-23T14:29:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/01/23/kernel-irq-mark3</id>
+    <content type="html"><![CDATA[<h3>软中断分析</h3>
+
+<h4>1. 为什么要软中断</h4>
+
+<p>编写驱动的时候，一个中断产生之后，内核在中断处理函数中可能需要完成很多工作。但是中断处理函数的处理是关闭了中断的。也就是说在响应中断时，系统不能再次响应外部的其它中断。这样的后果会造成有可能丢失外部中断。于是，linux内核设计出了一种架构，中断函数需要处理的任务分为两部分，一部分在中断处理函数中执行，这时系统关闭中断。另外一部分在软件中断中执行，这个时候开启中断，系统可以响应外部中断。</p>
+
+<p>关于软件中断的理论各种书籍都有介绍，不多叙述。而要真正体会软件中断的作用就必须从代码的角度来分析。我们做工作时候讲求的是professional，当一个人在某个领域一无所知的时候，我们称他为小白，偶，非苹果电脑。小白的脑子里充满了各种问题。慢慢的当这些疑惑解释完之后，小白就脱白了。此时，我们对这个领域的基本框架有了解，但这和professional还有一定的差距。再加以时日，逐渐融会贯通该领域才能达到专业的境界。</p>
+
+<h4>2. 什么时候触发处理软件中断</h4>
+
+<p>说了这么多废话，赶快步入正题。初识软中断，脑子里肯定有不少的疑问，首先就是软件中断在什么地方被触发处理？这个问题的答案就是：一个硬件中断处理完成之后。下面的函数在处理完硬件中断之后推出中断处理函数，在irq_exit中会触发软件中断的处理。
 ```
-    /<em><em>
-     * irq: 要分配的中断号
-     * handler: 要注册的中断处理函数
-     * flags: 标志(一般为0)
-     * name: 设备名(dev->name)
-     * dev: 设备(struct net_device </em>dev)，作为中断处理函数的参数
-     * 成功返回0
-     </em>/</p>
+    asmlinkage void __exception asm_do_IRQ(unsigned int irq, struct pt_regs <em>regs)
+    {
+        struct pt_regs </em>old_regs = set_irq_regs(regs);</p>
 
-<pre><code>int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,   
-    const char *name, void *dev);  
+<pre><code>    irq_enter();
+
+    /*
+     * Some hardware gives randomly wrong interrupts.  Rather
+     * than crashing, do something sensible.
+     */ 
+    if (irq &gt;= NR_IRQS)
+        handle_bad_irq(irq, &amp;bad_irq_desc);
+    else 
+        generic_handle_irq(irq);
+
+    /* AT91 specific workaround */ 
+    irq_finish(irq);
+
+    irq_exit();
+    set_irq_regs(old_regs);
+}
+</code></pre>
+
+<pre><code>这里要注意，invoke_softirq必须满足两个条件才能被调用到，一个就是不是在硬件中断处理过程中或者在软件中断处理中，第二个就是必须有软件中断处于pending状态。第二个好理解，有软件中断产生才去处理，没有就不处理。第一个就不好理解了。
+</code></pre>
+
+<pre><code>/*
+* Exit an interrupt context. Process softirqs if needed and possible:
+*/ 
+void irq_exit(void)
+{
+    account_system_vtime(current);
+    trace_hardirq_exit();
+    sub_preempt_count(IRQ_EXIT_OFFSET);
+    if (!in_interrupt() &amp;&amp; local_softirq_pending())
+        invoke_softirq();
+
+#ifdef CONFIG_NO_HZ
+    /* Make sure that timer wheel updates are propagated */ 
+    rcu_irq_exit();
+    if (idle_cpu(smp_processor_id()) &amp;&amp; !in_interrupt() &amp;&amp; !need_resched())
+        tick_nohz_stop_sched_tick(0);
+#endif 
+    preempt_enable_no_resched();
+}
+</code></pre>
+
+<pre><code>在linux系统的进程数据结构里，有这么一个数据结构
+</code></pre>
+
+<pre><code>#define preempt_count() (current_thread_info()-&gt;preempt_count)，
+</code></pre>
+
+<pre><code>利用preempt_count可以表示是否处于中断处理或者软件中断处理过程中。
+</code></pre>
+
+<pre><code>#define PREEMPT_MASK    (__IRQ_MASK(PREEMPT_BITS) &lt;&lt; PREEMPT_SHIFT)
+#define SOFTIRQ_MASK    (__IRQ_MASK(SOFTIRQ_BITS) &lt;&lt; SOFTIRQ_SHIFT)
+#define HARDIRQ_MASK    (__IRQ_MASK(HARDIRQ_BITS) &lt;&lt; HARDIRQ_SHIFT)
+
+#define PREEMPT_OFFSET    (1UL &lt;&lt; PREEMPT_SHIFT)
+#define SOFTIRQ_OFFSET    (1UL &lt;&lt; SOFTIRQ_SHIFT)
+#define HARDIRQ_OFFSET    (1UL &lt;&lt; HARDIRQ_SHIFT)
+
+sub_preempt_count(IRQ_EXIT_OFFSET);
+
+#define in_interrupt() (irq_count())
+
+#define irq_count() (preempt_count() &amp; (HARDIRQ_MASK | SOFTIRQ_MASK))
 </code></pre>
 
 <pre><code>
-中断处理函数本身：
+![](/images/kernel/2015-01-23-1.png)
+
+preempt_count的8～23位记录中断处理和软件中断处理过程的计数。如果有计数，表示系统在硬件中断或者软件中断处理过程中。系统这么设计是为了避免软件中断在中断嵌套中被调用，并且达到在单个CPU上软件中断不能被重入的目的。对于ARM架构的CPU不存在中断嵌套中调用软件中断的问题，因为ARM架构的CPU在处理硬件中断的过程中是关闭掉中断的。只有在进入了软中断处理过程中之后才会开启硬件中断，如果在软件中断处理过程中有硬件中断嵌套，也不会再次调用软中断，because硬件中断是软件中断处理过程中再次进入的，此时preempt_count已经记录了软件中断！对于其它架构的CPU，有可能在触发调用软件中断前，也就是还在处理硬件中断的时候，就已经开启了硬件中断，可能会发生中断嵌套，在中断嵌套中是不允许调用软件中断处理的。Why？我的理解是，在发生中断嵌套的时候，表明这个时候是系统突发繁忙的时候，内核第一要务就是赶紧把中断中的事情处理完成，退出中断嵌套。避免多次嵌套，哪里有时间处理软件中断，所以把软件中断推迟到了所有中断处理完成的时候才能触发软件中断。
+
+#### 3. 软件中断的处理过程
+
+之前我已经说到，软中断的一个很大的目的就是避免中断处理中，处理的操作过多而丢失中断。同时中断还需要考虑到一件事情就是中断处理过程过长就会影响系统响应时间。如果一个中断处理一秒钟，那你一定能感受到串口卡住的现象。从另外一方面说呢，我们又必须考虑中断处理的操作一定的优先度，毕竟是硬件触发的事务，关系到网络、块设备的效率问题。Linux内核就中断方面就必须考虑平衡这三个方面的问题。而下面我要分析的__do_softirq函数就恰似在这三者之间打太极，游刃有余，面面俱到！
 </code></pre>
 
-<pre><code>typedef irqreturn_t (*irq_handler_t) (int, void *);  
+<pre><code>/*
+* We restart softirq processing MAX_SOFTIRQ_RESTART times,
+* and we fall back to softirqd after that.
+*
+* This number has been established via experimentation.
+* The two things to balance is latency against fairness -
+* we want to handle softirqs as soon as possible, but they
+* should not be able to lock up the box.
+*/ 
+#define MAX_SOFTIRQ_RESTART 10 
 
-/** 
- * enum irqreturn 
- * @IRQ_NONE: interrupt was not from this device 
- * @IRQ_HANDLED: interrupt was handled by this device 
- * @IRQ_WAKE_THREAD: handler requests to wake the handler thread 
- */  
-enum irqreturn {  
-    IRQ_NONE,  
-    IRQ_HANDLED,  
-    IRQ_WAKE_THREAD,  
-};  
-typedef enum irqreturn irqreturn_t;  
-#define IRQ_RETVAL(x) ((x) != IRQ_NONE)  
-</code></pre>
+asmlinkage void __do_softirq(void)
+{
+    struct softirq_action *h;
+    __u32 pending;
+    int max_restart = MAX_SOFTIRQ_RESTART;
+    int cpu;
 
-<pre><code>
-##### (2) 注销中断处理函数
-</code></pre>
+    pending = local_softirq_pending();
+    account_system_vtime(current);
 
-<pre><code>/** 
- * free_irq - free an interrupt allocated with request_irq 
- * @irq: Interrupt line to free 
- * @dev_id: Device identity to free 
- * 
- * Remove an interrupt handler. The handler is removed and if the 
- * interrupt line is no longer in use by any driver it is disabled. 
- * On a shared IRQ the caller must ensure the interrupt is disabled 
- * on the card it drives before calling this function. The function does 
- * not return until any executing interrupts for this IRQ have completed. 
- * This function must not be called from interrupt context. 
- */  
+    __local_bh_disable((unsigned long)__builtin_return_address(0));
+    trace_softirq_enter();
 
-void free_irq(unsigned int irq, void *dev_id);  
-</code></pre>
+    cpu = smp_processor_id();
+restart:
+    /* Reset the pending bitmask before enabling irqs */ 
+    set_softirq_pending(0);
 
-<pre><code>
-#### 软中断
-##### (1) 定义
-软中断是一组静态定义的下半部接口，可以在所有处理器上同时执行，即使两个类型相同也可以。  
-但一个软中断不会抢占另一个软中断，唯一可以抢占软中断的是硬中断。
+    local_irq_enable();
 
-软中断由softirq_action结构体表示：
-</code></pre>
+    h = softirq_vec;
 
-<pre><code>struct softirq_action {  
-    void (*action) (struct softirq_action *); /* 软中断的处理函数 */  
-};  
-</code></pre>
+    do 
+    {
+        if (pending &amp; 1)
+        {
+            int prev_count = preempt_count();
 
-<pre><code>
-目前已注册的软中断有10种，定义为一个全局数组：
-</code></pre>
+            h-&gt;action(h);
 
-<pre><code>static struct softirq_action softirq_vec[NR_SOFTIRQS];  
+            if (unlikely(prev_count != preempt_count()))
+            {
+                printk(KERN_ERR "huh, entered softirq %td %p" 
+                       "with preempt_count %08x," 
+                       " exited with %08x?\n", h - softirq_vec,
+                       h-&gt;action, prev_count, preempt_count());
+                preempt_count() = prev_count;
+            }
 
-enum {  
-    HI_SOFTIRQ = 0, /* 优先级高的tasklets */  
-    TIMER_SOFTIRQ, /* 定时器的下半部 */  
-    NET_TX_SOFTIRQ, /* 发送网络数据包 */  
-    NET_RX_SOFTIRQ, /* 接收网络数据包 */  
-    BLOCK_SOFTIRQ, /* BLOCK装置 */  
-    BLOCK_IOPOLL_SOFTIRQ,  
-    TASKLET_SOFTIRQ, /* 正常优先级的tasklets */  
-    SCHED_SOFTIRQ, /* 调度程序 */  
-    HRTIMER_SOFTIRQ, /* 高分辨率定时器 */  
-    RCU_SOFTIRQ, /* RCU锁定 */  
-    NR_SOFTIRQS /* 10 */  
-};  
-</code></pre>
+            rcu_bh_qsctr_inc(cpu);
+        }
+        h++;
+        pending &gt;&gt;= 1;
+    }
+    while (pending);
 
-<pre><code>
-##### (2) 注册软中断处理函数
-</code></pre>
+    local_irq_disable();
 
-<pre><code>/** 
- * @nr: 软中断的索引号 
- * @action: 软中断的处理函数 
- */  
+    pending = local_softirq_pending();
+    if (pending &amp;&amp; --max_restart)
+        goto restart;
 
-void open_softirq(int nr, void (*action) (struct softirq_action *))  
-{  
-    softirq_vec[nr].action = action;  
-}  
-</code></pre>
+    if (pending)
+        wakeup_softirqd();
 
-<pre><code>例如：
-</code></pre>
+    trace_softirq_exit();
 
-<pre><code>open_softirq(NET_TX_SOFTIRQ, net_tx_action);
-open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+    account_system_vtime(current);
+    _local_bh_enable();
+}
 </code></pre>
 
 <pre><code>
-##### (3) 触发软中断 
-调用raise_softirq()来触发软中断。
+__do_softirq函数处理软件中断过程如下图流程分析
+
+4. 首先调用local_softirq_pending函数取得目前有哪些位存在软件中断
+
+5. 调用__local_bh_disable关闭软中断，其实就是设置正在处理软件中断标记，在同一个CPU上使得不能重入__do_softirq函数
+
+6. 重新设置软中断标记为0，set_softirq_pending重新设置软中断标记为0，这样在之后重新开启中断之后硬件中断中又可以设置软件中断位。
+
+7. 开启硬件中断
+
+8. 之后在一个循环中，遍历pending标志的每一位，如果这一位设置就会调用软件中断的处理函数。在这个过程中硬件中断是开启的，随时可以打断软件中断。这样保证硬件中断不会丢失。
+
+9. 之后关闭硬件中断，查看是否又有软件中断处于pending状态，如果是，并且在本次调用__do_softirq函数过程中没有累计重复进入软件中断处理的次数超过10次，就可以重新调用软件中断处理。如果超过了10次，就调用wakeup_softirqd();唤醒内核的一个进程来处理软件中断。设立10次的限制，也是为了避免影响系统响应时间。
+
+![](/images/kernel/2015-01-23-2.png)
+
+#### 4. 处理软中断内核线程
+
+之前我说到不能让CPU长时间来处理中断事务，这样会影响系统的响应时间，严重影响用户和系统之间的交互式体验。所以在之前的__do_softirq中最多将循环执行10次，那么当执行了10次仍然有软中断在pending状态，这个时候应该怎么处理呢？系统将唤醒一个软件中断处理的内核进程，在内核进程中处理pending中的软件中断。这里要注意，之前我们分析的触发软件中断的位置其实是中断上下文中，而在软中断的内核线程中实际已经是进程的上下文。
+
+这里说的软中断上下文指的就是系统为每个CPU建立的ksoftirqd进程。
+
+看完这个函数，我不得不佩服这个函数设计的精巧！而我更多的从中体会到其中蕴藏的一种做人的道理。那就是做人要霸道一点，太谦和太恭维不行，但是又不能横行霸道，原则的问题要公平讲理，一定的时候顾及别人的利益，好处不能一个人独吞。这就跟下面ksoftirqd处理过程一样，该狠的时候禁止抢占，其它进程别想调度到哦，但是自己占用CPU时间过长的话，也自觉的问一问是不是该释放CPU给其它进程了。
+
+下面我们就来分析一下这个处理过程怎么就体现了上面的这种说法呢？软中断的内核进程中主要有两个大循环，外层的循环处理有软件中断就处理，没有软件中断就休眠。内层的循环处理软件中断，并每循环一次都试探一次是否过长时间占据了CPU，需要调度释放CPU给其它进程。具体的操作在注释中做了解释。
 </code></pre>
 
-<pre><code>void raise_softirq(unsigned int nr)  
-{  
-    unsigned long flags;  
-    local_irq_save(flags);  
-    raise_softirq_irqoff(nr);  
-    local_irq_restore(flags);  
-}  
+<pre><code>static int ksoftirqd(void *__bind_cpu)
+{
+    set_current_state(TASK_INTERRUPTIBLE);
 
-/* This function must run with irqs disabled */  
-inline void rasie_softirq_irqsoff(unsigned int nr)  
-{  
-    __raise_softirq_irqoff(nr);  
+    while (!kthread_should_stop())
+    {
+        /*不管三七二十一首先禁止抢占，我掌握CPU，并全凭我自己掌握调度*/ 
+        preempt_disable();
+        if (!local_softirq_pending())
+        {
+            preempt_enable_no_resched();
+            /*如果没有软中断在pending，那就让出CPU来吧*/ 
+            schedule();
+           /*我被唤醒了，首先掌握CPU，不让自己被抢占，自己决定自己的是否要调度*/ 
+            preempt_disable();
+        }
 
-    /* If we're in an interrupt or softirq, we're done 
-     * (this also catches softirq-disabled code). We will 
-     * actually run the softirq once we return from the irq 
-     * or softirq. 
-     * Otherwise we wake up ksoftirqd to make sure we 
-     * schedule the softirq soon. 
-     */  
-    if (! in_interrupt()) /* 如果不处于硬中断或软中断 */  
-        wakeup_softirqd(void); /* 唤醒ksoftirqd/n进程 */  
-}  
-</code></pre>
+        __set_current_state(TASK_RUNNING);
 
-<pre><code>
-Percpu变量irq_cpustat_t中的__softirq_pending是等待处理的软中断的位图，通过设置此变量
+        while (local_softirq_pending())
+        {
+            /* Preempt disable stops cpu going offline.
+               If already offline, we'll be on wrong CPU:
+               don't process */ 
+            if (cpu_is_offline((long)__bind_cpu))
+                goto wait_to_die;
+            /*处理软中断*/ 
+            do_softirq();
+            /*虽然我自己掌握是否要调度，虽然我可以一直不调度，但是我是
+            个正直的人，运行一段时间后我会看看是否需要调度，还其它进程运行*/ 
+            preempt_enable_no_resched();
+            cond_resched();
+            preempt_disable();
+            rcu_qsctr_inc((long)__bind_cpu);
+        }
+        preempt_enable();
+        set_current_state(TASK_INTERRUPTIBLE);
+    }
+    __set_current_state(TASK_RUNNING);
+    return 0;
 
-即可告诉内核该执行哪些软中断。
-</code></pre>
-
-<pre><code>static inline void __rasie_softirq_irqoff(unsigned int nr)  
-{  
-    trace_softirq_raise(nr);  
-    or_softirq_pending(1UL &lt;&lt; nr);  
-}  
-
-typedef struct {  
-    unsigned int __softirq_pending;  
-    unsigned int __nmi_count; /* arch dependent */  
-} irq_cpustat_t;  
-
-irq_cpustat_t irq_stat[];  
-#define __IRQ_STAT(cpu, member) (irq_stat[cpu].member)  
-#define or_softirq_pending(x) percpu_or(irq_stat.__softirq_pending, (x))  
-#define local_softirq_pending() percpu_read(irq_stat.__softirq_pending)  
-</code></pre>
-
-<pre><code>
-唤醒ksoftirqd内核线程处理软中断。
-</code></pre>
-
-<pre><code>static void wakeup_softirqd(void)  
-{  
-    /* Interrupts are disabled: no need to stop preemption */  
-    struct task_struct *tsk = __get_cpu_var(ksoftirqd);  
-
-    if (tsk &amp;&amp; tsk-&gt;state != TASK_RUNNING)  
-        wake_up_process(tsk);  
-}  
-</code></pre>
-
-<pre><code>
-在下列地方，待处理的软中断会被检查和执行：  
-1. 从一个硬件中断代码处返回时  
-2. 在ksoftirqd内核线程中  
-3. 在那些显示检查和执行待处理的软中断的代码中，如网络子系统中
-
-而不管是用什么方法唤起，软中断都要在do_softirq()中执行。如果有待处理的软中断，do_softirq()会循环遍历每一个，调用它们的相应的处理程序。在中断处理程序中触发软中断是最常见的形式。中断处理程序执行硬件设备的相关操作，然后触发相应的软中断，最后退出。内核在执行完中断处理程序以后，马上就会调用do_softirq()，于是软中断开始执行中断处理程序完成剩余的任务。
-
-下面来看下do_softirq()的具体实现。
-</code></pre>
-
-<pre><code>asmlinkage void do_softirq(void)  
-{  
-    __u32 pending;  
-    unsigned long flags;  
-
-    /* 如果当前已处于硬中断或软中断中，直接返回 */  
-    if (in_interrupt())   
-        return;  
-
-    local_irq_save(flags);  
-    pending = local_softirq_pending();  
-    if (pending) /* 如果有激活的软中断 */  
-        __do_softirq(); /* 处理函数 */  
-    local_irq_restore(flags);  
-}  
-</code></pre>
-
-<p><code>
-</code>
-    /<em> We restart softirq processing MAX_SOFTIRQ_RESTART times,
-     * and we fall back to softirqd after that.
-     * This number has been established via experimentation.
-     * The two things to balance is latency against fairness - we want
-     * to handle softirqs as soon as possible, but they should not be
-     * able to lock up the box.
-     </em>/<br/>
-    asmlinkage void <strong>do_softirq(void)<br/>
-    {<br/>
-        struct softirq_action *h;<br/>
-        </strong>u32 pending;<br/>
-        /<em> 本函数能重复触发执行的次数，防止占用过多的cpu时间 </em>/<br/>
-        int max_restart = MAX_SOFTIRQ_RESTART;<br/>
-        int cpu;</p>
-
-<pre><code>    pending = local_softirq_pending(); /* 激活的软中断位图 */  
-    account_system_vtime(current);  
-    /* 本地禁止当前的软中断 */  
-    __local_bh_disable((unsigned long)__builtin_return_address(0), SOFTIRQ_OFFSET);  
-    lockdep_softirq_enter(); /* current-&gt;softirq_context++ */  
-    cpu = smp_processor_id(); /* 当前cpu编号 */  
-
-restart:  
-    /* Reset the pending bitmask before enabling irqs */  
-    set_softirq_pending(0); /* 重置位图 */  
-    local_irq_enable();  
-    h = softirq_vec;  
-    do {  
-        if (pending &amp; 1) {  
-            unsigned int vec_nr = h - softirq_vec; /* 软中断索引 */  
-            int prev_count = preempt_count();  
-            kstat_incr_softirqs_this_cpu(vec_nr);  
-
-            trace_softirq_entry(vec_nr);  
-            h-&gt;action(h); /* 调用软中断的处理函数 */  
-            trace_softirq_exit(vec_nr);  
-
-            if (unlikely(prev_count != preempt_count())) {  
-                printk(KERN_ERR "huh, entered softirq %u %s %p" "with preempt_count %08x,"  
-                    "exited with %08x?\n", vec_nr, softirq_to_name[vec_nr], h-&gt;action, prev_count,  
-                    preempt_count());  
-            }  
-            rcu_bh_qs(cpu);  
-        }  
-        h++;  
-        pending &gt;&gt;= 1;  
-    } while(pending);  
-
-    local_irq_disable();  
-    pending = local_softirq_pending();  
-    if (pending &amp; --max_restart) /* 重复触发 */  
-        goto restart;  
-
-    /* 如果重复触发了10次了，接下来唤醒ksoftirqd/n内核线程来处理 */  
-    if (pending)  
-        wakeup_softirqd();   
-
-    lockdep_softirq_exit();  
-    account_system_vtime(current);  
-    __local_bh_enable(SOFTIRQ_OFFSET);  
-}  
-</code></pre>
-
-<pre><code>
-##### (4) ksoftirqd内核线程
-内核不会立即处理重新触发的软中断。  
-当大量软中断出现的时候，内核会唤醒一组内核线程来处理。  
-这些线程的优先级最低(nice值为19)，这能避免它们跟其它重要的任务抢夺资源。  
-但它们最终肯定会被执行，所以这个折中的方案能够保证在软中断很多时用户程序不会因为得不到处理时间而处于饥饿状态，同时也保证过量的软中断最终会得到处理。
-
-每个处理器都有一个这样的线程，名字为ksoftirqd/n，n为处理器的编号。
-</code></pre>
-
-<pre><code>static int run_ksoftirqd(void *__bind_cpu)  
-{  
-    set_current_state(TASK_INTERRUPTIBLE);  
-    current-&gt;flags |= PF_KSOFTIRQD; /* I am ksoftirqd */  
-
-    while(! kthread_should_stop()) {  
-        preempt_disable();  
-
-        if (! local_softirq_pending()) { /* 如果没有要处理的软中断 */  
-            preempt_enable_no_resched();  
-            schedule();  
-            preempt_disable():  
-        }  
-
-        __set_current_state(TASK_RUNNING);  
-
-        while(local_softirq_pending()) {  
-            /* Preempt disable stops cpu going offline. 
-             * If already offline, we'll be on wrong CPU: don't process. 
-             */  
-             if (cpu_is_offline(long)__bind_cpu))/* 被要求释放cpu */  
-                 goto wait_to_die;  
-
-            do_softirq(); /* 软中断的统一处理函数 */  
-
-            preempt_enable_no_resched();  
-            cond_resched();  
-            preempt_disable();  
-            rcu_note_context_switch((long)__bind_cpu);  
-        }  
-
-        preempt_enable();  
-        set_current_state(TASK_INTERRUPTIBLE);  
-    }  
-
-    __set_current_state(TASK_RUNNING);  
-    return 0;  
-
-wait_to_die:  
-    preempt_enable();  
-    /* Wait for kthread_stop */  
-    set_current_state(TASK_INTERRUPTIBLE);  
-    while(! kthread_should_stop()) {  
-        schedule();  
-        set_current_state(TASK_INTERRUPTIBLE);  
-    }  
-
-    __set_current_state(TASK_RUNNING);  
-    return 0;  
+wait_to_die:
+    preempt_enable();
+    /* Wait for kthread_stop */ 
+    set_current_state(TASK_INTERRUPTIBLE);
+    while (!kthread_should_stop())
+    {
+        schedule();
+        set_current_state(TASK_INTERRUPTIBLE);
+    }
+    __set_current_state(TASK_RUNNING);
+    return 0;
 }
 </code></pre>
 
