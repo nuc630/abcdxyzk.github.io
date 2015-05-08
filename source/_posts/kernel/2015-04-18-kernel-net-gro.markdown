@@ -10,6 +10,10 @@ categories:
 - kernel~net
 tags:
 ---
+----------
+Attention: gro会合并多个gso_size不同的包, 会将gso_size设置成第一个包的gso_size.
+----------
+
 http://www.pagefault.info/?p=159
 
 GRO(Generic receive offload)在内核2.6.29之后合并进去的，作者是一个华裔Herbert Xu ,GRO的简介可以看这里：
@@ -20,7 +24,7 @@ http://lwn.net/Articles/358910/
 
 GRO类似tso，可是tso只支持发送数据包，这样你tcp层大的段会在网卡被切包，然后再传递给对端，而如果没有gro，则小的段会被一个个送到协议栈，有了gro之后，就会在接收端做一个反向的操作(想对于tso).也就是将tso切好的数据包组合成大包再传递给协议栈。
 
-如果实现了GRO支持的驱动是这样子处理数据的，在NAPI的回调poll方法中读取数据包，然后调用GRO的接口napi_gro_receive或者napi_gro_frags来将数据包feed进协议栈。而具体GRO的工作就是在这两个函数中进行的，他们最终都会调用__napi_gro_receive。下面就是napi_gro_receive，它最终会调用napi_skb_finish以及__napi_gro_receive。
+如果实现了GRO支持的驱动是这样子处理数据的，在NAPI的回调poll方法中读取数据包，然后调用GRO的接口napi_gro_receive或者napi_gro_frags来将数据包feed进协议栈。而具体GRO的工作就是在这两个函数中进行的，他们最终都会调用`__napi_gro_receive`。下面就是napi_gro_receive，它最终会调用napi_skb_finish以及`__napi_gro_receive`。
 ```
 	gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 	{
@@ -29,7 +33,7 @@ GRO类似tso，可是tso只支持发送数据包，这样你tcp层大的段会�
 		return napi_skb_finish(__napi_gro_receive(napi, skb), skb);
 	}
 ```
-然后GRO什么时候会将数据feed进协议栈呢，这里会有两个退出点，一个是在napi_skb_finish里，他会通过判断__napi_gro_receive的返回值，来决定是需要将数据包立即feed进协议栈还是保存起来，还有一个点是当napi的循环执行完毕时，也就是执行napi_complete的时候，先来看napi_skb_finish,napi_complete我们后面会详细介绍。
+然后GRO什么时候会将数据feed进协议栈呢，这里会有两个退出点，一个是在napi_skb_finish里，他会通过判断`__napi_gro_receive`的返回值，来决定是需要将数据包立即feed进协议栈还是保存起来，还有一个点是当napi的循环执行完毕时，也就是执行napi_complete的时候，先来看napi_skb_finish,napi_complete我们后面会详细介绍。
 
 在NAPI驱动中，直接调用netif_receive_skb会将数据feed 进协议栈，因此这里如果返回值是NORMAL，则直接调用netif_receive_skb来将数据送进协议栈。
 ```
@@ -38,19 +42,19 @@ GRO类似tso，可是tso只支持发送数据包，这样你tcp层大的段会�
 		switch (ret) {
 		case GRO_NORMAL:
 			//将数据包送进协议栈
-		    if (netif_receive_skb(skb))
-		        ret = GRO_DROP;
-		    break;
+			if (netif_receive_skb(skb))
+				ret = GRO_DROP;
+			break;
 		//表示skb可以被free，因为gro已经将skb合并并保存起来。
 		case GRO_DROP:
 		case GRO_MERGED_FREE:
 			//free skb
-		    kfree_skb(skb);
-		    break;
+			kfree_skb(skb);
+			break;
 		//这个表示当前数据已经被gro保存起来，但是并没有进行合并，因此skb还需要保存。
 		case GRO_HELD:
 		case GRO_MERGED:
-		    break;
+			break;
 		}
 	 
 		return ret;
@@ -121,7 +125,7 @@ GRO的主要思想就是，组合一些类似的数据包(基于一些数据域�
 		.gro_complete = inet_gro_complete,
 	};
 ```
-gro的入口函数是napi_gro_receive，它的实现很简单，就是将skb包含的gro上下文reset，然后调用__napi_gro_receive,最终通过napi_skb_finis来判断是否需要讲数据包feed进协议栈。
+gro的入口函数是napi_gro_receive，它的实现很简单，就是将skb包含的gro上下文reset，然后调用`__napi_gro_receive`,最终通过napi_skb_finis来判断是否需要讲数据包feed进协议栈。
 ```
 	gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 	{
@@ -131,7 +135,7 @@ gro的入口函数是napi_gro_receive，它的实现很简单，就是将skb包�
 		return napi_skb_finish(__napi_gro_receive(napi, skb), skb);
 	}
 ```
-napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断传递进来的ret(__napi_gro_receive的返回值),来决定是否需要feed数据进协议栈。它的第二个参数是前面处理过的skb。
+napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断传递进来的ret(`__napi_gro_receive`的返回值),来决定是否需要feed数据进协议栈。它的第二个参数是前面处理过的skb。
 
 这里再来看下skb_gro_reset_offset，首先要知道一种情况，那就是skb本身不包含数据(包括头也没有),而所有的数据都保存在skb_shared_info中(支持S/G的网卡有可能会这么做).此时我们如果想要合并的话，就需要将包头这些信息取出来，也就是从skb_shared_info的frags[0]中去的，在 skb_gro_reset_offset中就有做这个事情,而这里就会把头的信息保存到napi_gro_cb 的frags0中。并且此时frags必然不会在high mem,要么是线性区，要么是dma(S/G io)。 来看skb_gro_reset_offset。
 ```
@@ -142,17 +146,18 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		NAPI_GRO_CB(skb)->frag0_len = 0;
 		//如果mac_header和skb->tail相等并且地址不在高端内存，则说明包头保存在skb_shinfo中，所以我们需要从frags中取得对应的数据包
 		if (skb->mac_header == skb->tail &&
-		    !PageHighMem(skb_shinfo(skb)->frags[0].page)) {
-			//可以看到frag0保存的就是对应的skb的frags的第一个元素的地址
-		    NAPI_GRO_CB(skb)->frag0 =
-		        page_address(skb_shinfo(skb)->frags[0].page) +
-		        skb_shinfo(skb)->frags[0].page_offset;
+			!PageHighMem(skb_shinfo(skb)->frags[0].page)) {
+			// 可以看到frag0保存的就是对应的skb的frags的第一个元素的地址
+			// frag0的作用是: 有些包的包头会存在skb->frag[0]里面，gro合并时会调用skb_gro_header_slow将包头拉到线性空间中，那么在非线性skb->frag[0]中的包头部分就应该删掉。
+				NAPI_GRO_CB(skb)->frag0 =
+					page_address(skb_shinfo(skb)->frags[0].page) +
+					skb_shinfo(skb)->frags[0].page_offset;
 			//然后保存对应的大小。
-		    NAPI_GRO_CB(skb)->frag0_len = skb_shinfo(skb)->frags[0].size;
+			NAPI_GRO_CB(skb)->frag0_len = skb_shinfo(skb)->frags[0].size;
 		}
 	}
 ```
-接下来就是__napi_gro_receive，它主要是遍历gro_list,然后给same_flow赋值，这里要注意，same_flow是一个标记，表示某个skb是否有可能会和当前要处理的skb是相同的流,而这里的相同会在每层都进行判断，也就是在设备层，ip层，tcp层都会判断，这里就是设备层的判断了。这里的判断很简单，有2个条件：  
+接下来就是`__napi_gro_receive`，它主要是遍历gro_list,然后给same_flow赋值，这里要注意，same_flow是一个标记，表示某个skb是否有可能会和当前要处理的skb是相同的流,而这里的相同会在每层都进行判断，也就是在设备层，ip层，tcp层都会判断，这里就是设备层的判断了。这里的判断很简单，有2个条件：  
 1 设备是否相同  
 2 mac的头必须相等  
 
@@ -164,15 +169,15 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		struct sk_buff *p;
 	 
 		if (netpoll_rx_on(skb))
-		    return GRO_NORMAL;
+			return GRO_NORMAL;
 		//遍历gro_list,然后判断是否有可能两个skb 相似。
 		for (p = napi->gro_list; p; p = p->next) {
 			//给same_flow赋值
-		    NAPI_GRO_CB(p)->same_flow =
-		        (p->dev == skb->dev) &&
-		        !compare_ether_header(skb_mac_header(p),
-		                      skb_gro_mac_header(skb));
-		    NAPI_GRO_CB(p)->flush = 0;
+			NAPI_GRO_CB(p)->same_flow =
+				(p->dev == skb->dev) &&
+				!compare_ether_header(skb_mac_header(p),
+					skb_gro_mac_header(skb));
+			NAPI_GRO_CB(p)->flush = 0;
 		}
 		//调用dev_gro_receiv
 		return dev_gro_receive(napi, skb);
@@ -199,31 +204,31 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		enum gro_result ret;
 		//判断是否支持gro
 		if (!(skb->dev->features & NETIF_F_GRO))
-		    goto normal;
+			goto normal;
 		//判断是否为切片的ip包
 		if (skb_is_gso(skb) || skb_has_frags(skb))
-		    goto normal;
-	 
+			goto normal;
+
 		rcu_read_lock();
 		//开始遍历对应的协议表
 		list_for_each_entry_rcu(ptype, head, list) {
-		    if (ptype->type != type || ptype->dev || !ptype->gro_receive)
-		        continue;
-	 
-		    skb_set_network_header(skb, skb_gro_offset(skb));
-		    mac_len = skb->network_header - skb->mac_header;
-		    skb->mac_len = mac_len;
-		    NAPI_GRO_CB(skb)->same_flow = 0;
-		    NAPI_GRO_CB(skb)->flush = 0;
-		    NAPI_GRO_CB(skb)->free = 0;
+			if (ptype->type != type || ptype->dev || !ptype->gro_receive)
+				continue;
+
+			skb_set_network_header(skb, skb_gro_offset(skb));
+			mac_len = skb->network_header - skb->mac_header;
+			skb->mac_len = mac_len;
+			NAPI_GRO_CB(skb)->same_flow = 0;
+			NAPI_GRO_CB(skb)->flush = 0;
+			NAPI_GRO_CB(skb)->free = 0;
 			//调用对应的gro接收函数
-		    pp = ptype->gro_receive(&napi->gro_list, skb);
-		    break;
+			pp = ptype->gro_receive(&napi->gro_list, skb);
+			break;
 		}
 		rcu_read_unlock();
 		//如果是没有实现gro的协议则也直接调到normal处理
 		if (&ptype->list == head)
-		    goto normal;
+			goto normal;
 	 
 		//到达这里，则说明gro_receive已经调用过了，因此进行后续的处理
 	 
@@ -233,20 +238,21 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
 		//如果返回值pp部位空，则说明pp需要马上被feed进协议栈
 		if (pp) {
-		    struct sk_buff *nskb = *pp;
+			struct sk_buff *nskb = *pp;
 	 
-		    *pp = nskb->next;
-		    nskb->next = NULL;
+			*pp = nskb->next;
+			nskb->next = NULL;
 			//调用napi_gro_complete 将pp刷进协议栈
-		    napi_gro_complete(nskb);
-		    napi->gro_count--;
+			napi_gro_complete(nskb);
+			napi->gro_count--;
 		}
 		//如果same_flow有设置，则说明skb已经被正确的合并，因此直接返回。
 		if (same_flow)
-		    goto ok;
+			goto ok;
 		//查看是否有设置flush和gro list的个数是否已经超过限制
+		// BUG: 这里是有点不对的，因为这时的skb是比gro_list中的skb更晚到的，但是却被先feed进了协议栈
 		if (NAPI_GRO_CB(skb)->flush || napi->gro_count >= MAX_GRO_SKBS)
-		    goto normal;
+			goto normal;
 	 
 		//到达这里说明skb对应gro list来说是一个新的skb，也就是说当前的gro list并不存在可以和skb合并的数据包，因此此时将这个skb插入到gro_list的头。
 		napi->gro_count++;
@@ -259,6 +265,7 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		ret = GRO_HELD;
 ```
 然后就是处理frag0的部分，以及不支持gro的处理。
+frag0的作用是: 有些包的包头会存在skb->frag[0]里面，gro合并时会调用skb_gro_header_slow将包头拉到线性空间中，那么在非线性skb->frag[0]中的包头部分就应该删掉。
 
 这里要需要对skb_shinfo的结构比较了解，我在以前的blog对这个有很详细的介绍，可以去查阅。
 ```
@@ -266,25 +273,25 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		//是否需要拷贝头
 		if (skb_headlen(skb) < skb_gro_offset(skb)) {
 			//得到对应的头的大小
-		    int grow = skb_gro_offset(skb) - skb_headlen(skb);
+			int grow = skb_gro_offset(skb) - skb_headlen(skb);
 	 
-		    BUG_ON(skb->end - skb->tail < grow);
+			BUG_ON(skb->end - skb->tail < grow);
 			//开始拷贝
-		    memcpy(skb_tail_pointer(skb), NAPI_GRO_CB(skb)->frag0, grow);
+			memcpy(skb_tail_pointer(skb), NAPI_GRO_CB(skb)->frag0, grow);
 	 
-		    skb->tail += grow;
-		    skb->data_len -= grow;
+			skb->tail += grow;
+			skb->data_len -= grow;
 			//更新对应的frags[0]
-		    skb_shinfo(skb)->frags[0].page_offset += grow;
-		    skb_shinfo(skb)->frags[0].size -= grow;
+			skb_shinfo(skb)->frags[0].page_offset += grow;
+			skb_shinfo(skb)->frags[0].size -= grow;
 			//如果size为0了，则说明第一个页全部包含头，因此需要将后面的页全部移动到前面。
-		    if (unlikely(!skb_shinfo(skb)->frags[0].size)) {
-		        put_page(skb_shinfo(skb)->frags[0].page);
+			if (unlikely(!skb_shinfo(skb)->frags[0].size)) {
+				put_page(skb_shinfo(skb)->frags[0].page);
 				//开始移动。
-		        memmove(skb_shinfo(skb)->frags,
-		            skb_shinfo(skb)->frags + 1,
-		            --skb_shinfo(skb)->nr_frags * sizeof(skb_frag_t));
-		    }
+				memmove(skb_shinfo(skb)->frags,
+					skb_shinfo(skb)->frags + 1,
+					--skb_shinfo(skb)->nr_frags * sizeof(skb_frag_t));
+			}
 		}
 	 
 	ok:
@@ -298,33 +305,33 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 接下来就是inet_gro_receive，这个函数是ip层的gro receive回调函数，函数很简单，首先取得ip头，然后判断是否需要从frag复制数据，如果需要则复制数据
 ```
 	//得到偏移
-    off = skb_gro_offset(skb);
+	off = skb_gro_offset(skb);
 	//得到头的整个长度(mac+ip)
-    hlen = off + sizeof(*iph);
+	hlen = off + sizeof(*iph);
 	//得到ip头
-    iph = skb_gro_header_fast(skb, off);
+	iph = skb_gro_header_fast(skb, off);
 	//是否需要复制
-    if (skb_gro_header_hard(skb, hlen)) {
-        iph = skb_gro_header_slow(skb, hlen, off);
-        if (unlikely(!iph))
-            goto out;
-    }
+	if (skb_gro_header_hard(skb, hlen)) {
+		iph = skb_gro_header_slow(skb, hlen, off);
+		if (unlikely(!iph))
+			goto out;
+	}
 ```
 然后就是一些校验工作，比如协议是否支持gro_reveive,ip头是否合法等等
 ```
-    proto = iph->protocol & (MAX_INET_PROTOS - 1);
+	proto = iph->protocol & (MAX_INET_PROTOS - 1);
  
-    rcu_read_lock();
-    ops = rcu_dereference(inet_protos[proto]);
+	rcu_read_lock();
+	ops = rcu_dereference(inet_protos[proto]);
 	//是否支持gro
-    if (!ops || !ops->gro_receive)
-        goto out_unlock;
-	//ip头是否合法
-    if (*(u8 *)iph != 0x45)
-        goto out_unlock;
+	if (!ops || !ops->gro_receive)
+		goto out_unlock;
+	//ip头是否合法, iph->version = 4, iph->ipl = 5
+	if (*(u8 *)iph != 0x45)
+		goto out_unlock;
 	//ip头教研
-    if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
-        goto out_unlock;
+	if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
+		goto out_unlock;
 ```
 然后就是核心的处理部分，它会遍历整个gro_list,然后进行same_flow和是否需要flush的判断。
 
@@ -350,27 +357,27 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		id >>= 16;
 		//开始遍历gro list
 		for (p = *head; p; p = p->next) {
-		    struct iphdr *iph2;
+			struct iphdr *iph2;
 			//如果上一层已经不可能same flow则直接继续下一个
-		    if (!NAPI_GRO_CB(p)->same_flow)
-		        continue;
+			if (!NAPI_GRO_CB(p)->same_flow)
+				continue;
 			//取出ip头
-		    iph2 = ip_hdr(p);
+			iph2 = ip_hdr(p);
 			//开始same flow的判断
-		    if ((iph->protocol ^ iph2->protocol) |
-		        (iph->tos ^ iph2->tos) |
-		        ((__force u32)iph->saddr ^ (__force u32)iph2->saddr) |
-		        ((__force u32)iph->daddr ^ (__force u32)iph2->daddr)) {
-		        NAPI_GRO_CB(p)->same_flow = 0;
-		        continue;
-		    }
+			if ((iph->protocol ^ iph2->protocol) |
+				(iph->tos ^ iph2->tos) |
+				((__force u32)iph->saddr ^ (__force u32)iph2->saddr) |
+				((__force u32)iph->daddr ^ (__force u32)iph2->daddr)) {
+				NAPI_GRO_CB(p)->same_flow = 0;
+				continue;
+			}
 			//开始flush的判断。这里注意如果不是same_flow的话，就没必要进行flush的判断。
-		    /* All fields must match except length and checksum. */
-		    NAPI_GRO_CB(p)->flush |=
-		        (iph->ttl ^ iph2->ttl) |
-		        ((u16)(ntohs(iph2->id) + NAPI_GRO_CB(p)->count) ^ id);
+			/* All fields must match except length and checksum. */
+			NAPI_GRO_CB(p)->flush |=
+				(iph->ttl ^ iph2->ttl) |
+				((u16)(ntohs(iph2->id) + NAPI_GRO_CB(p)->count) ^ id);
 	 
-		    NAPI_GRO_CB(p)->flush |= flush;
+			NAPI_GRO_CB(p)->flush |= flush;
 		}
 	 
 		NAPI_GRO_CB(skb)->flush |= flush;
@@ -395,20 +402,20 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 首先来看gro list遍历的部分,它对same flow的要求就是source必须相同，如果不同则设置same flow为0.如果相同则跳到found部分，进行合并处理。
 ```
 	//遍历gro list
-    for (; (p = *head); head = &p->next) {
+	for (; (p = *head); head = &p->next) {
 		//如果ip层已经不可能same flow则直接进行下一次匹配
-        if (!NAPI_GRO_CB(p)->same_flow)
-            continue;
+		if (!NAPI_GRO_CB(p)->same_flow)
+			continue;
  
-        th2 = tcp_hdr(p);
+		th2 = tcp_hdr(p);
 		//判断源地址
-        if (*(u32 *)&th->source ^ *(u32 *)&th2->source) {
-            NAPI_GRO_CB(p)->same_flow = 0;
-            continue;
-        }
+		if (*(u32 *)&th->source ^ *(u32 *)&th2->source) {
+			NAPI_GRO_CB(p)->same_flow = 0;
+			continue;
+		}
  
-        goto found;
-    }
+		goto found;
+	}
 ```
 
 接下来就是当找到能够合并的skb的时候的处理，这里首先来看flush的设置,这里会有4个条件：  
@@ -429,22 +436,22 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		flush |= (__force int)(flags & TCP_FLAG_CWR);
 		//如果相差的域是除了这3个中的，就需要flush出skb
 		flush |= (__force int)((flags ^ tcp_flag_word(th2)) &
-		      ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
+			  ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
 		//ack的序列号必须一致
 		flush |= (__force int)(th->ack_seq ^ th2->ack_seq);
 		//tcp的option头必须一致
 		for (i = sizeof(*th); i < thlen; i += 4)
-		    flush |= *(u32 *)((u8 *)th + i) ^
-		         *(u32 *)((u8 *)th2 + i);
+			flush |= *(u32 *)((u8 *)th + i) ^
+				 *(u32 *)((u8 *)th2 + i);
 	 
 		mss = skb_shinfo(p)->gso_size;
-	 
+		// 0-1 = 0xFFFFFFFF, 所以skb的数据部分长度为0的包是不会被合并的
 		flush |= (len - 1) >= mss;
 		flush |= (ntohl(th2->seq) + skb_gro_len(p)) ^ ntohl(th->seq);
 		//如果flush有设置则不会调用 skb_gro_receive，也就是不需要进行合并，否则调用skb_gro_receive进行数据包合并
 		if (flush || skb_gro_receive(head, skb)) {
-		    mss = 1;
-		    goto out_check_final;
+			mss = 1;
+			goto out_check_final;
 		}
 	 
 		p = *head;
@@ -460,11 +467,11 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		flush = len < mss;
 		//根据flag得到flush
 		flush |= (__force int)(flags & (TCP_FLAG_URG | TCP_FLAG_PSH |
-		                TCP_FLAG_RST | TCP_FLAG_SYN |
-		                TCP_FLAG_FIN));
+						TCP_FLAG_RST | TCP_FLAG_SYN |
+						TCP_FLAG_FIN));
 	 
 		if (p && (!NAPI_GRO_CB(skb)->same_flow || flush))
-		    pp = head;
+			pp = head;
 	 
 	out:
 		NAPI_GRO_CB(skb)->flush |= flush;
@@ -478,55 +485,55 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 先来看支持Scatter-Gather I/O的处理部分。
 ```	
 	//一些需要用到的变量
-    struct sk_buff *p = *head;
-    struct sk_buff *nskb;
+	struct sk_buff *p = *head;
+	struct sk_buff *nskb;
 	//当前的skb的 share_ino
-    struct skb_shared_info *skbinfo = skb_shinfo(skb);
+	struct skb_shared_info *skbinfo = skb_shinfo(skb);
 	//当前的gro list中的要合并的skb的share_info
-    struct skb_shared_info *pinfo = skb_shinfo(p);
-    unsigned int headroom;
-    unsigned int len = skb_gro_len(skb);
-    unsigned int offset = skb_gro_offset(skb);
-    unsigned int headlen = skb_headlen(skb);
+	struct skb_shared_info *pinfo = skb_shinfo(p);
+	unsigned int headroom;
+	unsigned int len = skb_gro_len(skb);
+	unsigned int offset = skb_gro_offset(skb);
+	unsigned int headlen = skb_headlen(skb);
 	//如果有frag_list的话，则直接去非Scatter-Gather I/O部分处理，也就是合并到frag_list.
-    if (pinfo->frag_list)
-        goto merge;
-    else if (headlen <= offset) {
+	if (pinfo->frag_list)
+		goto merge;
+	else if (headlen <= offset) {
 		//支持Scatter-Gather I/O的处理
-        skb_frag_t *frag;
-        skb_frag_t *frag2;
-        int i = skbinfo->nr_frags;
+		skb_frag_t *frag;
+		skb_frag_t *frag2;
+		int i = skbinfo->nr_frags;
 		//这里遍历是从后向前。
-        int nr_frags = pinfo->nr_frags + i;
+		int nr_frags = pinfo->nr_frags + i;
  
-        offset -= headlen;
+		offset -= headlen;
  
-        if (nr_frags > MAX_SKB_FRAGS)
-            return -E2BIG;
+		if (nr_frags > MAX_SKB_FRAGS)
+			return -E2BIG;
 		//设置pinfo的frags的大小，可以看到就是加上skb的frags的大小
-        pinfo->nr_frags = nr_frags;
-        skbinfo->nr_frags = 0;
+		pinfo->nr_frags = nr_frags;
+		skbinfo->nr_frags = 0;
  
-        frag = pinfo->frags + nr_frags;
-        frag2 = skbinfo->frags + i;
+		frag = pinfo->frags + nr_frags;
+		frag2 = skbinfo->frags + i;
 		//遍历赋值，其实就是地址赋值，这里就是将skb的frag加到pinfo的frgas后面。
-        do {
-            *--frag = *--frag2;
-        } while (--i);
+		do {
+			*--frag = *--frag2;
+		} while (--i);
 		//更改page_offet的值
-        frag->page_offset += offset;
+		frag->page_offset += offset;
 		//修改size大小
-        frag->size -= offset;
+		frag->size -= offset;
 		//更新skb的相关值
-        skb->truesize -= skb->data_len;
-        skb->len -= skb->data_len;
-        skb->data_len = 0;
+		skb->truesize -= skb->data_len;
+		skb->len -= skb->data_len;
+		skb->data_len = 0;
  
-        NAPI_GRO_CB(skb)->free = 1;
+		NAPI_GRO_CB(skb)->free = 1;
 		//最终完成
-        goto done;
-    } else if (skb_gro_len(p) != pinfo->gso_size)
-        return -E2BIG;
+		goto done;
+	} else if (skb_gro_len(p) != pinfo->gso_size)
+		return -E2BIG;
 ```
 这里gro list中的要被合并的skb我们叫做skb_s.
 
@@ -535,7 +542,7 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		headroom = skb_headroom(p);
 		nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
 		if (unlikely(!nskb))
-		    return -ENOMEM;
+			return -ENOMEM;
 		//复制头
 		__copy_skb_header(nskb, p);
 		nskb->mac_len = p->mac_len;
@@ -550,7 +557,7 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		__skb_pull(p, skb_gro_offset(p));
 		//复制数据
 		memcpy(skb_mac_header(nskb), skb_mac_header(p),
-		       p->data - skb_mac_header(p));
+			   p->data - skb_mac_header(p));
 		//对应的gro 域的赋值
 		*NAPI_GRO_CB(nskb) = *NAPI_GRO_CB(p);
 		//可以看到frag_list被赋值
@@ -561,7 +568,7 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 		nskb->prev = p;
 		//更新新的skb的数据段
 		nskb->data_len += p->len;
-		nskb->truesize += p->len;
+		nskb->truesize += p->len;  // 应该改成 nskb->truesize += p->truesize; 更准确
 		nskb->len += p->len;
 		//将新的skb插入到gro list中
 		*head = nskb;
@@ -572,13 +579,14 @@ napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断�
 	 
 	merge:
 		if (offset > headlen) {
-		    skbinfo->frags[0].page_offset += offset - headlen;
-		    skbinfo->frags[0].size -= offset - headlen;
-		    offset = headlen;
+			skbinfo->frags[0].page_offset += offset - headlen;
+			skbinfo->frags[0].size -= offset - headlen;
+			offset = headlen;
 		}
 	 
 		__skb_pull(skb, offset);
 		//将skb插入新的skb的(或者老的skb，当frag list本身存在)fraglist
+		// 这里是用p->prev来记录了p->fraglist的最后一个包，所以在gro向协议栈提交时最好加一句skb->prev = NULL;
 		p->prev->next = skb;
 		p->prev = skb;
 		skb_header_release(skb);
