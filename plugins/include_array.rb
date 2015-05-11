@@ -58,7 +58,7 @@ module Jekyll
       @@retstore = rtn
       fp = File.new('sidebar.html', 'w');
       fp.puts(rtn);
-      fp.puts('<script src="/javascripts/category.js" type="text/javascript"></script>');
+#      fp.puts('<script src="/javascripts/category.js" type="text/javascript"></script>');
       fp.puts('<script type="text/javascript"> hadOpenDiv();</script>');
       fp.close();
       rtn
