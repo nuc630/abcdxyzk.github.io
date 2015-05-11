@@ -4,7 +4,7 @@
   <title><![CDATA[Category: debug | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/debug/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-05-08T16:54:59+08:00</updated>
+  <updated>2015-05-11T11:08:27+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,126 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[tcp_read_sock BUG]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_read_sock_bug/"/>
+    <updated>2015-05-11T10:17:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_read_sock_bug</id>
+    <content type="html"><![CDATA[<pre><code>commit baff42ab1494528907bf4d5870359e31711746ae
+Author: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+Date:   Tue Mar 30 13:56:01 2010 -0700
+
+    net: Fix oops from tcp_collapse() when using splice()
+
+    tcp_read_sock() can have a eat skbs without immediately advancing copied_seq.
+    This can cause a panic in tcp_collapse() if it is called as a result
+    of the recv_actor dropping the socket lock.
+
+    A userspace program that splices data from a socket to either another
+    socket or to a file can trigger this bug.
+
+    Signed-off-by: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+    Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+</code></pre>
+
+<pre><code>    diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+    index 6afb6d8..2c75f89 100644
+    --- a/net/ipv4/tcp.c
+    +++ b/net/ipv4/tcp.c
+    @@ -1368,6 +1368,7 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+            sk_eat_skb(sk, skb, 0);
+            if (!desc-&gt;count)
+                break;
+    +       tp-&gt;copied_seq = seq;
+        }
+        tp-&gt;copied_seq = seq;
+</code></pre>
+
+<p>如果在tcp_read_sock中sk_eat_skb时copied_seq没有及时一起修改的话，就会出现copied_seq小于sk_write_queue队列第一个包的seq。<br/>
+tcp_read_sock的recv_actor指向的函数(比如tcp_splice_data_recv)是有可能释放sk锁的，如果这时进入收包软中断且内存紧张调用tcp_collapse，<br/>
+tcp_collapse中：<br/>
+```
+    start = copied_seq
+    &hellip;
+    int offset = start - TCP_SKB_CB(skb)->seq;</p>
+
+<pre><code>BUG_ON(offset &lt; 0);
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[tcp_match_skb_to_sack BUG]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_match_skb_to_sack_bug/"/>
+    <updated>2015-05-11T10:09:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_match_skb_to_sack_bug</id>
+    <content type="html"><![CDATA[<pre><code>commit 2cd0d743b05e87445c54ca124a9916f22f16742e
+Author: Neal Cardwell &lt;ncardwell@google.com&gt;
+Date:   Wed Jun 18 21:15:03 2014 -0400
+
+    tcp: fix tcp_match_skb_to_sack() for unaligned SACK at end of an skb
+
+    If there is an MSS change (or misbehaving receiver) that causes a SACK
+    to arrive that covers the end of an skb but is less than one MSS, then
+    tcp_match_skb_to_sack() was rounding up pkt_len to the full length of
+    the skb ("Round if necessary..."), then chopping all bytes off the skb
+    and creating a zero-byte skb in the write queue.
+
+    This was visible now because the recently simplified TLP logic in
+    bef1909ee3ed1c ("tcp: fixing TLP's FIN recovery") could find that 0-byte
+    skb at the end of the write queue, and now that we do not check that
+    skb's length we could send it as a TLP probe.
+
+    Consider the following example scenario:
+
+     mss: 1000
+     skb: seq: 0 end_seq: 4000  len: 4000
+     SACK: start_seq: 3999 end_seq: 4000
+
+    The tcp_match_skb_to_sack() code will compute:
+
+     in_sack = false
+     pkt_len = start_seq - TCP_SKB_CB(skb)-&gt;seq = 3999 - 0 = 3999
+     new_len = (pkt_len / mss) * mss = (3999/1000)*1000 = 3000
+     new_len += mss = 4000
+
+    Previously we would find the new_len &gt; skb-&gt;len check failing, so we
+    would fall through and set pkt_len = new_len = 4000 and chop off
+    pkt_len of 4000 from the 4000-byte skb, leaving a 0-byte segment
+    afterward in the write queue.
+
+    With this new commit, we notice that the new new_len &gt;= skb-&gt;len check
+    succeeds, so that we return without trying to fragment.
+
+    Fixes: adb92db857ee ("tcp: Make SACK code to split only at mss boundaries")
+    Reported-by: Eric Dumazet &lt;edumazet@google.com&gt;
+    Signed-off-by: Neal Cardwell &lt;ncardwell@google.com&gt;
+    Cc: Eric Dumazet &lt;edumazet@google.com&gt;
+    Cc: Yuchung Cheng &lt;ycheng@google.com&gt;
+    Cc: Ilpo Jarvinen &lt;ilpo.jarvinen@helsinki.fi&gt;
+    Acked-by: Eric Dumazet &lt;edumazet@google.com&gt;
+    Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+</code></pre>
+
+<pre><code>    diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+    index 40661fc..b5c2375 100644
+    --- a/net/ipv4/tcp_input.c
+    +++ b/net/ipv4/tcp_input.c
+    @@ -1162,7 +1162,7 @@ static int tcp_match_skb_to_sack(struct sock *sk, struct sk_buff *skb,
+                unsigned int new_len = (pkt_len / mss) * mss;
+                if (!in_sack &amp;&amp; new_len &lt; pkt_len) {
+                    new_len += mss;
+    -               if (new_len &gt; skb-&gt;len)
+    +               if (new_len &gt;= skb-&gt;len)
+                        return 0;
+                }
+                pkt_len = new_len;
+</code></pre>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[gro收包]]></title>
@@ -77,8 +197,8 @@
     <id>http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-tcp_trim_head_bug</id>
     <content type="html"><![CDATA[<p><a href="http://kernel.opensuse.org/cgit/kernel/commit/?id=5b35e1e6e9ca651e6b291c96d1106043c9af314a">http://kernel.opensuse.org/cgit/kernel/commit/?id=5b35e1e6e9ca651e6b291c96d1106043c9af314a</a></p>
 
-<p>author  Neal Cardwell <a href="&#x6d;&#97;&#105;&#x6c;&#x74;&#x6f;&#x3a;&#x6e;&#x63;&#x61;&#x72;&#100;&#119;&#x65;&#108;&#108;&#64;&#x67;&#x6f;&#x6f;&#x67;&#108;&#x65;&#x2e;&#99;&#x6f;&#109;">&#x6e;&#x63;&#x61;&#114;&#100;&#119;&#x65;&#108;&#x6c;&#64;&#x67;&#111;&#x6f;&#103;&#108;&#101;&#x2e;&#x63;&#111;&#x6d;</a>    2012-01-28 17:29:46 (GMT)<br/>
-committer   David S. Miller <a href="&#x6d;&#x61;&#x69;&#108;&#116;&#x6f;&#58;&#x64;&#x61;&#x76;&#101;&#x6d;&#x40;&#x64;&#x61;&#x76;&#x65;&#109;&#x6c;&#111;&#102;&#x74;&#x2e;&#110;&#x65;&#x74;">&#100;&#97;&#118;&#101;&#109;&#64;&#100;&#x61;&#118;&#101;&#109;&#108;&#111;&#102;&#116;&#46;&#x6e;&#x65;&#x74;</a>   2012-01-30 17:42:58 (GMT)<br/>
+<p>author  Neal Cardwell <a href="&#x6d;&#x61;&#x69;&#108;&#116;&#x6f;&#58;&#110;&#x63;&#97;&#x72;&#x64;&#119;&#x65;&#x6c;&#108;&#64;&#x67;&#x6f;&#111;&#103;&#108;&#101;&#46;&#x63;&#111;&#109;">&#110;&#x63;&#x61;&#114;&#100;&#119;&#x65;&#108;&#108;&#64;&#103;&#111;&#x6f;&#x67;&#x6c;&#101;&#x2e;&#99;&#x6f;&#x6d;</a>    2012-01-28 17:29:46 (GMT)<br/>
+committer   David S. Miller <a href="&#109;&#x61;&#105;&#108;&#x74;&#111;&#x3a;&#100;&#x61;&#x76;&#101;&#109;&#64;&#x64;&#97;&#118;&#x65;&#109;&#x6c;&#x6f;&#102;&#x74;&#46;&#110;&#101;&#x74;">&#100;&#x61;&#118;&#101;&#109;&#64;&#x64;&#97;&#x76;&#101;&#x6d;&#108;&#111;&#102;&#x74;&#46;&#110;&#101;&#x74;</a>   2012-01-30 17:42:58 (GMT)<br/>
 commit  5b35e1e6e9ca651e6b291c96d1106043c9af314a (patch)<br/>
 tree    d18caadee5e93dc45d0c5fa2c530537cfa14586c<br/>
 parent  4acb41903b2f99f3dffd4c3df9acc84ca5942cb2 (diff)</p>
@@ -91,10 +211,10 @@ parent  4acb41903b2f99f3dffd4c3df9acc84ca5942cb2 (diff)</p>
 
 <p>As an aside, if tcp_trim_head() had really wanted the skb to reflect the current MSS, it should have called tcp_set_skb_tso_segs() unconditionally, since a decrease in MSS would mean that a single-packet skb should now be sliced into multiple segments.</p>
 
-<p>Signed-off-by: Neal Cardwell <a href="&#109;&#97;&#x69;&#x6c;&#116;&#x6f;&#x3a;&#x6e;&#99;&#x61;&#114;&#x64;&#x77;&#x65;&#108;&#108;&#x40;&#103;&#111;&#111;&#103;&#108;&#101;&#x2e;&#99;&#111;&#x6d;">&#110;&#x63;&#97;&#114;&#100;&#119;&#x65;&#x6c;&#108;&#64;&#103;&#x6f;&#x6f;&#103;&#108;&#101;&#x2e;&#x63;&#111;&#x6d;</a> <br/>
-Acked-by: Nandita Dukkipati <a href="&#109;&#97;&#x69;&#108;&#x74;&#111;&#58;&#110;&#97;&#x6e;&#x64;&#x69;&#116;&#x61;&#x64;&#64;&#x67;&#111;&#x6f;&#103;&#108;&#101;&#x2e;&#x63;&#111;&#x6d;">&#110;&#x61;&#110;&#100;&#x69;&#116;&#x61;&#100;&#64;&#103;&#111;&#x6f;&#103;&#x6c;&#101;&#x2e;&#99;&#111;&#109;</a> <br/>
-Acked-by: Ilpo Järvinen <a href="&#x6d;&#x61;&#x69;&#x6c;&#116;&#x6f;&#x3a;&#105;&#x6c;&#x70;&#111;&#46;&#x6a;&#97;&#x72;&#x76;&#x69;&#x6e;&#101;&#x6e;&#64;&#104;&#101;&#x6c;&#115;&#x69;&#x6e;&#x6b;&#x69;&#x2e;&#x66;&#105;">&#105;&#x6c;&#x70;&#x6f;&#46;&#106;&#x61;&#x72;&#x76;&#105;&#110;&#101;&#110;&#x40;&#104;&#x65;&#108;&#115;&#105;&#110;&#x6b;&#105;&#x2e;&#x66;&#x69;</a> <br/>
-Signed-off-by: David S. Miller <a href="&#109;&#x61;&#105;&#108;&#116;&#111;&#58;&#x64;&#x61;&#x76;&#101;&#109;&#x40;&#x64;&#x61;&#x76;&#x65;&#109;&#x6c;&#111;&#102;&#116;&#x2e;&#110;&#101;&#x74;">&#x64;&#x61;&#x76;&#x65;&#109;&#x40;&#100;&#x61;&#x76;&#101;&#x6d;&#108;&#111;&#x66;&#x74;&#46;&#x6e;&#101;&#x74;</a></p>
+<p>Signed-off-by: Neal Cardwell <a href="&#x6d;&#97;&#105;&#x6c;&#x74;&#111;&#x3a;&#x6e;&#99;&#x61;&#x72;&#x64;&#119;&#x65;&#x6c;&#108;&#x40;&#103;&#x6f;&#111;&#x67;&#x6c;&#x65;&#x2e;&#99;&#x6f;&#109;">&#110;&#99;&#97;&#114;&#x64;&#x77;&#101;&#108;&#108;&#64;&#x67;&#x6f;&#111;&#x67;&#x6c;&#101;&#x2e;&#99;&#x6f;&#x6d;</a> <br/>
+Acked-by: Nandita Dukkipati <a href="&#x6d;&#x61;&#105;&#x6c;&#116;&#x6f;&#58;&#x6e;&#x61;&#110;&#100;&#105;&#116;&#97;&#100;&#x40;&#x67;&#111;&#x6f;&#103;&#x6c;&#101;&#x2e;&#x63;&#x6f;&#109;">&#x6e;&#97;&#110;&#x64;&#x69;&#116;&#97;&#x64;&#x40;&#x67;&#x6f;&#111;&#103;&#108;&#101;&#46;&#99;&#111;&#x6d;</a> <br/>
+Acked-by: Ilpo Järvinen <a href="&#109;&#x61;&#105;&#x6c;&#116;&#111;&#58;&#105;&#108;&#x70;&#111;&#46;&#x6a;&#97;&#x72;&#118;&#105;&#x6e;&#101;&#x6e;&#64;&#x68;&#101;&#108;&#115;&#x69;&#110;&#107;&#x69;&#46;&#x66;&#105;">&#x69;&#108;&#x70;&#x6f;&#46;&#x6a;&#97;&#114;&#118;&#105;&#x6e;&#x65;&#110;&#64;&#x68;&#101;&#x6c;&#115;&#105;&#x6e;&#x6b;&#105;&#46;&#x66;&#x69;</a> <br/>
+Signed-off-by: David S. Miller <a href="&#109;&#97;&#x69;&#x6c;&#x74;&#x6f;&#58;&#x64;&#97;&#118;&#101;&#x6d;&#64;&#100;&#x61;&#118;&#x65;&#x6d;&#108;&#x6f;&#102;&#x74;&#46;&#110;&#x65;&#116;">&#100;&#x61;&#118;&#x65;&#x6d;&#64;&#x64;&#97;&#x76;&#x65;&#x6d;&#108;&#111;&#x66;&#116;&#46;&#110;&#101;&#x74;</a></p>
 
 <p>1 files changed, 2 insertions, 4 deletions
 <code>
@@ -113,7 +233,7 @@ Signed-off-by: David S. Miller <a href="&#109;&#x61;&#105;&#108;&#116;&#111;&#58
     -       tcp_set_skb_tso_segs(sk, skb, tcp_current_mss(sk));
     +       tcp_set_skb_tso_segs(sk, skb, tcp_skb_mss(skb));
         return 0;
-    }
+     }
 </code></p>
 
 <hr />
@@ -301,238 +421,6 @@ Signed-off-by: David S. Miller <a href="&#109;&#x61;&#105;&#108;&#116;&#111;&#58
 
     然后将skb1, skb2发送出去, tp-&gt;packets_out += 3; 这时假设ack了skb，清掉skb1和skb2的一个mss，。。。没错。。。
 </code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[ubuntu安装systemtap]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/28/debug-ubuntu-stap/"/>
-    <updated>2015-04-28T14:42:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/28/debug-ubuntu-stap</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/ustc_dylan/article/details/7079876">http://blog.csdn.net/ustc_dylan/article/details/7079876</a></p>
-
-<h4>1. 从源安装systemtap</h4>
-
-<pre><code>    $ sudo apt-get install systemtap
-</code></pre>
-
-<h4>2. 安装kernel-debug-info</h4>
-
-<p>由于ubuntu 桌面版默认没有安装kernel-debug-info，所以安装了systemtap后仍然不能够追踪内核信息，因此需要手动安装kernel-debug-info包。</p>
-
-<h5>（1）查看当前内核版本</h5>
-
-<pre><code>    $ uname -a
-    Linux kk-desktop 2.6.32-73-generic #141-Ubuntu SMP Tue Mar 10 17:15:10 UTC 2015 x86_64 GNU/Linux
-</code></pre>
-
-<h5>（2）下载对应内核版本的debug-info package</h5>
-
-<p><a href="http://ddebs.ubuntu.com/pool/main/l/linux/">http://ddebs.ubuntu.com/pool/main/l/linux/</a></p>
-
-<p><a href="http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb">http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb</a></p>
-
-<h4>3. 安装kernel-debug-info</h4>
-
-<pre><code>    $ sudo dpkg -i linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb
-</code></pre>
-
-<p>经过以上安装配置后，就可以跟踪监控内核信息了，但是现在还不能跟踪linux内核模块的信息，因为，systemtap对linux内核模块的跟踪是通过libelf库来查找
-/usr/lib/debug目录下以.ko.dedug结尾的模块，但是linux发行版通常将linux模块的扩展名修改为.ko。</p>
-
-<h4>4. 安装elfutils并进行相应配置</h4>
-
-<pre><code>    $ sudo apt-get install elfutils
-</code></pre>
-
-<pre><code>    # 这些似乎不用
-    for file in `find /usr/lib/debug-name'*.ko' -print`
-        do
-        buildid=`eu-readelf-n $file| grep Build.ID:| awk '{print $3}'`
-        dir=`echo $buildid| cut-c1-2`
-        fn=`echo $buildid| cut-c3-`
-        rm -fr /usr/lib/debug/.build-id
-        mkdir -p/usr/lib/debug/.build-id/$dir
-        ln -s $file/usr/lib/debug/.build-id/$dir/$fn
-        ln -s $file/usr/lib/debug/.build-id/$dir/${fn}.debug
-        done
-</code></pre>
-
-<h4>5. 写个例子测试下</h4>
-
-<pre><code>    $ sudo stap -ve 'probe begin { log("hello world") exit() }'
-</code></pre>
-
-<p>如果能够打印出hello world，说明安装配置成功!</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[拥塞控制模块注意]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong/"/>
-    <updated>2015-04-15T14:24:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/15/debug-mark-cong</id>
-    <content type="html"><![CDATA[<h4>应用改变sock的拥塞控制算法</h4>
-
-<pre><code>    #define SOL_TCP 6
-    #define TCP_CONGESTION  13
-
-    strcpy(name, "cubic");
-    setsockopt (connfd, SOL_TCP, TCP_CONGESTION, name, strlen(name));
-</code></pre>
-
-<h5>net/socket.c</h5>
-
-<pre><code>    SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
-            char __user *, optval, int, optlen)
-    {
-        ...
-                err =
-                    sock-&gt;ops-&gt;setsockopt(sock, level, optname, optval,
-                              optlen);
-        ...
-    }
-</code></pre>
-
-<p>对于ipv4的tcp，sock->ops指向 net/ipv4/af_inet.c 中的 inet_stream_ops，所以setsockopt等于sock_common_setsockopt。</p>
-
-<h5>net/core/sock.c</h5>
-
-<pre><code>    int sock_common_setsockopt(struct socket *sock, int level, int optname,
-                   char __user *optval, unsigned int optlen)
-    {
-        struct sock *sk = sock-&gt;sk;
-
-        return sk-&gt;sk_prot-&gt;setsockopt(sk, level, optname, optval, optlen);
-    }
-</code></pre>
-
-<p>sk_prot 指向 net/ipv4/tcp_ipv4.c 中的 tcp_prot，所以setsockopt等于tcp_setsockopt</p>
-
-<h5>net/ipv4/tcp.c</h5>
-
-<pre><code>    int tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
-               unsigned int optlen)
-    {
-        struct inet_connection_sock *icsk = inet_csk(sk);
-
-        if (level != SOL_TCP)
-            return icsk-&gt;icsk_af_ops-&gt;setsockopt(sk, level, optname,
-                                 optval, optlen);
-        return do_tcp_setsockopt(sk, level, optname, optval, optlen);
-    }
-</code></pre>
-
-<p>因为level = SOL_TCP, optname = TCP_CONGESTION, 所以直接到do_tcp_setsockopt的第一个if里。</p>
-
-<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level,
-            int optname, char __user *optval, unsigned int optlen)
-    {
-        struct tcp_sock *tp = tcp_sk(sk);
-        struct inet_connection_sock *icsk = inet_csk(sk); 
-        int val;      
-        int err = 0;
-
-        /* This is a string value all the others are int's */
-        if (optname == TCP_CONGESTION) {      
-            char name[TCP_CA_NAME_MAX]; 
-
-            if (optlen &lt; 1)
-                return -EINVAL;
-
-            val = strncpy_from_user(name, optval,
-                        min_t(long, TCP_CA_NAME_MAX-1, optlen));
-            if (val &lt; 0)
-                return -EFAULT;
-            name[val] = 0;
-
-            lock_sock(sk);
-            err = tcp_set_congestion_control(sk, name);
-            release_sock(sk);
-            return err;
-        }
-
-    ...
-</code></pre>
-
-<h4>net/ipv4/tcp_cong.c</h4>
-
-<pre><code>    /* Change congestion control for socket */
-    int tcp_set_congestion_control(struct sock *sk, const char *name)
-    {
-        struct inet_connection_sock *icsk = inet_csk(sk);
-        struct tcp_congestion_ops *ca;
-        int err = 0;
-
-        rcu_read_lock();
-        ca = tcp_ca_find(name);
-
-        /* no change asking for existing value */
-        if (ca == icsk-&gt;icsk_ca_ops)
-            goto out;
-
-    #ifdef CONFIG_MODULES
-        /* not found attempt to autoload module */
-        if (!ca &amp;&amp; capable(CAP_NET_ADMIN)) {
-            rcu_read_unlock();
-            request_module("tcp_%s", name);
-            rcu_read_lock();
-            ca = tcp_ca_find(name);
-        }
-    #endif
-        if (!ca)
-            err = -ENOENT;
-
-        else if (!((ca-&gt;flags &amp; TCP_CONG_NON_RESTRICTED) || capable(CAP_NET_ADMIN)))
-            err = -EPERM;
-
-        else if (!try_module_get(ca-&gt;owner))
-            err = -EBUSY;
-
-        else {
-            tcp_cleanup_congestion_control(sk);
-            icsk-&gt;icsk_ca_ops = ca;
-
-            if (sk-&gt;sk_state != TCP_CLOSE &amp;&amp; icsk-&gt;icsk_ca_ops-&gt;init) // 如果sk-&gt;sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化
-                icsk-&gt;icsk_ca_ops-&gt;init(sk);
-        }
-     out:
-        rcu_read_unlock();
-        return err;
-    }
-</code></pre>
-
-<p>可以看到，如果sk->sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化。</p>
-
-<hr />
-
-<h4>那么什么时候sk->sk_state == TCP_CLOSE，并且还能调用setsockopt呢？</h4>
-
-<h5>举一种情况：当收到RST包的时候，tcp_rcv_established()->tcp_validate_incoming()->tcp_reset()->tcp_done()将sk置为TCP_CLOSE。</h5>
-
-<h5>如果拥塞控制模块中init有申请内存，release中释放内存。那么在上述情况下将会出现没有申请而直接释放的情况，导致panic。</h5>
-
-<pre><code>    BUG: unable to handle kernel paging request at ffffeba4000002a0
-
-    [&lt;ffffffff8115b17e&gt;] kfree+0x6e/0x240
-    [&lt;ffffffffa0068055&gt;] cong_release+0x35/0x50 [cong]
-    [&lt;ffffffff81467953&gt;] tcp_cleanup_congestion_control+0x23/0x40
-    [&lt;ffffffff81465bb9&gt;] tcp_v4_destroy_sock+0x29/0x2d0
-    [&lt;ffffffff8144e9e3&gt;] inet_csk_destroy_sock+0x53/0x140
-    [&lt;ffffffff814504c0&gt;] tcp_close+0x340/0x4a0
-    [&lt;ffffffff814748de&gt;] inet_release+0x5e/0x90
-    [&lt;ffffffff813f4359&gt;] sock_release+0x29/0x90
-    [&lt;ffffffff813f43d7&gt;] sock_close+0x17/0x40
-    [&lt;ffffffff81173ed3&gt;] __fput+0xf3/0x220
-    [&lt;ffffffff8117401c&gt;] fput+0x1c/0x30
-    [&lt;ffffffff8116df2d&gt;] filp_close+0x5d/0x90
-    [&lt;ffffffff8117090c&gt;] sys_close+0xac/0x110
-    [&lt;ffffffff8100af72&gt;] system_call_fastpath+0x16/0x1b
-</code></pre>
-
-<h4>测试代码</h4>
-
-<p><a href="/download/debug/congestion_mod_panic.tar.gz">congestion_mod_panic</a></p>
 ]]></content>
   </entry>
   
