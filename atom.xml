@@ -4,7 +4,7 @@
   <title><![CDATA[kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-05-11T12:20:22+08:00</updated>
+  <updated>2015-05-11T18:16:33+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,279 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[tcp三个接收队列]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/11/kernel-net-tcp_queue/"/>
+    <updated>2015-05-11T15:46:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/11/kernel-net-tcp_queue</id>
+    <content type="html"><![CDATA[<p><a href="http://www.cnblogs.com/alreadyskb/p/4386565.html">http://www.cnblogs.com/alreadyskb/p/4386565.html</a></p>
+
+<h4>三个接收队列</h4>
+
+<ul>
+<li>tcp协议栈数据接收实现了三个接收缓存分别是prequeue、sk_write_queue、sk_backlog。</li>
+</ul>
+
+
+<p>之所以需要三个接收缓存的原因如下：<br/>
+tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者中断上下文占用：</p>
+
+<p>  1、如果处于进程上下文sk_lock.owned=1，软中断因为sk_lock.owned=1，所以数据只能暂存在后备队列中（backlog），当进程上下文逻辑处理完成后会回调tcp_v4_do_rcv处理backlog队列作为补偿，具体看tcp_sendmsg 函数 release_sock的实现。</p>
+
+<p>  2、如果当前处于中断上下文，sk_lock.owned=0，那么数据可能被放置到receive_queue或者prequeue，数据优先放置到prequeue中，如果prequeue满了则会放置到receive_queue中，理论上这里有一个队列就行了，但是TCP协议栈为什么要设计两个呢？其实是为了快点结束软中断数据处理流程，软中断处理函数中禁止了进程抢占和其他软中断发生，效率应该是很低下的，如果数据被放置到prequeue中，那么软中断流程很快就结束了，如果放置到receive_queue那么会有很复杂的逻辑需要处理。receive_queue队列的处理在软中断中，prequeue队列的处理则是在进程上下文中。总的来说就是为了提高TCP协议栈的效率。</p>
+
+<h4>后备队列的处理逻辑</h4>
+
+<h5>1、什么时候使用后备队列</h5>
+
+<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
+
+<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么接收到的skb则只能先放置到后备队列中sk_backlog中。如果是软中断上下文则可以放置到prequeue和sk_write_queue中。</p>
+
+<p>代码片段如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>    bh_lock_sock_nested(sk);               // 获取第一把锁。
+</span><span class='line'>    ret = 0;
+</span><span class='line'>    if (!sock_owned_by_user(sk)) {         // 判断第二把锁，区分是处于进程上下文还是软中断上下文。
+</span><span class='line'>#ifdef CONFIG_NET_DMA
+</span><span class='line'>        struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>        if (!tp-&gt;ucopy.dma_chan && tp-&gt;ucopy.pinned_list)
+</span><span class='line'>            tp-&gt;ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+</span><span class='line'>        if (tp-&gt;ucopy.dma_chan)
+</span><span class='line'>            ret = tcp_v4_do_rcv(sk, skb);
+</span><span class='line'>        else
+</span><span class='line'>#endif
+</span><span class='line'>        {
+</span><span class='line'>            if (!tcp_prequeue(sk, skb))    // 如果处于中断上下文，则优先放置到prequeue中，如果prequeue满则放置到sk_write_queue中。
+</span><span class='line'>                ret = tcp_v4_do_rcv(sk, skb);
+</span><span class='line'>        }
+</span><span class='line'>    } else if (unlikely(sk_add_backlog(sk, skb,  // 如果是处于进程上下文则直接放置到后备队列中(sk_backlog中)。
+</span><span class='line'>                        sk-&gt;sk_rcvbuf + sk-&gt;sk_sndbuf))) {
+</span><span class='line'>        bh_unlock_sock(sk);
+</span><span class='line'>        NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
+</span><span class='line'>        goto discard_and_relse;
+</span><span class='line'>    }
+</span><span class='line'>    bh_unlock_sock(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2、skb怎么add到sk_backlog中</h5>
+
+<p>sk_add_backlog函数用于add sbk到sk_backlog中，所以下面我们分析次函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* The per-socket spinlock must be held here. */
+</span><span class='line'>static inline __must_check int sk_add_backlog(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>                           unsigned int limit)
+</span><span class='line'>{
+</span><span class='line'>    if (sk_rcvqueues_full(sk, skb, limit))  // 判断接收缓存是否已经用完了，很明显sk_backlog的缓存大小也算在了总接收缓存中。
+</span><span class='line'>        return -ENOBUFS;
+</span><span class='line'>
+</span><span class='line'>    __sk_add_backlog(sk, skb);              // 将skb添加到sk_backlog队列中。
+</span><span class='line'>    sk_extended(sk)-&gt;sk_backlog.len += skb-&gt;truesize;  // 更新sk_backlog中已经挂载的数据量。
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* OOB backlog add */
+</span><span class='line'>static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    if (!sk-&gt;sk_backlog.tail) {   // 如果当前sk_backlog为NULL，此时head和tail都指向skb。
+</span><span class='line'>        sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = skb;
+</span><span class='line'>    } else {                      // 分支表示sk_backlog中已经有数据了，那么skb直接挂在tail的尾部，之后tail指针后移到skb。
+</span><span class='line'>        sk-&gt;sk_backlog.tail-&gt;next = skb;
+</span><span class='line'>        sk-&gt;sk_backlog.tail = skb;
+</span><span class='line'>    }
+</span><span class='line'>    skb-&gt;next = NULL;             // 这种很重要，在sk_backlog处理时会用来判断skb是否处理完毕。
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3、sk_backlog中skb的处理</h5>
+
+<p>很明显sk_backlog的处理必然中进程上下文进行，对于数据接收，进程上下文的接口是tcp_recvmmsg，所以sk_backlog肯定要在tcp_recvmmsg中处理。</p>
+
+<p>tcp_recvmmsg sk_backlog的代码处理片段如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_cleanup_rbuf(sk, copied);
+</span><span class='line'>TCP_CHECK_TIMER(sk);
+</span><span class='line'>release_sock(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>release_sock(sk)涉及到sk_backlog处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    /*
+</span><span class='line'>    * The sk_lock has mutex_unlock() semantics:
+</span><span class='line'>    */
+</span><span class='line'>    mutex_release(&sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
+</span><span class='line'>
+</span><span class='line'>    spin_lock_bh(&sk-&gt;sk_lock.slock);   // 获取第一把锁。
+</span><span class='line'>    if (sk-&gt;sk_backlog.tail)            // 如果后备队列不为NULL，则开始处理。
+</span><span class='line'>        __release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>    if (proto_has_rhel_ext(sk-&gt;sk_prot, RHEL_PROTO_HAS_RELEASE_CB) &&
+</span><span class='line'>            sk-&gt;sk_prot-&gt;release_cb)
+</span><span class='line'>        sk-&gt;sk_prot-&gt;release_cb(sk);
+</span><span class='line'>
+</span><span class='line'>    sk-&gt;sk_lock.owned = 0;              // 进成上下文skb处理完了，释放第二把锁。
+</span><span class='line'>    if (waitqueue_active(&sk-&gt;sk_lock.wq))
+</span><span class='line'>        wake_up(&sk-&gt;sk_lock.wq);
+</span><span class='line'>    spin_unlock_bh(&sk-&gt;sk_lock.slock); // 释放第一把锁。
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p><code>__release_sock(sk)</code>是后备队列的真正处理函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    struct sk_buff *skb = sk-&gt;sk_backlog.head;
+</span><span class='line'>
+</span><span class='line'>    do {
+</span><span class='line'>        sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = NULL;
+</span><span class='line'>        bh_unlock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>        do {
+</span><span class='line'>            struct sk_buff *next = skb-&gt;next;
+</span><span class='line'>
+</span><span class='line'>            skb-&gt;next = NULL;
+</span><span class='line'>            sk_backlog_rcv(sk, skb);    // skb的处理函数，其实调用的是tcp_v4_do_rcv函数。
+</span><span class='line'>
+</span><span class='line'>            /*
+</span><span class='line'>             * We are in process context here with softirqs
+</span><span class='line'>             * disabled, use cond_resched_softirq() to preempt.
+</span><span class='line'>             * This is safe to do because we've taken the backlog
+</span><span class='line'>             * queue private:
+</span><span class='line'>             */
+</span><span class='line'>            cond_resched_softirq();
+</span><span class='line'>
+</span><span class='line'>            skb = next;
+</span><span class='line'>        } while (skb != NULL);          // 如果skb=NULL，那么说明之前的sk_backlog已经处理完了。
+</span><span class='line'>
+</span><span class='line'>        bh_lock_sock(sk);
+</span><span class='line'>    } while ((skb = sk-&gt;sk_backlog.head) != NULL); // 在处理上一个sk_backlog时，可能被软中断中断了，建立了新的sk_backlog，新建立的sk_backlog也将一并被处理。
+</span><span class='line'>
+</span><span class='line'>    /*
+</span><span class='line'>    * Doing the zeroing here guarantee we can not loop forever
+</span><span class='line'>    * while a wild producer attempts to flood us.
+</span><span class='line'>    */
+</span><span class='line'>    sk_extended(sk)-&gt;sk_backlog.len = 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  一开始重置sk->sk_backlog.head ，sk->sk_backlog.tail为NULL。sk_backlog是一个双链表，head指向了链表头部的skb，而tail则指向了链表尾部的skb。这里之所以置NULL head 和tail，是因为struct sk_buff *skb = sk->sk_backlog.head 提前取到了head指向的skb，之后就可以通过skb->next来获取下一个skb处理，结束的条件是skb->next=NULL，这个是在<code>__sk_add_backlog</code>函数中置位的，也就说对于sk_backlog的处理head和tail指针已经没有用了。</p>
+
+<p>  为什么要置NULLsk->sk_backlog.head ，sk->sk_backlog.tail呢？第一想法是它可能要被重新使用了。那么在什么情况下会被重新使用呢？试想一下当前是在进程上下文，并且sk->sk_lock.slock没有被锁住，那是不是可能被软中断打断呢？如果被软中断打断了是不是要接收数据呢，tcp协议栈为了效率考虑肯定是要接收数据的，前面分析道这种情况的数据必须放置到后备队列中(sk_backlog)，所以可以肯定置NULL sk->sk_backlog.head ，sk->sk_backlog.tail是为了在处理上一个sk_backlog时，能重用sk_backlog，建立一条新的sk_backlog，或许有人会问为什么不直接添加到原先的sk_backlog tail末尾呢？这个问题我也没有想太清楚，或许是同步不好做吧。</p>
+
+<h5>4、skb被处理到哪去了</h5>
+
+<p>  很明显接收的数据最终都将被传递到应用层，在传递到应用层前必须要保证三个接收队列中的数据有序，那么这三个队列是怎么保证数据字节流有序的被递交给应用层呢？三个队列都会调用tcp_v4_do_rcv函数，prequeue和sk_backlog是在tcp_recvmsg中调用tcp_v4_do_rcv函数，也就是进程上下文中调用tcp_v4_do_rcv函数。</p>
+
+<p>  如果仔细分析tcp_v4_do_rcv函数能发现，这个函数能保证数据有序的排列在一起，所以无论是在处理sk_backlog还是prequeue，最终都会调用tcp_v4_do_rcv函数将数据有效地插入到sk_write_queue中，最后被应用层取走。</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[tcp_read_sock BUG]]></title>
@@ -319,8 +592,8 @@ tcp_collapse中：</p>
     <id>http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-tcp_trim_head_bug</id>
     <content type="html"><![CDATA[<p><a href="http://kernel.opensuse.org/cgit/kernel/commit/?id=5b35e1e6e9ca651e6b291c96d1106043c9af314a">http://kernel.opensuse.org/cgit/kernel/commit/?id=5b35e1e6e9ca651e6b291c96d1106043c9af314a</a></p>
 
-<p>author  Neal Cardwell <a href="&#x6d;&#x61;&#105;&#108;&#x74;&#x6f;&#x3a;&#x6e;&#x63;&#97;&#114;&#x64;&#x77;&#x65;&#x6c;&#x6c;&#x40;&#x67;&#111;&#111;&#103;&#108;&#101;&#46;&#99;&#111;&#x6d;">&#110;&#99;&#97;&#x72;&#100;&#x77;&#101;&#108;&#108;&#x40;&#x67;&#x6f;&#x6f;&#x67;&#108;&#101;&#46;&#x63;&#x6f;&#x6d;</a>    2012-01-28 17:29:46 (GMT)<br/>
-committer   David S. Miller <a href="&#109;&#x61;&#x69;&#x6c;&#x74;&#x6f;&#x3a;&#x64;&#x61;&#x76;&#101;&#109;&#64;&#100;&#x61;&#118;&#x65;&#x6d;&#108;&#x6f;&#x66;&#x74;&#x2e;&#110;&#101;&#x74;">&#100;&#97;&#118;&#101;&#x6d;&#x40;&#x64;&#97;&#118;&#101;&#x6d;&#x6c;&#x6f;&#102;&#116;&#46;&#110;&#101;&#116;</a>   2012-01-30 17:42:58 (GMT)<br/>
+<p>author  Neal Cardwell <a href="&#x6d;&#x61;&#x69;&#x6c;&#x74;&#x6f;&#x3a;&#x6e;&#x63;&#97;&#x72;&#100;&#x77;&#x65;&#108;&#x6c;&#x40;&#103;&#x6f;&#x6f;&#x67;&#108;&#101;&#46;&#x63;&#x6f;&#x6d;">&#110;&#99;&#97;&#x72;&#x64;&#x77;&#101;&#x6c;&#x6c;&#x40;&#103;&#111;&#x6f;&#x67;&#x6c;&#x65;&#46;&#99;&#111;&#x6d;</a>    2012-01-28 17:29:46 (GMT)<br/>
+committer   David S. Miller <a href="&#109;&#97;&#105;&#x6c;&#x74;&#111;&#x3a;&#100;&#x61;&#x76;&#x65;&#109;&#x40;&#x64;&#x61;&#118;&#101;&#x6d;&#x6c;&#x6f;&#x66;&#116;&#x2e;&#110;&#x65;&#x74;">&#x64;&#x61;&#x76;&#x65;&#109;&#x40;&#x64;&#97;&#118;&#x65;&#x6d;&#108;&#x6f;&#102;&#x74;&#46;&#110;&#101;&#x74;</a>   2012-01-30 17:42:58 (GMT)<br/>
 commit  5b35e1e6e9ca651e6b291c96d1106043c9af314a (patch)<br/>
 tree    d18caadee5e93dc45d0c5fa2c530537cfa14586c<br/>
 parent  4acb41903b2f99f3dffd4c3df9acc84ca5942cb2 (diff)</p>
@@ -333,10 +606,10 @@ parent  4acb41903b2f99f3dffd4c3df9acc84ca5942cb2 (diff)</p>
 
 <p>As an aside, if tcp_trim_head() had really wanted the skb to reflect the current MSS, it should have called tcp_set_skb_tso_segs() unconditionally, since a decrease in MSS would mean that a single-packet skb should now be sliced into multiple segments.</p>
 
-<p>Signed-off-by: Neal Cardwell <a href="&#109;&#97;&#105;&#x6c;&#116;&#x6f;&#58;&#x6e;&#99;&#97;&#x72;&#x64;&#x77;&#x65;&#108;&#x6c;&#64;&#x67;&#111;&#111;&#x67;&#108;&#x65;&#46;&#x63;&#111;&#109;">&#x6e;&#99;&#x61;&#114;&#100;&#x77;&#101;&#108;&#108;&#x40;&#103;&#x6f;&#111;&#x67;&#x6c;&#x65;&#46;&#99;&#x6f;&#x6d;</a> <br/>
-Acked-by: Nandita Dukkipati <a href="&#x6d;&#97;&#x69;&#x6c;&#x74;&#x6f;&#x3a;&#x6e;&#97;&#x6e;&#100;&#105;&#x74;&#x61;&#100;&#64;&#103;&#111;&#111;&#103;&#x6c;&#101;&#46;&#x63;&#x6f;&#x6d;">&#x6e;&#x61;&#x6e;&#100;&#105;&#116;&#x61;&#x64;&#64;&#103;&#111;&#x6f;&#103;&#x6c;&#101;&#46;&#x63;&#x6f;&#x6d;</a> <br/>
-Acked-by: Ilpo Järvinen <a href="&#x6d;&#x61;&#x69;&#x6c;&#x74;&#111;&#58;&#105;&#108;&#112;&#x6f;&#x2e;&#x6a;&#x61;&#114;&#x76;&#x69;&#x6e;&#101;&#x6e;&#x40;&#x68;&#x65;&#108;&#x73;&#105;&#110;&#x6b;&#x69;&#x2e;&#102;&#105;">&#x69;&#x6c;&#x70;&#111;&#x2e;&#106;&#97;&#x72;&#118;&#105;&#110;&#x65;&#x6e;&#x40;&#104;&#101;&#108;&#x73;&#x69;&#x6e;&#107;&#x69;&#x2e;&#x66;&#x69;</a> <br/>
-Signed-off-by: David S. Miller <a href="&#x6d;&#97;&#x69;&#108;&#116;&#x6f;&#x3a;&#x64;&#x61;&#118;&#x65;&#x6d;&#64;&#100;&#x61;&#118;&#x65;&#109;&#x6c;&#111;&#102;&#116;&#46;&#x6e;&#x65;&#x74;">&#x64;&#97;&#118;&#101;&#109;&#x40;&#100;&#x61;&#x76;&#101;&#109;&#x6c;&#111;&#x66;&#x74;&#x2e;&#110;&#x65;&#x74;</a></p>
+<p>Signed-off-by: Neal Cardwell <a href="&#x6d;&#97;&#x69;&#x6c;&#116;&#x6f;&#58;&#110;&#99;&#97;&#x72;&#x64;&#x77;&#101;&#x6c;&#x6c;&#64;&#103;&#111;&#111;&#x67;&#x6c;&#x65;&#x2e;&#99;&#111;&#109;">&#110;&#99;&#97;&#x72;&#100;&#119;&#x65;&#x6c;&#108;&#64;&#x67;&#111;&#111;&#x67;&#x6c;&#101;&#46;&#x63;&#x6f;&#x6d;</a> <br/>
+Acked-by: Nandita Dukkipati <a href="&#x6d;&#x61;&#105;&#108;&#116;&#x6f;&#x3a;&#x6e;&#97;&#x6e;&#x64;&#105;&#116;&#x61;&#100;&#64;&#103;&#x6f;&#x6f;&#103;&#x6c;&#101;&#x2e;&#x63;&#x6f;&#109;">&#x6e;&#x61;&#110;&#100;&#x69;&#x74;&#97;&#x64;&#x40;&#103;&#111;&#x6f;&#103;&#108;&#101;&#x2e;&#x63;&#111;&#x6d;</a> <br/>
+Acked-by: Ilpo Järvinen <a href="&#x6d;&#97;&#x69;&#108;&#x74;&#x6f;&#x3a;&#x69;&#108;&#112;&#111;&#x2e;&#106;&#97;&#x72;&#118;&#x69;&#110;&#101;&#110;&#64;&#x68;&#101;&#x6c;&#x73;&#x69;&#x6e;&#107;&#105;&#46;&#x66;&#x69;">&#105;&#108;&#x70;&#111;&#46;&#106;&#x61;&#114;&#118;&#105;&#x6e;&#101;&#110;&#64;&#x68;&#x65;&#x6c;&#x73;&#x69;&#x6e;&#107;&#x69;&#46;&#x66;&#105;</a> <br/>
+Signed-off-by: David S. Miller <a href="&#x6d;&#97;&#105;&#x6c;&#x74;&#x6f;&#58;&#100;&#97;&#118;&#101;&#109;&#x40;&#100;&#x61;&#x76;&#101;&#x6d;&#x6c;&#111;&#102;&#116;&#x2e;&#110;&#x65;&#116;">&#100;&#x61;&#118;&#101;&#x6d;&#64;&#100;&#97;&#x76;&#x65;&#x6d;&#x6c;&#x6f;&#102;&#x74;&#x2e;&#110;&#x65;&#116;</a></p>
 
 <p>1 files changed, 2 insertions, 4 deletions</p>
 
@@ -377,309 +650,6 @@ Signed-off-by: David S. Miller <a href="&#x6d;&#97;&#x69;&#108;&#116;&#x6f;&#x3a
 <hr />
 
 <p>会出现tp->packets_out不正确, 导致sk_write_queue为空时却掉tcp_rearm_rto()，判断tp->packets_out不为0，启动重传定时器，然后重传时取出的是list_head的地址，不是skb的地址，导致后面异常。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[如果sk_write_queue异常]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-write_queue/"/>
-    <updated>2015-05-08T14:14:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-write_queue</id>
-    <content type="html"><![CDATA[<ul>
-<li>注意，以下情况内核都不可能产生，纯属假设</li>
-</ul>
-
-
-<h4>一、连续的SYN/FIN</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>|---FIN---|---SYN/FIN---|
-</span><span class='line'>    skb       next_skb</span></code></pre></td></tr></table></div></figure>
-
-
-<ul>
-<li>内核不可能出现是因为：发送FIN包后就不再发包。所以FIN包只可能在sk_write_queue的最后一个包</li>
-</ul>
-
-
-<p>假设skb和next_skb发出去后都丢了，那tcp_retransmit_skb会重传skb，
-重传的时候会调用tcp_retrans_try_collapse尝试去和下一个包合并。</p>
-
-<p>skb和next_skb合并过程：<br/>
-先检查一些条件，然后</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>...
-</span><span class='line'>skb_copy_from_linear_data(next_skb, skb_put(skb, next_skb_size), next_skb_size);
-</span><span class='line'>...
-</span><span class='line'>TCP_SKB_CB(skb)-&gt;end_seq = TCP_SKB_CB(next_skb)-&gt;end_seq;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>也就是skb->len += next_skb->len; skb->end_seq = next_skb->end_seq;</p>
-
-<p>假设:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb-&gt;len = 0;      skb-&gt;seq = 10;      skb-&gt;end_seq = 10 + FIN = 11;
-</span><span class='line'>next_skb-&gt;len = 0; next_skb-&gt;seq = 11; next_skb-&gt;end_seq = 11 + SYN/FIN = 12;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>那么合并后：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb-&gt;len = 0;      skb-&gt;seq = 10;      skb-&gt;end_seq = 12;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>很明显不正常了，正常情况下：skb->len &lt;= skb->end_seq - skb->seq &lt;= skb->len+1</p>
-
-<p>这时如果来了ack 11，那么会再重传合并后的skb，然后会调用tcp_trim_head(struct ws_st_sock <em>sk, struct sk_buff </em>skb, u32 len)，参数len = tp->snd_una - TCP_SKB_CB(skb)->seq = 1，但skb->len = 0;</p>
-
-<p>tcp_trim_head函数中会：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb-&gt;len -= len;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这时skb->len = (U32)-1 = 0xFFFFFFFF，skb->len错误后，再调用skb_copy之类的就会访问越界，报BUG。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> 821 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)
-</span><span class='line'> 822 {
-</span><span class='line'>        ......
-</span><span class='line'> 835         if (skb_copy_bits(skb, -headerlen, n-&gt;head, headerlen + skb-&gt;len))
-</span><span class='line'> 836                 BUG();</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>二、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<ul>
-<li>内核用tp->write_seq控制，保证了write_queue的skb->end_seq == next_skb->seq</li>
-</ul>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
-</span><span class='line'>next_skb:  |---------------------|
-</span><span class='line'>
-</span><span class='line'>假设skb已经发送出去，并被ack了，这时tp-&gt;snd_una = skb-&gt;end_seq
-</span><span class='line'>此时再发送next_skb，并且mss变小了，需要对next_skb分包，分包后如下：
-</span><span class='line'>
-</span><span class='line'>skb:       |------------------|
-</span><span class='line'>next_skb:  |-------|-------:-----|
-</span><span class='line'>              skb1       skb2
-</span><span class='line'>
-</span><span class='line'>next_skb 被分成了两个包，skb1-&gt;len = mss, skb1-&gt;gso_segs = 1; skb2-&gt;len &gt; mss, skb2-&gt;gso_segs = 2;
-</span><span class='line'>skb1, skb2发送出去，丢了，然后重传skb1，
-</span><span class='line'>此时 skb1-&gt;end_seq &lt; tp-&gt;snd_una
-</span><span class='line'>
-</span><span class='line'>2092 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>2093 {
-</span><span class='line'>        ......
-</span><span class='line'>2111         if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {
-</span><span class='line'>2112                 if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))
-</span><span class='line'>2113                         BUG();</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>三、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
-</span><span class='line'>next_skb:  |---------------------|
-</span><span class='line'>
-</span><span class='line'>skb, next_skb 发送出去丢了，重传，调用tcp_retrans_try_collapse合并。
-</span><span class='line'>合并后：skb-&gt;len += next_skb-&gt;len; skb-&gt;end_seq = next_skb-&gt;end_seq;
-</span><span class='line'>
-</span><span class='line'>假设   skb-&gt;len = 100;      skb-&gt;seq = 0;      skb-&gt;end_seq = 100;
-</span><span class='line'>      next_skb-&gt;len = 120  next_skb-&gt;seq = 0; next_skb-&gt;end_seq = 120;
-</span><span class='line'>合并后 skb-&gt;len = 200;      skb-&gt;seq = 0;      skb-&gt;end_seq = 120;
-</span><span class='line'>
-</span><span class='line'>发送合并后的skb，再丢包，再重传，mss = 150，skb-&gt;len &gt; mss, 会分包
-</span><span class='line'>      skb-&gt;len = 150;      skb-&gt;seq = 0;      skb-&gt;end_seq = 150;
-</span><span class='line'>      next_skb-&gt;len = 50;  next_skb-&gt;seq = 150; next_skb-&gt;end_seq = 120;
-</span><span class='line'>也就是出现了next_skb-&gt;seq &gt; next_skb-&gt;end_seq
-</span><span class='line'>(此时如果ack skb也会把next_skb一起清了，因为next_skb-&gt;end_seq &lt; skb-&gt;end_seq)
-</span><span class='line'>
-</span><span class='line'>这时如果skb再重传分包，分成skb3，skb4
-</span><span class='line'>    skb3-&gt;len = 130;   skb3-&gt;seq = 0;   skb3-&gt;end_seq = 130;
-</span><span class='line'>    skb4-&gt;len = 20;    skb4-&gt;seq = 130; skb4-&gt;end_seq = 150;
-</span><span class='line'>
-</span><span class='line'>这时ack了skb3，tp-&gt;snd_una = 130 (虽然next_skb-&gt;end_seq &lt; skb3-&gt;end_seq, 但skb4-&gt;end_seq &gt; skb3-&gt;end_seq, 所以不会把next_skb清掉)
-</span><span class='line'>重传skb4，skb5，此时skb5-&gt;end_seq &lt; tp-&gt;snd_una
-</span><span class='line'>
-</span><span class='line'>2092 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>2093 {
-</span><span class='line'>        ......
-</span><span class='line'>2111         if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {
-</span><span class='line'>2112                 if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))
-</span><span class='line'>2113                         BUG();</span></code></pre></td></tr></table></div></figure>
-
-
-<p></p>
-
-<h4>四、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
-</span><span class='line'>next_skb:  |---------------------|
-</span><span class='line'>
-</span><span class='line'>发送 skb，next_skb
-</span><span class='line'>接收到 sack:|---------------------|
-</span><span class='line'>
-</span><span class='line'>调用tcp_sacktag_walk() ---&gt; tcp_shift_skb_data() 将多个被sack的包合并成一个。
-</span><span class='line'>合并过程：
-</span><span class='line'>    skb-&gt;len += next_skb-&gt;len; skb-&gt;end_seq += next_skb-&gt;len;
-</span><span class='line'>那么就会合并出一超出原来end_seq的包：
-</span><span class='line'>           |----------------------------------------|
-</span><span class='line'>然后再ack:  |----------------------|
-</span><span class='line'>这时把合并出的包trim掉一部分，剩skb7:  |-----------------|
-</span><span class='line'>
-</span><span class='line'>再发包skb_new:                     |-------|
-</span><span class='line'>这时tp-&gt;snd_nxt = skb_new-&gt;end_seq
-</span><span class='line'>再重传skb7, 并分包:                 |----------|------|
-</span><span class='line'>分包时skb7-&gt;end_seq &gt; tp-&gt;snd_nxt, 所以不会调整tp-&gt;packets_out，
-</span><span class='line'>但ack到来时(tcp_clean_rtx_queue)tp-&gt;packets_out却会减去分包后的gso_segs。
-</span><span class='line'>导致tp-&gt;packets_out &lt; 0, 但sk_write_queue却是空的。
-</span><span class='line'>tcp_rearm_rto()判断tp-&gt;packets_out不为0，启动重传定时器，然后重传时取出的是list_head的地址，不是skb的地址，导致后面异常。
-</span><span class='line'>代码：
-</span><span class='line'> 974 int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
-</span><span class='line'> 975                  unsigned int mss_now)
-</span><span class='line'> 976 {
-</span><span class='line'>    ......
-</span><span class='line'>1047         if (!before(tp-&gt;snd_nxt, TCP_SKB_CB(buff)-&gt;end_seq)) {
-</span><span class='line'>1048                 int diff = old_factor - tcp_skb_pcount(skb) -
-</span><span class='line'>1049                         tcp_skb_pcount(buff);
-</span><span class='line'>1050 
-</span><span class='line'>1051                 if (diff)
-</span><span class='line'>1052                         tcp_adjust_pcount(sk, skb, diff);
-</span><span class='line'>1053         }
-</span><span class='line'>
-</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>五（发现好像没错）、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<ul>
-<li>内核用tp->write_seq控制，保证了write_queue的skb->end_seq == next_skb->seq</li>
-</ul>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
-</span><span class='line'>next_skb:  |---------------------|
-</span><span class='line'>
-</span><span class='line'>假设skb已经发送出去，这时tp-&gt;snd_nxt = skb-&gt;end_seq
-</span><span class='line'>发送next_skb时mss变小了，需要对next_skb分包，分包后如下：
-</span><span class='line'>
-</span><span class='line'>skb:       |------------------|
-</span><span class='line'>next_skb:  |-------|-------:-----|
-</span><span class='line'>              skb1       skb2
-</span><span class='line'>next_skb 被分成了两个包，skb1-&gt;len = mss, skb1-&gt;gso_segs = 1; skb2-&gt;len &gt; mss, skb2-&gt;gso_segs = 2;
-</span><span class='line'>
-</span><span class='line'>然后将skb1, skb2发送出去, tp-&gt;packets_out += 3; 这时假设ack了skb，清掉skb1和skb2的一个mss，。。。没错。。。
-</span></code></pre></td></tr></table></div></figure>
-
-
-
 ]]></content>
   </entry>
   

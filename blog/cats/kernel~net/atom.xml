@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~net | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~net/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-05-11T12:20:22+08:00</updated>
+  <updated>2015-05-11T18:16:33+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,200 +14,63 @@
 
   
   <entry>
-    <title type="html"><![CDATA[文件socket]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/29/kernel-net-socket-file/"/>
-    <updated>2015-04-29T17:32:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/29/kernel-net-socket-file</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/y_23k_bug/article/details/9993555">http://blog.csdn.net/y_23k_bug/article/details/9993555</a></p>
+    <title type="html"><![CDATA[tcp三个接收队列]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/11/kernel-net-tcp_queue/"/>
+    <updated>2015-05-11T15:46:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/11/kernel-net-tcp_queue</id>
+    <content type="html"><![CDATA[<p><a href="http://www.cnblogs.com/alreadyskb/p/4386565.html">http://www.cnblogs.com/alreadyskb/p/4386565.html</a></p>
 
-<h4>1. 建立socket</h4>
+<h4>三个接收队列</h4>
 
-<pre><code>    #include&lt;sys/socket.h&gt;
+<ul>
+<li>tcp协议栈数据接收实现了三个接收缓存分别是prequeue、sk_write_queue、sk_backlog。</li>
+</ul>
 
-    int socket(
-        int domain,    //地址族的类型AF_UNIX (绑定在本地) AF_INET（绑定在网卡）
-        int type,      //支持的数据格式：流SOCK_STREAM/报文SOCK_DGRAM
-        int protocol); //支持的协议,建议为0
 
-    返回值：
-        成功返回文件描述符号。
-        失败返回-1;
-</code></pre>
+<p>之所以需要三个接收缓存的原因如下：<br/>
+tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者中断上下文占用：</p>
 
-<h4>2.绑定在地址上(文件目录地址)URL(Universe ResourceLocation)</h4>
+<p>  1、如果处于进程上下文sk_lock.owned=1，软中断因为sk_lock.owned=1，所以数据只能暂存在后备队列中（backlog），当进程上下文逻辑处理完成后会回调tcp_v4_do_rcv处理backlog队列作为补偿，具体看tcp_sendmsg 函数 release_sock的实现。</p>
 
-<pre><code>    协议://路径/文件名
-    file:///usr/bin/ls      普通文件
-    http://192.168.0.72/index.php
-    struct sockaddr;  地址结构体
-</code></pre>
+<p>  2、如果当前处于中断上下文，sk_lock.owned=0，那么数据可能被放置到receive_queue或者prequeue，数据优先放置到prequeue中，如果prequeue满了则会放置到receive_queue中，理论上这里有一个队列就行了，但是TCP协议栈为什么要设计两个呢？其实是为了快点结束软中断数据处理流程，软中断处理函数中禁止了进程抢占和其他软中断发生，效率应该是很低下的，如果数据被放置到prequeue中，那么软中断流程很快就结束了，如果放置到receive_queue那么会有很复杂的逻辑需要处理。receive_queue队列的处理在软中断中，prequeue队列的处理则是在进程上下文中。总的来说就是为了提高TCP协议栈的效率。</p>
 
-<pre><code>    #include&lt;linux/un.h&gt;
+<h4>后备队列的处理逻辑</h4>
 
-    struct sockaddr_un;   un=unix（绑定unix本地）
+<h5>1、什么时候使用后备队列</h5>
 
-    struct sockaddr_un {
-        sa_family_t   sun_family; /*AF_UNIX*/
-        char sun_path[UNIX_PATH_MAX];
-    };
-</code></pre>
+<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
 
-<pre><code>    struct sockaddr_in;   in=internet（绑定网卡）
-    int bind(int fd,           //socket描述符号
-        struct sockaddr *addr, //绑定地址
-        socklen_tsize);        //地址长度
+<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么接收到的skb则只能先放置到后备队列中sk_backlog中。如果是软中断上下文则可以放置到prequeue和sk_write_queue中。</p>
 
-    返回值：
-        0成功
-        -1失败
-</code></pre>
+<p>代码片段如下：
+<code>
+        bh_lock_sock_nested(sk);               // 获取第一把锁。
+        ret = 0;
+        if (!sock_owned_by_user(sk)) {         // 判断第二把锁，区分是处于进程上下文还是软中断上下文。
+    #ifdef CONFIG_NET_DMA
+            struct tcp_sock *tp = tcp_sk(sk);
+            if (!tp-&gt;ucopy.dma_chan &amp;&amp; tp-&gt;ucopy.pinned_list)
+                tp-&gt;ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+            if (tp-&gt;ucopy.dma_chan)
+                ret = tcp_v4_do_rcv(sk, skb);
+            else
+    #endif
+            {
+                if (!tcp_prequeue(sk, skb))    // 如果处于中断上下文，则优先放置到prequeue中，如果prequeue满则放置到sk_write_queue中。
+                    ret = tcp_v4_do_rcv(sk, skb);
+            }
+        } else if (unlikely(sk_add_backlog(sk, skb,  // 如果是处于进程上下文则直接放置到后备队列中(sk_backlog中)。
+                            sk-&gt;sk_rcvbuf + sk-&gt;sk_sndbuf))) {
+            bh_unlock_sock(sk);
+            NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
+            goto discard_and_relse;
+        }
+        bh_unlock_sock(sk);
+</code></p>
 
-<h4>样例</h4>
+<h5>2、skb怎么add到sk_backlog中</h5>
 
-<h5>server.c</h5>
-
-<pre><code>    #include&lt;sys/socket.h&gt;
-    #include&lt;stdio.h&gt;
-    #include&lt;stdlib.h&gt;
-    #include&lt;string.h&gt;
-    #include&lt;unistd.h&gt;
-    #include&lt;linux/un.h&gt;
-
-    int main()
-    {
-        int fd; 
-        int r;
-        char buf[100];
-        //1.建立socket
-        fd = socket(AF_UNIX, SOCK_DGRAM, 0);  //AF_FILE 等同//AF_UNIX
-        if (fd == -1) {
-            printf("socket error:%m\n");
-            exit(-1);
-        }   
-
-        //2.构造本地文件地址
-        struct sockaddr_un addr = {0};
-        addr.sun_family = AF_UNIX; //必须跟socket的地址族一致
-        memcpy(addr.sun_path, "my.sock", strlen("my.sock"));
-
-        //3.把socket绑定在地址上
-        r = bind(fd, (struct sockaddr *)&amp;addr, sizeof(addr));
-        if (r == -1) {
-            printf("bind error:%m\n");
-            exit(-1);
-        }   
-
-        //4.接收数据
-        bzero(buf , sizeof(buf));
-        r = read(fd, buf, sizeof(buf));
-        buf[r] = 0;
-        printf("%s\n", buf);
-
-        //5.关闭
-        close(fd);
-
-        //6.删除socket文件
-        unlink("my.sock");
-
-        //socket文件不会自动删除，需要在程序结尾去删除该文件，否则，再次运行//A程序出错
-        return 0;
-    }
-</code></pre>
-
-<h5>client.c</h5>
-
-<pre><code>    #include&lt;stdio.h&gt;
-    #include&lt;stdlib.h&gt;
-    #include&lt;sys/socket.h&gt;
-    #include&lt;linux/un.h&gt;
-    #include&lt;string.h&gt;
-    #include&lt;unistd.h&gt;
-
-    int main()
-    {
-        int fd; 
-        int r;
-        struct sockaddr_un addr = {0};
-        //1.建立socket
-        fd = socket(AF_UNIX, SOCK_DGRAM, 0); 
-
-        //2.连接到指定的地址
-        addr.sun_family = AF_UNIX;
-        memcpy(addr.sun_path, "my.sock", strlen("my.sock"));
-        r = connect(fd, (struct sockaddr*)&amp;addr, sizeof(addr));
-
-        //3.发送数据
-        write(fd, "hello!", strlen("hello!"));
-
-        //4.关闭
-        close(fd);
-        return 0;
-    }
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[TCP状态转换]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-tcp-state/"/>
-    <updated>2015-04-18T16:13:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-tcp-state</id>
-    <content type="html"><![CDATA[<p><img src="/images/kernel/2015-04-18-1.png" alt="" /></p>
-
-<h5>1、建立连接协议（三次握手）</h5>
-
-<p>(1) 客户端发送一个带SYN标志的TCP报文到服务器。这是三次握手过程中的报文1。<br/>
-(2) 服务器端回应客户端的，这是三次握手中的第2个报文，这个报文同时带ACK标志和SYN标志。因此它表示对刚才客户端SYN报文的回应；同时又标志SYN给客户端，询问客户端是否准备好进行数据通讯。<br/>
-(3) 客户必须再次回应服务段一个ACK报文，这是报文段3。</p>
-
-<h5>2、连接终止协议（四次握手）</h5>
-
-<p>  由于TCP连接是全双工的，因此每个方向都必须单独进行关闭。这原则是当一方完成它的数据发送任务后就能发送一个FIN来终止这个方向的连接。收到一个 FIN只意味着这一方向上没有数据流动，一个TCP连接在收到一个FIN后仍能发送数据。首先进行关闭的一方将执行主动关闭，而另一方执行被动关闭。<br/>
-(1) TCP客户端发送一个FIN，用来关闭客户到服务器的数据传送（报文段4）。<br/>
-(2) 服务器收到这个FIN，它发回一个ACK，确认序号为收到的序号加1（报文段5）。和SYN一样，一个FIN将占用一个序号。<br/>
-(3) 服务器关闭客户端的连接，发送一个FIN给客户端（报文段6）。<br/>
-(4) 客户段发回ACK报文确认，并将确认序号设置为收到序号加1（报文段7）。</p>
-
-<h4>tcp状态解释</h4>
-
-<ol>
-<li>CLOSED: 表示初始状态。</li>
-<li>LISTEN: 表示服务器端的某个SOCKET处于监听状态，可以接受连接了.</li>
-<li>SYN_SENT: 客户端通过应用程序调用connect进行active open.于是客户端tcp发送一个SYN以请求建立一个连接.之后状态置为SYN_SENT.</li>
-<li>SYN_RECV: 服务端应发出ACK确认客户端的SYN,同时自己向客户端发送一个SYN.之后状态置为SYN_RECV.</li>
-<li>ESTABLISHED：代表一个打开的连接，双方可以进行或已经在数据交互了.</li>
-<li>FIN_WAIT_1: 主动关闭(active close)端应用程序调用close，于是其TCP发出FIN请求主动关闭连接，之后进入FIN_WAIT1状态.</li>
-<li>FIN_WAIT2: 主动关闭端接到ACK后，就进入了FIN-WAIT-2 . 其实FIN_WAIT_1和FIN_WAIT_2状态的真正含义都是表示等待对方的FIN报文。而这两种状态的区别 是：FIN_WAIT_1状态实际上是当SOCKET在ESTABLISHED状态时，它想主动关闭连接，向对方发送了FIN报文，此时该SOCKET即 进入到FIN_WAIT_1状态。而当对方回应ACK报文后，则进入到FIN_WAIT_2状态.</li>
-<li>CLOSE_WAIT: CLOSE_WAIT:被动关闭(passive close)端TCP接到FIN后，就发出ACK以回应FIN请求(它的接收也作为文件结束符传递给上层应用程序),并进入CLOSE_WAIT。接下来还有数据发送给对方，如果没有的话，那么你也就可以 close这个SOCKET，发送FIN报文给对方，也即关闭连接。所以你在CLOSE_WAIT状态下，需要完成的事情是等待你去关闭连接.</li>
-<li>LAST_ACK: 被动关闭端一段时间后，接收到文件结束符的应用程序将调用CLOSE关闭连接。这导致它的TCP也发送一个 FIN,等待对方的ACK.就进入了LAST-ACK.</li>
-<li>TIME_WAIT: 在主动关闭端接收到FIN后，TCP就发送ACK包，并进入TIME-WAIT状态.</li>
-<li>CLOSING: 正常情况下，当你发送FIN报文后，按理来说是应该先收到（或同时收到）对方的 ACK报文，再收到对方的FIN报文。但是CLOSING状态表示你发送FIN报文后，没有收到对方的ACK报文，反而收到了对方的FIN报文。表示双方都正在关闭SOCKET连接.</li>
-<li>CLOSED: 被动关闭端在接受到ACK包后，就进入了closed的状态。连接结束.</li>
-</ol>
-
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[linux kernel 网络协议栈之GRO(Generic receive offload)]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-gro/"/>
-    <updated>2015-04-18T15:48:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-gro</id>
-    <content type="html"><![CDATA[<hr />
-
-<h2>Attention: gro会合并多个gso_size不同的包, 会将gso_size设置成第一个包的gso_size.</h2>
-
-<p><a href="http://www.pagefault.info/?p=159">http://www.pagefault.info/?p=159</a></p>
-
-<p>GRO(Generic receive offload)在内核2.6.29之后合并进去的，作者是一个华裔Herbert Xu ,GRO的简介可以看这里：</p>
-
-<p><a href="http://lwn.net/Articles/358910/">http://lwn.net/Articles/358910/</a></p>
-
-<p>先来描述一下GRO的作用，GRO是针对网络接受包的处理的，并且只是针对NAPI类型的驱动，因此如果要支持GRO，不仅要内核支持，而且驱动也必须调用相应的借口，用ethtool -K gro on来设置，如果报错就说明网卡驱动本身就不支持GRO。</p>
-
-<p>GRO类似tso，可是tso只支持发送数据包，这样你tcp层大的段会在网卡被切包，然后再传递给对端，而如果没有gro，则小的段会被一个个送到协议栈，有了gro之后，就会在接收端做一个反向的操作(想对于tso).也就是将tso切好的数据包组合成大包再传递给协议栈。</p>
-
-<p>如果实现了GRO支持的驱动是这样子处理数据的，在NAPI的回调poll方法中读取数据包，然后调用GRO的接口napi_gro_receive或者napi_gro_frags来将数据包feed进协议栈。而具体GRO的工作就是在这两个函数中进行的，他们最终都会调用<code>__napi_gro_receive</code>。下面就是napi_gro_receive，它最终会调用napi_skb_finish以及<code>__napi_gro_receive</code>。
+<p>sk_add_backlog函数用于add sbk到sk_backlog中，所以下面我们分析次函数。
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -523,1049 +386,1001 @@
 <span class='line-number'>313</span>
 <span class='line-number'>314</span>
 <span class='line-number'>315</span>
-<span class='line-number'>316</span>
-<span class='line-number'>317</span>
-<span class='line-number'>318</span>
-<span class='line-number'>319</span>
-<span class='line-number'>320</span>
-<span class='line-number'>321</span>
-<span class='line-number'>322</span>
-<span class='line-number'>323</span>
-<span class='line-number'>324</span>
-<span class='line-number'>325</span>
-<span class='line-number'>326</span>
-<span class='line-number'>327</span>
-<span class='line-number'>328</span>
-<span class='line-number'>329</span>
-<span class='line-number'>330</span>
-<span class='line-number'>331</span>
-<span class='line-number'>332</span>
-<span class='line-number'>333</span>
-<span class='line-number'>334</span>
-<span class='line-number'>335</span>
-<span class='line-number'>336</span>
-<span class='line-number'>337</span>
-<span class='line-number'>338</span>
-<span class='line-number'>339</span>
-<span class='line-number'>340</span>
-<span class='line-number'>341</span>
-<span class='line-number'>342</span>
-<span class='line-number'>343</span>
-<span class='line-number'>344</span>
-<span class='line-number'>345</span>
-<span class='line-number'>346</span>
-<span class='line-number'>347</span>
-<span class='line-number'>348</span>
-<span class='line-number'>349</span>
-<span class='line-number'>350</span>
-<span class='line-number'>351</span>
-<span class='line-number'>352</span>
-<span class='line-number'>353</span>
-<span class='line-number'>354</span>
-<span class='line-number'>355</span>
-<span class='line-number'>356</span>
-<span class='line-number'>357</span>
-<span class='line-number'>358</span>
-<span class='line-number'>359</span>
-<span class='line-number'>360</span>
-<span class='line-number'>361</span>
-<span class='line-number'>362</span>
-<span class='line-number'>363</span>
-<span class='line-number'>364</span>
-<span class='line-number'>365</span>
-<span class='line-number'>366</span>
-<span class='line-number'>367</span>
-<span class='line-number'>368</span>
-<span class='line-number'>369</span>
-<span class='line-number'>370</span>
-<span class='line-number'>371</span>
-<span class='line-number'>372</span>
-<span class='line-number'>373</span>
-<span class='line-number'>374</span>
-<span class='line-number'>375</span>
-<span class='line-number'>376</span>
-<span class='line-number'>377</span>
-<span class='line-number'>378</span>
-<span class='line-number'>379</span>
-<span class='line-number'>380</span>
-<span class='line-number'>381</span>
-<span class='line-number'>382</span>
-<span class='line-number'>383</span>
-<span class='line-number'>384</span>
-<span class='line-number'>385</span>
-<span class='line-number'>386</span>
-<span class='line-number'>387</span>
-<span class='line-number'>388</span>
-<span class='line-number'>389</span>
-<span class='line-number'>390</span>
-<span class='line-number'>391</span>
-<span class='line-number'>392</span>
-<span class='line-number'>393</span>
-<span class='line-number'>394</span>
-<span class='line-number'>395</span>
-<span class='line-number'>396</span>
-<span class='line-number'>397</span>
-<span class='line-number'>398</span>
-<span class='line-number'>399</span>
-<span class='line-number'>400</span>
-<span class='line-number'>401</span>
-<span class='line-number'>402</span>
-<span class='line-number'>403</span>
-<span class='line-number'>404</span>
-<span class='line-number'>405</span>
-<span class='line-number'>406</span>
-<span class='line-number'>407</span>
-<span class='line-number'>408</span>
-<span class='line-number'>409</span>
-<span class='line-number'>410</span>
-<span class='line-number'>411</span>
-<span class='line-number'>412</span>
-<span class='line-number'>413</span>
-<span class='line-number'>414</span>
-<span class='line-number'>415</span>
-<span class='line-number'>416</span>
-<span class='line-number'>417</span>
-<span class='line-number'>418</span>
-<span class='line-number'>419</span>
-<span class='line-number'>420</span>
-<span class='line-number'>421</span>
-<span class='line-number'>422</span>
-<span class='line-number'>423</span>
-<span class='line-number'>424</span>
-<span class='line-number'>425</span>
-<span class='line-number'>426</span>
-<span class='line-number'>427</span>
-<span class='line-number'>428</span>
-<span class='line-number'>429</span>
-<span class='line-number'>430</span>
-<span class='line-number'>431</span>
-<span class='line-number'>432</span>
-<span class='line-number'>433</span>
-<span class='line-number'>434</span>
-<span class='line-number'>435</span>
-<span class='line-number'>436</span>
-<span class='line-number'>437</span>
-<span class='line-number'>438</span>
-<span class='line-number'>439</span>
-<span class='line-number'>440</span>
-<span class='line-number'>441</span>
-<span class='line-number'>442</span>
-<span class='line-number'>443</span>
-<span class='line-number'>444</span>
-<span class='line-number'>445</span>
-<span class='line-number'>446</span>
-<span class='line-number'>447</span>
-<span class='line-number'>448</span>
-<span class='line-number'>449</span>
-<span class='line-number'>450</span>
-<span class='line-number'>451</span>
-<span class='line-number'>452</span>
-<span class='line-number'>453</span>
-<span class='line-number'>454</span>
-<span class='line-number'>455</span>
-<span class='line-number'>456</span>
-<span class='line-number'>457</span>
-<span class='line-number'>458</span>
-<span class='line-number'>459</span>
-<span class='line-number'>460</span>
-<span class='line-number'>461</span>
-<span class='line-number'>462</span>
-<span class='line-number'>463</span>
-<span class='line-number'>464</span>
-<span class='line-number'>465</span>
-<span class='line-number'>466</span>
-<span class='line-number'>467</span>
-<span class='line-number'>468</span>
-<span class='line-number'>469</span>
-<span class='line-number'>470</span>
-<span class='line-number'>471</span>
-<span class='line-number'>472</span>
-<span class='line-number'>473</span>
-<span class='line-number'>474</span>
-<span class='line-number'>475</span>
-<span class='line-number'>476</span>
-<span class='line-number'>477</span>
-<span class='line-number'>478</span>
-<span class='line-number'>479</span>
-<span class='line-number'>480</span>
-<span class='line-number'>481</span>
-<span class='line-number'>482</span>
-<span class='line-number'>483</span>
-<span class='line-number'>484</span>
-<span class='line-number'>485</span>
-<span class='line-number'>486</span>
-<span class='line-number'>487</span>
-<span class='line-number'>488</span>
-<span class='line-number'>489</span>
-<span class='line-number'>490</span>
-<span class='line-number'>491</span>
-<span class='line-number'>492</span>
-<span class='line-number'>493</span>
-<span class='line-number'>494</span>
-<span class='line-number'>495</span>
-<span class='line-number'>496</span>
-<span class='line-number'>497</span>
-<span class='line-number'>498</span>
-<span class='line-number'>499</span>
-<span class='line-number'>500</span>
-<span class='line-number'>501</span>
-<span class='line-number'>502</span>
-<span class='line-number'>503</span>
-<span class='line-number'>504</span>
-<span class='line-number'>505</span>
-<span class='line-number'>506</span>
-<span class='line-number'>507</span>
-<span class='line-number'>508</span>
-<span class='line-number'>509</span>
-<span class='line-number'>510</span>
-<span class='line-number'>511</span>
-<span class='line-number'>512</span>
-<span class='line-number'>513</span>
-<span class='line-number'>514</span>
-<span class='line-number'>515</span>
-<span class='line-number'>516</span>
-<span class='line-number'>517</span>
-<span class='line-number'>518</span>
-<span class='line-number'>519</span>
-<span class='line-number'>520</span>
-<span class='line-number'>521</span>
-<span class='line-number'>522</span>
-<span class='line-number'>523</span>
-<span class='line-number'>524</span>
-<span class='line-number'>525</span>
-<span class='line-number'>526</span>
-<span class='line-number'>527</span>
-<span class='line-number'>528</span>
-<span class='line-number'>529</span>
-<span class='line-number'>530</span>
-<span class='line-number'>531</span>
-<span class='line-number'>532</span>
-<span class='line-number'>533</span>
-<span class='line-number'>534</span>
-<span class='line-number'>535</span>
-<span class='line-number'>536</span>
-<span class='line-number'>537</span>
-<span class='line-number'>538</span>
-<span class='line-number'>539</span>
-<span class='line-number'>540</span>
-<span class='line-number'>541</span>
-<span class='line-number'>542</span>
-<span class='line-number'>543</span>
-<span class='line-number'>544</span>
-<span class='line-number'>545</span>
-<span class='line-number'>546</span>
-<span class='line-number'>547</span>
-<span class='line-number'>548</span>
-<span class='line-number'>549</span>
-<span class='line-number'>550</span>
-<span class='line-number'>551</span>
-<span class='line-number'>552</span>
-<span class='line-number'>553</span>
-<span class='line-number'>554</span>
-<span class='line-number'>555</span>
-<span class='line-number'>556</span>
-<span class='line-number'>557</span>
-<span class='line-number'>558</span>
-<span class='line-number'>559</span>
-<span class='line-number'>560</span>
-<span class='line-number'>561</span>
-<span class='line-number'>562</span>
-<span class='line-number'>563</span>
-<span class='line-number'>564</span>
-<span class='line-number'>565</span>
-<span class='line-number'>566</span>
-<span class='line-number'>567</span>
-<span class='line-number'>568</span>
-<span class='line-number'>569</span>
-<span class='line-number'>570</span>
-<span class='line-number'>571</span>
-<span class='line-number'>572</span>
-<span class='line-number'>573</span>
-<span class='line-number'>574</span>
-<span class='line-number'>575</span>
-<span class='line-number'>576</span>
-<span class='line-number'>577</span>
-<span class='line-number'>578</span>
-<span class='line-number'>579</span>
-<span class='line-number'>580</span>
-<span class='line-number'>581</span>
-<span class='line-number'>582</span>
-<span class='line-number'>583</span>
-<span class='line-number'>584</span>
-<span class='line-number'>585</span>
-<span class='line-number'>586</span>
-<span class='line-number'>587</span>
-<span class='line-number'>588</span>
-<span class='line-number'>589</span>
-<span class='line-number'>590</span>
-<span class='line-number'>591</span>
-<span class='line-number'>592</span>
-<span class='line-number'>593</span>
-<span class='line-number'>594</span>
-<span class='line-number'>595</span>
-<span class='line-number'>596</span>
-<span class='line-number'>597</span>
-<span class='line-number'>598</span>
-<span class='line-number'>599</span>
-<span class='line-number'>600</span>
-<span class='line-number'>601</span>
-<span class='line-number'>602</span>
-<span class='line-number'>603</span>
-<span class='line-number'>604</span>
-<span class='line-number'>605</span>
-<span class='line-number'>606</span>
-<span class='line-number'>607</span>
-<span class='line-number'>608</span>
-<span class='line-number'>609</span>
-<span class='line-number'>610</span>
-<span class='line-number'>611</span>
-<span class='line-number'>612</span>
-<span class='line-number'>613</span>
-<span class='line-number'>614</span>
-<span class='line-number'>615</span>
-<span class='line-number'>616</span>
-<span class='line-number'>617</span>
-<span class='line-number'>618</span>
-<span class='line-number'>619</span>
-<span class='line-number'>620</span>
-<span class='line-number'>621</span>
-<span class='line-number'>622</span>
-<span class='line-number'>623</span>
-<span class='line-number'>624</span>
-<span class='line-number'>625</span>
-<span class='line-number'>626</span>
-<span class='line-number'>627</span>
-<span class='line-number'>628</span>
-<span class='line-number'>629</span>
-<span class='line-number'>630</span>
-<span class='line-number'>631</span>
-<span class='line-number'>632</span>
-<span class='line-number'>633</span>
-<span class='line-number'>634</span>
-<span class='line-number'>635</span>
-<span class='line-number'>636</span>
-<span class='line-number'>637</span>
-<span class='line-number'>638</span>
-<span class='line-number'>639</span>
-<span class='line-number'>640</span>
-<span class='line-number'>641</span>
-<span class='line-number'>642</span>
-<span class='line-number'>643</span>
-<span class='line-number'>644</span>
-<span class='line-number'>645</span>
-<span class='line-number'>646</span>
-<span class='line-number'>647</span>
-<span class='line-number'>648</span>
-<span class='line-number'>649</span>
-<span class='line-number'>650</span>
-<span class='line-number'>651</span>
-<span class='line-number'>652</span>
-<span class='line-number'>653</span>
-<span class='line-number'>654</span>
-<span class='line-number'>655</span>
-<span class='line-number'>656</span>
-<span class='line-number'>657</span>
-<span class='line-number'>658</span>
-<span class='line-number'>659</span>
-<span class='line-number'>660</span>
-<span class='line-number'>661</span>
-<span class='line-number'>662</span>
-<span class='line-number'>663</span>
-<span class='line-number'>664</span>
-<span class='line-number'>665</span>
-<span class='line-number'>666</span>
-<span class='line-number'>667</span>
-<span class='line-number'>668</span>
-<span class='line-number'>669</span>
-<span class='line-number'>670</span>
-<span class='line-number'>671</span>
-<span class='line-number'>672</span>
-<span class='line-number'>673</span>
-<span class='line-number'>674</span>
-<span class='line-number'>675</span>
-<span class='line-number'>676</span>
-<span class='line-number'>677</span>
-<span class='line-number'>678</span>
-<span class='line-number'>679</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>gro_result_t napi_gro_receive(struct napi_struct &lt;em&gt;napi, struct sk_buff &lt;/em&gt;skb)
+</pre></td><td class='code'><pre><code class=''><span class='line'>/&lt;em&gt; The per-socket spinlock must be held here. &lt;/em&gt;/
+</span><span class='line'>static inline __must_check int sk_add_backlog(struct sock &lt;em&gt;sk, struct sk_buff &lt;/em&gt;skb,
+</span><span class='line'>                           unsigned int limit)
 </span><span class='line'>{
-</span><span class='line'>    skb_gro_reset_offset(skb);&lt;/p&gt;
+</span><span class='line'>    if (sk_rcvqueues_full(sk, skb, limit))  // 判断接收缓存是否已经用完了，很明显sk_backlog的缓存大小也算在了总接收缓存中。
+</span><span class='line'>        return -ENOBUFS;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    return napi_skb_finish(__napi_gro_receive(napi, skb), skb);
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    __sk_add_backlog(sk, skb);              // 将skb添加到sk_backlog队列中。
+</span><span class='line'>sk_extended(sk)-&gt;sk_backlog.len += skb-&gt;truesize;  // 更新sk_backlog中已经挂载的数据量。
+</span><span class='line'>return 0;
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;然后GRO什么时候会将数据feed进协议栈呢，这里会有两个退出点，一个是在napi_skb_finish里，他会通过判断`__napi_gro_receive`的返回值，来决定是需要将数据包立即feed进协议栈还是保存起来，还有一个点是当napi的循环执行完毕时，也就是执行napi_complete的时候，先来看napi_skb_finish,napi_complete我们后面会详细介绍。
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>在NAPI驱动中，直接调用netif_receive_skb会将数据feed 进协议栈，因此这里如果返回值是NORMAL，则直接调用netif_receive_skb来将数据送进协议栈。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* OOB backlog add */
+</span><span class='line'>static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
 </span><span class='line'>{
-</span><span class='line'>switch (ret) {
-</span><span class='line'>case GRO_NORMAL:
-</span><span class='line'>    //将数据包送进协议栈
-</span><span class='line'>    if (netif_receive_skb(skb))
-</span><span class='line'>        ret = GRO_DROP;
-</span><span class='line'>    break;
-</span><span class='line'>//表示skb可以被free，因为gro已经将skb合并并保存起来。
-</span><span class='line'>case GRO_DROP:
-</span><span class='line'>case GRO_MERGED_FREE:
-</span><span class='line'>    //free skb
-</span><span class='line'>    kfree_skb(skb);
-</span><span class='line'>    break;
-</span><span class='line'>//这个表示当前数据已经被gro保存起来，但是并没有进行合并，因此skb还需要保存。
-</span><span class='line'>case GRO_HELD:
-</span><span class='line'>case GRO_MERGED:
-</span><span class='line'>    break;
+</span><span class='line'>if (!sk-&gt;sk_backlog.tail) {   // 如果当前sk_backlog为NULL，此时head和tail都指向skb。
+</span><span class='line'>    sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = skb;
+</span><span class='line'>} else {                      // 分支表示sk_backlog中已经有数据了，那么skb直接挂在tail的尾部，之后tail指针后移到skb。
+</span><span class='line'>    sk-&gt;sk_backlog.tail-&gt;next = skb;
+</span><span class='line'>    sk-&gt;sk_backlog.tail = skb;
 </span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>return ret;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;GRO的主要思想就是，组合一些类似的数据包(基于一些数据域，后面会介绍到)为一个大的数据包(一个skb)，然后feed给协议栈，这里主要是利用Scatter-gather IO，也就是skb的struct skb_shared_info域(我前面的blog讲述ip分片的时候有详细介绍这个域)来合并数据包。
-</span><span class='line'>
-</span><span class='line'>在每个NAPI的实例都会包括一个域叫gro_list,保存了我们积攒的数据包(将要被merge的).然后每次进来的skb都会在这个链表里面进行查找，看是否需要merge。而gro_count表示当前的gro_list中的skb的个数。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct napi_struct {
-</span><span class='line'>................................................
-</span><span class='line'>//个数
-</span><span class='line'>unsigned int        gro_count;
-</span><span class='line'>......................................
-</span><span class='line'>//积攒的数据包
-</span><span class='line'>struct sk_buff      *gro_list;
-</span><span class='line'>struct sk_buff      *skb;
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;紧接着是gro最核心的一个数据结构napi_gro_cb,它是保存在skb的cb域中，它保存了gro要使用到的一些上下文，这里每个域kernel的注释都比较清楚。到后面我们会看到这些域的具体用途。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct napi_gro_cb {
-</span><span class='line'>/* Virtual address of skb_shinfo(skb)-&gt;frags[0].page + offset. */
-</span><span class='line'>void *frag0;
-</span><span class='line'>
-</span><span class='line'>/* Length of frag0. */
-</span><span class='line'>unsigned int frag0_len;
-</span><span class='line'>
-</span><span class='line'>/* This indicates where we are processing relative to skb-&gt;data. */
-</span><span class='line'>int data_offset;
-</span><span class='line'>
-</span><span class='line'>/* This is non-zero if the packet may be of the same flow. */
-</span><span class='line'>int same_flow;
-</span><span class='line'>
-</span><span class='line'>/* This is non-zero if the packet cannot be merged with the new skb. */
-</span><span class='line'>int flush;
-</span><span class='line'>
-</span><span class='line'>/* Number of segments aggregated. */
-</span><span class='line'>int count;
-</span><span class='line'>
-</span><span class='line'>/* Free the skb? */
-</span><span class='line'>int free;
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;每一层协议都实现了自己的gro回调函数，gro_receive和gro_complete，gro系统会根据协议来调用对应回调函数，其中gro_receive是将输入skb尽量合并到我们gro_list中。而gro_complete则是当我们需要提交gro合并的数据包到协议栈时被调用的。
-</span><span class='line'>
-</span><span class='line'>下面就是ip层和tcp层对应的回调方法：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static const struct net_protocol tcp_protocol = {
-</span><span class='line'>.handler =  tcp_v4_rcv,
-</span><span class='line'>.err_handler =  tcp_v4_err,
-</span><span class='line'>.gso_send_check = tcp_v4_gso_send_check,
-</span><span class='line'>.gso_segment =  tcp_tso_segment,
-</span><span class='line'>//gso回调
-</span><span class='line'>.gro_receive =  tcp4_gro_receive,
-</span><span class='line'>.gro_complete = tcp4_gro_complete,
-</span><span class='line'>.no_policy =    1,
-</span><span class='line'>.netns_ok = 1,
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>static struct packet_type ip_packet_type __read_mostly = {
-</span><span class='line'>.type = cpu_to_be16(ETH_P_IP),
-</span><span class='line'>.func = ip_rcv,
-</span><span class='line'>.gso_send_check = inet_gso_send_check,
-</span><span class='line'>.gso_segment = inet_gso_segment,
-</span><span class='line'>//gso回调
-</span><span class='line'>.gro_receive = inet_gro_receive,
-</span><span class='line'>.gro_complete = inet_gro_complete,
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;gro的入口函数是napi_gro_receive，它的实现很简单，就是将skb包含的gro上下文reset，然后调用`__napi_gro_receive`,最终通过napi_skb_finis来判断是否需要讲数据包feed进协议栈。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>//reset gro对应的域
-</span><span class='line'>skb_gro_reset_offset(skb);
-</span><span class='line'>
-</span><span class='line'>return napi_skb_finish(__napi_gro_receive(napi, skb), skb);
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断传递进来的ret(`__napi_gro_receive`的返回值),来决定是否需要feed数据进协议栈。它的第二个参数是前面处理过的skb。
-</span><span class='line'>
-</span><span class='line'>这里再来看下skb_gro_reset_offset，首先要知道一种情况，那就是skb本身不包含数据(包括头也没有),而所有的数据都保存在skb_shared_info中(支持S/G的网卡有可能会这么做).此时我们如果想要合并的话，就需要将包头这些信息取出来，也就是从skb_shared_info的frags[0]中去的，在 skb_gro_reset_offset中就有做这个事情,而这里就会把头的信息保存到napi_gro_cb 的frags0中。并且此时frags必然不会在high mem,要么是线性区，要么是dma(S/G io)。 来看skb_gro_reset_offset。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;void skb_gro_reset_offset(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;data_offset = 0;
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;frag0 = NULL;
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;frag0_len = 0;
-</span><span class='line'>//如果mac_header和skb-&gt;tail相等并且地址不在高端内存，则说明包头保存在skb_shinfo中，所以我们需要从frags中取得对应的数据包
-</span><span class='line'>if (skb-&gt;mac_header == skb-&gt;tail &amp;&amp;
-</span><span class='line'>    !PageHighMem(skb_shinfo(skb)-&gt;frags[0].page)) {
-</span><span class='line'>    // 可以看到frag0保存的就是对应的skb的frags的第一个元素的地址
-</span><span class='line'>    // frag0的作用是: 有些包的包头会存在skb-&gt;frag[0]里面，gro合并时会调用skb_gro_header_slow将包头拉到线性空间中，那么在非线性skb-&gt;frag[0]中的包头部分就应该删掉。
-</span><span class='line'>        NAPI_GRO_CB(skb)-&gt;frag0 =
-</span><span class='line'>            page_address(skb_shinfo(skb)-&gt;frags[0].page) +
-</span><span class='line'>            skb_shinfo(skb)-&gt;frags[0].page_offset;
-</span><span class='line'>    //然后保存对应的大小。
-</span><span class='line'>    NAPI_GRO_CB(skb)-&gt;frag0_len = skb_shinfo(skb)-&gt;frags[0].size;
-</span><span class='line'>}
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;接下来就是`__napi_gro_receive`，它主要是遍历gro_list,然后给same_flow赋值，这里要注意，same_flow是一个标记，表示某个skb是否有可能会和当前要处理的skb是相同的流,而这里的相同会在每层都进行判断，也就是在设备层，ip层，tcp层都会判断，这里就是设备层的判断了。这里的判断很简单，有2个条件：  
-</span><span class='line'>1 设备是否相同  
-</span><span class='line'>2 mac的头必须相等  
-</span><span class='line'>
-</span><span class='line'>如果上面两个条件都满足，则说明两个skb有可能是相同的flow，所以设置same_flow,以便与我们后面合并。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static gro_result_t
-</span><span class='line'>__napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>struct sk_buff *p;
-</span><span class='line'>
-</span><span class='line'>if (netpoll_rx_on(skb))
-</span><span class='line'>    return GRO_NORMAL;
-</span><span class='line'>//遍历gro_list,然后判断是否有可能两个skb 相似。
-</span><span class='line'>for (p = napi-&gt;gro_list; p; p = p-&gt;next) {
-</span><span class='line'>    //给same_flow赋值
-</span><span class='line'>    NAPI_GRO_CB(p)-&gt;same_flow =
-</span><span class='line'>        (p-&gt;dev == skb-&gt;dev) &amp;&amp;
-</span><span class='line'>        !compare_ether_header(skb_mac_header(p),
-</span><span class='line'>            skb_gro_mac_header(skb));
-</span><span class='line'>    NAPI_GRO_CB(p)-&gt;flush = 0;
-</span><span class='line'>}
-</span><span class='line'>//调用dev_gro_receiv
-</span><span class='line'>return dev_gro_receive(napi, skb);
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;接下来来看dev_gro_receive，这个函数我们分做两部分来看，第一部分是正常处理部分，第二部份是处理frag0的部分。
-</span><span class='line'>
-</span><span class='line'>来看如何判断是否支持GRO，这里每个设备的features会在驱动初始化的时候被初始化，然后如果支持GRO，则会包括NETIF_F_GRO。 还有要注意的就是，gro不支持切片的ip包，因为ip切片的组包在内核的ip会做一遍，因此这里gro如果合并的话，没有多大意义，而且还增加复杂度。
-</span><span class='line'>
-</span><span class='line'>在dev_gro_receive中会遍历对应的ptype(也就是协议的类链表，以前的blog有详细介绍),然后调用对应的回调函数，一般来说这里会调用文章开始说的ip_packet_type，也就是 inet_gro_receive。
-</span><span class='line'>
-</span><span class='line'>而 inet_gro_receive的返回值表示我们需要立刻feed 进协议栈的数据包，如果为空，则说明不需要feed数据包进协议栈。后面会分析到这里他的详细算法。
-</span><span class='line'>
-</span><span class='line'>而如果当inet_gro_receive正确返回后，如果same_flow没有被设置，则说明gro list中不存在能和当前的skb合并的项，因此此时需要将skb插入到gro list中。这个时候的返回值就是HELD。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>struct sk_buff **pp = NULL;
-</span><span class='line'>struct packet_type *ptype;
-</span><span class='line'>__be16 type = skb-&gt;protocol;
-</span><span class='line'>struct list_head *head = &amp;ptype_base[ntohs(type) &amp; PTYPE_HASH_MASK];
-</span><span class='line'>int same_flow;
-</span><span class='line'>int mac_len;
-</span><span class='line'>enum gro_result ret;
-</span><span class='line'>//判断是否支持gro
-</span><span class='line'>if (!(skb-&gt;dev-&gt;features &amp; NETIF_F_GRO))
-</span><span class='line'>    goto normal;
-</span><span class='line'>//判断是否为切片的ip包
-</span><span class='line'>if (skb_is_gso(skb) || skb_has_frags(skb))
-</span><span class='line'>    goto normal;
-</span><span class='line'>
-</span><span class='line'>rcu_read_lock();
-</span><span class='line'>//开始遍历对应的协议表
-</span><span class='line'>list_for_each_entry_rcu(ptype, head, list) {
-</span><span class='line'>    if (ptype-&gt;type != type || ptype-&gt;dev || !ptype-&gt;gro_receive)
-</span><span class='line'>        continue;
-</span><span class='line'>
-</span><span class='line'>    skb_set_network_header(skb, skb_gro_offset(skb));
-</span><span class='line'>    mac_len = skb-&gt;network_header - skb-&gt;mac_header;
-</span><span class='line'>    skb-&gt;mac_len = mac_len;
-</span><span class='line'>    NAPI_GRO_CB(skb)-&gt;same_flow = 0;
-</span><span class='line'>    NAPI_GRO_CB(skb)-&gt;flush = 0;
-</span><span class='line'>    NAPI_GRO_CB(skb)-&gt;free = 0;
-</span><span class='line'>    //调用对应的gro接收函数
-</span><span class='line'>    pp = ptype-&gt;gro_receive(&amp;napi-&gt;gro_list, skb);
-</span><span class='line'>    break;
-</span><span class='line'>}
-</span><span class='line'>rcu_read_unlock();
-</span><span class='line'>//如果是没有实现gro的协议则也直接调到normal处理
-</span><span class='line'>if (&amp;ptype-&gt;list == head)
-</span><span class='line'>    goto normal;
-</span><span class='line'>
-</span><span class='line'>//到达这里，则说明gro_receive已经调用过了，因此进行后续的处理
-</span><span class='line'>
-</span><span class='line'>//得到same_flow
-</span><span class='line'>same_flow = NAPI_GRO_CB(skb)-&gt;same_flow;
-</span><span class='line'>//看是否有需要free对应的skb
-</span><span class='line'>ret = NAPI_GRO_CB(skb)-&gt;free ? GRO_MERGED_FREE : GRO_MERGED;
-</span><span class='line'>//如果返回值pp部位空，则说明pp需要马上被feed进协议栈
-</span><span class='line'>if (pp) {
-</span><span class='line'>    struct sk_buff *nskb = *pp;
-</span><span class='line'>
-</span><span class='line'>    *pp = nskb-&gt;next;
-</span><span class='line'>    nskb-&gt;next = NULL;
-</span><span class='line'>    //调用napi_gro_complete 将pp刷进协议栈
-</span><span class='line'>    napi_gro_complete(nskb);
-</span><span class='line'>    napi-&gt;gro_count--;
-</span><span class='line'>}
-</span><span class='line'>//如果same_flow有设置，则说明skb已经被正确的合并，因此直接返回。
-</span><span class='line'>if (same_flow)
-</span><span class='line'>    goto ok;
-</span><span class='line'>//查看是否有设置flush和gro list的个数是否已经超过限制
-</span><span class='line'>// BUG: 这里是有点不对的，因为这时的skb是比gro_list中的skb更晚到的，但是却被先feed进了协议栈
-</span><span class='line'>if (NAPI_GRO_CB(skb)-&gt;flush || napi-&gt;gro_count &gt;= MAX_GRO_SKBS)
-</span><span class='line'>    goto normal;
-</span><span class='line'>
-</span><span class='line'>//到达这里说明skb对应gro list来说是一个新的skb，也就是说当前的gro list并不存在可以和skb合并的数据包，因此此时将这个skb插入到gro_list的头。
-</span><span class='line'>napi-&gt;gro_count++;
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;count = 1;
-</span><span class='line'>skb_shinfo(skb)-&gt;gso_size = skb_gro_len(skb);
-</span><span class='line'>//将skb插入到gro list的头
-</span><span class='line'>skb-&gt;next = napi-&gt;gro_list;
-</span><span class='line'>napi-&gt;gro_list = skb;
-</span><span class='line'>//设置返回值
-</span><span class='line'>ret = GRO_HELD;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;然后就是处理frag0的部分，以及不支持gro的处理。
-</span><span class='line'>frag0的作用是: 有些包的包头会存在skb-&gt;frag[0]里面，gro合并时会调用skb_gro_header_slow将包头拉到线性空间中，那么在非线性skb-&gt;frag[0]中的包头部分就应该删掉。
-</span><span class='line'>
-</span><span class='line'>这里要需要对skb_shinfo的结构比较了解，我在以前的blog对这个有很详细的介绍，可以去查阅。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;pull:
-</span><span class='line'>//是否需要拷贝头
-</span><span class='line'>if (skb_headlen(skb) &lt; skb_gro_offset(skb)) {
-</span><span class='line'>    //得到对应的头的大小
-</span><span class='line'>    int grow = skb_gro_offset(skb) - skb_headlen(skb);
-</span><span class='line'>
-</span><span class='line'>    BUG_ON(skb-&gt;end - skb-&gt;tail &lt; grow);
-</span><span class='line'>    //开始拷贝
-</span><span class='line'>    memcpy(skb_tail_pointer(skb), NAPI_GRO_CB(skb)-&gt;frag0, grow);
-</span><span class='line'>
-</span><span class='line'>    skb-&gt;tail += grow;
-</span><span class='line'>    skb-&gt;data_len -= grow;
-</span><span class='line'>    //更新对应的frags[0]
-</span><span class='line'>    skb_shinfo(skb)-&gt;frags[0].page_offset += grow;
-</span><span class='line'>    skb_shinfo(skb)-&gt;frags[0].size -= grow;
-</span><span class='line'>    //如果size为0了，则说明第一个页全部包含头，因此需要将后面的页全部移动到前面。
-</span><span class='line'>    if (unlikely(!skb_shinfo(skb)-&gt;frags[0].size)) {
-</span><span class='line'>        put_page(skb_shinfo(skb)-&gt;frags[0].page);
-</span><span class='line'>        //开始移动。
-</span><span class='line'>        memmove(skb_shinfo(skb)-&gt;frags,
-</span><span class='line'>            skb_shinfo(skb)-&gt;frags + 1,
-</span><span class='line'>            --skb_shinfo(skb)-&gt;nr_frags * sizeof(skb_frag_t));
-</span><span class='line'>    }
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>ok:
-</span><span class='line'>return ret;
-</span><span class='line'>
-</span><span class='line'>normal:
-</span><span class='line'>ret = GRO_NORMAL;
-</span><span class='line'>goto pull;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;接下来就是inet_gro_receive，这个函数是ip层的gro receive回调函数，函数很简单，首先取得ip头，然后判断是否需要从frag复制数据，如果需要则复制数据
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;//得到偏移
-</span><span class='line'>off = skb_gro_offset(skb);
-</span><span class='line'>//得到头的整个长度(mac+ip)
-</span><span class='line'>hlen = off + sizeof(*iph);
-</span><span class='line'>//得到ip头
-</span><span class='line'>iph = skb_gro_header_fast(skb, off);
-</span><span class='line'>//是否需要复制
-</span><span class='line'>if (skb_gro_header_hard(skb, hlen)) {
-</span><span class='line'>iph = skb_gro_header_slow(skb, hlen, off);
-</span><span class='line'>if (unlikely(!iph))
-</span><span class='line'>    goto out;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;然后就是一些校验工作，比如协议是否支持gro_reveive,ip头是否合法等等
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;proto = iph-&gt;protocol &amp; (MAX_INET_PROTOS - 1);
-</span><span class='line'>
-</span><span class='line'>rcu_read_lock();
-</span><span class='line'>ops = rcu_dereference(inet_protos[proto]);
-</span><span class='line'>//是否支持gro
-</span><span class='line'>if (!ops || !ops-&gt;gro_receive)
-</span><span class='line'>goto out_unlock;
-</span><span class='line'>//ip头是否合法, iph-&gt;version = 4, iph-&gt;ipl = 5
-</span><span class='line'>if (*(u8 *)iph != 0x45)
-</span><span class='line'>goto out_unlock;
-</span><span class='line'>//ip头教研
-</span><span class='line'>if (unlikely(ip_fast_csum((u8 *)iph, iph-&gt;ihl)))
-</span><span class='line'>goto out_unlock;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;然后就是核心的处理部分，它会遍历整个gro_list,然后进行same_flow和是否需要flush的判断。
-</span><span class='line'>
-</span><span class='line'>这里ip层设置same_flow是根据下面的规则的:  
-</span><span class='line'>1 4层的协议必须相同  
-</span><span class='line'>2 tos域必须相同  
-</span><span class='line'>3 源，目的地址必须相同  
-</span><span class='line'>
-</span><span class='line'>如果3个条件一个不满足，则会设置same_flow为0。
-</span><span class='line'>这里还有一个就是判断是否需要flush 对应的skb到协议栈，这里的判断条件是这样子的。  
-</span><span class='line'>1 ip包的ttl不一样  
-</span><span class='line'>2 ip包的id顺序不对  
-</span><span class='line'>3 如果是切片包  
-</span><span class='line'>
-</span><span class='line'>如果上面两个条件某一个满足，则说明skb需要被flush出gro。
-</span><span class='line'>
-</span><span class='line'>不过这里要注意只有两个数据包是same flow的情况下，才会进行flush判断。原因很简单，都不是有可能进行merge的包，自然没必要进行flush了。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    //取出id
-</span><span class='line'>id = ntohl(*(__be32 *)&amp;iph-&gt;id);
-</span><span class='line'>//判断是否需要切片
-</span><span class='line'>flush = (u16)((ntohl(*(__be32 *)iph) ^ skb_gro_len(skb)) | (id ^ IP_DF));
-</span><span class='line'>id &gt;&gt;= 16;
-</span><span class='line'>//开始遍历gro list
-</span><span class='line'>for (p = *head; p; p = p-&gt;next) {
-</span><span class='line'>    struct iphdr *iph2;
-</span><span class='line'>    //如果上一层已经不可能same flow则直接继续下一个
-</span><span class='line'>    if (!NAPI_GRO_CB(p)-&gt;same_flow)
-</span><span class='line'>        continue;
-</span><span class='line'>    //取出ip头
-</span><span class='line'>    iph2 = ip_hdr(p);
-</span><span class='line'>    //开始same flow的判断
-</span><span class='line'>    if ((iph-&gt;protocol ^ iph2-&gt;protocol) |
-</span><span class='line'>        (iph-&gt;tos ^ iph2-&gt;tos) |
-</span><span class='line'>        ((__force u32)iph-&gt;saddr ^ (__force u32)iph2-&gt;saddr) |
-</span><span class='line'>        ((__force u32)iph-&gt;daddr ^ (__force u32)iph2-&gt;daddr)) {
-</span><span class='line'>        NAPI_GRO_CB(p)-&gt;same_flow = 0;
-</span><span class='line'>        continue;
-</span><span class='line'>    }
-</span><span class='line'>    //开始flush的判断。这里注意如果不是same_flow的话，就没必要进行flush的判断。
-</span><span class='line'>    /* All fields must match except length and checksum. */
-</span><span class='line'>    NAPI_GRO_CB(p)-&gt;flush |=
-</span><span class='line'>        (iph-&gt;ttl ^ iph2-&gt;ttl) |
-</span><span class='line'>        ((u16)(ntohs(iph2-&gt;id) + NAPI_GRO_CB(p)-&gt;count) ^ id);
-</span><span class='line'>
-</span><span class='line'>    NAPI_GRO_CB(p)-&gt;flush |= flush;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;flush |= flush;
-</span><span class='line'>//pull ip头进gro，这里更新data_offset
-</span><span class='line'>skb_gro_pull(skb, sizeof(*iph));
-</span><span class='line'>//设置传输层的头的位置
-</span><span class='line'>skb_set_transport_header(skb, skb_gro_offset(skb));
-</span><span class='line'>//调用传输层的reveive方法。
-</span><span class='line'>pp = ops-&gt;gro_receive(head, skb);
-</span><span class='line'>
-</span><span class='line'>out_unlock:
-</span><span class='line'>rcu_read_unlock();
-</span><span class='line'>
-</span><span class='line'>out:
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;flush |= flush;
-</span><span class='line'>
+</span><span class='line'>skb-&gt;next = NULL;             // 这种很重要，在sk_backlog处理时会用来判断skb是否处理完毕。
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>然后就是tcp层的gro方法，它的主要实现函数是tcp_gro_receive，他的流程和inet_gro_receiv类似，就是取得tcp的头，然后对gro list进行遍历，最终会调用合并方法。
+</span><span class='line'>##### 3、sk_backlog中skb的处理
 </span><span class='line'>
-</span><span class='line'>首先来看gro list遍历的部分,它对same flow的要求就是source必须相同，如果不同则设置same flow为0.如果相同则跳到found部分，进行合并处理。
+</span><span class='line'>很明显sk_backlog的处理必然中进程上下文进行，对于数据接收，进程上下文的接口是tcp_recvmmsg，所以sk_backlog肯定要在tcp_recvmmsg中处理。
+</span><span class='line'>
+</span><span class='line'>tcp_recvmmsg sk_backlog的代码处理片段如下：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;//遍历gro list
-</span><span class='line'>for (; (p = *head); head = &amp;p-&gt;next) {
-</span><span class='line'>//如果ip层已经不可能same flow则直接进行下一次匹配
-</span><span class='line'>if (!NAPI_GRO_CB(p)-&gt;same_flow)
-</span><span class='line'>    continue;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;tcp_cleanup_rbuf(sk, copied);
+</span><span class='line'>TCP_CHECK_TIMER(sk);
+</span><span class='line'>release_sock(sk);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>th2 = tcp_hdr(p);
-</span><span class='line'>//判断源地址
-</span><span class='line'>if (*(u32 *)&amp;th-&gt;source ^ *(u32 *)&amp;th2-&gt;source) {
-</span><span class='line'>    NAPI_GRO_CB(p)-&gt;same_flow = 0;
-</span><span class='line'>    continue;
-</span><span class='line'>}
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>release_sock(sk)涉及到sk_backlog处理。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>goto found;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>/*
+</span><span class='line'>* The sk_lock has mutex_unlock() semantics:
+</span><span class='line'>*/
+</span><span class='line'>mutex_release(&amp;sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
+</span><span class='line'>
+</span><span class='line'>spin_lock_bh(&amp;sk-&gt;sk_lock.slock);   // 获取第一把锁。
+</span><span class='line'>if (sk-&gt;sk_backlog.tail)            // 如果后备队列不为NULL，则开始处理。
+</span><span class='line'>    __release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>if (proto_has_rhel_ext(sk-&gt;sk_prot, RHEL_PROTO_HAS_RELEASE_CB) &amp;&amp;
+</span><span class='line'>        sk-&gt;sk_prot-&gt;release_cb)
+</span><span class='line'>    sk-&gt;sk_prot-&gt;release_cb(sk);
+</span><span class='line'>
+</span><span class='line'>sk-&gt;sk_lock.owned = 0;              // 进成上下文skb处理完了，释放第二把锁。
+</span><span class='line'>if (waitqueue_active(&amp;sk-&gt;sk_lock.wq))
+</span><span class='line'>    wake_up(&amp;sk-&gt;sk_lock.wq);
+</span><span class='line'>spin_unlock_bh(&amp;sk-&gt;sk_lock.slock); // 释放第一把锁。
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>接下来就是当找到能够合并的skb的时候的处理，这里首先来看flush的设置,这里会有4个条件：  
-</span><span class='line'>1 拥塞状态被设置(TCP_FLAG_CWR).  
-</span><span class='line'>2 tcp的ack的序列号不匹配 (这是肯定的，因为它只是对tso或者说gso进行反向操作)  
-</span><span class='line'>3 skb的flag和从gro list中查找到要合并skb的flag 如果他们中的不同位 不包括TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH，这三个任意一个域。  
-</span><span class='line'>4 tcp的option域不同  
-</span><span class='line'>
-</span><span class='line'>如果上面4个条件有一个满足，则会设置flush为1，也就是找到的这个skb(gro list中)必须被刷出到协议栈。
-</span><span class='line'>
-</span><span class='line'>这里谈一下flags域的设置问题首先如果当前的skb设置了cwr，也就是发生了拥塞，那么自然前面被缓存的数据包需要马上被刷到协议栈，以便与tcp的拥塞控制马上进行。
-</span><span class='line'>
-</span><span class='line'>而FIN和PSH这两个flag自然不需要一致，因为这两个和其他的不是互斥的。
+</span><span class='line'>`__release_sock(sk)`是后备队列的真正处理函数。
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;found:
-</span><span class='line'>flush = NAPI_GRO_CB(p)-&gt;flush;
-</span><span class='line'>//如果设置拥塞，则肯定需要刷出skb到协议栈
-</span><span class='line'>flush |= (__force int)(flags &amp; TCP_FLAG_CWR);
-</span><span class='line'>//如果相差的域是除了这3个中的，就需要flush出skb
-</span><span class='line'>flush |= (__force int)((flags ^ tcp_flag_word(th2)) &amp;
-</span><span class='line'>      ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
-</span><span class='line'>//ack的序列号必须一致
-</span><span class='line'>flush |= (__force int)(th-&gt;ack_seq ^ th2-&gt;ack_seq);
-</span><span class='line'>//tcp的option头必须一致
-</span><span class='line'>for (i = sizeof(*th); i &lt; thlen; i += 4)
-</span><span class='line'>    flush |= *(u32 *)((u8 *)th + i) ^
-</span><span class='line'>         *(u32 *)((u8 *)th2 + i);
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void __release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>struct sk_buff *skb = sk-&gt;sk_backlog.head;
 </span><span class='line'>
-</span><span class='line'>mss = skb_shinfo(p)-&gt;gso_size;
-</span><span class='line'>// 0-1 = 0xFFFFFFFF, 所以skb的数据部分长度为0的包是不会被合并的
-</span><span class='line'>flush |= (len - 1) &gt;= mss;
-</span><span class='line'>flush |= (ntohl(th2-&gt;seq) + skb_gro_len(p)) ^ ntohl(th-&gt;seq);
-</span><span class='line'>//如果flush有设置则不会调用 skb_gro_receive，也就是不需要进行合并，否则调用skb_gro_receive进行数据包合并
-</span><span class='line'>if (flush || skb_gro_receive(head, skb)) {
-</span><span class='line'>    mss = 1;
-</span><span class='line'>    goto out_check_final;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>p = *head;
-</span><span class='line'>th2 = tcp_hdr(p);
-</span><span class='line'>//更新p的头。到达这里说明合并完毕，因此需要更新合并完的新包的头。
-</span><span class='line'>tcp_flag_word(th2) |= flags &amp; (TCP_FLAG_FIN | TCP_FLAG_PSH);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;从上面我们可以看到如果tcp的包被设置了一些特殊的flag比如PSH，SYN这类的就必须马上把数据包刷出到协议栈。
-</span><span class='line'>
-</span><span class='line'>下面就是最终的一些flags判断,比如第一个数据包进来都会到这里来判断。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;out_check_final:
-</span><span class='line'>flush = len &lt; mss;
-</span><span class='line'>//根据flag得到flush
-</span><span class='line'>flush |= (__force int)(flags &amp; (TCP_FLAG_URG | TCP_FLAG_PSH |
-</span><span class='line'>                TCP_FLAG_RST | TCP_FLAG_SYN |
-</span><span class='line'>                TCP_FLAG_FIN));
-</span><span class='line'>
-</span><span class='line'>if (p &amp;&amp; (!NAPI_GRO_CB(skb)-&gt;same_flow || flush))
-</span><span class='line'>    pp = head;
-</span><span class='line'>
-</span><span class='line'>out:
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;flush |= flush;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;这里要知道每次我们只会刷出gro list中的一个skb节点，这是因为每次进来的数据包我们也只会匹配一个。因此如果遇到需要刷出的数据包，会在dev_gro_receive中先刷出gro list中的，然后再将当前的skb feed进协议栈。
-</span><span class='line'>
-</span><span class='line'>最后就是gro最核心的一个函数skb_gro_receive，它的主要工作就是合并，它有2个参数，第一个是gro list中和当前处理的skb是same flow的skb，第二个就是我们需要合并的skb。
-</span><span class='line'>
-</span><span class='line'>这里要注意就是farg_list,其实gro对待skb_shared_info和ip层切片，组包很类似，就是frags放Scatter-Gather I/O的数据包，frag_list放线性数据。这里gro 也是这样的，如果过来的skb支持Scatter-Gather I/O并且数据是只放在frags中，则会合并frags，如果过来的skb不支持Scatter-Gather I/O(数据头还是保存在skb中)，则合并很简单，就是新建一个skb然后拷贝当前的skb，并将gro list中的skb直接挂载到farg_list。
-</span><span class='line'>
-</span><span class='line'>先来看支持Scatter-Gather I/O的处理部分。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;//一些需要用到的变量
-</span><span class='line'>struct sk_buff *p = *head;
-</span><span class='line'>struct sk_buff *nskb;
-</span><span class='line'>//当前的skb的 share_ino
-</span><span class='line'>struct skb_shared_info *skbinfo = skb_shinfo(skb);
-</span><span class='line'>//当前的gro list中的要合并的skb的share_info
-</span><span class='line'>struct skb_shared_info *pinfo = skb_shinfo(p);
-</span><span class='line'>unsigned int headroom;
-</span><span class='line'>unsigned int len = skb_gro_len(skb);
-</span><span class='line'>unsigned int offset = skb_gro_offset(skb);
-</span><span class='line'>unsigned int headlen = skb_headlen(skb);
-</span><span class='line'>//如果有frag_list的话，则直接去非Scatter-Gather I/O部分处理，也就是合并到frag_list.
-</span><span class='line'>if (pinfo-&gt;frag_list)
-</span><span class='line'>goto merge;
-</span><span class='line'>else if (headlen &lt;= offset) {
-</span><span class='line'>//支持Scatter-Gather I/O的处理
-</span><span class='line'>skb_frag_t *frag;
-</span><span class='line'>skb_frag_t *frag2;
-</span><span class='line'>int i = skbinfo-&gt;nr_frags;
-</span><span class='line'>//这里遍历是从后向前。
-</span><span class='line'>int nr_frags = pinfo-&gt;nr_frags + i;
-</span><span class='line'>
-</span><span class='line'>offset -= headlen;
-</span><span class='line'>
-</span><span class='line'>if (nr_frags &gt; MAX_SKB_FRAGS)
-</span><span class='line'>    return -E2BIG;
-</span><span class='line'>//设置pinfo的frags的大小，可以看到就是加上skb的frags的大小
-</span><span class='line'>pinfo-&gt;nr_frags = nr_frags;
-</span><span class='line'>skbinfo-&gt;nr_frags = 0;
-</span><span class='line'>
-</span><span class='line'>frag = pinfo-&gt;frags + nr_frags;
-</span><span class='line'>frag2 = skbinfo-&gt;frags + i;
-</span><span class='line'>//遍历赋值，其实就是地址赋值，这里就是将skb的frag加到pinfo的frgas后面。
 </span><span class='line'>do {
-</span><span class='line'>    *--frag = *--frag2;
-</span><span class='line'>} while (--i);
-</span><span class='line'>//更改page_offet的值
-</span><span class='line'>frag-&gt;page_offset += offset;
-</span><span class='line'>//修改size大小
-</span><span class='line'>frag-&gt;size -= offset;
-</span><span class='line'>//更新skb的相关值
-</span><span class='line'>skb-&gt;truesize -= skb-&gt;data_len;
-</span><span class='line'>skb-&gt;len -= skb-&gt;data_len;
-</span><span class='line'>skb-&gt;data_len = 0;
+</span><span class='line'>    sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = NULL;
+</span><span class='line'>    bh_unlock_sock(sk);
 </span><span class='line'>
-</span><span class='line'>NAPI_GRO_CB(skb)-&gt;free = 1;
-</span><span class='line'>//最终完成
-</span><span class='line'>goto done;
-</span><span class='line'>} else if (skb_gro_len(p) != pinfo-&gt;gso_size)
-</span><span class='line'>return -E2BIG;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>    do {
+</span><span class='line'>        struct sk_buff *next = skb-&gt;next;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;这里gro list中的要被合并的skb我们叫做skb_s.
+</span><span class='line'>        skb-&gt;next = NULL;
+</span><span class='line'>        sk_backlog_rcv(sk, skb);    // skb的处理函数，其实调用的是tcp_v4_do_rcv函数。
 </span><span class='line'>
-</span><span class='line'>接下来就是不支持支持Scatter-Gather I/O(skb的头放在skb中)的处理。这里处理也比较简单，就是复制一个新的nskb，然后它的头和skb_s一样，然后将skb_s挂载到nskb的frag_list上，并且把新建的nskb挂在到gro list中，代替skb_s的位置，而当前的skb
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>        /*
+</span><span class='line'>         * We are in process context here with softirqs
+</span><span class='line'>         * disabled, use cond_resched_softirq() to preempt.
+</span><span class='line'>         * This is safe to do because we've taken the backlog
+</span><span class='line'>         * queue private:
+</span><span class='line'>         */
+</span><span class='line'>        cond_resched_softirq();
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    headroom = skb_headroom(p);
-</span><span class='line'>nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
-</span><span class='line'>if (unlikely(!nskb))
-</span><span class='line'>    return -ENOMEM;
-</span><span class='line'>//复制头
-</span><span class='line'>__copy_skb_header(nskb, p);
-</span><span class='line'>nskb-&gt;mac_len = p-&gt;mac_len;
+</span><span class='line'>        skb = next;
+</span><span class='line'>    } while (skb != NULL);          // 如果skb=NULL，那么说明之前的sk_backlog已经处理完了。
 </span><span class='line'>
-</span><span class='line'>skb_reserve(nskb, headroom);
-</span><span class='line'>__skb_put(nskb, skb_gro_offset(p));
-</span><span class='line'>//设置各层的头
-</span><span class='line'>skb_set_mac_header(nskb, skb_mac_header(p) - p-&gt;data);
-</span><span class='line'>skb_set_network_header(nskb, skb_network_offset(p));
-</span><span class='line'>skb_set_transport_header(nskb, skb_transport_offset(p));
+</span><span class='line'>    bh_lock_sock(sk);
+</span><span class='line'>} while ((skb = sk-&gt;sk_backlog.head) != NULL); // 在处理上一个sk_backlog时，可能被软中断中断了，建立了新的sk_backlog，新建立的sk_backlog也将一并被处理。
 </span><span class='line'>
-</span><span class='line'>__skb_pull(p, skb_gro_offset(p));
-</span><span class='line'>//复制数据
-</span><span class='line'>memcpy(skb_mac_header(nskb), skb_mac_header(p),
-</span><span class='line'>       p-&gt;data - skb_mac_header(p));
-</span><span class='line'>//对应的gro 域的赋值
-</span><span class='line'>*NAPI_GRO_CB(nskb) = *NAPI_GRO_CB(p);
-</span><span class='line'>//可以看到frag_list被赋值
-</span><span class='line'>skb_shinfo(nskb)-&gt;frag_list = p;
-</span><span class='line'>skb_shinfo(nskb)-&gt;gso_size = pinfo-&gt;gso_size;
-</span><span class='line'>pinfo-&gt;gso_size = 0;
-</span><span class='line'>skb_header_release(p);
-</span><span class='line'>nskb-&gt;prev = p;
-</span><span class='line'>//更新新的skb的数据段
-</span><span class='line'>nskb-&gt;data_len += p-&gt;len;
-</span><span class='line'>nskb-&gt;truesize += p-&gt;len;  // 应该改成 nskb-&gt;truesize += p-&gt;truesize; 更准确
-</span><span class='line'>nskb-&gt;len += p-&gt;len;
-</span><span class='line'>//将新的skb插入到gro list中
-</span><span class='line'>*head = nskb;
-</span><span class='line'>nskb-&gt;next = p-&gt;next;
-</span><span class='line'>p-&gt;next = NULL;
-</span><span class='line'>
-</span><span class='line'>p = nskb;
-</span><span class='line'>
-</span><span class='line'>merge:
-</span><span class='line'>if (offset &gt; headlen) {
-</span><span class='line'>    skbinfo-&gt;frags[0].page_offset += offset - headlen;
-</span><span class='line'>    skbinfo-&gt;frags[0].size -= offset - headlen;
-</span><span class='line'>    offset = headlen;
+</span><span class='line'>/*
+</span><span class='line'>* Doing the zeroing here guarantee we can not loop forever
+</span><span class='line'>* while a wild producer attempts to flood us.
+</span><span class='line'>*/
+</span><span class='line'>sk_extended(sk)-&gt;sk_backlog.len = 0;
 </span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>__skb_pull(skb, offset);
-</span><span class='line'>//将skb插入新的skb的(或者老的skb，当frag list本身存在)fraglist
-</span><span class='line'>// 这里是用p-&gt;prev来记录了p-&gt;fraglist的最后一个包，所以在gro向协议栈提交时最好加一句skb-&gt;prev = NULL;
-</span><span class='line'>p-&gt;prev-&gt;next = skb;
-</span><span class='line'>p-&gt;prev = skb;
-</span><span class='line'>skb_header_release(skb);
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;code&gt;``
+</span><span class='line'>  一开始重置sk-&gt;sk_backlog.head ，sk-&gt;sk_backlog.tail为NULL。sk_backlog是一个双链表，head指向了链表头部的skb，而tail则指向了链表尾部的skb。这里之所以置NULL head 和tail，是因为struct sk_buff *skb = sk-&gt;sk_backlog.head 提前取到了head指向的skb，之后就可以通过skb-&gt;next来获取下一个skb处理，结束的条件是skb-&gt;next=NULL，这个是在&lt;/code&gt;__sk_add_backlog`函数中置位的，也就说对于sk_backlog的处理head和tail指针已经没有用了。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  为什么要置NULLsk-&gt;sk_backlog.head ，sk-&gt;sk_backlog.tail呢？第一想法是它可能要被重新使用了。那么在什么情况下会被重新使用呢？试想一下当前是在进程上下文，并且sk-&gt;sk_lock.slock没有被锁住，那是不是可能被软中断打断呢？如果被软中断打断了是不是要接收数据呢，tcp协议栈为了效率考虑肯定是要接收数据的，前面分析道这种情况的数据必须放置到后备队列中(sk_backlog)，所以可以肯定置NULL sk-&gt;sk_backlog.head ，sk-&gt;sk_backlog.tail是为了在处理上一个sk_backlog时，能重用sk_backlog，建立一条新的sk_backlog，或许有人会问为什么不直接添加到原先的sk_backlog tail末尾呢？这个问题我也没有想太清楚，或许是同步不好做吧。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;4、skb被处理到哪去了&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  很明显接收的数据最终都将被传递到应用层，在传递到应用层前必须要保证三个接收队列中的数据有序，那么这三个队列是怎么保证数据字节流有序的被递交给应用层呢？三个队列都会调用tcp_v4_do_rcv函数，prequeue和sk_backlog是在tcp_recvmsg中调用tcp_v4_do_rcv函数，也就是进程上下文中调用tcp_v4_do_rcv函数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  如果仔细分析tcp_v4_do_rcv函数能发现，这个函数能保证数据有序的排列在一起，所以无论是在处理sk_backlog还是prequeue，最终都会调用tcp_v4_do_rcv函数将数据有效地插入到sk_write_queue中，最后被应用层取走。&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[TCP校验和的原理和实现]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-04-15T14:07:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/zhangskd/article/details/11770647"&gt;http://blog.csdn.net/zhangskd/article/details/11770647&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[文件socket]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/04/29/kernel-net-socket-file/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-04-29T17:32:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/04/29/kernel-net-socket-file&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/y_23k_bug/article/details/9993555"&gt;http://blog.csdn.net/y_23k_bug/article/details/9993555&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;概述&lt;/h4&gt;
+</span><span class='line'>&lt;h4&gt;1. 建立socket&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;TCP校验和是一个端到端的校验和，由发送端计算，然后由接收端验证。其目的是为了发现TCP首部和数据在发送端到接收端之间发生的任何改动。如果接收方检测到校验和有差错，则TCP段会被直接丢弃。&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #include&lt;sys/socket.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;TCP校验和覆盖TCP首部和TCP数据，而IP首部中的校验和只覆盖IP的首部，不覆盖IP数据报中的任何数据。&lt;/p&gt;
+</span><span class='line'>int socket(
+</span><span class='line'>    int domain,    //地址族的类型AF_UNIX (绑定在本地) AF_INET（绑定在网卡）
+</span><span class='line'>    int type,      //支持的数据格式：流SOCK_STREAM/报文SOCK_DGRAM
+</span><span class='line'>    int protocol); //支持的协议,建议为0
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;TCP的校验和是必需的，而UDP的校验和是可选的。&lt;/p&gt;
+</span><span class='line'>返回值：
+</span><span class='line'>    成功返回文件描述符号。
+</span><span class='line'>    失败返回-1;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;TCP和UDP计算校验和时，都要加上一个12字节的伪首部。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;2.绑定在地址上(文件目录地址)URL(Universe ResourceLocation)&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;伪首部&lt;/h4&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    协议://路径/文件名
+</span><span class='line'>file:///usr/bin/ls      普通文件
+</span><span class='line'>http://192.168.0.72/index.php
+</span><span class='line'>struct sockaddr;  地址结构体
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-04-15-1.jpeg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #include&lt;linux/un.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;伪首部共有12字节，包含如下信息：源IP地址、目的IP地址、保留字节(置0)、传输层协议号(TCP是6)、TCP报文长度(报头+数据)。&lt;/p&gt;
+</span><span class='line'>struct sockaddr_un;   un=unix（绑定unix本地）
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;伪首部是为了增加TCP校验和的检错能力：如检查TCP报文是否收错了(目的IP地址)、传输层协议是否选对了(传输层协议号)等。&lt;/p&gt;
+</span><span class='line'>struct sockaddr_un {
+</span><span class='line'>    sa_family_t   sun_family; /*AF_UNIX*/
+</span><span class='line'>    char sun_path[UNIX_PATH_MAX];
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;定义&lt;/h4&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct sockaddr_in;   in=internet（绑定网卡）
+</span><span class='line'>int bind(int fd,           //socket描述符号
+</span><span class='line'>    struct sockaddr *addr, //绑定地址
+</span><span class='line'>    socklen_tsize);        //地址长度
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;(1) RFC 793的TCP校验和定义&lt;/h5&gt;
+</span><span class='line'>返回值：
+</span><span class='line'>    0成功
+</span><span class='line'>    -1失败
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;The checksum field is the 16 bit one&rsquo;s complement of the one&rsquo;s complement sum of all 16-bit words in the header and text. If a segment contains an odd number of header and text octets to be checksummed, the last octet is padded on the right with zeros to form a 16-bit word for checksum purposes. The pad is not transmitted as part of the segment. While computing the checksum, the checksum field itself is replaced with zeros.&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;样例&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;上述的定义说得很明确：&lt;br/&gt;
-</span><span class='line'>首先，把伪首部、TCP报头、TCP数据分为16位的字，如果总长度为奇数个字节，则在最后增添一个位都为0的字节。把TCP报头中的校验和字段置为0（否则就陷入鸡生蛋还是蛋生鸡的问题）。&lt;/p&gt;
+</span><span class='line'>&lt;h5&gt;server.c&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;其次，用反码相加法累加所有的16位字（进位也要累加）。&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #include&lt;sys/socket.h&gt;
+</span><span class='line'>#include&lt;stdio.h&gt;
+</span><span class='line'>#include&lt;stdlib.h&gt;
+</span><span class='line'>#include&lt;string.h&gt;
+</span><span class='line'>#include&lt;unistd.h&gt;
+</span><span class='line'>#include&lt;linux/un.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;最后，对计算结果取反，作为TCP的校验和。&lt;/p&gt;
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    int fd; 
+</span><span class='line'>    int r;
+</span><span class='line'>    char buf[100];
+</span><span class='line'>    //1.建立socket
+</span><span class='line'>    fd = socket(AF_UNIX, SOCK_DGRAM, 0);  //AF_FILE 等同//AF_UNIX
+</span><span class='line'>    if (fd == -1) {
+</span><span class='line'>        printf("socket error:%m\n");
+</span><span class='line'>        exit(-1);
+</span><span class='line'>    }   
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;(2) RFC 1071的IP校验和定义&lt;/h5&gt;
+</span><span class='line'>    //2.构造本地文件地址
+</span><span class='line'>    struct sockaddr_un addr = {0};
+</span><span class='line'>    addr.sun_family = AF_UNIX; //必须跟socket的地址族一致
+</span><span class='line'>    memcpy(addr.sun_path, "my.sock", strlen("my.sock"));
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;1.Adjacent octets to be checksummed are paired to form 16-bit integers, and the 1&rsquo;s complement sum of these 16-bit integers is formed.&lt;/p&gt;
+</span><span class='line'>    //3.把socket绑定在地址上
+</span><span class='line'>    r = bind(fd, (struct sockaddr *)&amp;addr, sizeof(addr));
+</span><span class='line'>    if (r == -1) {
+</span><span class='line'>        printf("bind error:%m\n");
+</span><span class='line'>        exit(-1);
+</span><span class='line'>    }   
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;2.To generate a checksum, the checksum field itself is cleared, the 16-bit 1&rsquo;s complement sum is computed over the octets concerned, and the 1&rsquo;s complement of this sum is placed in the checksum field.&lt;/p&gt;
+</span><span class='line'>    //4.接收数据
+</span><span class='line'>    bzero(buf , sizeof(buf));
+</span><span class='line'>    r = read(fd, buf, sizeof(buf));
+</span><span class='line'>    buf[r] = 0;
+</span><span class='line'>    printf("%s\n", buf);
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;3.To check a checksum, the 1&rsquo;s complement sum is computed over the same set of octets, including the checksum field. If the result is all 1 bits (-0 in 1&rsquo;s complement arithmetic), the check succeeds.&lt;/p&gt;
+</span><span class='line'>    //5.关闭
+</span><span class='line'>    close(fd);
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;可以看到，TCP校验和、IP校验和的计算方法是基本一致的，除了计算的范围不同。&lt;/p&gt;
+</span><span class='line'>    //6.删除socket文件
+</span><span class='line'>    unlink("my.sock");
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;实现&lt;/h4&gt;
+</span><span class='line'>    //socket文件不会自动删除，需要在程序结尾去删除该文件，否则，再次运行//A程序出错
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;基于2.6.18、x86_64。&lt;/p&gt;
+</span><span class='line'>&lt;h5&gt;client.c&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;csum_tcpudp_nofold()按4字节累加伪首部到sum中。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>static inline unsigned long csum_tcpudp_nofold (unsigned long saddr, unsigned long daddr,  
-</span><span class='line'>                                                unsigned short len, unsigned short proto,  
-</span><span class='line'>                                                unsigned int sum)  
-</span><span class='line'>{  
-</span><span class='line'>    asm("addl %1, %0\n"    /* 累加daddr */  
-</span><span class='line'>        "adcl %2, %0\n"    /* 累加saddr */  
-</span><span class='line'>        "adcl %3, %0\n"    /* 累加len(2字节), proto, 0*/  
-</span><span class='line'>        "adcl $0, %0\n"    /*加上进位 */  
-</span><span class='line'>        : "=r" (sum)  
-</span><span class='line'>        : "g" (daddr), "g" (saddr), "g" ((ntohs(len) &lt;&lt; 16) + proto*256), "0" (sum));  
-</span><span class='line'>    return sum;  
-</span><span class='line'>}   
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #include&lt;stdio.h&gt;
+</span><span class='line'>#include&lt;stdlib.h&gt;
+</span><span class='line'>#include&lt;sys/socket.h&gt;
+</span><span class='line'>#include&lt;linux/un.h&gt;
+</span><span class='line'>#include&lt;string.h&gt;
+</span><span class='line'>#include&lt;unistd.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;csum_tcpudp_magic()产生最终的校验和。&lt;/p&gt;
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    int fd; 
+</span><span class='line'>    int r;
+</span><span class='line'>    struct sockaddr_un addr = {0};
+</span><span class='line'>    //1.建立socket
+</span><span class='line'>    fd = socket(AF_UNIX, SOCK_DGRAM, 0); 
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;首先，按4字节累加伪首部到sum中。&lt;/p&gt;
+</span><span class='line'>    //2.连接到指定的地址
+</span><span class='line'>    addr.sun_family = AF_UNIX;
+</span><span class='line'>    memcpy(addr.sun_path, "my.sock", strlen("my.sock"));
+</span><span class='line'>    r = connect(fd, (struct sockaddr*)&amp;addr, sizeof(addr));
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;其次，累加sum的低16位、sum的高16位，并且对累加的结果取反。&lt;/p&gt;
+</span><span class='line'>    //3.发送数据
+</span><span class='line'>    write(fd, "hello!", strlen("hello!"));
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;最后，截取sum的高16位，作为校验和。</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>    //4.关闭
+</span><span class='line'>    close(fd);
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[TCP状态转换]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-tcp-state/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-04-18T16:13:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-tcp-state&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;img src="/images/kernel/2015-04-18-1.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;1、建立连接协议（三次握手）&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;(1) 客户端发送一个带SYN标志的TCP报文到服务器。这是三次握手过程中的报文1。&lt;br/&gt;
+</span><span class='line'>(2) 服务器端回应客户端的，这是三次握手中的第2个报文，这个报文同时带ACK标志和SYN标志。因此它表示对刚才客户端SYN报文的回应；同时又标志SYN给客户端，询问客户端是否准备好进行数据通讯。&lt;br/&gt;
+</span><span class='line'>(3) 客户必须再次回应服务段一个ACK报文，这是报文段3。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;2、连接终止协议（四次握手）&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  由于TCP连接是全双工的，因此每个方向都必须单独进行关闭。这原则是当一方完成它的数据发送任务后就能发送一个FIN来终止这个方向的连接。收到一个 FIN只意味着这一方向上没有数据流动，一个TCP连接在收到一个FIN后仍能发送数据。首先进行关闭的一方将执行主动关闭，而另一方执行被动关闭。&lt;br/&gt;
+</span><span class='line'>(1) TCP客户端发送一个FIN，用来关闭客户到服务器的数据传送（报文段4）。&lt;br/&gt;
+</span><span class='line'>(2) 服务器收到这个FIN，它发回一个ACK，确认序号为收到的序号加1（报文段5）。和SYN一样，一个FIN将占用一个序号。&lt;br/&gt;
+</span><span class='line'>(3) 服务器关闭客户端的连接，发送一个FIN给客户端（报文段6）。&lt;br/&gt;
+</span><span class='line'>(4) 客户段发回ACK报文确认，并将确认序号设置为收到序号加1（报文段7）。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;tcp状态解释&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;ol&gt;
+</span><span class='line'>&lt;li&gt;CLOSED: 表示初始状态。&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;LISTEN: 表示服务器端的某个SOCKET处于监听状态，可以接受连接了.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;SYN_SENT: 客户端通过应用程序调用connect进行active open.于是客户端tcp发送一个SYN以请求建立一个连接.之后状态置为SYN_SENT.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;SYN_RECV: 服务端应发出ACK确认客户端的SYN,同时自己向客户端发送一个SYN.之后状态置为SYN_RECV.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;ESTABLISHED：代表一个打开的连接，双方可以进行或已经在数据交互了.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;FIN_WAIT_1: 主动关闭(active close)端应用程序调用close，于是其TCP发出FIN请求主动关闭连接，之后进入FIN_WAIT1状态.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;FIN_WAIT2: 主动关闭端接到ACK后，就进入了FIN-WAIT-2 . 其实FIN_WAIT_1和FIN_WAIT_2状态的真正含义都是表示等待对方的FIN报文。而这两种状态的区别 是：FIN_WAIT_1状态实际上是当SOCKET在ESTABLISHED状态时，它想主动关闭连接，向对方发送了FIN报文，此时该SOCKET即 进入到FIN_WAIT_1状态。而当对方回应ACK报文后，则进入到FIN_WAIT_2状态.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;CLOSE_WAIT: CLOSE_WAIT:被动关闭(passive close)端TCP接到FIN后，就发出ACK以回应FIN请求(它的接收也作为文件结束符传递给上层应用程序),并进入CLOSE_WAIT。接下来还有数据发送给对方，如果没有的话，那么你也就可以 close这个SOCKET，发送FIN报文给对方，也即关闭连接。所以你在CLOSE_WAIT状态下，需要完成的事情是等待你去关闭连接.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;LAST_ACK: 被动关闭端一段时间后，接收到文件结束符的应用程序将调用CLOSE关闭连接。这导致它的TCP也发送一个 FIN,等待对方的ACK.就进入了LAST-ACK.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;TIME_WAIT: 在主动关闭端接收到FIN后，TCP就发送ACK包，并进入TIME-WAIT状态.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;CLOSING: 正常情况下，当你发送FIN报文后，按理来说是应该先收到（或同时收到）对方的 ACK报文，再收到对方的FIN报文。但是CLOSING状态表示你发送FIN报文后，没有收到对方的ACK报文，反而收到了对方的FIN报文。表示双方都正在关闭SOCKET连接.&lt;/li&gt;
+</span><span class='line'>&lt;li&gt;CLOSED: 被动关闭端在接受到ACK包后，就进入了closed的状态。连接结束.&lt;/li&gt;
+</span><span class='line'>&lt;/ol&gt;
+</span><span class='line'>
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[linux kernel 网络协议栈之GRO(Generic receive offload)]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-gro/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-04-18T15:48:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/04/18/kernel-net-gro&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;hr /&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h2&gt;Attention: gro会合并多个gso_size不同的包, 会将gso_size设置成第一个包的gso_size.&lt;/h2&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;a href="http://www.pagefault.info/?p=159"&gt;http://www.pagefault.info/?p=159&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;GRO(Generic receive offload)在内核2.6.29之后合并进去的，作者是一个华裔Herbert Xu ,GRO的简介可以看这里：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;a href="http://lwn.net/Articles/358910/"&gt;http://lwn.net/Articles/358910/&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;先来描述一下GRO的作用，GRO是针对网络接受包的处理的，并且只是针对NAPI类型的驱动，因此如果要支持GRO，不仅要内核支持，而且驱动也必须调用相应的借口，用ethtool -K gro on来设置，如果报错就说明网卡驱动本身就不支持GRO。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;GRO类似tso，可是tso只支持发送数据包，这样你tcp层大的段会在网卡被切包，然后再传递给对端，而如果没有gro，则小的段会被一个个送到协议栈，有了gro之后，就会在接收端做一个反向的操作(想对于tso).也就是将tso切好的数据包组合成大包再传递给协议栈。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果实现了GRO支持的驱动是这样子处理数据的，在NAPI的回调poll方法中读取数据包，然后调用GRO的接口napi_gro_receive或者napi_gro_frags来将数据包feed进协议栈。而具体GRO的工作就是在这两个函数中进行的，他们最终都会调用&lt;code&gt;__napi_gro_receive&lt;/code&gt;。下面就是napi_gro_receive，它最终会调用napi_skb_finish以及&lt;code&gt;__napi_gro_receive&lt;/code&gt;。</span></code></pre></td></tr></table></div></figure>
+    gro_result_t napi_gro_receive(struct napi_struct <em>napi, struct sk_buff </em>skb)
+    {
+        skb_gro_reset_offset(skb);</p>
+
+<pre><code>    return napi_skb_finish(__napi_gro_receive(napi, skb), skb);
+}
+</code></pre>
+
+<pre><code>然后GRO什么时候会将数据feed进协议栈呢，这里会有两个退出点，一个是在napi_skb_finish里，他会通过判断`__napi_gro_receive`的返回值，来决定是需要将数据包立即feed进协议栈还是保存起来，还有一个点是当napi的循环执行完毕时，也就是执行napi_complete的时候，先来看napi_skb_finish,napi_complete我们后面会详细介绍。
+
+在NAPI驱动中，直接调用netif_receive_skb会将数据feed 进协议栈，因此这里如果返回值是NORMAL，则直接调用netif_receive_skb来将数据送进协议栈。
+</code></pre>
+
+<pre><code>gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
+{
+    switch (ret) {
+    case GRO_NORMAL:
+        //将数据包送进协议栈
+        if (netif_receive_skb(skb))
+            ret = GRO_DROP;
+        break;
+    //表示skb可以被free，因为gro已经将skb合并并保存起来。
+    case GRO_DROP:
+    case GRO_MERGED_FREE:
+        //free skb
+        kfree_skb(skb);
+        break;
+    //这个表示当前数据已经被gro保存起来，但是并没有进行合并，因此skb还需要保存。
+    case GRO_HELD:
+    case GRO_MERGED:
+        break;
+    }
+
+    return ret;
+}
+</code></pre>
+
+<pre><code>GRO的主要思想就是，组合一些类似的数据包(基于一些数据域，后面会介绍到)为一个大的数据包(一个skb)，然后feed给协议栈，这里主要是利用Scatter-gather IO，也就是skb的struct skb_shared_info域(我前面的blog讲述ip分片的时候有详细介绍这个域)来合并数据包。
+
+在每个NAPI的实例都会包括一个域叫gro_list,保存了我们积攒的数据包(将要被merge的).然后每次进来的skb都会在这个链表里面进行查找，看是否需要merge。而gro_count表示当前的gro_list中的skb的个数。
+</code></pre>
+
+<pre><code>struct napi_struct {
+................................................
+    //个数
+    unsigned int        gro_count;
+......................................
+    //积攒的数据包
+    struct sk_buff      *gro_list;
+    struct sk_buff      *skb;
+};
+</code></pre>
+
+<pre><code>紧接着是gro最核心的一个数据结构napi_gro_cb,它是保存在skb的cb域中，它保存了gro要使用到的一些上下文，这里每个域kernel的注释都比较清楚。到后面我们会看到这些域的具体用途。
+</code></pre>
+
+<pre><code>struct napi_gro_cb {
+    /* Virtual address of skb_shinfo(skb)-&gt;frags[0].page + offset. */
+    void *frag0;
+
+    /* Length of frag0. */
+    unsigned int frag0_len;
+
+    /* This indicates where we are processing relative to skb-&gt;data. */
+    int data_offset;
+
+    /* This is non-zero if the packet may be of the same flow. */
+    int same_flow;
+
+    /* This is non-zero if the packet cannot be merged with the new skb. */
+    int flush;
+
+    /* Number of segments aggregated. */
+    int count;
+
+    /* Free the skb? */
+    int free;
+};
+</code></pre>
+
+<pre><code>每一层协议都实现了自己的gro回调函数，gro_receive和gro_complete，gro系统会根据协议来调用对应回调函数，其中gro_receive是将输入skb尽量合并到我们gro_list中。而gro_complete则是当我们需要提交gro合并的数据包到协议栈时被调用的。
+
+下面就是ip层和tcp层对应的回调方法：
+</code></pre>
+
+<pre><code>static const struct net_protocol tcp_protocol = {
+    .handler =  tcp_v4_rcv,
+    .err_handler =  tcp_v4_err,
+    .gso_send_check = tcp_v4_gso_send_check,
+    .gso_segment =  tcp_tso_segment,
+    //gso回调
+    .gro_receive =  tcp4_gro_receive,
+    .gro_complete = tcp4_gro_complete,
+    .no_policy =    1,
+    .netns_ok = 1,
+};
+
+static struct packet_type ip_packet_type __read_mostly = {
+    .type = cpu_to_be16(ETH_P_IP),
+    .func = ip_rcv,
+    .gso_send_check = inet_gso_send_check,
+    .gso_segment = inet_gso_segment,
+    //gso回调
+    .gro_receive = inet_gro_receive,
+    .gro_complete = inet_gro_complete,
+};
+</code></pre>
+
+<pre><code>gro的入口函数是napi_gro_receive，它的实现很简单，就是将skb包含的gro上下文reset，然后调用`__napi_gro_receive`,最终通过napi_skb_finis来判断是否需要讲数据包feed进协议栈。
+</code></pre>
+
+<pre><code>gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+{
+    //reset gro对应的域
+    skb_gro_reset_offset(skb);
+
+    return napi_skb_finish(__napi_gro_receive(napi, skb), skb);
+}
+</code></pre>
+
+<pre><code>napi_skb_finish一开始已经介绍过了，这个函数主要是通过判断传递进来的ret(`__napi_gro_receive`的返回值),来决定是否需要feed数据进协议栈。它的第二个参数是前面处理过的skb。
+
+这里再来看下skb_gro_reset_offset，首先要知道一种情况，那就是skb本身不包含数据(包括头也没有),而所有的数据都保存在skb_shared_info中(支持S/G的网卡有可能会这么做).此时我们如果想要合并的话，就需要将包头这些信息取出来，也就是从skb_shared_info的frags[0]中去的，在 skb_gro_reset_offset中就有做这个事情,而这里就会把头的信息保存到napi_gro_cb 的frags0中。并且此时frags必然不会在high mem,要么是线性区，要么是dma(S/G io)。 来看skb_gro_reset_offset。
+</code></pre>
+
+<pre><code>void skb_gro_reset_offset(struct sk_buff *skb)
+{
+    NAPI_GRO_CB(skb)-&gt;data_offset = 0;
+    NAPI_GRO_CB(skb)-&gt;frag0 = NULL;
+    NAPI_GRO_CB(skb)-&gt;frag0_len = 0;
+    //如果mac_header和skb-&gt;tail相等并且地址不在高端内存，则说明包头保存在skb_shinfo中，所以我们需要从frags中取得对应的数据包
+    if (skb-&gt;mac_header == skb-&gt;tail &amp;&amp;
+        !PageHighMem(skb_shinfo(skb)-&gt;frags[0].page)) {
+        // 可以看到frag0保存的就是对应的skb的frags的第一个元素的地址
+        // frag0的作用是: 有些包的包头会存在skb-&gt;frag[0]里面，gro合并时会调用skb_gro_header_slow将包头拉到线性空间中，那么在非线性skb-&gt;frag[0]中的包头部分就应该删掉。
+            NAPI_GRO_CB(skb)-&gt;frag0 =
+                page_address(skb_shinfo(skb)-&gt;frags[0].page) +
+                skb_shinfo(skb)-&gt;frags[0].page_offset;
+        //然后保存对应的大小。
+        NAPI_GRO_CB(skb)-&gt;frag0_len = skb_shinfo(skb)-&gt;frags[0].size;
+    }
+}
+</code></pre>
+
+<pre><code>接下来就是`__napi_gro_receive`，它主要是遍历gro_list,然后给same_flow赋值，这里要注意，same_flow是一个标记，表示某个skb是否有可能会和当前要处理的skb是相同的流,而这里的相同会在每层都进行判断，也就是在设备层，ip层，tcp层都会判断，这里就是设备层的判断了。这里的判断很简单，有2个条件：  
+1 设备是否相同  
+2 mac的头必须相等  
+
+如果上面两个条件都满足，则说明两个skb有可能是相同的flow，所以设置same_flow,以便与我们后面合并。
+</code></pre>
+
+<pre><code>static gro_result_t
+__napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+{
+    struct sk_buff *p;
+
+    if (netpoll_rx_on(skb))
+        return GRO_NORMAL;
+    //遍历gro_list,然后判断是否有可能两个skb 相似。
+    for (p = napi-&gt;gro_list; p; p = p-&gt;next) {
+        //给same_flow赋值
+        NAPI_GRO_CB(p)-&gt;same_flow =
+            (p-&gt;dev == skb-&gt;dev) &amp;&amp;
+            !compare_ether_header(skb_mac_header(p),
+                skb_gro_mac_header(skb));
+        NAPI_GRO_CB(p)-&gt;flush = 0;
+    }
+    //调用dev_gro_receiv
+    return dev_gro_receive(napi, skb);
+}
+</code></pre>
+
+<pre><code>接下来来看dev_gro_receive，这个函数我们分做两部分来看，第一部分是正常处理部分，第二部份是处理frag0的部分。
+
+来看如何判断是否支持GRO，这里每个设备的features会在驱动初始化的时候被初始化，然后如果支持GRO，则会包括NETIF_F_GRO。 还有要注意的就是，gro不支持切片的ip包，因为ip切片的组包在内核的ip会做一遍，因此这里gro如果合并的话，没有多大意义，而且还增加复杂度。
+
+在dev_gro_receive中会遍历对应的ptype(也就是协议的类链表，以前的blog有详细介绍),然后调用对应的回调函数，一般来说这里会调用文章开始说的ip_packet_type，也就是 inet_gro_receive。
+
+而 inet_gro_receive的返回值表示我们需要立刻feed 进协议栈的数据包，如果为空，则说明不需要feed数据包进协议栈。后面会分析到这里他的详细算法。
+
+而如果当inet_gro_receive正确返回后，如果same_flow没有被设置，则说明gro list中不存在能和当前的skb合并的项，因此此时需要将skb插入到gro list中。这个时候的返回值就是HELD。
+</code></pre>
+
+<pre><code>enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
+{
+    struct sk_buff **pp = NULL;
+    struct packet_type *ptype;
+    __be16 type = skb-&gt;protocol;
+    struct list_head *head = &amp;ptype_base[ntohs(type) &amp; PTYPE_HASH_MASK];
+    int same_flow;
+    int mac_len;
+    enum gro_result ret;
+    //判断是否支持gro
+    if (!(skb-&gt;dev-&gt;features &amp; NETIF_F_GRO))
+        goto normal;
+    //判断是否为切片的ip包
+    if (skb_is_gso(skb) || skb_has_frags(skb))
+        goto normal;
+
+    rcu_read_lock();
+    //开始遍历对应的协议表
+    list_for_each_entry_rcu(ptype, head, list) {
+        if (ptype-&gt;type != type || ptype-&gt;dev || !ptype-&gt;gro_receive)
+            continue;
+
+        skb_set_network_header(skb, skb_gro_offset(skb));
+        mac_len = skb-&gt;network_header - skb-&gt;mac_header;
+        skb-&gt;mac_len = mac_len;
+        NAPI_GRO_CB(skb)-&gt;same_flow = 0;
+        NAPI_GRO_CB(skb)-&gt;flush = 0;
+        NAPI_GRO_CB(skb)-&gt;free = 0;
+        //调用对应的gro接收函数
+        pp = ptype-&gt;gro_receive(&amp;napi-&gt;gro_list, skb);
+        break;
+    }
+    rcu_read_unlock();
+    //如果是没有实现gro的协议则也直接调到normal处理
+    if (&amp;ptype-&gt;list == head)
+        goto normal;
+
+    //到达这里，则说明gro_receive已经调用过了，因此进行后续的处理
+
+    //得到same_flow
+    same_flow = NAPI_GRO_CB(skb)-&gt;same_flow;
+    //看是否有需要free对应的skb
+    ret = NAPI_GRO_CB(skb)-&gt;free ? GRO_MERGED_FREE : GRO_MERGED;
+    //如果返回值pp部位空，则说明pp需要马上被feed进协议栈
+    if (pp) {
+        struct sk_buff *nskb = *pp;
+
+        *pp = nskb-&gt;next;
+        nskb-&gt;next = NULL;
+        //调用napi_gro_complete 将pp刷进协议栈
+        napi_gro_complete(nskb);
+        napi-&gt;gro_count--;
+    }
+    //如果same_flow有设置，则说明skb已经被正确的合并，因此直接返回。
+    if (same_flow)
+        goto ok;
+    //查看是否有设置flush和gro list的个数是否已经超过限制
+    // BUG: 这里是有点不对的，因为这时的skb是比gro_list中的skb更晚到的，但是却被先feed进了协议栈
+    if (NAPI_GRO_CB(skb)-&gt;flush || napi-&gt;gro_count &gt;= MAX_GRO_SKBS)
+        goto normal;
+
+    //到达这里说明skb对应gro list来说是一个新的skb，也就是说当前的gro list并不存在可以和skb合并的数据包，因此此时将这个skb插入到gro_list的头。
+    napi-&gt;gro_count++;
+    NAPI_GRO_CB(skb)-&gt;count = 1;
+    skb_shinfo(skb)-&gt;gso_size = skb_gro_len(skb);
+    //将skb插入到gro list的头
+    skb-&gt;next = napi-&gt;gro_list;
+    napi-&gt;gro_list = skb;
+    //设置返回值
+    ret = GRO_HELD;
+</code></pre>
+
+<pre><code>然后就是处理frag0的部分，以及不支持gro的处理。
+frag0的作用是: 有些包的包头会存在skb-&gt;frag[0]里面，gro合并时会调用skb_gro_header_slow将包头拉到线性空间中，那么在非线性skb-&gt;frag[0]中的包头部分就应该删掉。
+
+这里要需要对skb_shinfo的结构比较了解，我在以前的blog对这个有很详细的介绍，可以去查阅。
+</code></pre>
+
+<pre><code>pull:
+    //是否需要拷贝头
+    if (skb_headlen(skb) &lt; skb_gro_offset(skb)) {
+        //得到对应的头的大小
+        int grow = skb_gro_offset(skb) - skb_headlen(skb);
+
+        BUG_ON(skb-&gt;end - skb-&gt;tail &lt; grow);
+        //开始拷贝
+        memcpy(skb_tail_pointer(skb), NAPI_GRO_CB(skb)-&gt;frag0, grow);
+
+        skb-&gt;tail += grow;
+        skb-&gt;data_len -= grow;
+        //更新对应的frags[0]
+        skb_shinfo(skb)-&gt;frags[0].page_offset += grow;
+        skb_shinfo(skb)-&gt;frags[0].size -= grow;
+        //如果size为0了，则说明第一个页全部包含头，因此需要将后面的页全部移动到前面。
+        if (unlikely(!skb_shinfo(skb)-&gt;frags[0].size)) {
+            put_page(skb_shinfo(skb)-&gt;frags[0].page);
+            //开始移动。
+            memmove(skb_shinfo(skb)-&gt;frags,
+                skb_shinfo(skb)-&gt;frags + 1,
+                --skb_shinfo(skb)-&gt;nr_frags * sizeof(skb_frag_t));
+        }
+    }
+
+ok:
+    return ret;
+
+normal:
+    ret = GRO_NORMAL;
+    goto pull;
+}
+</code></pre>
+
+<pre><code>接下来就是inet_gro_receive，这个函数是ip层的gro receive回调函数，函数很简单，首先取得ip头，然后判断是否需要从frag复制数据，如果需要则复制数据
+</code></pre>
+
+<pre><code>//得到偏移
+off = skb_gro_offset(skb);
+//得到头的整个长度(mac+ip)
+hlen = off + sizeof(*iph);
+//得到ip头
+iph = skb_gro_header_fast(skb, off);
+//是否需要复制
+if (skb_gro_header_hard(skb, hlen)) {
+    iph = skb_gro_header_slow(skb, hlen, off);
+    if (unlikely(!iph))
+        goto out;
+}
+</code></pre>
+
+<pre><code>然后就是一些校验工作，比如协议是否支持gro_reveive,ip头是否合法等等
+</code></pre>
+
+<pre><code>proto = iph-&gt;protocol &amp; (MAX_INET_PROTOS - 1);
+
+rcu_read_lock();
+ops = rcu_dereference(inet_protos[proto]);
+//是否支持gro
+if (!ops || !ops-&gt;gro_receive)
+    goto out_unlock;
+//ip头是否合法, iph-&gt;version = 4, iph-&gt;ipl = 5
+if (*(u8 *)iph != 0x45)
+    goto out_unlock;
+//ip头教研
+if (unlikely(ip_fast_csum((u8 *)iph, iph-&gt;ihl)))
+    goto out_unlock;
+</code></pre>
+
+<pre><code>然后就是核心的处理部分，它会遍历整个gro_list,然后进行same_flow和是否需要flush的判断。
+
+这里ip层设置same_flow是根据下面的规则的:  
+1 4层的协议必须相同  
+2 tos域必须相同  
+3 源，目的地址必须相同  
+
+如果3个条件一个不满足，则会设置same_flow为0。
+这里还有一个就是判断是否需要flush 对应的skb到协议栈，这里的判断条件是这样子的。  
+1 ip包的ttl不一样  
+2 ip包的id顺序不对  
+3 如果是切片包  
+
+如果上面两个条件某一个满足，则说明skb需要被flush出gro。
+
+不过这里要注意只有两个数据包是same flow的情况下，才会进行flush判断。原因很简单，都不是有可能进行merge的包，自然没必要进行flush了。
+</code></pre>
+
+<pre><code>    //取出id
+    id = ntohl(*(__be32 *)&amp;iph-&gt;id);
+    //判断是否需要切片
+    flush = (u16)((ntohl(*(__be32 *)iph) ^ skb_gro_len(skb)) | (id ^ IP_DF));
+    id &gt;&gt;= 16;
+    //开始遍历gro list
+    for (p = *head; p; p = p-&gt;next) {
+        struct iphdr *iph2;
+        //如果上一层已经不可能same flow则直接继续下一个
+        if (!NAPI_GRO_CB(p)-&gt;same_flow)
+            continue;
+        //取出ip头
+        iph2 = ip_hdr(p);
+        //开始same flow的判断
+        if ((iph-&gt;protocol ^ iph2-&gt;protocol) |
+            (iph-&gt;tos ^ iph2-&gt;tos) |
+            ((__force u32)iph-&gt;saddr ^ (__force u32)iph2-&gt;saddr) |
+            ((__force u32)iph-&gt;daddr ^ (__force u32)iph2-&gt;daddr)) {
+            NAPI_GRO_CB(p)-&gt;same_flow = 0;
+            continue;
+        }
+        //开始flush的判断。这里注意如果不是same_flow的话，就没必要进行flush的判断。
+        /* All fields must match except length and checksum. */
+        NAPI_GRO_CB(p)-&gt;flush |=
+            (iph-&gt;ttl ^ iph2-&gt;ttl) |
+            ((u16)(ntohs(iph2-&gt;id) + NAPI_GRO_CB(p)-&gt;count) ^ id);
+
+        NAPI_GRO_CB(p)-&gt;flush |= flush;
+    }
+
+    NAPI_GRO_CB(skb)-&gt;flush |= flush;
+    //pull ip头进gro，这里更新data_offset
+    skb_gro_pull(skb, sizeof(*iph));
+    //设置传输层的头的位置
+    skb_set_transport_header(skb, skb_gro_offset(skb));
+    //调用传输层的reveive方法。
+    pp = ops-&gt;gro_receive(head, skb);
+
+out_unlock:
+    rcu_read_unlock();
+
+out:
+    NAPI_GRO_CB(skb)-&gt;flush |= flush;
+
+}
+</code></pre>
+
+<pre><code>
+然后就是tcp层的gro方法，它的主要实现函数是tcp_gro_receive，他的流程和inet_gro_receiv类似，就是取得tcp的头，然后对gro list进行遍历，最终会调用合并方法。
+
+首先来看gro list遍历的部分,它对same flow的要求就是source必须相同，如果不同则设置same flow为0.如果相同则跳到found部分，进行合并处理。
+</code></pre>
+
+<pre><code>//遍历gro list
+for (; (p = *head); head = &amp;p-&gt;next) {
+    //如果ip层已经不可能same flow则直接进行下一次匹配
+    if (!NAPI_GRO_CB(p)-&gt;same_flow)
+        continue;
+
+    th2 = tcp_hdr(p);
+    //判断源地址
+    if (*(u32 *)&amp;th-&gt;source ^ *(u32 *)&amp;th2-&gt;source) {
+        NAPI_GRO_CB(p)-&gt;same_flow = 0;
+        continue;
+    }
+
+    goto found;
+}
+</code></pre>
+
+<pre><code>
+接下来就是当找到能够合并的skb的时候的处理，这里首先来看flush的设置,这里会有4个条件：  
+1 拥塞状态被设置(TCP_FLAG_CWR).  
+2 tcp的ack的序列号不匹配 (这是肯定的，因为它只是对tso或者说gso进行反向操作)  
+3 skb的flag和从gro list中查找到要合并skb的flag 如果他们中的不同位 不包括TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH，这三个任意一个域。  
+4 tcp的option域不同  
+
+如果上面4个条件有一个满足，则会设置flush为1，也就是找到的这个skb(gro list中)必须被刷出到协议栈。
+
+这里谈一下flags域的设置问题首先如果当前的skb设置了cwr，也就是发生了拥塞，那么自然前面被缓存的数据包需要马上被刷到协议栈，以便与tcp的拥塞控制马上进行。
+
+而FIN和PSH这两个flag自然不需要一致，因为这两个和其他的不是互斥的。
+</code></pre>
+
+<pre><code>found:
+    flush = NAPI_GRO_CB(p)-&gt;flush;
+    //如果设置拥塞，则肯定需要刷出skb到协议栈
+    flush |= (__force int)(flags &amp; TCP_FLAG_CWR);
+    //如果相差的域是除了这3个中的，就需要flush出skb
+    flush |= (__force int)((flags ^ tcp_flag_word(th2)) &amp;
+          ~(TCP_FLAG_CWR | TCP_FLAG_FIN | TCP_FLAG_PSH));
+    //ack的序列号必须一致
+    flush |= (__force int)(th-&gt;ack_seq ^ th2-&gt;ack_seq);
+    //tcp的option头必须一致
+    for (i = sizeof(*th); i &lt; thlen; i += 4)
+        flush |= *(u32 *)((u8 *)th + i) ^
+             *(u32 *)((u8 *)th2 + i);
+
+    mss = skb_shinfo(p)-&gt;gso_size;
+    // 0-1 = 0xFFFFFFFF, 所以skb的数据部分长度为0的包是不会被合并的
+    flush |= (len - 1) &gt;= mss;
+    flush |= (ntohl(th2-&gt;seq) + skb_gro_len(p)) ^ ntohl(th-&gt;seq);
+    //如果flush有设置则不会调用 skb_gro_receive，也就是不需要进行合并，否则调用skb_gro_receive进行数据包合并
+    if (flush || skb_gro_receive(head, skb)) {
+        mss = 1;
+        goto out_check_final;
+    }
+
+    p = *head;
+    th2 = tcp_hdr(p);
+    //更新p的头。到达这里说明合并完毕，因此需要更新合并完的新包的头。
+    tcp_flag_word(th2) |= flags &amp; (TCP_FLAG_FIN | TCP_FLAG_PSH);
+</code></pre>
+
+<pre><code>从上面我们可以看到如果tcp的包被设置了一些特殊的flag比如PSH，SYN这类的就必须马上把数据包刷出到协议栈。
+
+下面就是最终的一些flags判断,比如第一个数据包进来都会到这里来判断。
+</code></pre>
+
+<pre><code>out_check_final:
+    flush = len &lt; mss;
+    //根据flag得到flush
+    flush |= (__force int)(flags &amp; (TCP_FLAG_URG | TCP_FLAG_PSH |
+                    TCP_FLAG_RST | TCP_FLAG_SYN |
+                    TCP_FLAG_FIN));
+
+    if (p &amp;&amp; (!NAPI_GRO_CB(skb)-&gt;same_flow || flush))
+        pp = head;
+
+out:
+    NAPI_GRO_CB(skb)-&gt;flush |= flush;
+</code></pre>
+
+<pre><code>这里要知道每次我们只会刷出gro list中的一个skb节点，这是因为每次进来的数据包我们也只会匹配一个。因此如果遇到需要刷出的数据包，会在dev_gro_receive中先刷出gro list中的，然后再将当前的skb feed进协议栈。
+
+最后就是gro最核心的一个函数skb_gro_receive，它的主要工作就是合并，它有2个参数，第一个是gro list中和当前处理的skb是same flow的skb，第二个就是我们需要合并的skb。
+
+这里要注意就是farg_list,其实gro对待skb_shared_info和ip层切片，组包很类似，就是frags放Scatter-Gather I/O的数据包，frag_list放线性数据。这里gro 也是这样的，如果过来的skb支持Scatter-Gather I/O并且数据是只放在frags中，则会合并frags，如果过来的skb不支持Scatter-Gather I/O(数据头还是保存在skb中)，则合并很简单，就是新建一个skb然后拷贝当前的skb，并将gro list中的skb直接挂载到farg_list。
+
+先来看支持Scatter-Gather I/O的处理部分。
+</code></pre>
+
+<pre><code>//一些需要用到的变量
+struct sk_buff *p = *head;
+struct sk_buff *nskb;
+//当前的skb的 share_ino
+struct skb_shared_info *skbinfo = skb_shinfo(skb);
+//当前的gro list中的要合并的skb的share_info
+struct skb_shared_info *pinfo = skb_shinfo(p);
+unsigned int headroom;
+unsigned int len = skb_gro_len(skb);
+unsigned int offset = skb_gro_offset(skb);
+unsigned int headlen = skb_headlen(skb);
+//如果有frag_list的话，则直接去非Scatter-Gather I/O部分处理，也就是合并到frag_list.
+if (pinfo-&gt;frag_list)
+    goto merge;
+else if (headlen &lt;= offset) {
+    //支持Scatter-Gather I/O的处理
+    skb_frag_t *frag;
+    skb_frag_t *frag2;
+    int i = skbinfo-&gt;nr_frags;
+    //这里遍历是从后向前。
+    int nr_frags = pinfo-&gt;nr_frags + i;
+
+    offset -= headlen;
+
+    if (nr_frags &gt; MAX_SKB_FRAGS)
+        return -E2BIG;
+    //设置pinfo的frags的大小，可以看到就是加上skb的frags的大小
+    pinfo-&gt;nr_frags = nr_frags;
+    skbinfo-&gt;nr_frags = 0;
+
+    frag = pinfo-&gt;frags + nr_frags;
+    frag2 = skbinfo-&gt;frags + i;
+    //遍历赋值，其实就是地址赋值，这里就是将skb的frag加到pinfo的frgas后面。
+    do {
+        *--frag = *--frag2;
+    } while (--i);
+    //更改page_offet的值
+    frag-&gt;page_offset += offset;
+    //修改size大小
+    frag-&gt;size -= offset;
+    //更新skb的相关值
+    skb-&gt;truesize -= skb-&gt;data_len;
+    skb-&gt;len -= skb-&gt;data_len;
+    skb-&gt;data_len = 0;
+
+    NAPI_GRO_CB(skb)-&gt;free = 1;
+    //最终完成
+    goto done;
+} else if (skb_gro_len(p) != pinfo-&gt;gso_size)
+    return -E2BIG;
+</code></pre>
+
+<pre><code>这里gro list中的要被合并的skb我们叫做skb_s.
+
+接下来就是不支持支持Scatter-Gather I/O(skb的头放在skb中)的处理。这里处理也比较简单，就是复制一个新的nskb，然后它的头和skb_s一样，然后将skb_s挂载到nskb的frag_list上，并且把新建的nskb挂在到gro list中，代替skb_s的位置，而当前的skb
+</code></pre>
+
+<pre><code>    headroom = skb_headroom(p);
+    nskb = alloc_skb(headroom + skb_gro_offset(p), GFP_ATOMIC);
+    if (unlikely(!nskb))
+        return -ENOMEM;
+    //复制头
+    __copy_skb_header(nskb, p);
+    nskb-&gt;mac_len = p-&gt;mac_len;
+
+    skb_reserve(nskb, headroom);
+    __skb_put(nskb, skb_gro_offset(p));
+    //设置各层的头
+    skb_set_mac_header(nskb, skb_mac_header(p) - p-&gt;data);
+    skb_set_network_header(nskb, skb_network_offset(p));
+    skb_set_transport_header(nskb, skb_transport_offset(p));
+
+    __skb_pull(p, skb_gro_offset(p));
+    //复制数据
+    memcpy(skb_mac_header(nskb), skb_mac_header(p),
+           p-&gt;data - skb_mac_header(p));
+    //对应的gro 域的赋值
+    *NAPI_GRO_CB(nskb) = *NAPI_GRO_CB(p);
+    //可以看到frag_list被赋值
+    skb_shinfo(nskb)-&gt;frag_list = p;
+    skb_shinfo(nskb)-&gt;gso_size = pinfo-&gt;gso_size;
+    pinfo-&gt;gso_size = 0;
+    skb_header_release(p);
+    nskb-&gt;prev = p;
+    //更新新的skb的数据段
+    nskb-&gt;data_len += p-&gt;len;
+    nskb-&gt;truesize += p-&gt;len;  // 应该改成 nskb-&gt;truesize += p-&gt;truesize; 更准确
+    nskb-&gt;len += p-&gt;len;
+    //将新的skb插入到gro list中
+    *head = nskb;
+    nskb-&gt;next = p-&gt;next;
+    p-&gt;next = NULL;
+
+    p = nskb;
+
+merge:
+    if (offset &gt; headlen) {
+        skbinfo-&gt;frags[0].page_offset += offset - headlen;
+        skbinfo-&gt;frags[0].size -= offset - headlen;
+        offset = headlen;
+    }
+
+    __skb_pull(skb, offset);
+    //将skb插入新的skb的(或者老的skb，当frag list本身存在)fraglist
+    // 这里是用p-&gt;prev来记录了p-&gt;fraglist的最后一个包，所以在gro向协议栈提交时最好加一句skb-&gt;prev = NULL;
+    p-&gt;prev-&gt;next = skb;
+    p-&gt;prev = skb;
+    skb_header_release(skb);
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[TCP校验和的原理和实现]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum/"/>
+    <updated>2015-04-15T14:07:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/04/15/kernel-net-sum</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/11770647">http://blog.csdn.net/zhangskd/article/details/11770647</a></p>
+
+<h4>概述</h4>
+
+<p>TCP校验和是一个端到端的校验和，由发送端计算，然后由接收端验证。其目的是为了发现TCP首部和数据在发送端到接收端之间发生的任何改动。如果接收方检测到校验和有差错，则TCP段会被直接丢弃。</p>
+
+<p>TCP校验和覆盖TCP首部和TCP数据，而IP首部中的校验和只覆盖IP的首部，不覆盖IP数据报中的任何数据。</p>
+
+<p>TCP的校验和是必需的，而UDP的校验和是可选的。</p>
+
+<p>TCP和UDP计算校验和时，都要加上一个12字节的伪首部。</p>
+
+<h4>伪首部</h4>
+
+<p><img src="/images/kernel/2015-04-15-1.jpeg" alt="" /></p>
+
+<p>伪首部共有12字节，包含如下信息：源IP地址、目的IP地址、保留字节(置0)、传输层协议号(TCP是6)、TCP报文长度(报头+数据)。</p>
+
+<p>伪首部是为了增加TCP校验和的检错能力：如检查TCP报文是否收错了(目的IP地址)、传输层协议是否选对了(传输层协议号)等。</p>
+
+<h4>定义</h4>
+
+<h5>(1) RFC 793的TCP校验和定义</h5>
+
+<p>The checksum field is the 16 bit one&rsquo;s complement of the one&rsquo;s complement sum of all 16-bit words in the header and text. If a segment contains an odd number of header and text octets to be checksummed, the last octet is padded on the right with zeros to form a 16-bit word for checksum purposes. The pad is not transmitted as part of the segment. While computing the checksum, the checksum field itself is replaced with zeros.</p>
+
+<p>上述的定义说得很明确：<br/>
+首先，把伪首部、TCP报头、TCP数据分为16位的字，如果总长度为奇数个字节，则在最后增添一个位都为0的字节。把TCP报头中的校验和字段置为0（否则就陷入鸡生蛋还是蛋生鸡的问题）。</p>
+
+<p>其次，用反码相加法累加所有的16位字（进位也要累加）。</p>
+
+<p>最后，对计算结果取反，作为TCP的校验和。</p>
+
+<h5>(2) RFC 1071的IP校验和定义</h5>
+
+<p>1.Adjacent octets to be checksummed are paired to form 16-bit integers, and the 1&rsquo;s complement sum of these 16-bit integers is formed.</p>
+
+<p>2.To generate a checksum, the checksum field itself is cleared, the 16-bit 1&rsquo;s complement sum is computed over the octets concerned, and the 1&rsquo;s complement of this sum is placed in the checksum field.</p>
+
+<p>3.To check a checksum, the 1&rsquo;s complement sum is computed over the same set of octets, including the checksum field. If the result is all 1 bits (-0 in 1&rsquo;s complement arithmetic), the check succeeds.</p>
+
+<p>可以看到，TCP校验和、IP校验和的计算方法是基本一致的，除了计算的范围不同。</p>
+
+<h4>实现</h4>
+
+<p>基于2.6.18、x86_64。</p>
+
+<p>csum_tcpudp_nofold()按4字节累加伪首部到sum中。
+<code>
+    static inline unsigned long csum_tcpudp_nofold (unsigned long saddr, unsigned long daddr,  
+                                                    unsigned short len, unsigned short proto,  
+                                                    unsigned int sum)  
+    {  
+        asm("addl %1, %0\n"    /* 累加daddr */  
+            "adcl %2, %0\n"    /* 累加saddr */  
+            "adcl %3, %0\n"    /* 累加len(2字节), proto, 0*/  
+            "adcl $0, %0\n"    /*加上进位 */  
+            : "=r" (sum)  
+            : "g" (daddr), "g" (saddr), "g" ((ntohs(len) &lt;&lt; 16) + proto*256), "0" (sum));  
+        return sum;  
+    }   
+</code></p>
+
+<p>csum_tcpudp_magic()产生最终的校验和。</p>
+
+<p>首先，按4字节累加伪首部到sum中。</p>
+
+<p>其次，累加sum的低16位、sum的高16位，并且对累加的结果取反。</p>
+
+<p>最后，截取sum的高16位，作为校验和。
+```
     static inline unsigned short int csum_tcpudp_magic(unsigned long saddr, unsigned long daddr,<br/>
                                                        unsigned short len, unsigned short proto,<br/>
                                                        unsigned int sum)<br/>
@@ -2027,583 +1842,6 @@ unsigned int skb_checksum(const struct sk_buff *skb, int offset, int len, unsign
 </code></pre>
 
 <p>```</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux网络编程：原始套接字 SOCK_RAW]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/04/14/kernel-net-sock-raw/"/>
-    <updated>2015-04-14T21:27:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/04/14/kernel-net-sock-raw</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-23069658-id-3280895.html">http://blog.chinaunix.net/uid-23069658-id-3280895.html</a></p>
-
-<h4>一、修改iphdr+tcphdr</h4>
-
-<p>对于TCP或UDP的程序开发，焦点在Data字段，我们没法直接对TCP或UDP头部字段进行赤裸裸的修改，当然还有IP头。换句话说，我们对它们头部操作的空间非常受限，只能使用它们已经开放给我们的诸如源、目的IP，源、目的端口等等。</p>
-
-<p>原始套接字的创建方法：
-<code>
-    socket(AF_INET, SOCK_RAW, protocol);
-</code>
-  重点在protocol字段，这里就不能简单的将其值为0了。在头文件netinet/in.h中定义了系统中该字段目前能取的值，注意：有些系统中不一定实现了netinet/in.h中的所有协议。源代码的linux/in.h中和netinet/in.h中的内容一样。我们常见的有IPPROTO_TCP，IPPROTO_UDP和IPPROTO_ICMP。</p>
-
-<p>用这种方式我就可以得到原始的IP包了，然后就可以自定义IP所承载的具体协议类型，如TCP，UDP或ICMP，并手动对每种承载在IP协议之上的报文进行填充。</p>
-
-<p>先简单复习一下TCP报文的格式</p>
-
-<p><img src="/images/kernel/2015-04-14-1.jpg" alt="" /></p>
-
-<p><img src="/images/kernel/2015-04-14-2.jpg" alt="" /></p>
-
-<p>原始套接字还提供了一个非常有用的参数IP_HDRINCL：</p>
-
-<p>1、当开启该参数时：我们可以从IP报文首部第一个字节开始依次构造整个IP报文的所有选项，但是IP报文头部中的标识字段(设置为0时)和IP首部校验和字段总是由内核自己维护的，不需要我们关心。</p>
-
-<p>2、如果不开启该参数：我们所构造的报文是从IP首部之后的第一个字节开始，IP首部由内核自己维护，首部中的协议字段被设置成调用socket()函数时我们所传递给它的第三个参数。</p>
-
-<p> 开启IP_HDRINCL特性的模板代码一般为：
-<code>
-    const int on =1;
-    if (setsockopt (sockfd, IPPROTO_IP, IP_HDRINCL, &amp;on, sizeof(on)) &lt; 0) {
-        printf("setsockopt error!\n");
-    }
-</code></p>
-
-<p>所以，我们还得复习一下IP报文的首部格式：</p>
-
-<p><img src="/images/kernel/2015-04-14-3.jpg" alt="" /></p>
-
-<p>同样，我们重点关注IP首部中的着色部分区段的填充情况。</p>
-
-<pre><code>    #include &lt;stdlib.h&gt;
-    #include &lt;stdio.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;string.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;netdb.h&gt;
-    #include &lt;sys/socket.h&gt;
-    #include &lt;sys/types.h&gt;
-    #include &lt;netinet/in.h&gt;
-    #include &lt;netinet/ip.h&gt;
-    #include &lt;arpa/inet.h&gt;
-    #include &lt;linux/tcp.h&gt;
-
-    #include &lt;linux/if_ether.h&gt;
-    #include &lt;linux/if_arp.h&gt;
-    #include &lt;linux/sockios.h&gt;
-
-    unsigned csum_tcpudp_nofold(unsigned saddr, unsigned daddr,
-                unsigned len, unsigned proto, unsigned sum)
-    {
-        unsigned long long s = (unsigned)sum;
-        s += (unsigned)saddr;
-        s += (unsigned)daddr;
-        s += (proto + len) &lt;&lt; 8;
-        s += (s &gt;&gt; 32);
-        return (unsigned)s;
-    }
-
-    unsigned short check_sum(unsigned short *addr, int len, unsigned sum)
-    {
-        int nleft = len;
-        unsigned short *w = addr;
-        unsigned short ret = 0;
-        while (nleft &gt; 1) {
-            sum += *w++;
-            nleft -= 2;
-        }
-        if (nleft == 1) {
-            *(unsigned char *)(&amp;ret) = *(unsigned char *)w;
-            sum += ret;
-        }
-
-        sum = (sum&gt;&gt;16) + (sum&amp;0xffff);
-        sum += (sum&gt;&gt;16);
-        ret = ~sum;
-        return ret;
-    }
-
-    //在该函数中构造整个IP报文，最后调用sendto函数将报文发送出去
-    void attack(int skfd, struct sockaddr_in *target, unsigned short srcport)
-    {
-        char buf[256] = {0};
-        struct ip *ip;
-        struct tcphdr *tcp;
-        int ip_len;
-        int op_len = 12;
-
-        //在我们TCP的报文中Data没有字段，所以整个IP报文的长度
-        ip_len = sizeof(struct ip) + sizeof(struct tcphdr) + op_len;
-
-        //开始填充IP首部
-        ip=(struct ip*)buf;
-        ip-&gt;ip_v = IPVERSION;
-        ip-&gt;ip_hl = sizeof(struct ip)&gt;&gt;2;
-        ip-&gt;ip_tos = 0;
-        ip-&gt;ip_len = htons(ip_len);
-        ip-&gt;ip_id = 0;
-        ip-&gt;ip_off = 0;
-        ip-&gt;ip_ttl = MAXTTL;
-        ip-&gt;ip_p = IPPROTO_TCP;
-        ip-&gt;ip_sum = 0;
-        ip-&gt;ip_dst = target-&gt;sin_addr;
-
-        //开始填充TCP首部
-        tcp = (struct tcphdr*)(buf+sizeof(struct ip));
-        tcp-&gt;source = htons(srcport);
-        tcp-&gt;dest = target-&gt;sin_port;
-        srand(time(NULL));
-        tcp-&gt;doff = (sizeof(struct tcphdr) + op_len) &gt;&gt; 2; // tcphdr + option
-        tcp-&gt;syn = 1;
-        tcp-&gt;check = 0;
-        tcp-&gt;window = ntohs(14600);
-
-        int i = ip_len - op_len;
-        // mss = 1460
-        buf[i++] = 0x02;
-        buf[i++] = 0x04;
-        buf[i++] = 0x05;
-        buf[i++] = 0xb4;
-        // sack
-        buf[i++] = 0x01;
-        buf[i++] = 0x01;
-        buf[i++] = 0x04;
-        buf[i++] = 0x02;
-        // wsscale = 7
-        buf[i++] = 0x01;
-        buf[i++] = 0x03;
-        buf[i++] = 0x03;
-        buf[i++] = 0x07;
-
-        int T = 1;
-        while(1) {
-            if (T == 0) break;
-            T--;
-            tcp-&gt;seq = random();
-            //源地址伪造，我们随便任意生成个地址，让服务器一直等待下去
-            //ip-&gt;ip_src.s_addr = random();
-            //自定义源地址192.168.204.136 = 0xc0a8cc88; 反转赋值
-            ip-&gt;ip_src.s_addr = 0x88cca8c0;
-            unsigned sum = csum_tcpudp_nofold(ip-&gt;ip_src.s_addr, ip-&gt;ip_dst.s_addr, sizeof(struct tcphdr)+op_len, IPPROTO_TCP, 0);
-            tcp-&gt;check = check_sum((unsigned short*)tcp, sizeof(struct tcphdr)+op_len, sum);
-    //      ip-&gt;ip_sum = check_sum((unsigned short*)ip, sizeof(struct ip), 0);
-            sendto(skfd, buf, ip_len, 0, (struct sockaddr*)target, sizeof(struct sockaddr_in));
-        }
-    }
-
-    int main(int argc, char** argv)
-    {
-        int skfd;
-        struct sockaddr_in target;
-        struct hostent *host;
-        const int on = 1;
-        unsigned short srcport;
-
-        if (argc != 4) {
-            printf("Usage:%s dstip dstport srcport\n", argv[0]);
-            exit(1);
-        }
-
-        bzero(&amp;target, sizeof(struct sockaddr_in));
-        target.sin_family = AF_INET;
-        target.sin_port = htons(atoi(argv[2]));
-
-        if (inet_aton(argv[1], &amp;target.sin_addr) == 0) {
-            host = gethostbyname(argv[1]);
-            if(host == NULL) {
-                printf("TargetName Error:%s\n", hstrerror(h_errno));
-                exit(1);
-            }
-            target.sin_addr = *(struct in_addr *)(host-&gt;h_addr_list[0]);
-        }
-
-        //将协议字段置为IPPROTO_TCP，来创建一个TCP的原始套接字
-        if (0 &gt; (skfd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP))) {
-            perror("Create Error");
-            exit(1);
-        }
-
-        //用模板代码来开启IP_HDRINCL特性，我们完全自己手动构造IP报文
-        if (0 &gt; setsockopt(skfd, IPPROTO_IP, IP_HDRINCL, &amp;on, sizeof(on))) {
-            perror("IP_HDRINCL failed");
-            exit(1);
-        }
-
-        //因为只有root用户才可以play with raw socket :)
-        setuid(getpid());
-        srcport = atoi(argv[3]);
-        attack(skfd, &amp;target, srcport);
-    }
-</code></pre>
-
-<ul>
-<li>原始套接字上也可以调用connet、bind之类的函数</li>
-</ul>
-
-
-<hr />
-
-<h4>修改mac+iphdr+tcphdr</h4>
-
-<p>blog.chinaunix.net/uid-23069658-id-3283534.html</p>
-
-<p>在Linux系统中要从链路层(MAC)直接收发数帧，比较普遍的做法就是用libpcap和libnet两个动态库来实现。但今天我们就要用原始套接字来实现这个功能。</p>
-
-<p><img src="/images/kernel/2015-04-14-4.jpg" alt="" /></p>
-
-<p>这里的2字节帧类型用来指示该数据帧所承载的上层协议是IP、ARP或其他。</p>
-
-<p>为了实现直接从链路层收发数据帧，我们要用到原始套接字的如下形式：
-<code>
-    socket(PF_PACKET, type, protocol)
-</code>
-1、其中type字段可取SOCK_RAW或SOCK_DGRAM。它们两个都使用一种与设备无关的标准物理层地址结构struct sockaddr_ll{}，但具体操作的报文格式不同：</p>
-
-<p>SOCK_RAW：直接向网络硬件驱动程序发送(或从网络硬件驱动程序接收)没有任何处理的完整数据报文(包括物理帧的帧头)，这就要求我们必须了解对应设备的物理帧帧头结构，才能正确地装载和分析报文。也就是说我们用这种套接字从网卡驱动上收上来的报文包含了MAC头部，如果我们要用这种形式的套接字直接向网卡发送数据帧，那么我们必须自己组装我们MAC头部。这正符合我们的需求。</p>
-
-<p>SOCK_DGRAM：这种类型的套接字对于收到的数据报文的物理帧帧头会被系统自动去掉，然后再将其往协议栈上层传递；同样地，在发送时数据时，系统将会根据sockaddr_ll结构中的目的地址信息为数据报文添加一个合适的MAC帧头。</p>
-
-<p>2、protocol字段，常见的，一般情况下该字段取ETH_P_IP，ETH_P_ARP，ETH_P_RARP或ETH_P_ALL，当然链路层协议很多，肯定不止我们说的这几个，但我们一般只关心这几个就够我们用了。这里简单提一下网络数据收发的一点基础。协议栈在组织数据收发流程时需要处理好两个方面的问题：“从上倒下”，即数据发送的任务；“从下到上”，即数据接收的任务。数据发送相对接收来说要容易些，因为对于数据接收而言，网卡驱动还要明确什么样的数据该接收、什么样的不该接收等问题。protocol字段可选的四个值及其意义如下：</p>
-
-<p>protocol        值        作用<br/>
-ETH_P_IP      0X0800   只接收发往目的MAC是本机的IP类型的数据帧<br/>
-ETH_P_ARP     0X0806   只接收发往目的MAC是本机的ARP类型的数据帧<br/>
-ETH_P_RARP    0X8035   只接受发往目的MAC是本机的RARP类型的数据帧<br/>
-ETH_P_ALL     0X0003   接收发往目的MAC是本机的所有类型(ip,arp,rarp)的数据帧，同时还可以接收从本机发出去的所有数据帧。在混杂模式打开的情况下，还会接收到发往目的MAC为非本地硬件地址的数据帧。</p>
-
-<p>protocol字段可取的所有协议参见/usr/include/linux/if_ether.h头文件里的定义。</p>
-
-<p>最后，格外需要留心一点的就是，发送数据的时候需要自己组织整个以太网数据帧。和地址相关的结构体就不能再用前面的struct sockaddr_in{}了，而是struct sockaddr_ll{}，如下：</p>
-
-<pre><code>    struct sockaddr_ll{
-        unsigned short sll_family; /* 总是 AF_PACKET */
-        unsigned short sll_protocol; /* 物理层的协议 */
-        int sll_ifindex; /* 接口号 */
-        unsigned short sll_hatype; /* 报头类型 */
-        unsigned char sll_pkttype; /* 分组类型 */
-        unsigned char sll_halen; /* 地址长度 */
-        unsigned char sll_addr[8]; /* 物理层地址 */
-    };
-</code></pre>
-
-<p>  sll_protocoll：取值在linux/if_ether.h中，可以指定我们所感兴趣的二层协议；</p>
-
-<p>  sll_ifindex：置为0表示处理所有接口，对于单网卡的机器就不存在“所有”的概念了。如果你有多网卡，该字段的值一般通过ioctl来搞定，模板代码如下，如果我们要获取eth0接口的序号，可以使用如下代码来获取：</p>
-
-<pre><code>    struct  sockaddr_ll  sll;
-    struct ifreq ifr;
-
-    strcpy(ifr.ifr_name, "eth0");
-    ioctl(sockfd, SIOCGIFINDEX, &amp;ifr);
-    sll.sll_ifindex = ifr.ifr_ifindex;
-</code></pre>
-
-<p>  sll_hatype：ARP硬件地址类型，定义在 linux/if_arp.h 中。 取ARPHRD_ETHER时表示为以太网。</p>
-
-<p>  sll_pkttype：包含分组类型。目前，有效的分组类型有：目标地址是本地主机的分组用的 PACKET_HOST，物理层广播分组用的 PACKET_BROADCAST ，发送到一个物理层多路广播地址的分组用的 PACKET_MULTICAST，在混杂(promiscuous)模式下的设备驱动器发向其他主机的分组用的 PACKET_OTHERHOST，源于本地主机的分组被环回到分组套接口用的 PACKET_OUTGOING。这些类型只对接收到的分组有意义。</p>
-
-<p>  sll_addr和sll_halen指示物理层(如以太网，802.3，802.4或802.5等)地址及其长度，严格依赖于具体的硬件设备。类似于获取接口索引sll_ifindex，要获取接口的物理地址，可以采用如下代码：</p>
-
-<pre><code>    struct ifreq ifr;
-
-    strcpy(ifr.ifr_name, "eth0");
-    ioctl(sockfd, SIOCGIFHWADDR, &amp;ifr);
-</code></pre>
-
-<p> 缺省情况下，从任何接口收到的符合指定协议的所有数据报文都会被传送到原始PACKET套接字口，而使用bind系统调用并以一个sochddr_ll结构体对象将PACKET套接字与某个网络接口相绑定，就可使我们的PACKET原始套接字只接收指定接口的数据报文。</p>
-
-<p> 接下来我们简单介绍一下网卡是怎么收报的，如果你对这部分已经很了解可以跳过这部分内容。网卡从线路上收到信号流，网卡的驱动程序会去检查数据帧开始的前6个字节，即目的主机的MAC地址，如果和自己的网卡地址一致它才会接收这个帧，不符合的一般都是直接无视。然后该数据帧会被网络驱动程序分解，IP报文将通过网络协议栈，最后传送到应用程序那里。往上层传递的过程就是一个校验和“剥头”的过程，由协议栈各层去实现。</p>
-
-<p>接下来我们来写个简单的抓包程序，将那些发给本机的IPv4报文全打印出来：</p>
-
-<pre><code>    #include &lt;stdio.h&gt;
-    #include &lt;stdlib.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;sys/socket.h&gt;
-    #include &lt;sys/types.h&gt;
-    #include &lt;netinet/in.h&gt;
-    #include &lt;netinet/ip.h&gt;
-    #include &lt;netinet/if_ether.h&gt;
-
-    int main(int argc, char **argv)
-    {
-        int sock, n;
-        char buffer[2048];
-        struct ethhdr *eth;
-        struct iphdr *iph;
-
-        if (0 &gt; (sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP)))) {
-            perror("socket");
-            exit(1);
-        }
-
-        while (1) {
-            printf("=====================================\n");
-            //注意：在这之前我没有调用bind函数，原因是什么呢？
-            n = recvfrom(sock, buffer, 2048, 0, NULL, NULL);
-            printf("%d bytes read\n", n);
-
-            //接收到的数据帧头6字节是目的MAC地址，紧接着6字节是源MAC地址。
-            eth = (struct ethhdr*)buffer;
-            printf("Dest MAC addr:%02x:%02x:%02x:%02x:%02x:%02x\n",eth-&gt;h_dest[0],eth-&gt;h_dest[1],eth-&gt;h_dest[2],eth-&gt;h_dest[3],eth-&gt;h_dest[4],eth-&gt;h_dest[5]);
-            printf("Source MAC addr:%02x:%02x:%02x:%02x:%02x:%02x\n",eth-&gt;h_source[0],eth-&gt;h_source[1],eth-&gt;h_source[2],eth-&gt;h_source[3],eth-&gt;h_source[4],eth-&gt;h_source[5]);
-
-            iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
-            //我们只对IPV4且没有选项字段的IPv4报文感兴趣
-            if(iph-&gt;version == 4 &amp;&amp; iph-&gt;ihl == 5){
-                unsigned char *sd, *dd;
-                sd = (unsigned char*)&amp;iph-&gt;saddr;
-                dd = (unsigned char*)&amp;iph-&gt;daddr;
-                printf("Source Host: %d.%d.%d.%d Dest host: %d.%d.%d.%d\n", sd[0], sd[1], sd[2], sd[3], dd[0], dd[1], dd[2], dd[3]);
-            //  printf("Source host:%s\n", inet_ntoa(iph-&gt;saddr));
-            //  printf("Dest host:%s\n", inet_ntoa(iph-&gt;daddr));
-            }
-        }
-        return 0;
-    }
-</code></pre>
-
-<p>构造mac源地址包，注意目标mac地址要正确，可以本机先抓包看看是什么</p>
-
-<pre><code>    #include &lt;stdlib.h&gt;
-    #include &lt;stdio.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;string.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;netdb.h&gt;
-    #include &lt;sys/socket.h&gt;
-    #include &lt;sys/types.h&gt;
-    #include &lt;netinet/in.h&gt;
-    #include &lt;netinet/ip.h&gt;
-    #include &lt;arpa/inet.h&gt;
-    #include &lt;linux/tcp.h&gt;
-
-    #include &lt;linux/if_ether.h&gt;
-    #include &lt;linux/if_arp.h&gt;
-    #include &lt;linux/sockios.h&gt;
-
-    unsigned csum_tcpudp_nofold(unsigned saddr, unsigned daddr,
-                unsigned len, unsigned proto, unsigned sum)
-    {
-        unsigned long long s = (unsigned)sum;
-        s += (unsigned)saddr;
-        s += (unsigned)daddr;
-        s += (proto + len) &lt;&lt; 8;
-        s += (s &gt;&gt; 32);
-        return (unsigned)s;
-    }
-
-    unsigned short check_sum(unsigned short *addr, int len, unsigned sum)
-    {
-        int nleft = len;
-        unsigned short *w = addr;
-        unsigned short ret = 0;
-        while (nleft &gt; 1) {
-            sum += *w++;
-            nleft -= 2;
-        }
-        if (nleft == 1) {
-            *(unsigned char *)(&amp;ret) = *(unsigned char *)w;
-            sum += ret;
-        }
-
-        sum = (sum&gt;&gt;16) + (sum&amp;0xffff);
-        sum += (sum&gt;&gt;16);
-        ret = ~sum;
-        return ret;
-    }
-
-    int change(char c)
-    {
-        if (c &gt;= 'a') return c-'a'+10;
-        if (c &gt;= 'A') return c-'A'+10;
-        return c-'0';
-    }
-
-    //在该函数中构造整个IP报文，最后调用sendto函数将报文发送出去
-    void attack(int skfd, struct sockaddr_ll *target, char **argv)
-    {
-        char buf[512]={0};
-        struct ethhdr *eth;
-        struct ip *ip;
-        struct tcphdr *tcp;
-        int pks_len;
-        int i;
-        int op_len = 12;
-        unsigned short dstport;
-        dstport = atoi(argv[3]);
-
-        //在我们TCP的报文中Data没有字段，所以整个IP报文的长度
-        pks_len = sizeof(struct ethhdr) + sizeof(struct ip) + sizeof(struct tcphdr) + op_len;
-        eth = (struct ethhdr *) buf;
-        /*
-        eth-&gt;h_dest[0] = 0x00;
-        eth-&gt;h_dest[1] = 0x50;
-        eth-&gt;h_dest[2] = 0x56;
-        eth-&gt;h_dest[3] = 0xee;
-        eth-&gt;h_dest[4] = 0x14;
-        eth-&gt;h_dest[5] = 0xa6;
-        */
-
-        for (i=0;i&lt;6;i++)
-            eth-&gt;h_dest[i] = change(argv[1][i*3])*16 + change(argv[1][i*3+1]);
-
-        /*
-        eth-&gt;h_source[0] = 0x00;
-        eth-&gt;h_source[1] = 0x0b;
-        eth-&gt;h_source[2] = 0x28;
-        eth-&gt;h_source[3] = 0xd7;
-        eth-&gt;h_source[4] = 0x26;
-        eth-&gt;h_source[5] = 0xa6;
-        */
-        eth-&gt;h_proto = ntohs(ETH_P_IP);
-
-        //开始填充IP首部
-        ip=(struct ip*)(buf + sizeof(struct ethhdr));
-        ip-&gt;ip_v = IPVERSION;
-        ip-&gt;ip_hl = sizeof(struct ip) &gt;&gt; 2;
-        ip-&gt;ip_tos = 0;
-        ip-&gt;ip_len = htons(pks_len - sizeof(struct ethhdr));
-        ip-&gt;ip_id = 0;
-        ip-&gt;ip_off = 0;
-        ip-&gt;ip_ttl = MAXTTL;
-        ip-&gt;ip_p = IPPROTO_TCP;
-        ip-&gt;ip_sum = 0;
-        ip-&gt;ip_dst.s_addr = inet_addr(argv[2]);
-
-        //开始填充TCP首部
-        srand(time(NULL));
-        tcp = (struct tcphdr*)(buf + sizeof(struct ethhdr) + sizeof(struct ip));
-        tcp-&gt;source = random()%50000+10000;
-        tcp-&gt;dest = ntohs(dstport);
-        tcp-&gt;seq = random();
-        tcp-&gt;doff = (sizeof(struct tcphdr) + op_len) &gt;&gt; 2;
-        tcp-&gt;syn = 1;
-        tcp-&gt;check = 0;
-        tcp-&gt;window = ntohs(14600);
-
-        i = pks_len - op_len;
-        // mss = 1460
-        buf[i++] = 0x02;
-        buf[i++] = 0x04;
-        buf[i++] = 0x05;
-        buf[i++] = 0xb4;
-        // sack
-        buf[i++] = 0x01;
-        buf[i++] = 0x01;
-        buf[i++] = 0x04;
-        buf[i++] = 0x02;
-        // wsscale = 7
-        buf[i++] = 0x01;
-        buf[i++] = 0x03;
-        buf[i++] = 0x03;
-        buf[i++] = 0x07;
-
-        int T = 1;
-        while(1) {
-            if (T == 0) break;
-            T--;
-            //源地址伪造，我们随便任意生成个地址，让服务器一直等待下去
-            ip-&gt;ip_src.s_addr = random();
-            //自定义源地址192.168.204.136 =&gt; 0xc0a8cc88
-            //ip-&gt;ip_src.s_addr = 0x8fcca8c0;
-            unsigned sum = csum_tcpudp_nofold(ip-&gt;ip_src.s_addr, ip-&gt;ip_dst.s_addr, sizeof(struct tcphdr)+op_len, IPPROTO_TCP, 0);
-            tcp-&gt;check = check_sum((unsigned short*)tcp, sizeof(struct tcphdr)+op_len, sum);
-            ip-&gt;ip_sum = check_sum((unsigned short*)ip, sizeof(struct ip), 0);
-            sendto(skfd, buf, pks_len, 0, (struct sockaddr*)target, sizeof(struct sockaddr_ll));
-        }
-    }
-
-    int main(int argc, char** argv)
-    {
-        int skfd;
-        struct sockaddr_ll target;
-        struct hostent *host;
-        const int on=1;
-
-        if (argc != 4) {
-            printf("Usage:%s dstmac dstip dstport\n", argv[0]);
-            exit(1);
-        }
-        if (strlen(argv[1]) != 17) {
-            printf("Usage: dstmac must be xx:xx:xx:xx:xx:xx\n");
-            exit(1);
-        }
-
-        //将协议字段置为IPPROTO_TCP，来创建一个TCP的原始套接字
-        if (0 &gt; (skfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP)))) {
-            perror("Create Error");
-            exit(1);
-        }
-
-        // mac
-        bzero(&amp;target, sizeof(struct sockaddr_ll));
-
-        struct ifreq ifr;
-        strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
-        ioctl(skfd, SIOCGIFINDEX, &amp;ifr);
-        target.sll_ifindex = ifr.ifr_ifindex;
-        /*
-        target.sll_family = AF_PACKET;
-        target.sll_protocol = ntohs(80);
-        target.sll_hatype = ARPHRD_ETHER;
-        target.sll_pkttype = PACKET_OTHERHOST;
-        target.sll_halen = ETH_ALEN;
-        memset(target.sll_addr,0,8);
-        target.sll_addr[0] = 0x00;
-        target.sll_addr[1] = 0x0C;
-        target.sll_addr[2] = 0x29;
-        target.sll_addr[3] = 0x61;
-        target.sll_addr[4] = 0xB6;
-        target.sll_addr[5] = 0x43;
-        */
-
-
-        /*
-        //http://blog.chinaunix.net/uid-305141-id-2133781.html
-        struct sockaddr_ll sll;
-        struct ifreq ifstruct;
-        memset (&amp;sll, 0, sizeof (sll));
-        sll.sll_family = PF_PACKET;
-        sll.sll_protocol = htons (ETH_P_IP);
-
-        strcpy (ifstruct.ifr_name, "eth0");
-        ioctl (skfd, SIOCGIFINDEX, &amp;ifstruct);
-        sll.sll_ifindex = ifstruct.ifr_ifindex;
-
-        strcpy (ifstruct.ifr_name, "eth0");
-        ioctl (skfd, SIOCGIFHWADDR, &amp;ifstruct);
-        memcpy (sll.sll_addr, ifstruct.ifr_ifru.ifru_hwaddr.sa_data, ETH_ALEN);
-        sll.sll_halen = ETH_ALEN;
-
-        if (bind (skfd, (struct sockaddr *) &amp;sll, sizeof (sll)) == -1) {
-            printf ("bind:   ERROR\n");
-            return -1;
-        }
-
-        memset(&amp;ifstruct, 0, sizeof(ifstruct));
-        strcpy (ifstruct.ifr_name, "eth0");
-        if (ioctl (skfd, SIOCGIFFLAGS, &amp;ifstruct) == -1) {
-            perror ("iotcl()\n");
-            printf ("Fun:%s Line:%d\n", __func__, __LINE__);
-            return -1;
-        }
-
-        ifstruct.ifr_flags |= IFF_PROMISC;
-
-        if(ioctl(skfd, SIOCSIFFLAGS, &amp;ifstruct) == -1) {
-            perror("iotcl()\n");
-            printf ("Fun:%s Line:%d\n", __func__, __LINE__);
-            return -1;
-        } 
-    */
-        //因为只有root用户才可以play with raw socket :)
-        setuid(getpid());
-    //  attack(skfd, &amp;sll, srcport);
-        attack(skfd, &amp;target, argv);
-    }
-</code></pre>
 ]]></content>
   </entry>
   
