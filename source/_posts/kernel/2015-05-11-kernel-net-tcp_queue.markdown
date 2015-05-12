@@ -165,7 +165,9 @@ release_sock(sk)涉及到sk_backlog处理。
   为什么要置NULLsk->sk_backlog.head ，sk->sk_backlog.tail呢？第一想法是它可能要被重新使用了。那么在什么情况下会被重新使用呢？试想一下当前是在进程上下文，并且sk->sk_lock.slock没有被锁住，那是不是可能被软中断打断呢？如果被软中断打断了是不是要接收数据呢，tcp协议栈为了效率考虑肯定是要接收数据的，前面分析道这种情况的数据必须放置到后备队列中(sk_backlog)，所以可以肯定置NULL sk->sk_backlog.head ，sk->sk_backlog.tail是为了在处理上一个sk_backlog时，能重用sk_backlog，建立一条新的sk_backlog，或许有人会问为什么不直接添加到原先的sk_backlog tail末尾呢？这个问题我也没有想太清楚，或许是同步不好做吧。
 
 ##### 4、skb被处理到哪去了
-  很明显接收的数据最终都将被传递到应用层，在传递到应用层前必须要保证三个接收队列中的数据有序，那么这三个队列是怎么保证数据字节流有序的被递交给应用层呢？三个队列都会调用tcp_v4_do_rcv函数，prequeue和sk_backlog是在tcp_recvmsg中调用tcp_v4_do_rcv函数，也就是进程上下文中调用tcp_v4_do_rcv函数。
+  很明显接收的数据最终都将被传递到应用层，在传递到应用层前必须要保证三个接收队列中的数据有序，那么这三个队列是怎么保证数据字节流有序的被递交给应用层呢？三个队列都会调用tcp_v4_do_rcv函数，prequeue和sk_backlog是在tcp_recvmsg中调用tcp_v4_do_rcv函数，也就是进程上下文中调用tcp_v4_do_rcv函数，但会local_bh_disable禁止软中断。如果在tcp_rcv_established, tcp_data_queue中如果刚好数据可以直接copy到用户空间，又会短暂开始软中断local_bh_enable。
+
+  但在tcp_checksum_complete_user、tcp_rcv_established、tcp_data_queue函数中开启软中断将来容易出问题，进入软中断:softirq()+=1; local_bh_enable:softirq()-=2; 所以现在只是软中断中softirq()统计不准，进程中还是准的。但如果以后在软中断中在local_bh_enable之前给softirq()+=1了，那么就会导致软中断被打断，导致软中断执行途中被切走而且永远切不回来。tcp_checksum_complete_user被切走导致收包不成功，tcp_rcv_established、tcp_data_queue函数中如果在tp->copied_seq+=chunk后被切走就会导致tp->copied_seq>tp->rcv_nxt，那么下次收包后就有可能出现tp->copied_seq > sk_write_queue.first.end_seq, 等异常。
 
   如果仔细分析tcp_v4_do_rcv函数能发现，这个函数能保证数据有序的排列在一起，所以无论是在处理sk_backlog还是prequeue，最终都会调用tcp_v4_do_rcv函数将数据有效地插入到sk_write_queue中，最后被应用层取走。
 
