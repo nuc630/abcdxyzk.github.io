@@ -46,7 +46,7 @@ http://blog.csdn.net/shanshanpt/article/details/22201847
 			}
 		} else {                                       // 每接收到一个ACK，窗口增大(1/snd_cwnd)，使用cnt计数
 			/* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd */
-			if (tp->snd_cwnd_cnt >= tp->snd_cwnd) {    // 线性增长计数器 >= 阈值 
+			if (tp->snd_cwnd_cnt >= tp->snd_cwnd) {    // 线性增长计数器 >= 阈值
 				if (tp->snd_cwnd < tp->snd_cwnd_clamp) // 如果窗口还没有达到阈值
 					tp->snd_cwnd++;                    // 那么++增大窗口
 				tp->snd_cwnd_cnt = 0;
@@ -61,7 +61,7 @@ http://blog.csdn.net/shanshanpt/article/details/22201847
 	void tcp_slow_start(struct tcp_sock *tp)           // 每到达一个ACK，snd_cwnd就加1。这意味着每个RTT，拥塞窗口就会翻倍。
 	{
 		int cnt; /* increase in packets */
-	 
+
 		/* RFC3465: ABC Slow start
 		 * Increase only after a full MSS of bytes is acked
 		 *
@@ -76,14 +76,14 @@ http://blog.csdn.net/shanshanpt/article/details/22201847
 			cnt = sysctl_tcp_max_ssthresh >> 1;     /* limited slow start */       // 窗口减半~~~~~
 		else
 			cnt = tp->snd_cwnd;          /* exponential increase */                // 否则还是原来的窗口
-	 
+
 		/* RFC3465: ABC
 		 * We MAY increase by 2 if discovered delayed ack
 		 */
 		if (sysctl_tcp_abc > 1 && tp->bytes_acked >= 2*tp->mss_cache) // 如果启动了延迟确认，那么当接收到的ACK大于等于两个MSS的时候才加倍窗口大小
 			cnt <<= 1;
 		tp->bytes_acked = 0;  // 清空
-	 
+
 		tp->snd_cwnd_cnt += cnt;
 		while (tp->snd_cwnd_cnt >= tp->snd_cwnd) {  // 这里snd_cwnd_cnt是snd_cwnd的几倍，拥塞窗口就增加几。
 			tp->snd_cwnd_cnt -= tp->snd_cwnd;       // ok
@@ -104,15 +104,15 @@ http://blog.csdn.net/shanshanpt/article/details/22201847
 	{
 		const struct tcp_sock *tp = tcp_sk(sk);
 		u32 left;
-	 
+
 		if (in_flight >= tp->snd_cwnd)    // 比较发送未确认和发送拥塞窗口的大小
 			return 1;                     // 如果未确认的大，那么需要增大拥塞窗口
-	 
+
 		if (!sk_can_gso(sk))              // 如果没有gso延时处理所有包，不需要增大窗口
 			return 0;
-	 
+
 		left = tp->snd_cwnd - in_flight;  // 得到还能发送的数据包的数量
-		if (sysctl_tcp_tso_win_divisor)    
+		if (sysctl_tcp_tso_win_divisor)
 			return left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd;
 		else
 			return left <= tcp_max_burst(tp); // 如果还可以发送的数量>burst，说明发送太快，不需要增大窗口。
