@@ -38,8 +38,8 @@ tcp_sacktag_write_queue()来根据SACK选项标记发送队列中skb的记分牌
 ```
 	/* 这就是一个SACK块 */
 	struct tcp_sack_block {
-		u32 start_seq; /* 起始序号 */
-		u32 end_seq; /* 结束序号 */
+		u32 start_seq;  /* 起始序号 */
+		u32 end_seq;    /* 结束序号 */
 	};
 ```
 ```
@@ -62,10 +62,10 @@ tcp_sacktag_write_queue()来根据SACK选项标记发送队列中skb的记分牌
 	struct tcp_options_received {
 		...
 		u16 saw_tstamp : 1,    /* Saw TIMESTAMP on last packet */
-				tstamp_ok : 1, /* TIMESTAMP seen on SYN packet */
-				dsack : 1,     /* D-SACK is scheduled, 下一个发送段是否存在D-SACK */
-				sack_ok : 4,   /* SACK seen on SYN packet, 接收方是否支持SACK */
-				...
+			tstamp_ok : 1,     /* TIMESTAMP seen on SYN packet */
+			dsack : 1,         /* D-SACK is scheduled, 下一个发送段是否存在D-SACK */
+			sack_ok : 4,       /* SACK seen on SYN packet, 接收方是否支持SACK */
+			...
 		u8 num_sacks;          /* Number of SACK blocks, 下一个发送段中SACK块数 */
 		...
 	};
@@ -470,7 +470,7 @@ RFC 2883
 	/* 用于处理SACK块时保存一些信息 */
 	struct tcp_sacktag_state {
 		int reord;       /* 乱序的位置 */
-		int fack_count;  /* 累加fackets_out */
+		int fack_count;  /* 累加fackets_out */ // fack_count只是单纯的累加write_queue的packets_out
 		int flag;        /* 返回标志 */
 	};
 ```
@@ -660,6 +660,7 @@ RFC 2883
 
 			/* Can skip some work by looking recv_sack_cache?
 			 * 查看当前SACK块和cache块有无交集，避免重复工作。
+			 * 前一个包的sack块(cache块)只是为了加快处理这个包的sack块
 			 */
 			if (tcp_sack_cache_ok(tp, cache) && ! dup_sack &&
 				after(end_seq, cache->start_seq)) {
@@ -690,7 +691,7 @@ RFC 2883
 					/* 如果已经到了snd_nxt了，那么直接退出SACK块的遍历 */
 					if (skb == NULL)
 						break;
-					state.fack_count = tp->fackets_out;
+					state.fack_count = tp->fackets_out; // fack_count只是单纯的累加write_queue的packets_out
 					cache++; /* 此cache已经用完了 */
 					goto walk; /* 继续SACK块还没处理完的部分 */
 				}
@@ -709,7 +710,7 @@ RFC 2883
 				skb = tcp_highest_sack(sk);
 				if (skb == NULL)
 					break;
-				state.fack_count = tp->fackets_out;
+				state.fack_count = tp->fackets_out; // fack_count只是单纯的累加write_queue的packets_out
 			}
 
 			skb = tcp_sacktag_skip(skb, sk, &state, start_seq); /* skb跳到start_seq处，下面会walk遍历此块 */
@@ -729,7 +730,7 @@ RFC 2883
 		}
 
 		/* Clear the head of the cache sack blocks so we can skip it next time.
-		 * 两个循环用于清除旧的SACK块，保存新的SACK块
+		 * 两个循环用于清除旧的SACK块，保存新的SACK块。保存前一个包的sack块只是为了加快处理下一个包的sack块
 		 */
 		for (i = 0; i < ARRAY_SIZE(tp->recv_sack_cache) - used_sacks; i++) {
 			tp->recv_sack_cache[i].start_seq = 0;
@@ -1163,7 +1164,7 @@ tcp_sacktag_walk()则遍历两个序号之间的skb，通常用于遍历一个SA
 			if (after(TCP_SKB_CB(skb)->end_seq, skip_to_seq)) /* 找到包含skip_to_seq序号的数据包了 */
 				break;
 
-			state->fack_count += tcp_skb_pcount(skb);         /* 统计fackets_out个数 */
+			state->fack_count += tcp_skb_pcount(skb);         /* 统计fackets_out个数 */ // fack_count只是单纯的累加write_queue的packets_out
 		}
 
 		return skb; /* 返回包含skip_to_seq的skb */
@@ -1236,7 +1237,7 @@ tcp_sacktag_walk()则遍历两个序号之间的skb，通常用于遍历一个SA
 					tcp_advance_highest_sack(sk, skb); /*把highest_sack设为skb->next */
 			}
 
-			state->fack_count += tcp_skb_pcount(skb); /* 更新fackets_out */
+			state->fack_count += tcp_skb_pcount(skb); /* 更新fackets_out */ // fack_count只是单纯的累加write_queue的packets_out
 		}
 
 		return skb; /* 遍历到此skb退出 */
