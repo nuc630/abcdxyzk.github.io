@@ -17,10 +17,8 @@ http://simohayha.iteye.com/blog/578744
   SACK是包含在tcp的option中的，由于tcp的头的长度的限制，因此SACK也就是最多包含4个段，也就是32个字节。我们先来看tcp中的SACK段的表示： 
 ```
 	struct tcp_sack_block {
-		//起始序列号
-		u32	start_seq;
-		//结束序列号
-		u32	end_seq;
+		u32	start_seq; //起始序列号
+		u32	end_seq;   //结束序列号
 	};
 ```
 可以看到很简单，就是一个段的起始序列号和一个结束序列号。 
@@ -32,7 +30,7 @@ http://simohayha.iteye.com/blog/578744
 ```
 	//首先得到sack option的起始指针。
 	unsigned char *ptr = (skb_transport_header(ack_skb) +
-			      TCP_SKB_CB(ack_skb)->sacked);
+				  TCP_SKB_CB(ack_skb)->sacked);
 	//加2的意思也就是加上类型和长度，这里刚好是2个字节。最终结果也就是sack option的数据段。
 	struct tcp_sack_block_wire *sp_wire = (struct tcp_sack_block_wire *)(ptr+2);
 ```
@@ -79,7 +77,7 @@ http://simohayha.iteye.com/blog/578744
 	#define TCP_NUM_SACKS 4
 	......
 	......
-        const struct inet_connection_sock *icsk = inet_csk(sk);
+		const struct inet_connection_sock *icsk = inet_csk(sk);
 		struct tcp_sock *tp = tcp_sk(sk);
 		//下面两句代码，前面已经分析过了，也就是取得sack的指针以及sack 数据段的指针。
 		unsigned char *ptr = (skb_transport_header(ack_skb) +
@@ -194,7 +192,7 @@ http://simohayha.iteye.com/blog/578744
 然后回到tcp_sacktag_write_queue，接下来这部分很简单，主要是提取sack的段到sp中，并校验每个段的合法性，然后统计一些信息。 
 ```
 	//开始遍历，这里num_sacks也就是我们前面计算的sack段的个数
-    for (i = 0; i < num_sacks; i++) {
+	for (i = 0; i < num_sacks; i++) {
 		int dup_sack = !i && found_dup_sack;
 
 		//赋值。
@@ -203,8 +201,8 @@ http://simohayha.iteye.com/blog/578744
 
 		//检测段的合法性。
 		if (!tcp_is_sackblock_valid(tp, dup_sack,
-					    sp[used_sacks].start_seq,
-					    sp[used_sacks].end_seq)) {
+						sp[used_sacks].start_seq,
+						sp[used_sacks].end_seq)) {
 			int mib_idx;
 
 			if (dup_sack) {
@@ -215,7 +213,7 @@ http://simohayha.iteye.com/blog/578744
 			} else {
 				/* Don't count olds caused by ACK reordering */
 				if ((TCP_SKB_CB(ack_skb)->ack_seq != tp->snd_una) &&
-				    !after(sp[used_sacks].end_seq, tp->snd_una))
+					!after(sp[used_sacks].end_seq, tp->snd_una))
 					continue;
 				mib_idx = LINUX_MIB_TCPSACKDISCARD;
 			}
@@ -262,7 +260,7 @@ http://simohayha.iteye.com/blog/578744
 		cache = tp->recv_sack_cache;
 		/* Skip empty blocks in at head of the cache */
 		while (tcp_sack_cache_ok(tp, cache) && !cache->start_seq &&
-		       !cache->end_seq)
+			   !cache->end_seq)
 			//跳过空的块。
 			cache++;
 	}
@@ -309,7 +307,7 @@ tcp socket的high_seq域，这个域是我们进入拥塞控制的时候最大�
 		state.fack_count = 0;
 		i = 0;
 
-		///这里used_sacks表示我们需要处理的sack段的个数。
+		//这里used_sacks表示我们需要处理的sack段的个数。
 		while (i < used_sacks) {
 			u32 start_seq = sp[i].start_seq;
 			u32 end_seq = sp[i].end_seq;
