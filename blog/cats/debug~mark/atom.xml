@@ -4,7 +4,7 @@
   <title><![CDATA[Category: debug~mark | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/debug~mark/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-05-13T14:20:30+08:00</updated>
+  <updated>2015-05-15T16:00:40+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,44 +14,394 @@
 
   
   <entry>
-    <title type="html"><![CDATA[tcp_read_sock BUG]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_read_sock_bug/"/>
-    <updated>2015-05-11T10:17:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_read_sock_bug</id>
-    <content type="html"><![CDATA[<pre><code>commit baff42ab1494528907bf4d5870359e31711746ae
-Author: Steven J. Magnani &lt;steve@digidescorp.com&gt;
-Date:   Tue Mar 30 13:56:01 2010 -0700
+    <title type="html"><![CDATA[tcp_collapse do not copy headers]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/15/debug-mark-tcp_collapse-bug/"/>
+    <updated>2015-05-15T10:08:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/15/debug-mark-tcp_collapse-bug</id>
+    <content type="html"><![CDATA[<pre><code>commit b3d6cb92fd190d720a01075c4d20cdca896663fc
+Author: Eric Dumazet &lt;edumazet@google.com&gt;
+Date:   Mon Sep 15 04:19:53 2014 -0700
 
-    net: Fix oops from tcp_collapse() when using splice()
+    tcp: do not copy headers in tcp_collapse()
 
-    tcp_read_sock() can have a eat skbs without immediately advancing copied_seq.
-    This can cause a panic in tcp_collapse() if it is called as a result
-    of the recv_actor dropping the socket lock.
+    tcp_collapse() wants to shrink skb so that the overhead is minimal.
 
-    A userspace program that splices data from a socket to either another
-    socket or to a file can trigger this bug.
+    Now we store tcp flags into TCP_SKB_CB(skb)-&gt;tcp_flags, we no longer
+    need to keep around full headers.
+    Whole available space is dedicated to the payload.
 
-    Signed-off-by: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+    Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
+    Acked-by: Neal Cardwell &lt;ncardwell@google.com&gt;
     Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
 </code></pre>
 
-<pre><code>    diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
-    index 6afb6d8..2c75f89 100644
-    --- a/net/ipv4/tcp.c
-    +++ b/net/ipv4/tcp.c
-    @@ -1368,6 +1368,7 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
-            sk_eat_skb(sk, skb, 0);
-            if (!desc-&gt;count)
-                break;
-    +       tp-&gt;copied_seq = seq;
-        }
-        tp-&gt;copied_seq = seq;
+<pre><code>    diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+    index 228bf0c..ea92f23 100644
+    --- a/net/ipv4/tcp_input.c
+    +++ b/net/ipv4/tcp_input.c
+    @@ -4535,26 +4535,13 @@ restart:
+            return;
+
+        while (before(start, end)) {
+    +       int copy = min_t(int, SKB_MAX_ORDER(0, 0), end - start);
+            struct sk_buff *nskb;
+    -       unsigned int header = skb_headroom(skb);
+    -       int copy = SKB_MAX_ORDER(header, 0);
+
+    -       /* Too big header? This can happen with IPv6. */
+    -       if (copy &lt; 0)
+    -           return;
+    -       if (end - start &lt; copy)
+    -           copy = end - start;
+    -       nskb = alloc_skb(copy + header, GFP_ATOMIC);
+    +       nskb = alloc_skb(copy, GFP_ATOMIC);
+            if (!nskb)
+                return;
+
+    -       skb_set_mac_header(nskb, skb_mac_header(skb) - skb-&gt;head);
+    -       skb_set_network_header(nskb, (skb_network_header(skb) -
+    -                         skb-&gt;head));
+    -       skb_set_transport_header(nskb, (skb_transport_header(skb) -
+    -                       skb-&gt;head));
+    -       skb_reserve(nskb, header);
+    -       memcpy(nskb-&gt;head, skb-&gt;head, header);
+            memcpy(nskb-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));
+            TCP_SKB_CB(nskb)-&gt;seq = TCP_SKB_CB(nskb)-&gt;end_seq = start;
+            __skb_queue_before(list, skb, nskb);
 </code></pre>
 
-<p>如果在tcp_read_sock中sk_eat_skb时copied_seq没有及时一起修改的话，就会出现copied_seq小于sk_write_queue队列第一个包的seq。<br/>
-tcp_read_sock的recv_actor指向的函数(比如tcp_splice_data_recv)是有可能释放sk锁的，如果这时进入收包软中断且内存紧张调用tcp_collapse，<br/>
-tcp_collapse中：<br/>
-```
+<hr />
+
+<p>这个改进无形中修了一个BUG，但是这BUG正常情况下不会触发，除非我们对skb进行改动导致skb->data - skb->head = 4k时，如果此时内存紧张，且满足tcp_collapse合并条件才触发。</p>
+
+<p>BUG：
+tcp_collapse代码中有：
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>    while (before(start, end)) {
+</span><span class='line'>        struct sk_buff *nskb;
+</span><span class='line'>        unsigned int header = skb_headroom(skb);
+</span><span class='line'>        int copy = SKB_MAX_ORDER(header, 0);&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        /* Too big header? This can happen with IPv6. */
+</span><span class='line'>    if (copy &lt; 0) 
+</span><span class='line'>        return;
+</span><span class='line'>
+</span><span class='line'>    ......
+</span><span class='line'>
+</span><span class='line'>    /* Copy data, releasing collapsed skbs. */
+</span><span class='line'>    while (copy &gt; 0) { 
+</span><span class='line'>        int offset = start - TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>        int size = TCP_SKB_CB(skb)-&gt;end_seq - start;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>也就是说如果header = 4k，那么copy = 0，那么会一直申请len=0的skb插入到receive队列，直到申请skb失败。这样就会造成tcp_recvmsg出错
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        skb_queue_walk(&amp;sk-&gt;sk_receive_queue, skb) {
+</span><span class='line'>        /* Now that we have two receive queues this
+</span><span class='line'>         * shouldn't happen.
+</span><span class='line'>         */
+</span><span class='line'>        if (WARN(before(*seq, TCP_SKB_CB(skb)-&gt;seq),
+</span><span class='line'>             KERN_INFO "recvmsg bug: copied %X "
+</span><span class='line'>                   "seq %X rcvnxt %X fl %X\n", *seq,
+</span><span class='line'>                   TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt,
+</span><span class='line'>                   flags))
+</span><span class='line'>            break;
+</span><span class='line'>
+</span><span class='line'>        offset = *seq - TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>        if (tcp_hdr(skb)-&gt;syn)
+</span><span class='line'>            offset--;
+</span><span class='line'>        if (offset &lt; skb-&gt;len)
+</span><span class='line'>            goto found_ok_skb;
+</span><span class='line'>        if (tcp_hdr(skb)-&gt;fin)
+</span><span class='line'>            goto found_fin_ok;
+</span><span class='line'>        WARN(!(flags &amp; MSG_PEEK), KERN_INFO "recvmsg bug 2: "
+</span><span class='line'>                "copied %X seq %X rcvnxt %X fl %X\n",
+</span><span class='line'>                *seq, TCP_SKB_CB(skb)-&gt;seq,
+</span><span class='line'>                tp-&gt;rcv_nxt, flags);
+</span><span class='line'>    }
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;因为offset = 0, len = 0, if (offset &lt; skb-&gt;len)就不符合，报WARN。而且如果申请的len=0的skb过多，会导致一直在这里循环，因为WARN有打印堆栈，执行很慢。
+</span><span class='line'>
+</span><span class='line'>错误如下：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G   W  ---------------   )
+</span><span class='line'>Hardware name: PowerEdge R620
+</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
+</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
+</span><span class='line'>Call Trace:
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
+</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
+</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
+</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
+</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
+</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
+</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
+</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
+</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
+</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
+</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
+</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
+</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
+</span><span class='line'>---[ end trace ef9663ba0fc61730 ]---
+</span><span class='line'>------------[ cut here ]------------
+</span><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G        W  ---------------   )
+</span><span class='line'>Hardware name: PowerEdge R620
+</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
+</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
+</span><span class='line'>Call Trace:
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
+</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
+</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
+</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
+</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
+</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
+</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
+</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
+</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
+</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
+</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
+</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
+</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
+</span><span class='line'>---[ end trace ef9663ba0fc61731 ]---
+</span><span class='line'>------------[ cut here ]------------
+</span><span class='line'>
+</span><span class='line'>.......
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>如果skb申请的不多，很快就能看到tcp_cleanup_rbuf的WARN，仔细观察会发现，这里打印的end_seq和上面的seq是一样的。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void tcp_cleanup_rbuf(struct sock *sk, int copied)
+</span><span class='line'>{
+</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>int time_to_ack = 0;
+</span><span class='line'>
+</span><span class='line'>#if TCP_DEBUG
+</span><span class='line'>struct sk_buff *skb = skb_peek(&amp;sk-&gt;sk_receive_queue);
+</span><span class='line'>
+</span><span class='line'>WARN(skb &amp;&amp; !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq),
+</span><span class='line'>     KERN_INFO "cleanup rbuf bug: copied %X seq %X rcvnxt %X\n",
+</span><span class='line'>     tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;rcv_nxt);
+</span><span class='line'>#endif
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[tcp_read_sock BUG]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_read_sock_bug/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-11T10:17:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/11/debug-mark-tcp_read_sock_bug&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;pre&gt;&lt;code&gt;commit baff42ab1494528907bf4d5870359e31711746ae
+</span><span class='line'>Author: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+</span><span class='line'>Date:   Tue Mar 30 13:56:01 2010 -0700
+</span><span class='line'>
+</span><span class='line'>net: Fix oops from tcp_collapse() when using splice()
+</span><span class='line'>
+</span><span class='line'>tcp_read_sock() can have a eat skbs without immediately advancing copied_seq.
+</span><span class='line'>This can cause a panic in tcp_collapse() if it is called as a result
+</span><span class='line'>of the recv_actor dropping the socket lock.
+</span><span class='line'>
+</span><span class='line'>A userspace program that splices data from a socket to either another
+</span><span class='line'>socket or to a file can trigger this bug.
+</span><span class='line'>
+</span><span class='line'>Signed-off-by: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+</span><span class='line'>Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+</span><span class='line'>index 6afb6d8..2c75f89 100644
+</span><span class='line'>--- a/net/ipv4/tcp.c
+</span><span class='line'>+++ b/net/ipv4/tcp.c
+</span><span class='line'>@@ -1368,6 +1368,7 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+</span><span class='line'>        sk_eat_skb(sk, skb, 0);
+</span><span class='line'>        if (!desc-&gt;count)
+</span><span class='line'>            break;
+</span><span class='line'>+       tp-&gt;copied_seq = seq;
+</span><span class='line'>    }
+</span><span class='line'>    tp-&gt;copied_seq = seq;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果在tcp_read_sock中sk_eat_skb时copied_seq没有及时一起修改的话，就会出现copied_seq小于sk_write_queue队列第一个包的seq。&lt;br/&gt;
+</span><span class='line'>tcp_read_sock的recv_actor指向的函数(比如tcp_splice_data_recv)是有可能释放sk锁的，如果这时进入收包软中断且内存紧张调用tcp_collapse，&lt;br/&gt;
+</span><span class='line'>tcp_collapse中：&lt;br/&gt;</span></code></pre></td></tr></table></div></figure>
     start = copied_seq
     &hellip;
     int offset = start - TCP_SKB_CB(skb)->seq;</p>
@@ -197,8 +547,8 @@ Date:   Wed Jun 18 21:15:03 2014 -0400
     <id>http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-tcp_trim_head_bug</id>
     <content type="html"><![CDATA[<p><a href="http://kernel.opensuse.org/cgit/kernel/commit/?id=5b35e1e6e9ca651e6b291c96d1106043c9af314a">http://kernel.opensuse.org/cgit/kernel/commit/?id=5b35e1e6e9ca651e6b291c96d1106043c9af314a</a></p>
 
-<p>author  Neal Cardwell <a href="&#109;&#97;&#x69;&#x6c;&#x74;&#x6f;&#x3a;&#110;&#99;&#x61;&#x72;&#100;&#119;&#x65;&#x6c;&#108;&#64;&#x67;&#x6f;&#111;&#x67;&#108;&#x65;&#46;&#99;&#x6f;&#x6d;">&#x6e;&#99;&#x61;&#114;&#100;&#x77;&#x65;&#x6c;&#108;&#64;&#x67;&#111;&#111;&#103;&#108;&#x65;&#46;&#x63;&#111;&#x6d;</a>    2012-01-28 17:29:46 (GMT)<br/>
-committer   David S. Miller <a href="&#x6d;&#97;&#105;&#108;&#x74;&#111;&#x3a;&#x64;&#x61;&#118;&#101;&#109;&#64;&#x64;&#97;&#118;&#x65;&#109;&#108;&#x6f;&#102;&#x74;&#46;&#x6e;&#x65;&#116;">&#100;&#x61;&#x76;&#101;&#109;&#64;&#100;&#97;&#118;&#x65;&#x6d;&#x6c;&#111;&#102;&#116;&#x2e;&#110;&#101;&#116;</a>   2012-01-30 17:42:58 (GMT)<br/>
+<p>author  Neal Cardwell <a href="&#x6d;&#97;&#105;&#x6c;&#116;&#x6f;&#58;&#x6e;&#x63;&#x61;&#x72;&#100;&#x77;&#101;&#x6c;&#x6c;&#x40;&#x67;&#111;&#x6f;&#103;&#x6c;&#101;&#x2e;&#x63;&#x6f;&#x6d;">&#x6e;&#x63;&#x61;&#114;&#100;&#119;&#101;&#x6c;&#108;&#64;&#x67;&#x6f;&#x6f;&#x67;&#108;&#x65;&#46;&#99;&#x6f;&#x6d;</a>    2012-01-28 17:29:46 (GMT)<br/>
+committer   David S. Miller <a href="&#109;&#97;&#x69;&#x6c;&#x74;&#111;&#x3a;&#100;&#x61;&#118;&#101;&#109;&#x40;&#x64;&#97;&#x76;&#x65;&#x6d;&#x6c;&#x6f;&#x66;&#116;&#x2e;&#110;&#x65;&#x74;">&#100;&#97;&#118;&#x65;&#x6d;&#64;&#x64;&#x61;&#x76;&#101;&#x6d;&#108;&#x6f;&#x66;&#116;&#x2e;&#x6e;&#x65;&#116;</a>   2012-01-30 17:42:58 (GMT)<br/>
 commit  5b35e1e6e9ca651e6b291c96d1106043c9af314a (patch)<br/>
 tree    d18caadee5e93dc45d0c5fa2c530537cfa14586c<br/>
 parent  4acb41903b2f99f3dffd4c3df9acc84ca5942cb2 (diff)</p>
@@ -211,10 +561,10 @@ parent  4acb41903b2f99f3dffd4c3df9acc84ca5942cb2 (diff)</p>
 
 <p>As an aside, if tcp_trim_head() had really wanted the skb to reflect the current MSS, it should have called tcp_set_skb_tso_segs() unconditionally, since a decrease in MSS would mean that a single-packet skb should now be sliced into multiple segments.</p>
 
-<p>Signed-off-by: Neal Cardwell <a href="&#109;&#x61;&#x69;&#108;&#x74;&#x6f;&#x3a;&#110;&#x63;&#97;&#x72;&#x64;&#119;&#101;&#108;&#108;&#x40;&#103;&#x6f;&#x6f;&#x67;&#108;&#101;&#46;&#x63;&#111;&#109;">&#110;&#99;&#x61;&#114;&#x64;&#119;&#101;&#x6c;&#x6c;&#x40;&#103;&#x6f;&#111;&#103;&#108;&#x65;&#46;&#99;&#x6f;&#x6d;</a> <br/>
-Acked-by: Nandita Dukkipati <a href="&#x6d;&#x61;&#105;&#x6c;&#116;&#111;&#x3a;&#x6e;&#x61;&#110;&#x64;&#x69;&#116;&#97;&#100;&#x40;&#103;&#111;&#x6f;&#x67;&#x6c;&#x65;&#46;&#x63;&#111;&#109;">&#110;&#97;&#x6e;&#x64;&#x69;&#116;&#97;&#x64;&#x40;&#x67;&#111;&#x6f;&#103;&#x6c;&#x65;&#x2e;&#x63;&#x6f;&#109;</a> <br/>
-Acked-by: Ilpo Järvinen <a href="&#x6d;&#x61;&#105;&#x6c;&#116;&#111;&#58;&#x69;&#108;&#x70;&#x6f;&#x2e;&#x6a;&#97;&#114;&#118;&#x69;&#110;&#101;&#x6e;&#64;&#x68;&#x65;&#x6c;&#x73;&#105;&#110;&#x6b;&#x69;&#x2e;&#x66;&#105;">&#105;&#x6c;&#x70;&#111;&#x2e;&#x6a;&#97;&#114;&#118;&#x69;&#x6e;&#x65;&#x6e;&#x40;&#x68;&#x65;&#x6c;&#115;&#105;&#x6e;&#x6b;&#x69;&#46;&#x66;&#x69;</a> <br/>
-Signed-off-by: David S. Miller <a href="&#109;&#97;&#x69;&#108;&#x74;&#x6f;&#58;&#100;&#x61;&#x76;&#101;&#109;&#x40;&#100;&#x61;&#118;&#x65;&#109;&#108;&#111;&#102;&#x74;&#x2e;&#110;&#x65;&#x74;">&#x64;&#97;&#x76;&#101;&#x6d;&#64;&#100;&#97;&#118;&#x65;&#109;&#108;&#111;&#x66;&#x74;&#46;&#x6e;&#101;&#116;</a></p>
+<p>Signed-off-by: Neal Cardwell <a href="&#109;&#97;&#105;&#x6c;&#x74;&#x6f;&#58;&#110;&#99;&#97;&#x72;&#100;&#119;&#x65;&#108;&#x6c;&#x40;&#103;&#x6f;&#111;&#x67;&#x6c;&#x65;&#x2e;&#99;&#111;&#x6d;">&#x6e;&#99;&#97;&#114;&#100;&#119;&#101;&#x6c;&#108;&#x40;&#x67;&#111;&#111;&#x67;&#x6c;&#101;&#46;&#x63;&#111;&#x6d;</a> <br/>
+Acked-by: Nandita Dukkipati <a href="&#109;&#97;&#105;&#108;&#x74;&#111;&#x3a;&#110;&#97;&#110;&#x64;&#105;&#116;&#x61;&#100;&#64;&#x67;&#111;&#x6f;&#x67;&#x6c;&#101;&#x2e;&#x63;&#x6f;&#x6d;">&#x6e;&#x61;&#110;&#x64;&#x69;&#116;&#x61;&#x64;&#64;&#103;&#x6f;&#x6f;&#103;&#108;&#x65;&#x2e;&#99;&#x6f;&#109;</a> <br/>
+Acked-by: Ilpo Järvinen <a href="&#109;&#x61;&#105;&#108;&#116;&#x6f;&#x3a;&#105;&#x6c;&#x70;&#111;&#46;&#106;&#x61;&#114;&#118;&#105;&#110;&#x65;&#110;&#64;&#104;&#x65;&#x6c;&#115;&#x69;&#x6e;&#107;&#x69;&#46;&#102;&#x69;">&#105;&#108;&#x70;&#111;&#46;&#x6a;&#x61;&#x72;&#118;&#x69;&#x6e;&#101;&#110;&#x40;&#104;&#x65;&#x6c;&#115;&#x69;&#x6e;&#107;&#105;&#46;&#102;&#105;</a> <br/>
+Signed-off-by: David S. Miller <a href="&#x6d;&#97;&#x69;&#108;&#x74;&#x6f;&#58;&#x64;&#97;&#118;&#x65;&#x6d;&#x40;&#100;&#x61;&#118;&#x65;&#109;&#x6c;&#111;&#102;&#116;&#x2e;&#110;&#x65;&#116;">&#100;&#x61;&#x76;&#x65;&#x6d;&#64;&#x64;&#x61;&#118;&#101;&#109;&#108;&#111;&#102;&#x74;&#x2e;&#110;&#101;&#116;</a></p>
 
 <p>1 files changed, 2 insertions, 4 deletions
 <code>
@@ -239,188 +589,6 @@ Signed-off-by: David S. Miller <a href="&#109;&#97;&#x69;&#108;&#x74;&#x6f;&#58;
 <hr />
 
 <p>会出现tp->packets_out不正确, 导致sk_write_queue为空时却掉tcp_rearm_rto()，判断tp->packets_out不为0，启动重传定时器，然后重传时取出的是list_head的地址，不是skb的地址，导致后面异常。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[如果sk_write_queue异常]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-write_queue/"/>
-    <updated>2015-05-08T14:14:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/05/08/debug-mark-write_queue</id>
-    <content type="html"><![CDATA[<ul>
-<li>注意，以下情况内核都不可能产生，纯属假设</li>
-</ul>
-
-
-<h4>一、连续的SYN/FIN</h4>
-
-<pre><code>    |---FIN---|---SYN/FIN---|
-        skb       next_skb
-</code></pre>
-
-<ul>
-<li>内核不可能出现是因为：发送FIN包后就不再发包。所以FIN包只可能在sk_write_queue的最后一个包</li>
-</ul>
-
-
-<p>假设skb和next_skb发出去后都丢了，那tcp_retransmit_skb会重传skb，
-重传的时候会调用tcp_retrans_try_collapse尝试去和下一个包合并。</p>
-
-<p>skb和next_skb合并过程：<br/>
-先检查一些条件，然后
-<code>
-    ...
-    skb_copy_from_linear_data(next_skb, skb_put(skb, next_skb_size), next_skb_size);
-    ...
-    TCP_SKB_CB(skb)-&gt;end_seq = TCP_SKB_CB(next_skb)-&gt;end_seq;
-</code>
-也就是skb->len += next_skb->len; skb->end_seq = next_skb->end_seq;</p>
-
-<p>假设:
-<code>
-    skb-&gt;len = 0;      skb-&gt;seq = 10;      skb-&gt;end_seq = 10 + FIN = 11;
-    next_skb-&gt;len = 0; next_skb-&gt;seq = 11; next_skb-&gt;end_seq = 11 + SYN/FIN = 12;
-</code>
-那么合并后：
-<code>
-    skb-&gt;len = 0;      skb-&gt;seq = 10;      skb-&gt;end_seq = 12;
-</code>
-很明显不正常了，正常情况下：skb->len &lt;= skb->end_seq - skb->seq &lt;= skb->len+1</p>
-
-<p>这时如果来了ack 11，那么会再重传合并后的skb，然后会调用tcp_trim_head(struct ws_st_sock <em>sk, struct sk_buff </em>skb, u32 len)，参数len = tp->snd_una - TCP_SKB_CB(skb)->seq = 1，但skb->len = 0;</p>
-
-<p>tcp_trim_head函数中会：
-<code>
-    skb-&gt;len -= len;
-</code>
-这时skb->len = (U32)-1 = 0xFFFFFFFF，skb->len错误后，再调用skb_copy之类的就会访问越界，报BUG。
-<code>
-     821 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)
-     822 {
-            ......
-     835         if (skb_copy_bits(skb, -headerlen, n-&gt;head, headerlen + skb-&gt;len))
-     836                 BUG();
-</code></p>
-
-<h4>二、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<ul>
-<li>内核用tp->write_seq控制，保证了write_queue的skb->end_seq == next_skb->seq</li>
-</ul>
-
-
-<pre><code>    skb:       |------------------|
-    next_skb:  |---------------------|
-
-    假设skb已经发送出去，并被ack了，这时tp-&gt;snd_una = skb-&gt;end_seq
-    此时再发送next_skb，并且mss变小了，需要对next_skb分包，分包后如下：
-
-    skb:       |------------------|
-    next_skb:  |-------|-------:-----|
-                  skb1       skb2
-
-    next_skb 被分成了两个包，skb1-&gt;len = mss, skb1-&gt;gso_segs = 1; skb2-&gt;len &gt; mss, skb2-&gt;gso_segs = 2;
-    skb1, skb2发送出去，丢了，然后重传skb1，
-    此时 skb1-&gt;end_seq &lt; tp-&gt;snd_una
-
-    2092 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
-    2093 {
-            ......
-    2111         if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {
-    2112                 if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))
-    2113                         BUG();
-</code></pre>
-
-<h4>三、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<pre><code>    skb:       |------------------|
-    next_skb:  |---------------------|
-
-    skb, next_skb 发送出去丢了，重传，调用tcp_retrans_try_collapse合并。
-    合并后：skb-&gt;len += next_skb-&gt;len; skb-&gt;end_seq = next_skb-&gt;end_seq;
-
-    假设   skb-&gt;len = 100;      skb-&gt;seq = 0;      skb-&gt;end_seq = 100;
-          next_skb-&gt;len = 120  next_skb-&gt;seq = 0; next_skb-&gt;end_seq = 120;
-    合并后 skb-&gt;len = 200;      skb-&gt;seq = 0;      skb-&gt;end_seq = 120;
-
-    发送合并后的skb，再丢包，再重传，mss = 150，skb-&gt;len &gt; mss, 会分包
-          skb-&gt;len = 150;      skb-&gt;seq = 0;      skb-&gt;end_seq = 150;
-          next_skb-&gt;len = 50;  next_skb-&gt;seq = 150; next_skb-&gt;end_seq = 120;
-    也就是出现了next_skb-&gt;seq &gt; next_skb-&gt;end_seq
-    (此时如果ack skb也会把next_skb一起清了，因为next_skb-&gt;end_seq &lt; skb-&gt;end_seq)
-
-    这时如果skb再重传分包，分成skb3，skb4
-        skb3-&gt;len = 130;   skb3-&gt;seq = 0;   skb3-&gt;end_seq = 130;
-        skb4-&gt;len = 20;    skb4-&gt;seq = 130; skb4-&gt;end_seq = 150;
-
-    这时ack了skb3，tp-&gt;snd_una = 130 (虽然next_skb-&gt;end_seq &lt; skb3-&gt;end_seq, 但skb4-&gt;end_seq &gt; skb3-&gt;end_seq, 所以不会把next_skb清掉)
-    重传skb4，skb5，此时skb5-&gt;end_seq &lt; tp-&gt;snd_una
-
-    2092 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
-    2093 {
-            ......
-    2111         if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {
-    2112                 if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))
-    2113                         BUG();
-</code></pre>
-
-<h4>四、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<pre><code>    skb:       |------------------|
-    next_skb:  |---------------------|
-
-    发送 skb，next_skb
-    接收到 sack:|---------------------|
-
-    调用tcp_sacktag_walk() ---&gt; tcp_shift_skb_data() 将多个被sack的包合并成一个。
-    合并过程：
-        skb-&gt;len += next_skb-&gt;len; skb-&gt;end_seq += next_skb-&gt;len;
-    那么就会合并出一超出原来end_seq的包：
-               |----------------------------------------|
-    然后再ack:  |----------------------|
-    这时把合并出的包trim掉一部分，剩skb7:  |-----------------|
-
-    再发包skb_new:                     |-------|
-    这时tp-&gt;snd_nxt = skb_new-&gt;end_seq
-    再重传skb7, 并分包:                 |----------|------|
-    分包时skb7-&gt;end_seq &gt; tp-&gt;snd_nxt, 所以不会调整tp-&gt;packets_out，
-    但ack到来时(tcp_clean_rtx_queue)tp-&gt;packets_out却会减去分包后的gso_segs。
-    导致tp-&gt;packets_out &lt; 0, 但sk_write_queue却是空的。
-    tcp_rearm_rto()判断tp-&gt;packets_out不为0，启动重传定时器，然后重传时取出的是list_head的地址，不是skb的地址，导致后面异常。
-    代码：
-     974 int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
-     975                  unsigned int mss_now)
-     976 {
-        ......
-    1047         if (!before(tp-&gt;snd_nxt, TCP_SKB_CB(buff)-&gt;end_seq)) {
-    1048                 int diff = old_factor - tcp_skb_pcount(skb) -
-    1049                         tcp_skb_pcount(buff);
-    1050 
-    1051                 if (diff)
-    1052                         tcp_adjust_pcount(sk, skb, diff);
-    1053         }
-</code></pre>
-
-<h4>五（发现好像没错）、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
-
-<ul>
-<li>内核用tp->write_seq控制，保证了write_queue的skb->end_seq == next_skb->seq</li>
-</ul>
-
-
-<pre><code>    skb:       |------------------|
-    next_skb:  |---------------------|
-
-    假设skb已经发送出去，这时tp-&gt;snd_nxt = skb-&gt;end_seq
-    发送next_skb时mss变小了，需要对next_skb分包，分包后如下：
-
-    skb:       |------------------|
-    next_skb:  |-------|-------:-----|
-                  skb1       skb2
-    next_skb 被分成了两个包，skb1-&gt;len = mss, skb1-&gt;gso_segs = 1; skb2-&gt;len &gt; mss, skb2-&gt;gso_segs = 2;
-
-    然后将skb1, skb2发送出去, tp-&gt;packets_out += 3; 这时假设ack了skb，清掉skb1和skb2的一个mss，。。。没错。。。
-</code></pre>
 ]]></content>
   </entry>
   
