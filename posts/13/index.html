@@ -62,6 +62,370 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-balance/">Linux内核CPU负载均衡机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-02-11T14:00:00+08:00'><span class='date'>2015-02-11</span> <span class='time'>14:00:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.oenhan.com/cpu-load-balance">http://www.oenhan.com/cpu-load-balance</a></p>
+
+<p> 还是神奇的进程调度问题引发的，参看Linux进程组调度机制分析，组调度机制是看清楚了，发现在重启过程中，很多内核调用栈阻塞在了double_rq_lock函数上，而double_rq_lock则是load_balance触发的，怀疑当时的核间调度出现了问题，在某个负责场景下产生了多核互锁，后面看了一下CPU负载平衡下的代码实现，写一下总结。</p>
+
+<p>内核代码版本：kernel-3.0.13-0.27。</p>
+
+<p>内核代码函数起自load_balance函数,从load_balance函数看引用它的函数可以一直找到schedule函数这里，便从这里开始往下看，在__schedule中有下面一句话。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!rq-&gt;nr_running))
+</span><span class='line'>    idle_balance(cpu, rq);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从上面可以看出什么时候内核会尝试进行CPU负载平衡：即当前CPU运行队列为NULL的时候。</p>
+
+<p>CPU负载平衡有两种方式：pull和push，即空闲CPU从其他忙的CPU队列中拉一个进程到当前CPU队列；或者忙的CPU队列将一个进程推送到空闲的CPU队列中。idle_balance干的则是pull的事情，具体push下面会提到。</p>
+
+<p>在idle_balance里面，有一个proc阀门控制当前CPU是否pull:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (this_rq-&gt;avg_idle &lt; sysctl_sched_migration_cost)
+</span><span class='line'>    return;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sysctl_sched_migration_cost对应proc控制文件是/proc/sys/kernel/sched_migration_cost，开关代表如果CPU队列空闲了500ms（sysctl_sched_migration_cost默认值）以上，则进行pull，否则则返回。</p>
+
+<p>for_each_domain(this_cpu, sd) 则是遍历当前CPU所在的调度域，可以直观的理解成一个CPU组，类似task_group，核间平衡指组内的平衡。负载平衡有一个矛盾就是：负载平衡的频度和CPU cache的命中率是矛盾的，CPU调度域就是将各个CPU分成层次不同的组，低层次搞定的平衡就绝不上升到高层次处理，避免影响cache的命中率。</p>
+
+<p>图例如下;</p>
+
+<p><img src="/images/kernel/2015-02-11-1.jpg" alt="" /></p>
+
+<p>最终通过load_balance进入正题。</p>
+
+<p>首先通过find_busiest_group获取当前调度域中的最忙的调度组，首先update_sd_lb_stats更新sd的状态，也就是遍历对应的sd，将sds里面的结构体数据填满，如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sd_lb_stats {
+</span><span class='line'>    struct sched_group *busiest; /* Busiest group in this sd */
+</span><span class='line'>    struct sched_group *this;  /* Local group in this sd */
+</span><span class='line'>    unsigned long total_load;  /* Total load of all groups in sd */
+</span><span class='line'>    unsigned long total_pwr;   /*   Total power of all groups in sd */
+</span><span class='line'>    unsigned long avg_load;    /* Average load across all groups in sd */
+</span><span class='line'> 
+</span><span class='line'>    /** Statistics of this group */
+</span><span class='line'>    unsigned long this_load; //当前调度组的负载
+</span><span class='line'>    unsigned long this_load_per_task; //当前调度组的平均负载
+</span><span class='line'>    unsigned long this_nr_running; //当前调度组内运行队列中进程的总数
+</span><span class='line'>    unsigned long this_has_capacity;
+</span><span class='line'>    unsigned int  this_idle_cpus;
+</span><span class='line'> 
+</span><span class='line'>    /* Statistics of the busiest group */
+</span><span class='line'>    unsigned int  busiest_idle_cpus;
+</span><span class='line'>    unsigned long max_load; //最忙的组的负载量
+</span><span class='line'>    unsigned long busiest_load_per_task; //最忙的组中平均每个任务的负载量
+</span><span class='line'>    unsigned long busiest_nr_running; //最忙的组中所有运行队列中进程的个数
+</span><span class='line'>    unsigned long busiest_group_capacity;
+</span><span class='line'>    unsigned long busiest_has_capacity;
+</span><span class='line'>    unsigned int  busiest_group_weight;</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>do
+</span><span class='line'>{
+</span><span class='line'>    local_group = cpumask_test_cpu(this_cpu, sched_group_cpus(sg));
+</span><span class='line'>    if (local_group) {
+</span><span class='line'>                  //如果是当前CPU上的group，则进行赋值
+</span><span class='line'>        sds-&gt;this_load = sgs.avg_load;
+</span><span class='line'>        sds-&gt;this = sg;
+</span><span class='line'>        sds-&gt;this_nr_running = sgs.sum_nr_running;
+</span><span class='line'>        sds-&gt;this_load_per_task = sgs.sum_weighted_load;
+</span><span class='line'>        sds-&gt;this_has_capacity = sgs.group_has_capacity;
+</span><span class='line'>        sds-&gt;this_idle_cpus = sgs.idle_cpus;
+</span><span class='line'>    } else if (update_sd_pick_busiest(sd, sds, sg, &sgs, this_cpu)) {
+</span><span class='line'>                 //在update_sd_pick_busiest判断当前sgs的是否超过了之前的最大值，如果是
+</span><span class='line'>                 //则将sgs值赋给sds
+</span><span class='line'>        sds-&gt;max_load = sgs.avg_load;
+</span><span class='line'>        sds-&gt;busiest = sg;
+</span><span class='line'>        sds-&gt;busiest_nr_running = sgs.sum_nr_running;
+</span><span class='line'>        sds-&gt;busiest_idle_cpus = sgs.idle_cpus;
+</span><span class='line'>        sds-&gt;busiest_group_capacity = sgs.group_capacity;
+</span><span class='line'>        sds-&gt;busiest_load_per_task = sgs.sum_weighted_load;
+</span><span class='line'>        sds-&gt;busiest_has_capacity = sgs.group_has_capacity;
+</span><span class='line'>        sds-&gt;busiest_group_weight = sgs.group_weight;
+</span><span class='line'>        sds-&gt;group_imb = sgs.group_imb;
+</span><span class='line'>    }
+</span><span class='line'>    sg = sg-&gt;next;
+</span><span class='line'>} while (sg != sd-&gt;groups);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>决定选择调度域中最忙的组的参照标准是该组内所有 CPU上负载(load) 的和， 找到组中找到忙的运行队列的参照标准是该CPU运行队列的长度， 即负载，并且 load 值越大就表示越忙。在平衡的过程中，通过比较当前队列与以前记录的busiest 的负载情况，及时更新这些变量，让 busiest 始终指向域内最忙的一组，以便于查找。</p>
+
+<p>调度域的平均负载计算</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sds.avg_load = (SCHED_POWER_SCALE * sds.total_load) / sds.total_pwr;
+</span><span class='line'>if (sds.this_load &gt;= sds.avg_load)
+</span><span class='line'>    goto out_balanced;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在比较负载大小的过程中， 当发现当前运行的CPU所在的组中busiest为空时，或者当前正在运行的 CPU队列就是最忙的时， 或者当前 CPU队列的负载不小于本组内的平均负载时，或者不平衡的额度不大时，都会返回 NULL 值，即组组之间不需要进行平衡；当最忙的组的负载小于该调度域的平均负载时，只需要进行小范围的负载平衡；当要转移的任务量小于每个进程的平均负载时，如此便拿到了最忙的调度组。</p>
+
+<p>然后find_busiest_queue中找到最忙的调度队列，遍历该组中的所有 CPU 队列，经过依次比较各个队列的负载，找到最忙的那个队列。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_cpu(i, sched_group_cpus(group)) {
+</span><span class='line'>    /*rq-&gt;cpu_power表示所在处理器的计算能力,在函式sched_init初始化时,会把这值设定为SCHED_LOAD_SCALE (=Nice 0的Load Weight=1024).并可透过函式update_cpu_power (in kernel/sched_fair.c)更新这个值.*/
+</span><span class='line'>    unsigned long power = power_of(i);
+</span><span class='line'>    unsigned long capacity = DIV_ROUND_CLOSEST(power,SCHED_POWER_SCALE);
+</span><span class='line'>    unsigned long wl;
+</span><span class='line'>    if (!cpumask_test_cpu(i, cpus))
+</span><span class='line'>        continue;
+</span><span class='line'> 
+</span><span class='line'>    rq = cpu_rq(i);
+</span><span class='line'>/*获取队列负载cpu_rq(cpu)-&gt;load.weight;*/
+</span><span class='line'>    wl = weighted_cpuload(i);
+</span><span class='line'> 
+</span><span class='line'>    /*
+</span><span class='line'>     * When comparing with imbalance, use weighted_cpuload()
+</span><span class='line'>     * which is not scaled with the cpu power.
+</span><span class='line'>     */
+</span><span class='line'>    if (capacity && rq-&gt;nr_running == 1 && wl &gt; imbalance)
+</span><span class='line'>        continue;
+</span><span class='line'> 
+</span><span class='line'>    /*
+</span><span class='line'>     * For the load comparisons with the other cpu's, consider
+</span><span class='line'>     * the weighted_cpuload() scaled with the cpu power, so that
+</span><span class='line'>     * the load can be moved away from the cpu that is potentially
+</span><span class='line'>     * running at a lower capacity.
+</span><span class='line'>     */
+</span><span class='line'>    wl = (wl * SCHED_POWER_SCALE) / power;
+</span><span class='line'> 
+</span><span class='line'>    if (wl &gt; max_load) {
+</span><span class='line'>        max_load = wl;
+</span><span class='line'>        busiest = rq;
+</span><span class='line'>    }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过上面的计算，便拿到了最忙队列。<br/>
+当busiest->nr_running运行数大于1的时候，进行pull操作，pull前对move_tasks,先进行double_rq_lock加锁处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>double_rq_lock(this_rq, busiest);
+</span><span class='line'>ld_moved = move_tasks(this_rq, this_cpu, busiest,
+</span><span class='line'>        imbalance, sd, idle, &all_pinned);
+</span><span class='line'>double_rq_unlock(this_rq, busiest);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>move_tasks进程pull task是允许失败的，即move_tasks->balance_tasks，在此处，有sysctl_sched_nr_migrate开关控制进程迁移个数，对应proc的是/proc/sys/kernel/sched_nr_migrate。</p>
+
+<p>下面有can_migrate_task函数检查选定的进程是否可以进行迁移，迁移失败的原因有3个，1.迁移的进程处于运行状态；2.进程被绑核了，不能迁移到目标CPU上；3.进程的cache仍然是hot，此处也是为了保证cache命中率。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*关于cache cold的情况下，如果迁移失败的个数太多，仍然进行迁移
+</span><span class='line'> * Aggressive migration if:
+</span><span class='line'> * 1) task is cache cold, or
+</span><span class='line'> * 2) too many balance attempts have failed.
+</span><span class='line'> */
+</span><span class='line'> 
+</span><span class='line'>tsk_cache_hot = task_hot(p, rq-&gt;clock_task, sd);
+</span><span class='line'>if (!tsk_cache_hot ||
+</span><span class='line'>    sd-&gt;nr_balance_failed &gt; sd-&gt;cache_nice_tries) {
+</span><span class='line'>#ifdef CONFIG_SCHEDSTATS
+</span><span class='line'>    if (tsk_cache_hot) {
+</span><span class='line'>        schedstat_inc(sd, lb_hot_gained[idle]);
+</span><span class='line'>        schedstat_inc(p, se.statistics.nr_forced_migrations);
+</span><span class='line'>    }
+</span><span class='line'>#endif
+</span><span class='line'>    return 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>判断进程cache是否有效，判断条件，进程的运行的时间大于proc控制开关sysctl_sched_migration_cost，对应目录/proc/sys/kernel/sched_migration_cost_ns</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int
+</span><span class='line'>task_hot(struct task_struct *p, u64 now, struct sched_domain *sd)
+</span><span class='line'>{
+</span><span class='line'>        s64 delta;
+</span><span class='line'>    delta = now - p-&gt;se.exec_start;
+</span><span class='line'>    return delta &lt; (s64)sysctl_sched_migration_cost;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在load_balance中，move_tasks返回失败也就是ld_moved==0，其中sd->nr_balance_failed++对应can_migrate_task中的”too many balance attempts have failed”,然后busiest->active_balance = 1设置，active_balance = 1。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (active_balance)
+</span><span class='line'>//如果pull失败了，开始触发push操作
+</span><span class='line'>stop_one_cpu_nowait(cpu_of(busiest),
+</span><span class='line'>    active_load_balance_cpu_stop, busiest,
+</span><span class='line'>    &busiest-&gt;active_balance_work);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>push整个触发操作代码机制比较绕，stop_one_cpu_nowait把active_load_balance_cpu_stop添加到cpu_stopper每CPU变量的任务队列里面，如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
+</span><span class='line'>            struct cpu_stop_work *work_buf)
+</span><span class='line'>{
+</span><span class='line'>    *work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, };
+</span><span class='line'>    cpu_stop_queue_work(&per_cpu(cpu_stopper, cpu), work_buf);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>而cpu_stopper则是cpu_stop_init函数通过cpu_stop_cpu_callback创建的migration内核线程，触发任务队列调度。因为migration内核线程是绑定每个核心上的，进程迁移失败的1和3问题就可以通过push解决。active_load_balance_cpu_stop则调用move_one_task函数迁移指定的进程。</p>
+
+<p>上面描述的则是整个pull和push的过程，需要补充的pull触发除了schedule后触发，还有scheduler_tick通过触发中断，调用run_rebalance_domains再调用rebalance_domains触发，不再细数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init sched_init(void)
+</span><span class='line'>{
+</span><span class='line'>      open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-trywakeup/">try_to_wake_up函数</a></h2>
     
     
@@ -1310,94 +1674,6 @@ sys     0m0.270s
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/09/system-base-attr/">隐藏权限--无法添加用户和组等</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-02-09T15:59:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>15:59:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>执行命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost softwaretools]# groupadd mysql
-</span><span class='line'>groupadd：无法打开组文件（groupadd: unable to open group file）</span></code></pre></td></tr></table></div></figure>
-
-
-<p>此时就奇怪了，当前用的明明是root用户，为什么没有创建组和用户的权限呢。</p>
-
-<p>结论：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1，添加用户需要用到passwd和shadow这两个文件
-</span><span class='line'>2，添加组需要用到shadow和gshadow这两个文件</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用 ls -l 命令发现权限正常。</p>
-
-<p>最终发现问题，找到了2个命令（lsattr和chattr），是因为隐藏权限在作怪：<br/>
-对这2个命令的简单做下说明：<br/>
-  对于某些有特殊要求的档案(如服务器日志)还可以追加隐藏权限的设定。这些隐藏权限包括： Append only (a), compressed &copy;, no dump (d), immutable (i), data journalling (j),secure deletion (s), no tail-merging (t), undeletable (u), no atime updates (A), synchronous directory updates (D), synchronous updates (S), and top of directory hierarchy (T).  <br/>
-  lsattr命令是查看隐藏权限设定情况的，chattr是变更隐藏权限的命令。</p>
-
-<p>首先使用使用lsattr查看了一下这几个文件：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost ~]# lsattr /etc/passwd  
-</span><span class='line'>------------- /etc/passwd  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/group  
-</span><span class='line'>----i-------- /etc/group  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/shadow  
-</span><span class='line'>------------- /etc/shadow  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/gshadow  
-</span><span class='line'>----i-------- /etc/gshadow  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到文件被设置的 i 这个隐藏权限，<br/>
-i：设定文件不能被删除、改名、设定链接关系，同时不能写入或新增内容。<br/>
-i参数对于文件 系统的安全设置有很大帮助。</p>
-
-<p>既然这样只要把i权限去掉就应该好了。</p>
-
-<p>使用命令chattr命令修改文件隐藏权限，执行如下命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>chattr -i /etc/gshadow
-</span><span class='line'>chattr -i /etc/group</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后可以正常执行了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/14">&larr; Older</a>
@@ -1517,8 +1793,8 @@ if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~sched')) document.getElementById('aexp_kernel~sched').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(17)</span></li>
-<div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(18)</span></li>
+<div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('android~base')) document.getElementById('aexp_android~base').style.visibility = 'hidden';
 </script>
@@ -1628,8 +1904,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>15</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(88)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>16</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
 <li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>19</span></li>
 <li><a href='/blog/cats/2015~02/?opendiv=2015'>2015-02</a><span class='right_span'>11</span></li>
@@ -1711,6 +1987,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/05/20/android-4.4.2/">编译android4.4.2源码</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/05/15/kernel-net-ipv6/">ipv6初始化和处理流程分析</a>
       </li>
     
@@ -1724,10 +2004,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/05/11/kernel-net-tcp_queue/">tcp三个接收队列</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/05/11/debug-mark-tcp_read_sock_bug/">tcp_read_sock BUG</a>
       </li>
     
   </ul>
