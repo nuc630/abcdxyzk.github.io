@@ -18,7 +18,7 @@ tags:
 Screen！
 
 #### 一、启动 Screen
-启动 Screen 再简单不过了，在 Shell 中运行 screen ，按回车，就进入 Screen 输入环境了。
+下载配置文件[screenrc](/download/tools/screenrc)，放到~/.screenrc，注意要加一个.号。然后启动 Screen 再简单不过了，在 Shell 中运行 screen ，按回车，就进入 Screen 输入环境了。
 
 #### 二、给 Screen 的指令
 和VIM类似，当你想给 Screen 发送指令，而不是给 shell 输入指令的时候需要用到特定的组合键：Ctrl-A 。（这类似于 VIM 中的 ESC。）当你执行Ctrl-A 后就可以引起 Screen 的注意了。
