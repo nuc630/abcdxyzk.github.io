@@ -34,9 +34,10 @@ tags:
 
 #### 三 对新建的分区进行格式化
 格式化成ext3的文件系统即可  
-使用mkfs.ext3 /dev/sda3    格式化分区  
+使用mkfs -t ext3 -c /dev/sda3    格式化分区  
+-c : 在制做档案系统前，检查该partition 是否有坏轨  
 ```
-[root@localhost ~]# mkfs.ext3 /dev/sda3
+[root@localhost ~]# mkfs -t ext3 -c /dev/sda3
 mke2fs 1.39 (29-May-2006)
 Filesystem label=
 OS type: Linux

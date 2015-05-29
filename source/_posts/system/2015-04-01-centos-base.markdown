@@ -6,10 +6,17 @@ comments: false
 categories:
 - 2015
 - 2015~04
-- kernel
-- kernel~net
+- system
+- system~centos
 tags:
 ---
+
+vmware虚拟机mkinitrd提示no module ehci-hcd 错误的话，加：
+```
+ --builtin=ehci-hcd --builtin=ohci-hcd --builtin=uhci-hcd 
+```
+
+-----------
 
 CentOS6.0 下默认开selinux时出现httpd 报“SELinux policy enabled; httpd running as context unconfined_u:system”的解决方案
 ```
