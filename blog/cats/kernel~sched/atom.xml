@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~sched | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~sched/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-06-01T15:48:01+08:00</updated>
+  <updated>2015-06-02T18:38:46+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,279 +14,157 @@
 
   
   <entry>
-    <title type="html"><![CDATA[字符设备驱动和等待队列样例]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample/"/>
-    <updated>2015-05-21T15:58:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample</id>
-    <content type="html"><![CDATA[<p>前两篇的样例</p>
+    <title type="html"><![CDATA[用户态到内核态切换]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-user-to-kernel/"/>
+    <updated>2015-06-02T14:16:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-user-to-kernel</id>
+    <content type="html"><![CDATA[<p><a href="http://www.cnblogs.com/justcxtoworld/p/3155741.html">http://www.cnblogs.com/justcxtoworld/p/3155741.html</a></p>
 
-<p><a href="/blog/2015/05/21/kernel-base-chardev/">字符设备驱动程序</a><br/>
-<a href="/blog/2015/05/21/kernel-sched-waitqueue/">Linux内核中的等待队列</a></p>
+<p>本文将主要研究在X86体系下Linux系统中用户态到内核态切换条件，及切换过程中内核栈和任务状态段TSS在中断机制/任务切换中的作用及相关寄存器的变化。</p>
 
-<h4>waitqueue.c</h4>
+<h4>一、用户态到内核态切换途径：</h4>
 
-<pre><code>    #include &lt;linux/module.h&gt;
-    #include &lt;linux/init.h&gt;
-    #include &lt;linux/fs.h&gt;
-    #include &lt;asm/uaccess.h&gt;
-    #include &lt;linux/wait.h&gt;
-    #include &lt;linux/semaphore.h&gt;
-    #include &lt;linux/kernel.h&gt;
-    #include &lt;linux/proc_fs.h&gt;
+<p> 1：系统调用        2：中断 　　3：异常</p>
 
-    #include &lt;linux/socket.h&gt;
-    #include &lt;linux/tcp.h&gt;
-    #include &lt;linux/proc_fs.h&gt;
-    #include &lt;net/net_namespace.h&gt;
+<p>对应代码，在3.3内核中，可以在/arch/x86/kernel/entry_32.S文件中查看。</p>
 
-    #include &lt;net/tcp.h&gt;
+<h4>二、内核栈</h4>
 
+<p>内核栈：Linux中每个进程有两个栈，分别用于用户态和内核态的进程执行，其中的内核栈就是用于内核态的堆栈，它和进程的task_struct结构，更具体的是thread_info结构一起放在两个连续的页框大小的空间内。</p>
 
-    static ssize_t globalvar_read(struct file *, char *, size_t, loff_t*);
-    static ssize_t globalvar_write(struct file *, const char *, size_t, loff_t*);
+<p>在内核源代码中使用C语言定义了一个联合结构方便地表示一个进程的thread_info和内核栈：</p>
 
-    struct file_operations globalvar_fops =
-    {
-        .owner   = THIS_MODULE,
-        .read = globalvar_read,
-        .write = globalvar_write,
-    };
-
-    #define LEN 1024
-    static char global_var[LEN];
-    static int read_index = 0;
-    static int write_index = 0;
-    static spinlock_t var_lock;
-    static wait_queue_head_t waitq;
-    static int flag = 0;
-    static int major;
-
-    static const char procname[] = "testvar";
-
-    static int __init globalvar_init(void)
-    {
-        init_waitqueue_head(&amp;waitq);
-        spin_lock_init(&amp;var_lock);
-    //  if (!proc_net_fops_create(&amp;init_net, procname, S_IRUSR, &amp;globalvar_fops)) {
-        if (!(major = register_chrdev(0, "globalvar", &amp;globalvar_fops))) {
-            printk("globalvar register failure\n");
-            return -1;
-        }
-        printk("major = %d\n", major);
-        return 0;
-    }
-
-    static void __exit globalvar_exit(void)
-    {
-    //  proc_net_remove(&amp;init_net, procname);
-        unregister_chrdev(major, "globalvar");
-    }
-
-    static ssize_t globalvar_read(struct file *filp, char *buf, size_t len, loff_t *off)
-    {
-        int read_len;
-        //等待数据可获得
-        if (wait_event_interruptible(waitq, flag != 0))
-            return -ERESTARTSYS;
-
-        spin_lock(&amp;var_lock);
-        read_len = write_index - read_index;
-        if (copy_to_user(buf, global_var+read_index, read_len)) {
-            spin_unlock(&amp;var_lock);
-            return -EFAULT;
-        }
-        read_index = write_index;
-        flag = 0;
-        spin_unlock(&amp;var_lock);
-        return read_len;
-    }
-
-    static ssize_t globalvar_write(struct file *filp, const char *buf, size_t len, loff_t *off)
-    {
-        spin_lock(&amp;var_lock);
-        if (copy_from_user(global_var+write_index, buf, len)) {
-            spin_unlock(&amp;var_lock);
-            return -EFAULT;
-        }
-        write_index += len;
-        spin_unlock(&amp;var_lock);
-
-        flag = 1;
-        //通知数据可获得
-        wake_up_interruptible(&amp;waitq);
-        return len;
-    }
-
-    module_init(globalvar_init);
-    module_exit(globalvar_exit);
-    MODULE_LICENSE("GPL");
-</code></pre>
-
-<h4>Makefile</h4>
-
-<pre><code>    obj-m += waitqueue.o
-
-    PWD = $(shell pwd)
-    KERNEL := /lib/modules/`uname -r`/build
-
-    all:
-        make -C $(KERNEL) M=$(PWD) modules
-</code></pre>
-
-<h5>安装模块</h5>
-
-<pre><code>    insmod ./waitqueue.ko
-</code></pre>
-
-<h5>查看对应的设备号</h5>
-
-<pre><code>    $ cat /proc/devices | grep globalvar
-    $ 249 globalvar
-</code></pre>
-
-<h5>建立文件</h5>
-
-<pre><code>    mknod /dev/globalvar c 249 0
-</code></pre>
-
-<h5>终端1: cat文件</h5>
-
-<pre><code>    cat /dev/globalvar
-</code></pre>
-
-<h5>终端2: echo数据到文件</h5>
-
-<pre><code>    echo 123 &gt; /dev/globalvar
-    echo 1234567 &gt; /dev/globalvar
-    echo 123 &gt; /dev/globalvar
-</code></pre>
-
-<p>这时就能看见终端1读到了内容。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux内核中的等待队列]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue/"/>
-    <updated>2015-05-21T15:58:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.sina.com.cn/s/blog_49d5604e010008bn.html">http://blog.sina.com.cn/s/blog_49d5604e010008bn.html</a></p>
-
-<p>等待队列可以参考net/ipv4/tcp_probe.c的实现</p>
-
-<p><a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/">简单样例</a></p>
-
-<h4>Linux内核中的等待队列</h4>
-
-<p>  Linux内核的等待队列是以双循环链表为基础数据结构，与进程调度机制紧密结合，能够用于实现核心的异步事件通知机制。在Linux2.4.21中，等待队列在源代码树include/linux/wait.h中，这是一个通过list_head连接的典型双循环链表，</p>
-
-<p>如下图所示。</p>
-
-<p><img src="/images/kernel/2015-05-21.jpg" alt="" /></p>
-
-<p>  在这个链表中，有两种数据结构：等待队列头（wait_queue_head_t）和等待队列项（wait_queue_t）。等待队列头和等待队列项中都包含一个list_head类型的域作为"连接件"。由于我们只需要对队列进行添加和删除操作，并不会修改其中的对象（等待队列项），因此，我们只需要提供一把保护整个基础设施和所有对象的锁，这把锁保存在等待队列头中，为wq_lock_t类型。在实现中，可以支持读写锁（rwlock）或自旋锁（spinlock）两种类型，通过一个宏定义来切换。如果使用读写锁，将wq_lock_t定义为rwlock_t类型；如果是自旋锁，将wq_lock_t定义为spinlock_t类型。无论哪种情况，分别相应设置wq_read_lock、wq_read_unlock、wq_read_lock_irqsave、wq_read_unlock_irqrestore、wq_write_lock_irq、wq_write_unlock、wq_write_lock_irqsave和wq_write_unlock_irqrestore等宏。</p>
-
-<h5>等待队列头</h5>
-
-<pre><code>    struct __wait_queue_head {
-        wq_lock_t lock;
-        struct list_head task_list;
-    };
-    typedef struct __wait_queue_head wait_queue_head_t;
-</code></pre>
-
-<p>  前面已经说过，等待队列的主体是进程，这反映在每个等待队列项中，是一个任务结构指针（struct task_struct * task）。flags为该进程的等待标志，当前只支持互斥。</p>
-
-<h5>等待队列项</h5>
-
-<pre><code>    struct __wait_queue {
-        unsigned int flags;
-    #define WQ_FLAG_EXCLUSIVE 0x01
-        struct task_struct * task;
-        struct list_head task_list;
-    };
-    typedef struct __wait_queue wait_queue_t;
-</code></pre>
-
-<h5>声明和初始化</h5>
-
-<pre><code>    #define DECLARE_WAITQUEUE(name, tsk)            \
-        wait_queue_t name = __WAITQUEUE_INITIALIZER(name, tsk)
-    #define __WAITQUEUE_INITIALIZER(name, tsk) {    \
-        task:  tsk,                                 \
-        task_list: { NULL, NULL },                  \
-        __WAITQUEUE_DEBUG_INIT(name)}
-</code></pre>
-
-<p>  通过DECLARE_WAITQUEUE宏将等待队列项初始化成对应的任务结构，并且用于连接的相关指针均设置为空。其中加入了调试相关代码。
+<p>此结构在3.3内核版本中的定义在include/linux/sched.h文件的第2106行：
 <code>
-    #define DECLARE_WAIT_QUEUE_HEAD(name)                    \
-        wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
-    #define __WAIT_QUEUE_HEAD_INITIALIZER(name) {            \
-        lock:  WAITQUEUE_RW_LOCK_UNLOCKED,                   \
-        task_list: { &amp;(name).task_list, &amp;(name).task_list }, \
-        __WAITQUEUE_HEAD_DEBUG_INIT(name)}
+    2016  union thread_union {
+    2017          struct thread_info thread_info;
+    2018          unsigned long stack[THREAD_SIZE/sizeof(long)];
+    2019     };        
 </code></p>
 
-<p>  通过DECLARE_WAIT_QUEUE_HEAD宏初始化一个等待队列头，使得其所在链表为空，并设置链表为"未上锁"状态。其中加入了调试相关代码。
+<p>其中thread_info结构的定义如下：</p>
+
+<p>3.3内核 /arch/x86/include/asm/thread_info.h文件第26行：
 <code>
-    static inline void init_waitqueue_head(wait_queue_head_t *q)
+     26 　　struct thread_info {
+     27         struct task_struct      *task;          /* main task structure */
+     28         struct exec_domain      *exec_domain;   /* execution domain */
+     29         __u32                   flags;          /* low level flags */
+     30         __u32                   status;         /* thread synchronous flags */
+     31         __u32                   cpu;            /* current CPU */
+     32         int                     preempt_count;  /* 0 =&gt; preemptable,
+     33                                                    &lt;0 =&gt; BUG */
+     34         mm_segment_t            addr_limit;
+     35         struct restart_block    restart_block;
+     36         void __user             *sysenter_return;
+     37 #ifdef CONFIG_X86_32
+     38         unsigned long           previous_esp;   /* ESP of the previous stack in
+     39                                                    case of nested (IRQ) stacks
+     40                                                 */
+     41         __u8                    supervisor_stack[0];
+     42 #endif
+     43         unsigned int            sig_on_uaccess_error:1;
+     44         unsigned int            uaccess_err:1;  /* uaccess failed */
+     45 };
 </code></p>
 
-<p>该函数初始化一个已经存在的等待队列头，它将整个队列设置为"未上锁"状态，并将链表指针prev和next指向它自身。
+<p>它们的结构图大致如下：</p>
+
+<p><img src="/images/kernel/2015-06-02.png" alt="" /></p>
+
+<p>  esp寄存器是CPU栈指针，存放内核栈栈顶地址。在X86体系中，栈开始于末端，并朝内存区开始的方向增长。从用户态刚切换到内核态时，进程的内核栈总是空的，此时esp指向这个栈的顶端。</p>
+
+<p>  在X86中调用int指令型系统调用后会把用户栈的%esp的值及相关寄存器压入内核栈中，系统调用通过iret指令返回，在返回之前会从内核栈弹出用户栈的%esp和寄存器的状态，然后进行恢复。所以在进入内核态之前要保存进程的上下文，中断结束后恢复进程上下文，那靠的就是内核栈。</p>
+
+<p>  这里有个细节问题，就是要想在内核栈保存用户态的esp,eip等寄存器的值，首先得知道内核栈的栈指针，那在进入内核态之前，通过什么才能获得内核栈的栈指针呢？答案是：TSS</p>
+
+<h4>三、TSS</h4>
+
+<p>X86体系结构中包括了一个特殊的段类型：任务状态段（TSS），用它来存放硬件上下文。TSS反映了CPU上的当前进程的特权级。</p>
+
+<p>linux为每一个cpu提供一个tss段，并且在tr寄存器中保存该段。</p>
+
+<p>在从用户态切换到内核态时，可以通过获取TSS段中的esp0来获取当前进程的内核栈 栈顶指针，从而可以保存用户态的cs,esp,eip等上下文。</p>
+
+<p>注：linux中之所以为每一个cpu提供一个tss段，而不是为每个进程提供一个tss段，主要原因是tr寄存器永远指向它，在任务切换的适合不必切换tr寄存器，从而减小开销。</p>
+
+<p>下面我们看下在X86体系中Linux内核对TSS的具体实现：</p>
+
+<p>内核代码中TSS结构的定义：</p>
+
+<p>3.3内核中：/arch/x86/include/asm/processor.h文件的第248行处：
 <code>
-    {
-        q-&gt;lock = WAITQUEUE_RW_LOCK_UNLOCKED;
-        INIT_LIST_HEAD(&amp;q-&gt;task_list);
-    }
-    static inline void init_waitqueue_entry(wait_queue_t *q, struct task_struct *p)
+    248   struct tss_struct {
+    249         /*
+    250          * The hardware state:
+    251          */
+    252         struct x86_hw_tss       x86_tss;
+    253
+    254         /*
+    255          * The extra 1 is there because the CPU will access an
+    256          * additional byte beyond the end of the IO permission
+    257          * bitmap. The extra byte must be all 1 bits, and must
+    258          * be within the limit.
+    259          */
+    260         unsigned long           io_bitmap[IO_BITMAP_LONGS + 1];
+    261
+    262         /*
+    263          * .. and then another 0x100 bytes for the emergency kernel stack:
+    264          */
+    265         unsigned long           stack[64];
+    266
+    267 } ____cacheline_aligned;    
 </code></p>
 
-<p>该函数初始化一个已经存在的等待队列项，它设置对应的任务结构，同时将标志位清0。
+<p>其中主要的内容是：<br/>
+  硬件状态结构:     x86_hw_tss<br/>
+  IO权位图: 　　　　io_bitmap<br/>
+  备用内核栈: 　　  stack</p>
+
+<p>其中硬件状态结构：其中在32位X86系统中x86_hw_tss的具体定义如下：</p>
+
+<p>/arch/x86/include/asm/processor.h文件中第190行处：
 <code>
-    {
-        q-&gt;flags = 0;
-        q-&gt;task = p;
-    }
-    static inline int waitqueue_active(wait_queue_head_t *q)
-</code>
-该函数检查等待队列是否为空。
-<code>
-    {
-        return !list_empty(&amp;q-&gt;task_list);
-    }
-    static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
+    190#ifdef CONFIG_X86_32
+    191 /* This is the TSS defined by the hardware. */
+    192 struct x86_hw_tss {
+    193         unsigned short          back_link, __blh;
+    194         unsigned long           sp0;　　            //当前进程的内核栈顶指针
+    195         unsigned short          ss0, __ss0h;       //当前进程的内核栈段描述符
+    196         unsigned long           sp1;
+    197         /* ss1 caches MSR_IA32_SYSENTER_CS: */
+    198         unsigned short          ss1, __ss1h;
+    199         unsigned long           sp2;
+    200         unsigned short          ss2, __ss2h;
+    201         unsigned long           __cr3;
+    202         unsigned long           ip;
+    203         unsigned long           flags;
+    204         unsigned long           ax;
+    205         unsigned long           cx;
+    206         unsigned long           dx;
+    207         unsigned long           bx;
+    208         unsigned long           sp;      　　　　　　//当前进程用户态栈顶指针
+    209         unsigned long           bp;
+    210         unsigned long           si;
+    211         unsigned long           di;
+    212         unsigned short          es, __esh;
+    213         unsigned short          cs, __csh;
+    214         unsigned short          ss, __ssh;
+    215         unsigned short          ds, __dsh;
+    216         unsigned short          fs, __fsh;
+    217         unsigned short          gs, __gsh;
+    218         unsigned short          ldt, __ldth;
+    219         unsigned short          trace;
+    220         unsigned short          io_bitmap_base;
+    221
+    222 } __attribute__((packed));
 </code></p>
 
-<p>将指定的等待队列项new添加到等待队列头head所在的链表头部，该函数假设已经获得锁。
-<code>
-    {
-        list_add(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
-    }
-    static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)
-</code></p>
+<p>linux的tss段中只使用esp0和iomap等字段，并且不用它的其他字段来保存寄存器，在一个用户进程被中断进入内核态的时候，从tss中的硬件状态结构中取出esp0（即内核栈栈顶指针），然后切到esp0，其它的寄存器则保存在esp0指的内核栈上而不保存在tss中。</p>
 
-<p>将指定的等待队列项new添加到等待队列头head所在的链表尾部，该函数假设已经获得锁。
-<code>
-    {
-        list_add_tail(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
-    }
-    static inline void __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)
-</code>
-将函数从等待队列头head所在的链表中删除指定等待队列项old，该函数假设已经获得锁，并且old在head所在链表中。
-<code>
-    {
-        list_del(&amp;old-&gt;task_list);
-    }
-</code></p>
+<p>每个CPU定义一个TSS段的具体实现代码：</p>
 
-<h4>睡眠和唤醒操作</h4>
-
-<p>对等待队列的操作包括睡眠和唤醒（相关函数保存在源代码树的/kernel/sched.c和include/linux/sched.h中）。思想是更改当前进程（CURRENT）的任务状态，并要求重新调度，因为这时这个进程的状态已经改变，不再在调度表的就绪队列中，因此无法再获得执行机会，进入"睡眠"状态，直至被"唤醒"，即其任务状态重新被修改回就绪态。</p>
-
-<p>常用的睡眠操作有interruptible_sleep_on和sleep_on。两个函数类似，只不过前者将进程的状态从就绪态（TASK_RUNNING）设置为TASK_INTERRUPTIBLE，允许通过发送signal唤醒它（即可中断的睡眠状态）；而后者将进程的状态设置为TASK_UNINTERRUPTIBLE，在这种状态下，不接收任何singal。</p>
-
-<p>以interruptible_sleep_on为例，其展开后的代码是：
+<p>3.3内核中/arch/x86/kernel/init_task.c第35行：
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -671,581 +549,988 @@
 <span class='line-number'>382</span>
 <span class='line-number'>383</span>
 <span class='line-number'>384</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void interruptible_sleep_on(wait_queue_head_t &lt;em&gt;q)
-</span><span class='line'>{
-</span><span class='line'>    unsigned long flags;
-</span><span class='line'>    wait_queue_t wait;
-</span><span class='line'>    /&lt;/em&gt; 构造当前进程对应的等待队列项 */
-</span><span class='line'>    init_waitqueue_entry(&amp;wait, current);&lt;/p&gt;
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+<span class='line-number'>412</span>
+<span class='line-number'>413</span>
+<span class='line-number'>414</span>
+<span class='line-number'>415</span>
+<span class='line-number'>416</span>
+<span class='line-number'>417</span>
+<span class='line-number'>418</span>
+<span class='line-number'>419</span>
+<span class='line-number'>420</span>
+<span class='line-number'>421</span>
+<span class='line-number'>422</span>
+<span class='line-number'>423</span>
+<span class='line-number'>424</span>
+<span class='line-number'>425</span>
+<span class='line-number'>426</span>
+<span class='line-number'>427</span>
+<span class='line-number'>428</span>
+<span class='line-number'>429</span>
+<span class='line-number'>430</span>
+<span class='line-number'>431</span>
+<span class='line-number'>432</span>
+<span class='line-number'>433</span>
+<span class='line-number'>434</span>
+<span class='line-number'>435</span>
+<span class='line-number'>436</span>
+<span class='line-number'>437</span>
+<span class='line-number'>438</span>
+<span class='line-number'>439</span>
+<span class='line-number'>440</span>
+<span class='line-number'>441</span>
+<span class='line-number'>442</span>
+<span class='line-number'>443</span>
+<span class='line-number'>444</span>
+<span class='line-number'>445</span>
+<span class='line-number'>446</span>
+<span class='line-number'>447</span>
+<span class='line-number'>448</span>
+<span class='line-number'>449</span>
+<span class='line-number'>450</span>
+<span class='line-number'>451</span>
+<span class='line-number'>452</span>
+<span class='line-number'>453</span>
+<span class='line-number'>454</span>
+<span class='line-number'>455</span>
+<span class='line-number'>456</span>
+<span class='line-number'>457</span>
+<span class='line-number'>458</span>
+<span class='line-number'>459</span>
+<span class='line-number'>460</span>
+<span class='line-number'>461</span>
+<span class='line-number'>462</span>
+<span class='line-number'>463</span>
+<span class='line-number'>464</span>
+<span class='line-number'>465</span>
+<span class='line-number'>466</span>
+<span class='line-number'>467</span>
+<span class='line-number'>468</span>
+<span class='line-number'>469</span>
+<span class='line-number'>470</span>
+<span class='line-number'>471</span>
+<span class='line-number'>472</span>
+<span class='line-number'>473</span>
+<span class='line-number'>474</span>
+<span class='line-number'>475</span>
+<span class='line-number'>476</span>
+<span class='line-number'>477</span>
+<span class='line-number'>478</span>
+<span class='line-number'>479</span>
+<span class='line-number'>480</span>
+<span class='line-number'>481</span>
+<span class='line-number'>482</span>
+<span class='line-number'>483</span>
+<span class='line-number'>484</span>
+<span class='line-number'>485</span>
+<span class='line-number'>486</span>
+<span class='line-number'>487</span>
+<span class='line-number'>488</span>
+<span class='line-number'>489</span>
+<span class='line-number'>490</span>
+<span class='line-number'>491</span>
+<span class='line-number'>492</span>
+<span class='line-number'>493</span>
+<span class='line-number'>494</span>
+<span class='line-number'>495</span>
+<span class='line-number'>496</span>
+<span class='line-number'>497</span>
+<span class='line-number'>498</span>
+<span class='line-number'>499</span>
+<span class='line-number'>500</span>
+<span class='line-number'>501</span>
+<span class='line-number'>502</span>
+<span class='line-number'>503</span>
+<span class='line-number'>504</span>
+<span class='line-number'>505</span>
+<span class='line-number'>506</span>
+<span class='line-number'>507</span>
+<span class='line-number'>508</span>
+<span class='line-number'>509</span>
+<span class='line-number'>510</span>
+<span class='line-number'>511</span>
+<span class='line-number'>512</span>
+<span class='line-number'>513</span>
+<span class='line-number'>514</span>
+<span class='line-number'>515</span>
+<span class='line-number'>516</span>
+<span class='line-number'>517</span>
+<span class='line-number'>518</span>
+<span class='line-number'>519</span>
+<span class='line-number'>520</span>
+<span class='line-number'>521</span>
+<span class='line-number'>522</span>
+<span class='line-number'>523</span>
+<span class='line-number'>524</span>
+<span class='line-number'>525</span>
+<span class='line-number'>526</span>
+<span class='line-number'>527</span>
+<span class='line-number'>528</span>
+<span class='line-number'>529</span>
+<span class='line-number'>530</span>
+<span class='line-number'>531</span>
+<span class='line-number'>532</span>
+<span class='line-number'>533</span>
+<span class='line-number'>534</span>
+<span class='line-number'>535</span>
+<span class='line-number'>536</span>
+<span class='line-number'>537</span>
+<span class='line-number'>538</span>
+<span class='line-number'>539</span>
+<span class='line-number'>540</span>
+<span class='line-number'>541</span>
+<span class='line-number'>542</span>
+<span class='line-number'>543</span>
+<span class='line-number'>544</span>
+<span class='line-number'>545</span>
+<span class='line-number'>546</span>
+<span class='line-number'>547</span>
+<span class='line-number'>548</span>
+<span class='line-number'>549</span>
+<span class='line-number'>550</span>
+<span class='line-number'>551</span>
+<span class='line-number'>552</span>
+<span class='line-number'>553</span>
+<span class='line-number'>554</span>
+<span class='line-number'>555</span>
+<span class='line-number'>556</span>
+<span class='line-number'>557</span>
+<span class='line-number'>558</span>
+<span class='line-number'>559</span>
+<span class='line-number'>560</span>
+<span class='line-number'>561</span>
+<span class='line-number'>562</span>
+<span class='line-number'>563</span>
+<span class='line-number'>564</span>
+<span class='line-number'>565</span>
+<span class='line-number'>566</span>
+<span class='line-number'>567</span>
+<span class='line-number'>568</span>
+<span class='line-number'>569</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 35  * per-CPU TSS segments. Threads are completely &lsquo;soft&rsquo; on Linux,
+</span><span class='line'> 36  * no more per-task TSS&rsquo;s. The TSS size is kept cacheline-aligned
+</span><span class='line'> 37  * so they are allowed to end up in the .data..cacheline_aligned
+</span><span class='line'> 38  * section. Since TSS&rsquo;s are completely CPU-local, we want them
+</span><span class='line'> 39  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
+</span><span class='line'> 40  */&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* 将当前进程的状态从TASK_RUNNING改为TASK_INTERRUPTIBLE */
-</span><span class='line'>current-&gt;state = TASK_INTERRUPTIBLE;
-</span><span class='line'>
-</span><span class='line'>/* 将等待队列项添加到指定链表中 */
-</span><span class='line'>wq_write_lock_irqsave(&amp;q-&gt;lock,flags);
-</span><span class='line'>__add_wait_queue(q, &amp;wait); 
-</span><span class='line'>wq_write_unlock(&amp;q-&gt;lock);
-</span><span class='line'>
-</span><span class='line'>/* 进程重新调度，放弃执行权 */
-</span><span class='line'>schedule();
-</span><span class='line'>
-</span><span class='line'>/* 本进程被唤醒，重新获得执行权，首要之事是将等待队列项从链表中删除 */
-</span><span class='line'>wq_write_lock_irq(&amp;q-&gt;lock);
-</span><span class='line'>__remove_wait_queue(q, &amp;wait);
-</span><span class='line'>wq_write_unlock_irqrestore(&amp;q-&gt;lock,flags);
-</span><span class='line'>/* 至此，等待过程结束，本进程可以正常执行下面的逻辑 */
-</span><span class='line'>}
+</span><span class='line'>&lt;pre&gt;&lt;code&gt; 41 DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>对应的唤醒操作包括wake_up_interruptible和wake_up。wake_up函数不仅可以唤醒状态为TASK_UNINTERRUPTIBLE的进程，而且可以唤醒状态为TASK_INTERRUPTIBLE的进程。
+</span><span class='line'>INIT_TSS的定义如下:
 </span><span class='line'>
-</span><span class='line'>wake_up_interruptible只负责唤醒状态为TASK_INTERRUPTIBLE的进程。这两个宏的定义如下：
+</span><span class='line'>3.3内核中 /arch/x86/include/asm/processor.h文件的第879行：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define wake_up(x)   __wake_up((x),TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE, 1)
-</span><span class='line'>#define wake_up_interruptible(x) __wake_up((x),TASK_INTERRUPTIBLE, 1)
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>__wake_up函数主要是获取队列操作的锁，具体工作是调用__wake_up_common完成的。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;void __wake_up(wait_queue_head_t *q, unsigned int mode, int nr)
-</span><span class='line'>{
-</span><span class='line'>if (q) {
-</span><span class='line'>    unsigned long flags;
-</span><span class='line'>    wq_read_lock_irqsave(&amp;q-&gt;lock, flags);
-</span><span class='line'>    __wake_up_common(q, mode, nr, 0);
-</span><span class='line'>    wq_read_unlock_irqrestore(&amp;q-&gt;lock, flags);
-</span><span class='line'>}
-</span><span class='line'>}
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;879 #define INIT_TSS  {                                                       \
+</span><span class='line'>880         .x86_tss = {                                                      \
+</span><span class='line'>881                 .sp0            = sizeof(init_stack) + (long)&amp;init_stack, \
+</span><span class='line'>882                 .ss0            = __KERNEL_DS,                            \
+</span><span class='line'>883                 .ss1            = __KERNEL_CS,                            \
+</span><span class='line'>884                 .io_bitmap_base = INVALID_IO_BITMAP_OFFSET,               \
+</span><span class='line'>885          },                                                               \
+</span><span class='line'>886         .io_bitmap              = { [0 ... IO_BITMAP_LONGS] = ~0 },       \
+</span><span class='line'>887 }
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>/* The core wakeup function.  Non-exclusive wakeups (nr_exclusive == 0) just wake everything up.  If it's an exclusive wakeup (nr_exclusive == small +ve number) then we wake all the non-exclusive tasks and one exclusive task.
-</span><span class='line'>There are circumstances in which we can try to wake a task which has already started to run but is not in state TASK_RUNNING.  try_to_wake_up() returns zero in this (rare) case, and we handle it by contonuing to scan the queue. */
+</span><span class='line'>其中init_stack是宏定义，指向内核栈：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void __wake_up_common (wait_queue_head_t *q, unsigned int mode, int nr_exclusive, const int sync)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;61 #define init_stack              (init_thread_union.stack)
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>参数q表示要操作的等待队列，mode表示要唤醒任务的状态，如TASK_UNINTERRUPTIBLE或TASK_INTERRUPTIBLE等。nr_exclusive是要唤醒的互斥进程数目，在这之前遇到的非互斥进程将被无条件唤醒。sync表示？？？
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>&lt;p&gt;```
+</span><span class='line'>这里可以看到分别把内核栈栈顶指针、内核代码段、内核数据段赋值给TSS中的相应项。从而进程从用户态切换到内核态时，可以从TSS段中获取内核栈栈顶指针，进而保存进程上下文到内核栈中。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;{
-</span><span class='line'>struct list_head *tmp;
-</span><span class='line'>struct task_struct *p;
+</span><span class='line'>&lt;h4&gt;总结、有了上面的一些准备，现总结在进程从用户态到内核态切换过程中，Linux主要做的事：&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>CHECK_MAGIC_WQHEAD(q);
-</span><span class='line'>WQ_CHECK_LIST_HEAD(&amp;q-&gt;task_list);
+</span><span class='line'>&lt;p&gt;  1：读取tr寄存器，访问TSS段&lt;br/&gt;
+</span><span class='line'>  2：从TSS段中的sp0获取进程内核栈的栈顶指针&lt;br/&gt;
+</span><span class='line'>  3：由控制单元在内核栈中保存当前eflags,cs,ss,eip,esp寄存器的值。&lt;br/&gt;
+</span><span class='line'>  4：由SAVE_ALL保存其寄存器的值到内核栈&lt;br/&gt;
+</span><span class='line'>  5：把内核代码选择符写入CS寄存器，内核栈指针写入ESP寄存器，把内核入口点的线性地址写入EIP寄存器&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>/* 遍历等待队列 */
-</span><span class='line'>list_for_each(tmp,&amp;q-&gt;task_list) {
-</span><span class='line'>    unsigned int state;
-</span><span class='line'>    /* 获得当前等待队列项 */
-</span><span class='line'>    wait_queue_t *curr = list_entry(tmp, wait_queue_t, task_list);
-</span><span class='line'>
-</span><span class='line'>    CHECK_MAGIC(curr-&gt;__magic);
-</span><span class='line'>    /* 获得对应的进程 */
-</span><span class='line'>    p = curr-&gt;task;
-</span><span class='line'>    state = p-&gt;state;
-</span><span class='line'>
-</span><span class='line'>    /* 如果我们需要处理这种状态的进程 */
-</span><span class='line'>    if (state &amp; mode) {
-</span><span class='line'>        WQ_NOTE_WAKER(curr);
-</span><span class='line'>        if (try_to_wake_up(p, sync) &amp;&amp; (curr-&gt;flags&amp;WQ_FLAG_EXCLUSIVE) &amp;&amp; !--nr_exclusive)
-</span><span class='line'>            break;
-</span><span class='line'>    }
-</span><span class='line'>}
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>/* 唤醒一个进程，将它放到运行队列中，如果它还不在运行队列的话。"当前"进程总是在运行队列中的（except when the actual re-schedule is in progress)，and as such you're allowed to do the simpler "current-&gt;state = TASK_RUNNING" to mark yourself runnable without the overhead of this. */
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline int try_to_wake_up(struct task_struct * p, int synchronous)
-</span><span class='line'>{
-</span><span class='line'>unsigned long flags;
-</span><span class='line'>int success = 0;
-</span><span class='line'>
-</span><span class='line'>/* 由于我们需要操作运行队列，必须获得对应的锁 */
-</span><span class='line'>spin_lock_irqsave(&amp;runqueue_lock, flags);
-</span><span class='line'>/* 将进程状态设置为TASK_RUNNING */
-</span><span class='line'>p-&gt;state = TASK_RUNNING;
-</span><span class='line'>/* 如果进程已经在运行队列中，释放锁退出 */
-</span><span class='line'>if (task_on_runqueue(p))
-</span><span class='line'>    goto out;
-</span><span class='line'>/* 否则将进程添加到运行队列中 */
-</span><span class='line'>add_to_runqueue(p);
-</span><span class='line'>
-</span><span class='line'>/* 如果设置了同步标志 */
-</span><span class='line'>if (!synchronous || !(p-&gt;cpus_allowed &amp; (1UL &lt;&lt; smp_processor_id())))
-</span><span class='line'>    reschedule_idle(p);
-</span><span class='line'>/* 唤醒成功，释放锁退出 */
-</span><span class='line'>success = 1;
-</span><span class='line'>out:
-</span><span class='line'>spin_unlock_irqrestore(&amp;runqueue_lock, flags);
-</span><span class='line'>return success;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>#### 等待队列应用模式
-</span><span class='line'>
-</span><span class='line'>等待队列的的应用涉及两个进程，假设为A和B。A是资源的消费者，B是资源的生产者。A在消费的时候必须确保资源已经生产出来，为此定义一个资源等待队列。这个队列同时要被进程A和进程B使用，我们可以将它定义为一个全局变量。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;DECLARE_WAIT_QUEUE_HEAD(rsc_queue); /* 全局变量 */
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>在进程A中，执行逻辑如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;while (resource is unavaiable) {
-</span><span class='line'>interruptible_sleep_on( &amp;wq );
-</span><span class='line'>}
-</span><span class='line'>consume_resource();
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>在进程B中，执行逻辑如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;produce_resource();
-</span><span class='line'>wake_up_interruptible( &amp;wq );
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;此时，CPU已经切换到内核态，根据EIP中的值开始执行内核入口点的第一条指令。&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[linux进程调度之FIFO和RR调度策略]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/03/13/kernel-sched-rt/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-03-13T00:00:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/03/13/kernel-sched-rt&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.chinaunix.net/uid-24774106-id-3379478.html"&gt;http://blog.chinaunix.net/uid-24774106-id-3379478.html&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[进程切换过程分析]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-switch/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-06-02T14:10:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-switch&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/nkguohao/article/details/9187381"&gt;http://blog.csdn.net/nkguohao/article/details/9187381&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;严格地说，对于优先级对于实时进程和普通进程的意义是不一样的。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;参考《深入理解Linux内核（第三版）》&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;1、在一定程度上，实时进程优先级高，实时进程存在，就没有普通进程占用CPU的机会，（但是前一篇博文也讲过了，实时组调度出现在内核以后，允许普通进程占用少量的CPU时间,取决于配置)。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;进程切换&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;2、对于实时进程而言，高优先级的进程存在，低优先级的进程是轮不上的，没机会跑在CPU上，所谓实时进程的调度策略,指的是相同优先级之间的调度策略。如果是FIFO实时进程在占用CPU，除非出现以下事情，否则FIFO一条道跑到黑。&lt;br/&gt;
-</span><span class='line'>  a）FIFO进程良心发现，调用了系统调用sched_yield 自愿让出CPU&lt;br/&gt;
-</span><span class='line'>  b) 更高优先级的进程横空出世，抢占FIFO进程的CPU。有些人觉得很奇怪，怎么FIFO占着CPU，为啥还能有更高优先级的进程出现呢。别忘记，我们是多核多CPU ,如果其他CPU上出现了一个比FIFO优先级高的进程，可能会push到FIFO进程所在的CPU上。&lt;br/&gt;
-</span><span class='line'>  c) FIFO进程停止（TASK_STOPPED or TASK_TRACED状态）或者被杀死（EXIT_ZOMBIE or EXIT_DEAD状态）&lt;br/&gt;
-</span><span class='line'>  d) FIFO进程执行了阻塞调用并进入睡眠（TASK_INTERRUPTIBLE OR TASK_UNINTERRUPTIBLE）。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;为了控制进程的执行，内核必须有能力挂起正在CPU上运行的进程，并恢复以前挂起的某个进程的执行。这种行为被称为进程切换，任务切换或上下文切换。下面几节描述在Linux中进行进程切换的主要内容。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  如果是进程的调度策略是时间片轮转RR，那么，除了前面提到的abcd，RR实时进程耗尽自己的时间片后，自动退到对应优先级实时队列的队尾，重新调度。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;硬件上下文&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct sched_param {
-</span><span class='line'>    /* ... */
-</span><span class='line'>    int sched_priority;
-</span><span class='line'>    /* ... */
-</span><span class='line'>};
-</span><span class='line'>int sched_setscheduler (pid_t pid,
-</span><span class='line'>                        int policy,
-</span><span class='line'>                        const struct sched_param *sp);
+</span><span class='line'>&lt;p&gt;尽管每个进程可以拥有属于自己的地址空间，但所有进程必须共享CPU寄存器。因此要恢复一个进程的执行之前，内核必须确保每个寄存器装入了挂起进程时的值。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;进程恢复执行前必须装入寄存器的一组数据称为硬件上下文。硬件上下文是进程可执行上下文的一个子集，因为可执行上下文包含进程执行时需要的所有信息。在Linux中，进程硬件上下文的一部分存在TSS段，而剩余部分存放在内核态的堆栈中。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在下面的描述中，我们假定用prev局部变量表示切换出的进程的描述符，next表示切换进的进程的描述符。因此，我们把进程切换定义为这样的行为：保存prev硬件上下文，用next硬件上下文代替prev。因为进程切换经常发生，因此减少和装入硬件上下文所花费的时间是非常重要的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;早期的Linux版本利用80x86体系结构所提供的硬件支持，并通过far jmp指令跳到进程TSS描述符的选择符来执行进程切换。当执行这条指令时，CPU通过自动保存原来的硬件上下文，装入新的硬件上下文来执行硬件上下文切换。但是基于以下原因，Linux2.6使用软件执行进程切换：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  通过一组mov指令逐步执行切换，这样能较好地控制所装入数据的合法性，尤其是，这使检查ds和es段寄存器的值成为可能，这些值有可能被恶意用户伪造。当用单独的farjmp指令时，不可能进行这类检查。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  旧方法和新方法所需时间大致相同。然而，尽管当前的切换代码还有改进的余地，却不能对硬件上下文切换进行优化。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;进程切换只发生在内核态。在执行进程切换之前，用户态进程所使用的所有寄存器内容已保存在内核态堆栈上，这也包括ss和esp这对寄存器的内容。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;任务状态段&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;80x86体系结构包括一个特殊的段类型，叫任务状态段（Task State Segment, TSS）来存放硬件上下文。尽管Linux并不使用硬件上下文切换，但是强制它为系统中每个不同的CPU创建一个TSS。这样做的两个主要理由为：&lt;br/&gt;
+</span><span class='line'>  当80x86的一个CPU从用户态切换到内核态时，它就从TSS中获取内核态堆栈的地址。&lt;br/&gt;
+</span><span class='line'>  当用户态进程试图通过in或out指令访问一个I/O端口时，CPU需要访问存放在TSS中的I/O许可图以检查该进程是否有访问端口的权力。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;更确切地说，当进程在用户态下执行in或out指令时，控制单元执行下列操作：&lt;br/&gt;
+</span><span class='line'>  它检查eflags寄存器中的2位IOPL字段。如果该字段值为3，控制单元就执行I/O指令。否则，执行下一个检查。&lt;br/&gt;
+</span><span class='line'>  访问tr寄存器以确定当前的TSS和相应的I/O许可权位图。&lt;br/&gt;
+</span><span class='line'>  检查I/O指令中指定的I/O端口在I/O许可权位图中对应的位。如果该位清0，这条I/O指令就执行，否则控制单元产生一个”Generalprotetion”异常。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;tss_struct结构描述TSS的格式。正如第二章(《深入理解Linux内核（第三版）》)所提到的，init_tss数组为系统上每个不同的CPU存放一个TSS。在每次进程切换时，内核都更新TSS的某些字段以便相应的CPU控制单元可以安全地检索到它需要的信息。因此，TSS反映了CPU上的当前进程的特权级，但不必为没有在运行的进程保留TSS。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;每个TSS有它自己8字节的任务状态段描述符。这个描述符包括指向TSS起始地址的32位Base字段，20位Limit字段。TSSD的S标志被清0，以表示相应的TSS是系统段的事实。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Type字段置为11或9以表示这个段实际上是TSS。在Intel的原始设计中，系统中的每个进程都应当指向自己的TSS；Type字段的第二个有效位叫做Busy位；如果进程正由CPU执行，则该位置为1，否则置为0。在Linux的设计中，每个CPU只有一个TSS，因此，Busy位总置为1。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;由linux创建的TSSD存放在全局描述符表中。GDT的基地址存放在每个CPU的gdtr寄存器中。每个CPU的tr寄存器包含相应TSS的TSSD选择符，也包括了两个隐藏了非编程字段；TSSD的Base字段和Limit字段。这样，处理器就能直接对TSS寻址而不用从GDT中检索TSS的地址。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;Thread字段&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在每次进程切换时，被替换进程的硬件上下文必须保存在别处。不能像Intel原始设计那样把它保存在TSS中，因为Linux为每个处理器而不是为每个进程使用TSS。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因此，每个进程描述符包含一个类型为thread_struct的thread字段，只要进程被切换出去，内核就把其硬件上下文保存在这个结构中。随后我们会看到，这个数据结构包含的字段涉及大部分CPU寄存器，但不包括诸如exa、ebx等等这些通用寄存器，它们的值保留在内核堆栈中。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;执行进程切换&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;进程切换可能只发生在精心定义的点：schedule()函数（《深入理解Linux内核（第三版）》第七章有详细讨论）。这里，我们仅关注内核如何执行一个进程切换。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;从本质上说，每个进程切换由两步组成：&lt;br/&gt;
+</span><span class='line'>  切换页全局目录以安装一个新的地址空间；将在第九章（《深入理解Linux内核（第三版）》）描述这一步。&lt;br/&gt;
+</span><span class='line'>  切换内核态堆栈和硬件上下文，因为硬件上下文提供了内核执行新进程所需要的所有信息，包含CPU寄存器。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们又一次假定prev指向被替换进程的描述符，而next指向被激活进程的描述符。prev和next是schedule()函数的局部变量。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;switch_to宏&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;进程切换的第二步由switch_to宏执行。它是内核中与硬件关系最密切的例程之一，要理解它到低做了些什么我们必须下些功夫。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先，该宏有三个参数，它们是prev,next和last。你可能很容易猜到prev和next的作用：它们仅是局部变量prev和next的占位符，即它们是输入参数，分别表示被替换进程和新进程描述符的地址在内存中的位置。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;那第三个参数last呢？在任何进程切换中，涉及到三个进程而不是两个。假设内核决定暂停进程A而激活里程B。在schedule()函数中，prev指向A的描述符而next指向B的描述符。switch_to宏一但使A暂停，A的执行流就冻结。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;随后，当内核想再次此激活A，就必须暂停另一个进程C，于是就要用prev指向C而next指向A来执行另一个swithch_to宏。当A恢复它的执行流时，就会找到它原来的内核栈，于是prev局部变量还是指向A的描述符而next指向B的描述符。此时，代表进程A执行的内核就失去了对C的任何引用。但是，事实表明这个引用对于完成进程切换是很有用的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描述符地址写在内存的什么位置了。在进程切换之前，宏把第一个输入参数prev表示的变量的内容存入CPU的eax寄存器。在完成进程切换，A已经恢复执行时，宏把CPU的eax寄存器的内容写入由第三个输出参数&mdash;&mdash;-last所指示的A在内存中的位置。因为CPU寄存器不会在切换点发生变化，所以C的描述符地址也存在内存的这个位置。在schedule()执行过程中，参数last指向A的局部变量prev，所以prev被C的地址覆盖。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;图3-7显示了进程A，B，C内核堆栈的内容以及eax寄存器的内容。必须注意的是：图中显示的是在被eax寄存器的内容覆盖以前的prev局部变量的值。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define switch_to(prev, next, last)                 \
+</span><span class='line'>32do {                                  \
+</span><span class='line'>33  /*                              \
+</span><span class='line'>34   * Context-switching clobbers all registers, so we clobber  \
+</span><span class='line'>35   * them explicitly, via unused output variables.        \
+</span><span class='line'>36   * (EAX and EBP is not listed because EBP is saved/restored \
+</span><span class='line'>37   * explicitly for wchan access and EAX is the return value of   \
+</span><span class='line'>38   * __switch_to())                       \
+</span><span class='line'>39   */                             \
+</span><span class='line'>40  unsigned long ebx, ecx, edx, esi, edi;              \
+</span><span class='line'>41                                  \
+</span><span class='line'>42  asm volatile("pushfl\n\t"       /* save    flags */ \
+</span><span class='line'>43           "pushl %%ebp\n\t"      /* save    EBP   */ \
+</span><span class='line'>44           "movl %%esp,%[prev_sp]\n\t"    /* save    ESP   */ \
+</span><span class='line'>45           "movl %[next_sp],%%esp\n\t"    /* restore ESP   */ \
+</span><span class='line'>46           "movl $1f,%[prev_ip]\n\t"  /* save    EIP   */ \
+</span><span class='line'>47           "pushl %[next_ip]\n\t" /* restore EIP   */ \
+</span><span class='line'>48           __switch_canary                    \
+</span><span class='line'>49           "jmp __switch_to\n"    /* regparm call  */ \
+</span><span class='line'>50           "1:\t"                     \
+</span><span class='line'>51           "popl %%ebp\n\t"       /* restore EBP   */ \
+</span><span class='line'>52           "popfl\n"          /* restore flags */ \
+</span><span class='line'>53                                  \
+</span><span class='line'>54           /* output parameters */                \
+</span><span class='line'>55           : [prev_sp] "=m" (prev-&gt;thread.sp),     \
+</span><span class='line'>56             [prev_ip] "=m" (prev-&gt;thread.ip),     \
+</span><span class='line'>57             "=a" (last),                 \
+</span><span class='line'>58                                  \
+</span><span class='line'>59             /* clobbered output registers: */        \
+</span><span class='line'>60             "=b" (ebx), "=c" (ecx), "=d" (edx),      \
+</span><span class='line'>61             "=S" (esi), "=D" (edi)               \
+</span><span class='line'>62                                      \
+</span><span class='line'>63             __switch_canary_oparam               \
+</span><span class='line'>64                                  \
+</span><span class='line'>65             /* input parameters: */              \
+</span><span class='line'>66           : [next_sp]  "m" (next-&gt;thread.sp),     \
+</span><span class='line'>67             [next_ip]  "m" (next-&gt;thread.ip),     \
+</span><span class='line'>68                                      \
+</span><span class='line'>69             /* regparm parameters for __switch_to(): */  \
+</span><span class='line'>70             [prev]     "a" (prev),               \
+</span><span class='line'>71             [next]     "d" (next)                \
+</span><span class='line'>72                                  \
+</span><span class='line'>73             __switch_canary_iparam               \
+</span><span class='line'>74                                  \
+</span><span class='line'>75           : /* reloaded segment registers */         \
+</span><span class='line'>76          "memory");                  \
+</span><span class='line'>77} while (0)
+</span><span class='line'>78
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  sched_setscheduler函数的第二个参数调度方法 ：
+</span><span class='line'>&lt;p&gt;由于switch_to宏采用扩展的内联汇编语言编码，所以可读性比较差：实际上这段代码通过特殊位置记数法使用寄存器，而实际使用的通用寄存器由编译器自由选择。我们将采用标准汇编语言而不是麻烦的内联汇编语言来描述switch_to宏在80x86微处理器上所完成的典型工作。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  在eax和edx寄存器中分别保存prev和next的值。
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define SCHED_OTHER 0
-</span><span class='line'>#define SCHED_FIFO 1
-</span><span class='line'>#define SCHED_RR 2
-</span><span class='line'>#ifdef __USE_GNU
-</span><span class='line'># define SCHED_BATCH 3
-</span><span class='line'>#endif
+</span><span class='line'>movl prev ,%eax
+</span><span class='line'>movl next ,%edx
 </span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  SCHED_OTHER表示普通进程，对于普通进程，第三个参数sp-&gt;sched_priority只能是0&lt;br/&gt;
-</span><span class='line'>  SCHED_FIFO 和SCHED_RR表示实时进程的调度策略，第三个参数的取值范围为[1,99]。&lt;br/&gt;
-</span><span class='line'>  如果sched_setscheduler 优先级设置的值和调度策略不符合的话，会返回失败的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;应用层和内核层的优先级含义是不同的：&lt;br/&gt;
-</span><span class='line'>  首先说实时进程：实时进程的优先级设置可以通过sched_setsheduler设置，也可以通过sched_setparam设置优先级的大小。
-</span><span class='line'>int sched_setparam (pid_t pid, const struct sched_param *sp);&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在用户层或者应用层，1表示优先级最低，99表示优先级最高。但是在内核中，[0,99]表示的实时进程的优先级，0最高，99最低。[100,139]是普通进程折腾的范围。应用层比较天真率直，就看大小，数字大，则优先级高。ps查看进程的优先级也是如此。有意思的是，应用层实时进程最高优先级的99，在ps看进程优先级的时候，输出的是139.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  对于普通进程，是通过nice系统调用来调整优先级的。从内核角度讲[100,139]是普通进程的优先级的范围，100最高，139最低，默认是120。普通进程的优先级的作用和实时进程不同，普通进程优先级表示的是占的CPU时间。深入linux内核架构中提到，普通优先级越高（100最高，139最低），享受的CPU time越多，相邻的两个优先级，高一级的进程比低一级的进程多占用10%的CPU，比如内核优先级数值为120的进程要比数值是121的进程多占用10%的CPU。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  内核中有一个数组：prio_to_weight[20]表示的是默认优先级120的权重，数值为1024，prio_to_weight[21]表示nice值为1，优先级为121的进程的权重，数值为820。这就到了CFS的原理了
+</span><span class='line'>  把eflags和ebp寄存器的内容保存在prev内核栈中。必須保存它们的原因是编译器认为在switch_to结束之前它们的值应当保持不变。
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>static const int prio_to_weight[40] = {
-</span><span class='line'> /* -20 */ 88761, 71755, 56483, 46273, 36291,
-</span><span class='line'> /* -15 */ 29154, 23254, 18705, 14949, 11916,
-</span><span class='line'> /* -10 */ 9548, 7620, 6100, 4904, 3906,
-</span><span class='line'> /* -5 */ 3121, 2501, 1991, 1586, 1277,
-</span><span class='line'> /* 0 */ 1024, 820, 655, 526, 423,
-</span><span class='line'> /* 5 */ 335, 272, 215, 172, 137,
-</span><span class='line'> /* 10 */ 110, 87, 70, 56, 45,
-</span><span class='line'> /* 15 */ 36, 29, 23, 18, 15,
-</span><span class='line'>};
+</span><span class='line'>pushf1
+</span><span class='line'>push %ebp
 </span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  假如有1台电脑，10个人玩，怎么才公平。&lt;br/&gt;
-</span><span class='line'>  1 约定好时间片，每人玩1小时，玩完后记账，张XX 1小时，谁玩的时间短，谁去玩&lt;br/&gt;
-</span><span class='line'>  2 引入优先级的概念，李四有紧急情况，需要提高他玩电脑的时间，怎么办，玩1个小时，记账半小时，那么同等情况下，李四会比其他人被选中玩电脑的频率要高，就体现了这个优先级的概念。&lt;br/&gt;
-</span><span class='line'>  3  王五也有紧急情况，但是以考察，不如李四的紧急，好吧，玩1个小时，记账45分钟。&lt;br/&gt;
-</span><span class='line'>  4  情况有变化，听说这里有电脑，突然又来了10个人，如果按照每人玩1小时的时间片，排在最后的那哥们早就开始骂人了，怎么办？时间片动态变化，根据人数来确定时间片。人越多，每个人玩的时间越少，防止哥们老捞不着玩，耐心耗尽，开始骂人。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  这个记账就是我们prio_to_weight的作用。我就不多说了，prio_to_weight[20]就是基准，玩一小时，记账一小时，数组20以前的值是特权一级，玩1小时记账20分钟之类的享有特权的，数组20之后是倒霉蛋，玩1小时，记账1.5小时之类的倒霉蛋。 CFS这种调度好在大家都能捞着玩。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;对于FIFO而言，一旦sleep过后，高优先级运行，低优先级是没戏运行的，同等优先级的进程，先运行的不运行完，后运行的也没戏。&lt;br/&gt;
-</span><span class='line'>对于RR而言，高优先级的先运行，同等优先级的进程过家家，你玩完，我玩，我玩完你再玩，每个进程耗费一个时间片的时间。对于Linux，RR时间片是100ms：
+</span><span class='line'>  把esp的内容保存到prev-&gt;thread.esp中以使该字段指向prev内核栈的栈顶：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define DEF_TIMESLICE        (100 * HZ / 1000)
+</span><span class='line'>movl %esp, 484(%eax)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  把next-&gt;thread.esp装入esp.此时，内核开始在next的内核栈上操作，因此这条指令实际上完成了从prev到next的切换。由于进程描述符的地址和内核栈的地址紧挨着，所以改变内核栈意味着改变进程。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>movl 484(%edx),%esp
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  把标记为1的地址存入prev-&gt;thread.eip。当被替换的进程重新恢复执行时，进程执行被标记为1的那条指令：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>movl $lf, 480(%eax)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  宏把next-&gt;thread.eip的值压入next的内核栈。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>push1 480(%edx)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  跳到&lt;code&gt;__switch_to()&lt;/code&gt; 函数
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>jmp __switch_to
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  这里被进程B替换的进程A再次获得CPU；它执行一些保存eflags和ebp寄存器内容的指令，这两条指令的第一条指令被标记为1。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  拷贝eax寄存器的内容到switch_to宏的第三个参数lash标识的内存区域中：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>movl  %eax, last
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>正如以前讨论的，eax寄存器指向刚被替换的进程描述符。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;&lt;code&gt;__switch_to()&lt;/code&gt;函数&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;code&gt;__switch_to()&lt;/code&gt;函数执行大多数开始于switch_to()宏的进程切换。这个函数作用于prev_p和next_p参数，这两个参数表示前一个进程和新进程。这个函数的调用不同于一般函数的调用，因为&lt;code&gt;__switch_to()&lt;/code&gt;从eax和edx取参数prev_p和next_p，而不像大多数函数一样从栈中取参数。为了强迫函数从寄存器取它的参数，内核利用&lt;code&gt;__attribute__&lt;/code&gt;和regparm关键字，这两个关键字是C语言非标准的扩展名，由gcc编译程序实现。在include/asm-i386/system.h头文件中，&lt;code&gt;__switch_to()&lt;/code&gt;函数的声明如下：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>__switch_to(structtask_struct *prev_p,struct tast_struct *next_p)__attribute_(regparm(2));
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>函数执行的步骤如下：&lt;br/&gt;
+</span><span class='line'>  1、执行由&lt;code&gt;__unlazy_fpu()&lt;/code&gt;宏产生的代码，以有选择地保存prev_p进程的FPU、MMX及XMM寄存器的内容。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>__unlazy_fpu(prev_p);
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  2、执行smp_processor_id()宏获得本地(local)CPU的下标，即执行代码的CPU。该宏从当前进程的thread_info结构的cpu字段获得下标将它保存到cpu局部变量。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  3、把next_p-&gt;thread.esp0装入对应于本地CPU的TSS的esp0字段；将在通过sysenter指令发生系统调用一节看到，以后任何由sysenter汇编指令产生的从用户态到内核态的特权级转换将把这个地址拷贝到esp寄存器中：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>init_tss[cpu].esp0= next_p-&gt;thread.esp0;
 </span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  4、把next_p进程使用的线程局部存储段装入本地CPU的全局描述符表；三个段选择符保存在进程描述符内的tls_array数组中
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>cpu_gdt_table[cpu][6]= next_p-&gt;thread.tls_array[0];
+</span><span class='line'>cpu_gdt_table[cpu][7]= next_p-&gt;thread.tls_array[1];
+</span><span class='line'>cpu_gdt_table[cpu][8]= next_p-&gt;thread.tls_array[2];
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  5、把fs和gs段寄存器的内容分别存放在prev_p-&gt;thread.fs和prev_p-&gt;thread.gs中，对应的汇编语言指令是：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>movl%fs,40(%esi)
+</span><span class='line'>movl%gs,44(%esi)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  6、如果fs或gs段寄存器已经被prev_p或next_p进程中的任意一个使用，则将next_p进程的thread_struct描述符中保存的值装入这些寄存器中。这一步在逻辑上补充了前一步中执行的操作。主要的汇编语言指令如下：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>movl40(%ebx),%fs
+</span><span class='line'>movl44(%edb),%gs
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  7、ebx寄存器指向next_p-&gt;thread结构。代码实际上更复杂，因为当它检测到一个无效的段寄存器值时，CPU可能产生一个异常。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  8、用next_p-&gt;thread.debugreg数组的内容装载dr0,&hellip;,dr7中的6个调试寄存器。只有在next_p被挂起时正在使用调试寄存器，这种操作才能进行。这些寄存器不需要被保存，因为只有当一个调试器想要监控prev时prev_p-&gt;thread.debugreg才会修改。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>if(next_p-&gt;thread.debugreg[7]){
+</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,0);
+</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,1);
+</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,2);
+</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,3);
+</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,6);
+</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,7);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  8、如果必要，更新TSS中的I/O位图。当next_p或prev_p有其自己的定制I/O权限位图时必须这么做：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>if(prev_p-&gt;thread.io_bitmap_ptr|| next_p-&gt;thread.io_bitmap_ptr )
+</span><span class='line'>handle_io_bitmap(&amp;next_p-&gt;thread,&amp;init_tss[cpu]);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因为进程很修改I/O权限位图，所以该位图在“懒”模式中被处理；当且仅当一个进程在当前时间片内实际访问I/O端口时，真实位图才被拷贝到本地CPU的TSS中。进程的定制I/O权限位图被保存在thread_info结构的io_bitmap_ptr字段指向的缓冲区中。handle_io_bitmap()函数为next_p进程设置本地CPU使用的TSS的in_bitmap字段如下：&lt;br/&gt;
+</span><span class='line'>  (a)如果next_p进程不拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x8000.&lt;br/&gt;
+</span><span class='line'>  (b) 如果next_p进程拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x9000。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;TSS的io_bitmap字段应当包含一个在TSS中的偏移量，其中存放实际位图。无论何时用户态进程试图访问一个I/O端口，0x8000和0x9000指向TSS界限之外并将因此引起”Generalprotection”异常。do_general_protection()异常处理程序将检查保存在io_bitmap字段的值：如果是0x8000，函数发送一个SIGSEGV信号给用户态进程；如果是0x9000，函数把进程位图拷贝拷贝到本地CPU的TSS中，把io_bitmap字段为实际位图的偏移(104)，并强制再一次执行有缺陷的汇编指令。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  9、终止。
+</span><span class='line'>&lt;code&gt;__switch_to()&lt;/code&gt;函数通过使用下列声明结束：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>return prev_p;
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  由编译器产生的相应汇编语言指令是：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>movl %edl,%eax
+</span><span class='line'>ret
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>  prev_p参数被拷贝到eax，因为缺省情况下任何C函数的返回值被传递给eax寄存器。注意eax的值因此在调用&lt;code&gt;__switch_to()&lt;/code&gt;的过程中被保护起来；这非常重要，因为调用switch_to宏时会假定eax总是用来存放被替换的进程描述符的地址。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  汇编语言指令ret把栈顶保存的返回地址装入eip程序计数器。不过，通过简单地跳转到&lt;code&gt;__switch_to()&lt;/code&gt;函数来调用该函数。因此，ret汇编指令在栈中找到标号为1的指令的地址，其中标号为1的地址是由switch_to()宏推入栈中的。如果因为next_p第一次执行而以前从未被挂起，&lt;code&gt;__switch_to()&lt;/code&gt;就找到ret_from_fork()函数的起始地址。&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[linux内核中异步通知机制--信号处理机制]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/02/11/kernel-sched-signal/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-02-11T15:08:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/02/11/kernel-sched-signal&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/yusiguyuan/article/details/23168363"&gt;http://blog.csdn.net/yusiguyuan/article/details/23168363&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[字符设备驱动和等待队列样例]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-21T15:58:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;前两篇的样例&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  什么是异步通知：很简单，一旦设备准备好，就主动通知应用程序，这种情况下应用程序就不需要查询设备状态， 特像硬件上常提的“中断的概念”。 比较准确的说法其实应该叫做“信号驱动的异步I/O”,信号是在软件层次上对中断机制的一种模拟。阻塞I/O意味着一直等待设备可访问再访问，非阻塞I/O意味着使用poll()来查询是否可访问，而异步通知则意味着设备通知应用程序自身可访问。（希望用这么一句话能表达我的意思）&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="/blog/2015/05/21/kernel-base-chardev/"&gt;字符设备驱动程序&lt;/a&gt;&lt;br/&gt;
+</span><span class='line'>&lt;a href="/blog/2015/05/21/kernel-sched-waitqueue/"&gt;Linux内核中的等待队列&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;一、系统中存在的异步机制&lt;/h4&gt;
+</span><span class='line'>&lt;h4&gt;waitqueue.c&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  我认为异步机制是一种理念，并不是某一种具体实现，同步/异步的核心理解应该是如何获取消息的问题，你自身（在计算机中当然是进程本身了）亲自去获取消息，那么就是同步机制，但是如果别人使用某种方式通知你某一个消息，那么你采用的就是异步机制。内核中使用到异步机制的大概有：信号，这是一种进程间通信的异步机制；epoll，这是一种高效处理IO的异步通信机制。也就是从通信和IO两个方面通过不同的方式使用了异步机制。（可能还有别的，暂时不知道）&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/init.h&gt;
+</span><span class='line'>#include &lt;linux/fs.h&gt;
+</span><span class='line'>#include &lt;asm/uaccess.h&gt;
+</span><span class='line'>#include &lt;linux/wait.h&gt;
+</span><span class='line'>#include &lt;linux/semaphore.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;下面进入正题：&lt;/p&gt;
+</span><span class='line'>#include &lt;linux/socket.h&gt;
+</span><span class='line'>#include &lt;linux/tcp.h&gt;
+</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
+</span><span class='line'>#include &lt;net/net_namespace.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;二、信号的基本概念&lt;/h4&gt;
+</span><span class='line'>#include &lt;net/tcp.h&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;1）信号的本质&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  软中断信号（signal，又简称为信号）用来通知进程发生了异步事件。在软件层次上是对中断机制的一种模拟，在原理上，一个进程收到一个信号与处理器收到一个中断请求可以说是一样的。信号是进程间通信机制中唯一的异步通信机制，一个进程不必通过任何操作来等待信号的到达，事实上，进程也不知道信号到底什么时候到达。进程之间可以互相通过系统调用kill发送软中断信号。内核也可以因为内部事件而给进程发送信号，通知进程发生了某个事件。信号机制除了基本通知功能外，还可以传递附加信息。&lt;/p&gt;
+</span><span class='line'>static ssize_t globalvar_read(struct file *, char *, size_t, loff_t*);
+</span><span class='line'>static ssize_t globalvar_write(struct file *, const char *, size_t, loff_t*);
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;收到信号的进程对各种信号有不同的处理方法。处理方法可以分为三类：&lt;br/&gt;
-</span><span class='line'>第一种是类似中断的处理程序，对于需要处理的信号，进程可以指定处理函数，由该函数来处理。&lt;br/&gt;
-</span><span class='line'>第二种方法是，忽略某个信号，对该信号不做任何处理，就象未发生过一样。&lt;br/&gt;
-</span><span class='line'>第三种方法是，对该信号的处理保留系统的默认值，这种缺省操作，对大部分的信号的缺省操作是使得进程终止。进程通过系统调用signal来指定进程对某个信号的处理行为。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在进程表的表项中有一个软中断信号域，该域中每一位对应一个信号，当有信号发送给进程时，对应位置位。由此可以看出，进程对不同的信号可以同时保留，但对于同一个信号，进程并不知道在处理之前来过多少个。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;2）信号的种类&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;可以从两个不同的分类角度对信号进行分类：&lt;br/&gt;
-</span><span class='line'>可靠性方面：可靠信号与不可靠信号；&lt;br/&gt;
-</span><span class='line'>与时间的关系上：实时信号与非实时信号。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;3）可靠信号与不可靠信号&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  Linux信号机制基本上是从Unix系统中继承过来的。早期Unix系统中的信号机制比较简单和原始，信号值小于SIGRTMIN的信号都是不可靠信号。这就是"不可靠信号"的来源。它的主要问题是信号可能丢失。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  随着时间的发展，实践证明了有必要对信号的原始机制加以改进和扩充。由于原来定义的信号已有许多应用，不好再做改动，最终只好又新增加了一些信号，并在一开始就把它们定义为可靠信号，这些信号支持排队，不会丢失。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  信号值位于SIGRTMIN和SIGRTMAX之间的信号都是可靠信号，可靠信号克服了信号可能丢失的问题。Linux在支持新版本的信号安装函数sigation()以及信号发送函数sigqueue()的同时，仍然支持早期的signal()信号安装函数，支持信号发送函数kill()。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;信号的可靠与不可靠只与信号值有关，与信号的发送及安装函数无关。目前linux中的signal()是通过sigation()函数实现的，因此，即使通过signal()安装的信号，在信号处理函数的结尾也不必再调用一次信号安装函数。同时，由signal()安装的实时信号支持排队，同样不会丢失。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  对于目前linux的两个信号安装函数：signal()及sigaction()来说，它们都不能把SIGRTMIN以前的信号变成可靠信号（都不支持排队，仍有可能丢失，仍然是不可靠信号），而且对SIGRTMIN以后的信号都支持排队。这两个函数的最大区别在于，经过sigaction安装的信号都能传递信息给信号处理函数，而经过signal安装的信号不能向信号处理函数传递信息。对于信号发送函数来说也是一样的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4）实时信号与非实时信号&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  早期Unix系统只定义了32种信号，前32种信号已经有了预定义值，每个信号有了确定的用途及含义，并且每种信号都有各自的缺省动作。如按键盘的CTRL ^C时，会产生SIGINT信号，对该信号的默认反应就是进程终止。后32个信号表示实时信号，等同于前面阐述的可靠信号。这保证了发送的多个实时信号都被接收。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;非实时信号都不支持排队，都是不可靠信号；实时信号都支持排队，都是可靠信号。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;5)linux 下信号的生命周期如下：&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在目的进程中安装该信号。即是设置捕获该信号时进程进程该执行的操作码。采用signal（）;sigaction（）系统调用来实现。&lt;br/&gt;
-</span><span class='line'>  信号被某个进程产生，同时设置该信号的目的进程（使用pid），之后交给操作系统进行管理。采用kill()、arise()、alarm()等系统调用来实现。&lt;br/&gt;
-</span><span class='line'>  信号在目的进程被注册。信号被添加进进程的PCB（task_struct）中相关的数据结构里——未决信号的数据成员。信号在进程中注册就是把信号值加入到进程的未决信号集里。并且，信号携带的其他信息被保留到未决信的队列的某个sigqueue结构中。&lt;br/&gt;
-</span><span class='line'>  信号在进程中注销。在执行信号处理函数前，要把信号在进程中注销。对于非实时信号（不可靠信号），其在信号未决信号信息链中最多只有一个sigqueue结构，因此该结构被释放后，相应的信号要在未决信号集删除。而实时信号（可靠信号），如果有多个sigqueue，则不会把信号从进程的未决信号集中删除。&lt;br/&gt;
-</span><span class='line'>  信号生命的终结。进程终止当前的工作，保护上下文，执行信号处理函数，之后回复。如果内核是可抢占的，那么还需要调度。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;三、信 号 机 制&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  上 一节中介绍了信号的基本概念，在这一节中，我们将介绍内核如何实现信号机制。即内核如何向一个进程发送信号、进程如何接收一个信号、进程怎样控制自己对信 号的反应、内核在什么时机处理和怎样处理进程收到的信号。还要介绍一下setjmp和longjmp在信号中起到的作用。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;1、内核对信号的基本处理方法&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  内核给一个进程发送软中断信号的方法，是在进程所在的进程表项的信号域设置对应于该信号的位。这里要补充的是，如果信号发送给一个正在睡眠的进程，那么要看 该进程进入睡眠的优先级，如果进程睡眠在可被中断的优先级上，则唤醒进程；否则仅设置进程表中信号域相应的位，而不唤醒进程。这一点比较重要，因为进程检 查是否收到信号的时机是：一个进程在即将从内核态返回到用户态时；或者，在一个进程要进入或离开一个适当的低调度优先级睡眠状态时。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;进程的task_struct结构中有关于本进程中未决信号的数据成员：struct sigpending pending：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct sigpending{
-</span><span class='line'>    struct sigqueue *head, *tail;
-</span><span class='line'>    sigset_t signal;
+</span><span class='line'>struct file_operations globalvar_fops =
+</span><span class='line'>{
+</span><span class='line'>    .owner   = THIS_MODULE,
+</span><span class='line'>    .read = globalvar_read,
+</span><span class='line'>    .write = globalvar_write,
 </span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>第三个成员是进程中所有未决信号集，第一、第二个成员分别指向一个sigqueue类型的结构链（称之为"未决信号信息链"）的首尾，信息链中的每个sigqueue结构刻画一个特定信号所携带的信息，并指向下一个sigqueue结构:
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct sigqueue{
-</span><span class='line'>    struct sigqueue *next;
-</span><span class='line'>    siginfo_t info;
+</span><span class='line'>
+</span><span class='line'>#define LEN 1024
+</span><span class='line'>static char global_var[LEN];
+</span><span class='line'>static int read_index = 0;
+</span><span class='line'>static int write_index = 0;
+</span><span class='line'>static spinlock_t var_lock;
+</span><span class='line'>static wait_queue_head_t waitq;
+</span><span class='line'>static int flag = 0;
+</span><span class='line'>static int major;
+</span><span class='line'>
+</span><span class='line'>static const char procname[] = "testvar";
+</span><span class='line'>
+</span><span class='line'>static int __init globalvar_init(void)
+</span><span class='line'>{
+</span><span class='line'>    init_waitqueue_head(&amp;waitq);
+</span><span class='line'>    spin_lock_init(&amp;var_lock);
+</span><span class='line'>//  if (!proc_net_fops_create(&amp;init_net, procname, S_IRUSR, &amp;globalvar_fops)) {
+</span><span class='line'>    if (!(major = register_chrdev(0, "globalvar", &amp;globalvar_fops))) {
+</span><span class='line'>        printk("globalvar register failure\n");
+</span><span class='line'>        return -1;
+</span><span class='line'>    }
+</span><span class='line'>    printk("major = %d\n", major);
+</span><span class='line'>    return 0;
 </span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>信号在进程中注册指的就是信号值加入到进程的未决信号集sigset_t signal（每个信号占用一位）中，并且信号所携带的信息被保留到未决信号信息链的某个sigqueue结构中。只要信号在进程的未决信号集中，表明进程已经知道这些信号的存在，但还没来得及处理，或者该信号被进程阻塞。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;当一个实时信号发送给一个进程时，不管该信号是否已经在进程中注册，都会被再注册一次，因此，信号不会丢失，因此，实时信号又叫做"可靠信号"。这意味着同一个实时信号可以在同一个进程的未决信号信息链中占有多个sigqueue结构（进程每收到一个实时信号，都会为它分配一个结构来登记该信号信息，并把该结构添加在未决信号链尾，即所有诞生的实时信号都会在目标进程中注册）。&lt;/p&gt;
+</span><span class='line'>static void __exit globalvar_exit(void)
+</span><span class='line'>{
+</span><span class='line'>//  proc_net_remove(&amp;init_net, procname);
+</span><span class='line'>    unregister_chrdev(major, "globalvar");
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;当一个非实时信号发送给一个进程时，如果该信号已经在进程中注册（通过sigset_t signal指示），则该信号将被丢弃，造成信号丢失。因此，非实时信号又叫做"不可靠信号"。这意味着同一个非实时信号在进程的未决信号信息链中，至多占有一个sigqueue结构。&lt;/p&gt;
+</span><span class='line'>static ssize_t globalvar_read(struct file *filp, char *buf, size_t len, loff_t *off)
+</span><span class='line'>{
+</span><span class='line'>    int read_len;
+</span><span class='line'>    //等待数据可获得
+</span><span class='line'>    if (wait_event_interruptible(waitq, flag != 0))
+</span><span class='line'>        return -ERESTARTSYS;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;总之信号注册与否，与发送信号的函数（如kill()或sigqueue()等）以及信号安装函数（signal()及sigaction()）无关，只与信号值有关（信号值小于SIGRTMIN的信号最多只注册一次，信号值在SIGRTMIN及SIGRTMAX之间的信号，只要被进程接收到就被注册）&lt;/p&gt;
+</span><span class='line'>    spin_lock(&amp;var_lock);
+</span><span class='line'>    read_len = write_index - read_index;
+</span><span class='line'>    if (copy_to_user(buf, global_var+read_index, read_len)) {
+</span><span class='line'>        spin_unlock(&amp;var_lock);
+</span><span class='line'>        return -EFAULT;
+</span><span class='line'>    }
+</span><span class='line'>    read_index = write_index;
+</span><span class='line'>    flag = 0;
+</span><span class='line'>    spin_unlock(&amp;var_lock);
+</span><span class='line'>    return read_len;
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核处理一个进程收到的信号的时机是在一个进程从内核态返回用户态时。所以，当一个进程在内核态下运行时，软中断信号并不立即起作用，要等到将返回用户态时才处理。进程只有处理完信号才会返回用户态，进程在用户态下不会有未处理完的信号。&lt;/p&gt;
+</span><span class='line'>static ssize_t globalvar_write(struct file *filp, const char *buf, size_t len, loff_t *off)
+</span><span class='line'>{
+</span><span class='line'>    spin_lock(&amp;var_lock);
+</span><span class='line'>    if (copy_from_user(global_var+write_index, buf, len)) {
+</span><span class='line'>        spin_unlock(&amp;var_lock);
+</span><span class='line'>        return -EFAULT;
+</span><span class='line'>    }
+</span><span class='line'>    write_index += len;
+</span><span class='line'>    spin_unlock(&amp;var_lock);
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核处理一个进程收到的软中断信号是在该进程的上下文中，因此，进程必须处于运行状态。前面介绍概念的时候讲过，处理信号有三种类型：进程接收到信号后退 出；进程忽略该信号；进程收到信号后执行用户设定用系统调用signal的函数。当进程接收到一个它忽略的信号时，进程丢弃该信号，就象没有收到该信号似 的继续运行。如果进程收到一个要捕捉的信号，那么进程从内核态返回用户态时执行用户定义的函数。而且执行用户定义的函数的方法很巧妙，内核是在用户栈上创 建一个新的层，该层中将返回地址的值设置成用户定义的处理函数的地址，这样进程从内核返回弹出栈顶时就返回到用户定义的函数处，从函数返回再弹出栈顶时， 才返回原先进入内核的地方。这样做的原因是用户定义的处理函数不能且不允许在内核态下执行（如果用户定义的函数在内核态下运行的话，用户就可以获得任何权 限）。&lt;/p&gt;
+</span><span class='line'>    flag = 1;
+</span><span class='line'>    //通知数据可获得
+</span><span class='line'>    wake_up_interruptible(&amp;waitq);
+</span><span class='line'>    return len;
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;对于非实时信号来说，由于在未决信号信息链中最多只占用一个sigqueue结构，因此该结构被释放后，应该把信号在进程未决信号集中删除（信号注销完毕）；而对于实时信号来说，可能在未决信号信息链中占用多个sigqueue结构，因此应该针对占用sigqueue结构的数目区别对待：如果只占用一个sigqueue结构（进程只收到该信号一次），则执行完相应的处理函数后应该把信号在进程的未决信号集中删除（信号注销完毕）。否则待该信号的所有sigqueue处理完毕后再在进程的未决信号集中删除该信号。&lt;/p&gt;
+</span><span class='line'>module_init(globalvar_init);
+</span><span class='line'>module_exit(globalvar_exit);
+</span><span class='line'>MODULE_LICENSE("GPL");
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;当所有未被屏蔽的信号都处理完毕后，即可返回用户空间。对于被屏蔽的信号，当取消屏蔽后，在返回到用户空间时会再次执行上述检查处理的一套流程。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;Makefile&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h6&gt;在信号的处理方法中有几点特别要引起注意。&lt;/h6&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    obj-m += waitqueue.o
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;第一，在一些系统中，当一个进程处理完中断信号返回用户态之前，内核清除用户区中设 定的对该信号的处理例程的地址，即下一次进程对该信号的处理方法又改为默认值，除非在下一次信号到来之前再次使用signal系统调用。这可能会使得进程 在调用signal之前又得到该信号而导致退出。在BSD中，内核不再清除该地址。但不清除该地址可能使得进程因为过多过快的得到某个信号而导致堆栈溢 出。为了避免出现上述情况。在BSD系统中，内核模拟了对硬件中断的处理方法，即在处理某个中断时，阻止接收新的该类中断。&lt;/p&gt;
+</span><span class='line'>PWD = $(shell pwd)
+</span><span class='line'>KERNEL := /lib/modules/`uname -r`/build
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;第二个要 引起注意的是，如果要捕捉的信号发生于进程正在一个系统调用中时，并且该进程睡眠在可中断的优先级上，这时该信号引起进程作一次longjmp，跳出睡眠 状态，返回用户态并执行信号处理例程。当从信号处理例程返回时，进程就象从系统调用返回一样，但返回了一个错误代码，指出该次系统调用曾经被中断。这要注 意的是，BSD系统中内核可以自动地重新开始系统调用。&lt;/p&gt;
+</span><span class='line'>all:
+</span><span class='line'>    make -C $(KERNEL) M=$(PWD) modules
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;第三个要注意的地方：若进程睡眠在可中断的优先级上，则当它收到一个要忽略的信号时，该进程被唤醒，但不做longjmp，一般是继续睡眠。但用户感觉不到进程曾经被唤醒，而是象没有发生过该信号一样。&lt;/p&gt;
+</span><span class='line'>&lt;h5&gt;安装模块&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;第四个要注意的地方：内核对子进程终止（SIGCLD）信号的处理方法与其他信号有所区别。当进程检查出收到了一个子进程终止的信号时，缺省情况下，该进程 就象没有收到该信号似的，如果父进程执行了系统调用wait，进程将从系统调用wait中醒来并返回wait调用，执行一系列wait调用的后续操作（找 出僵死的子进程，释放子进程的进程表项），然后从wait中返回。SIGCLD信号的作用是唤醒一个睡眠在可被中断优先级上的进程。如果该进程捕捉了这个 信号，就象普通信号处理一样转到处理例程。如果进程忽略该信号，那么系统调用wait的动作就有所不同，因为SIGCLD的作用仅仅是唤醒一个睡眠在可被 中断优先级上的进程，那么执行wait调用的父进程被唤醒继续执行wait调用的后续操作，然后等待其他的子进程。&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    insmod ./waitqueue.ko
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt; 如果一个进程调用signal系统调用，并设置了SIGCLD的处理方法，并且该进程有子进程处于僵死状态，则内核将向该进程发一个SIGCLD信号。&lt;/p&gt;
+</span><span class='line'>&lt;h5&gt;查看对应的设备号&lt;/h5&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;2、setjmp和longjmp的作用&lt;/h5&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    $ cat /proc/devices | grep globalvar
+</span><span class='line'>$ 249 globalvar
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  前面在介绍信号处理机制时，多次提到了setjmp和longjmp，但没有仔细说明它们的作用和实现方法。这里就此作一个简单的介绍。 &lt;br/&gt;
-</span><span class='line'>  在 介绍信号的时候，我们看到多个地方要求进程在检查收到信号后，从原来的系统调用中直接返回，而不是等到该调用完成。这种进程突然改变其上下文的情况，就是 使用setjmp和longjmp的结果。setjmp将保存的上下文存入用户区，并继续在旧的上下文中执行。这就是说，进程执行一个系统调用，当因为资 源或其他原因要去睡眠时，内核为进程作了一次setjmp，如果在睡眠中被信号唤醒，进程不能再进入睡眠时，内核为进程调用longjmp，该操作是内核 为进程将原先setjmp调用保存在进程用户区的上下文恢复成现在的上下文，这样就使得进程可以恢复等待资源前的状态，而且内核为setjmp返回1，使 得进程知道该次系统调用失败。这就是它们的作用。&lt;/p&gt;
+</span><span class='line'>&lt;h5&gt;建立文件&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    mknod /dev/globalvar c 249 0
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;终端1: cat文件&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    cat /dev/globalvar
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;终端2: echo数据到文件&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    echo 123 &gt; /dev/globalvar
+</span><span class='line'>echo 1234567 &gt; /dev/globalvar
+</span><span class='line'>echo 123 &gt; /dev/globalvar
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这时就能看见终端1读到了内容。&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux内核CPU负载均衡机制]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/02/11/kernel-sched-balance/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-02-11T14:00:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/02/11/kernel-sched-balance&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.oenhan.com/cpu-load-balance"&gt;http://www.oenhan.com/cpu-load-balance&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux内核中的等待队列]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-05-21T15:58:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.sina.com.cn/s/blog_49d5604e010008bn.html"&gt;http://blog.sina.com.cn/s/blog_49d5604e010008bn.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt; 还是神奇的进程调度问题引发的，参看Linux进程组调度机制分析，组调度机制是看清楚了，发现在重启过程中，很多内核调用栈阻塞在了double_rq_lock函数上，而double_rq_lock则是load_balance触发的，怀疑当时的核间调度出现了问题，在某个负责场景下产生了多核互锁，后面看了一下CPU负载平衡下的代码实现，写一下总结。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;等待队列可以参考net/ipv4/tcp_probe.c的实现&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核代码版本：kernel-3.0.13-0.27。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/"&gt;简单样例&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核代码函数起自load_balance函数,从load_balance函数看引用它的函数可以一直找到schedule函数这里，便从这里开始往下看，在__schedule中有下面一句话。
+</span><span class='line'>&lt;h4&gt;Linux内核中的等待队列&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  Linux内核的等待队列是以双循环链表为基础数据结构，与进程调度机制紧密结合，能够用于实现核心的异步事件通知机制。在Linux2.4.21中，等待队列在源代码树include/linux/wait.h中，这是一个通过list_head连接的典型双循环链表，&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如下图所示。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-05-21.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  在这个链表中，有两种数据结构：等待队列头（wait_queue_head_t）和等待队列项（wait_queue_t）。等待队列头和等待队列项中都包含一个list_head类型的域作为"连接件"。由于我们只需要对队列进行添加和删除操作，并不会修改其中的对象（等待队列项），因此，我们只需要提供一把保护整个基础设施和所有对象的锁，这把锁保存在等待队列头中，为wq_lock_t类型。在实现中，可以支持读写锁（rwlock）或自旋锁（spinlock）两种类型，通过一个宏定义来切换。如果使用读写锁，将wq_lock_t定义为rwlock_t类型；如果是自旋锁，将wq_lock_t定义为spinlock_t类型。无论哪种情况，分别相应设置wq_read_lock、wq_read_unlock、wq_read_lock_irqsave、wq_read_unlock_irqrestore、wq_write_lock_irq、wq_write_unlock、wq_write_lock_irqsave和wq_write_unlock_irqrestore等宏。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;等待队列头&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct __wait_queue_head {
+</span><span class='line'>    wq_lock_t lock;
+</span><span class='line'>    struct list_head task_list;
+</span><span class='line'>};
+</span><span class='line'>typedef struct __wait_queue_head wait_queue_head_t;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  前面已经说过，等待队列的主体是进程，这反映在每个等待队列项中，是一个任务结构指针（struct task_struct * task）。flags为该进程的等待标志，当前只支持互斥。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;等待队列项&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct __wait_queue {
+</span><span class='line'>    unsigned int flags;
+</span><span class='line'>#define WQ_FLAG_EXCLUSIVE 0x01
+</span><span class='line'>    struct task_struct * task;
+</span><span class='line'>    struct list_head task_list;
+</span><span class='line'>};
+</span><span class='line'>typedef struct __wait_queue wait_queue_t;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;声明和初始化&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define DECLARE_WAITQUEUE(name, tsk)            \
+</span><span class='line'>    wait_queue_t name = __WAITQUEUE_INITIALIZER(name, tsk)
+</span><span class='line'>#define __WAITQUEUE_INITIALIZER(name, tsk) {    \
+</span><span class='line'>    task:  tsk,                                 \
+</span><span class='line'>    task_list: { NULL, NULL },                  \
+</span><span class='line'>    __WAITQUEUE_DEBUG_INIT(name)}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  通过DECLARE_WAITQUEUE宏将等待队列项初始化成对应的任务结构，并且用于连接的相关指针均设置为空。其中加入了调试相关代码。
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>if (unlikely(!rq-&gt;nr_running))
-</span><span class='line'>    idle_balance(cpu, rq);
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>从上面可以看出什么时候内核会尝试进行CPU负载平衡：即当前CPU运行队列为NULL的时候。&lt;/p&gt;
+</span><span class='line'>#define DECLARE_WAIT_QUEUE_HEAD(name)                    \
+</span><span class='line'>    wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
+</span><span class='line'>#define __WAIT_QUEUE_HEAD_INITIALIZER(name) {            \
+</span><span class='line'>    lock:  WAITQUEUE_RW_LOCK_UNLOCKED,                   \
+</span><span class='line'>    task_list: { &amp;(name).task_list, &amp;(name).task_list }, \
+</span><span class='line'>    __WAITQUEUE_HEAD_DEBUG_INIT(name)}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPU负载平衡有两种方式：pull和push，即空闲CPU从其他忙的CPU队列中拉一个进程到当前CPU队列；或者忙的CPU队列将一个进程推送到空闲的CPU队列中。idle_balance干的则是pull的事情，具体push下面会提到。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;在idle_balance里面，有一个proc阀门控制当前CPU是否pull:
+</span><span class='line'>&lt;p&gt;  通过DECLARE_WAIT_QUEUE_HEAD宏初始化一个等待队列头，使得其所在链表为空，并设置链表为"未上锁"状态。其中加入了调试相关代码。
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>if (this_rq-&gt;avg_idle &lt; sysctl_sched_migration_cost)
-</span><span class='line'>    return;
+</span><span class='line'>static inline void init_waitqueue_head(wait_queue_head_t *q)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;该函数初始化一个已经存在的等待队列头，它将整个队列设置为"未上锁"状态，并将链表指针prev和next指向它自身。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>{
+</span><span class='line'>    q-&gt;lock = WAITQUEUE_RW_LOCK_UNLOCKED;
+</span><span class='line'>    INIT_LIST_HEAD(&amp;q-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void init_waitqueue_entry(wait_queue_t *q, struct task_struct *p)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;该函数初始化一个已经存在的等待队列项，它设置对应的任务结构，同时将标志位清0。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>{
+</span><span class='line'>    q-&gt;flags = 0;
+</span><span class='line'>    q-&gt;task = p;
+</span><span class='line'>}
+</span><span class='line'>static inline int waitqueue_active(wait_queue_head_t *q)
 </span><span class='line'>&lt;/code&gt;
-</span><span class='line'>sysctl_sched_migration_cost对应proc控制文件是/proc/sys/kernel/sched_migration_cost，开关代表如果CPU队列空闲了500ms（sysctl_sched_migration_cost默认值）以上，则进行pull，否则则返回。&lt;/p&gt;
+</span><span class='line'>该函数检查等待队列是否为空。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>{
+</span><span class='line'>    return !list_empty(&amp;q-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;for_each_domain(this_cpu, sd) 则是遍历当前CPU所在的调度域，可以直观的理解成一个CPU组，类似task_group，核间平衡指组内的平衡。负载平衡有一个矛盾就是：负载平衡的频度和CPU cache的命中率是矛盾的，CPU调度域就是将各个CPU分成层次不同的组，低层次搞定的平衡就绝不上升到高层次处理，避免影响cache的命中率。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;将指定的等待队列项new添加到等待队列头head所在的链表头部，该函数假设已经获得锁。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>{
+</span><span class='line'>    list_add(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;图例如下;&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;将指定的等待队列项new添加到等待队列头head所在的链表尾部，该函数假设已经获得锁。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>{
+</span><span class='line'>    list_add_tail(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>将函数从等待队列头head所在的链表中删除指定等待队列项old，该函数假设已经获得锁，并且old在head所在链表中。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>{
+</span><span class='line'>    list_del(&amp;old-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-02-11-1.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;睡眠和唤醒操作&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;最终通过load_balance进入正题。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;对等待队列的操作包括睡眠和唤醒（相关函数保存在源代码树的/kernel/sched.c和include/linux/sched.h中）。思想是更改当前进程（CURRENT）的任务状态，并要求重新调度，因为这时这个进程的状态已经改变，不再在调度表的就绪队列中，因此无法再获得执行机会，进入"睡眠"状态，直至被"唤醒"，即其任务状态重新被修改回就绪态。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;首先通过find_busiest_group获取当前调度域中的最忙的调度组，首先update_sd_lb_stats更新sd的状态，也就是遍历对应的sd，将sds里面的结构体数据填满，如下：</span></code></pre></td></tr></table></div></figure>
-    struct sd_lb_stats {
-        struct sched_group <em>busiest; /</em> Busiest group in this sd <em>/
-        struct sched_group </em>this;  /<em> Local group in this sd </em>/
-        unsigned long total_load;  /<em> Total load of all groups in sd </em>/
-        unsigned long total_pwr;   /<em>   Total power of all groups in sd </em>/
-        unsigned long avg_load;    /<em> Average load across all groups in sd </em>/</p>
+</span><span class='line'>&lt;p&gt;常用的睡眠操作有interruptible_sleep_on和sleep_on。两个函数类似，只不过前者将进程的状态从就绪态（TASK_RUNNING）设置为TASK_INTERRUPTIBLE，允许通过发送signal唤醒它（即可中断的睡眠状态）；而后者将进程的状态设置为TASK_UNINTERRUPTIBLE，在这种状态下，不接收任何singal。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;以interruptible_sleep_on为例，其展开后的代码是：</span></code></pre></td></tr></table></div></figure>
+    void interruptible_sleep_on(wait_queue_head_t <em>q)
+    {
+        unsigned long flags;
+        wait_queue_t wait;
+        /</em> 构造当前进程对应的等待队列项 */
+        init_waitqueue_entry(&amp;wait, current);</p>
 
-<pre><code>    /** Statistics of this group */
-    unsigned long this_load; //当前调度组的负载
-    unsigned long this_load_per_task; //当前调度组的平均负载
-    unsigned long this_nr_running; //当前调度组内运行队列中进程的总数
-    unsigned long this_has_capacity;
-    unsigned int  this_idle_cpus;
+<pre><code>    /* 将当前进程的状态从TASK_RUNNING改为TASK_INTERRUPTIBLE */
+    current-&gt;state = TASK_INTERRUPTIBLE;
 
-    /* Statistics of the busiest group */
-    unsigned int  busiest_idle_cpus;
-    unsigned long max_load; //最忙的组的负载量
-    unsigned long busiest_load_per_task; //最忙的组中平均每个任务的负载量
-    unsigned long busiest_nr_running; //最忙的组中所有运行队列中进程的个数
-    unsigned long busiest_group_capacity;
-    unsigned long busiest_has_capacity;
-    unsigned int  busiest_group_weight;
-</code></pre>
+    /* 将等待队列项添加到指定链表中 */
+    wq_write_lock_irqsave(&amp;q-&gt;lock,flags);
+    __add_wait_queue(q, &amp;wait); 
+    wq_write_unlock(&amp;q-&gt;lock);
 
-<pre><code></code></pre>
+    /* 进程重新调度，放弃执行权 */
+    schedule();
 
-<pre><code>do
-{
-    local_group = cpumask_test_cpu(this_cpu, sched_group_cpus(sg));
-    if (local_group) {
-                  //如果是当前CPU上的group，则进行赋值
-        sds-&gt;this_load = sgs.avg_load;
-        sds-&gt;this = sg;
-        sds-&gt;this_nr_running = sgs.sum_nr_running;
-        sds-&gt;this_load_per_task = sgs.sum_weighted_load;
-        sds-&gt;this_has_capacity = sgs.group_has_capacity;
-        sds-&gt;this_idle_cpus = sgs.idle_cpus;
-    } else if (update_sd_pick_busiest(sd, sds, sg, &amp;sgs, this_cpu)) {
-                 //在update_sd_pick_busiest判断当前sgs的是否超过了之前的最大值，如果是
-                 //则将sgs值赋给sds
-        sds-&gt;max_load = sgs.avg_load;
-        sds-&gt;busiest = sg;
-        sds-&gt;busiest_nr_running = sgs.sum_nr_running;
-        sds-&gt;busiest_idle_cpus = sgs.idle_cpus;
-        sds-&gt;busiest_group_capacity = sgs.group_capacity;
-        sds-&gt;busiest_load_per_task = sgs.sum_weighted_load;
-        sds-&gt;busiest_has_capacity = sgs.group_has_capacity;
-        sds-&gt;busiest_group_weight = sgs.group_weight;
-        sds-&gt;group_imb = sgs.group_imb;
-    }
-    sg = sg-&gt;next;
-} while (sg != sd-&gt;groups);
-</code></pre>
-
-<pre><code>
-决定选择调度域中最忙的组的参照标准是该组内所有 CPU上负载(load) 的和， 找到组中找到忙的运行队列的参照标准是该CPU运行队列的长度， 即负载，并且 load 值越大就表示越忙。在平衡的过程中，通过比较当前队列与以前记录的busiest 的负载情况，及时更新这些变量，让 busiest 始终指向域内最忙的一组，以便于查找。
-
-调度域的平均负载计算
-</code></pre>
-
-<pre><code>sds.avg_load = (SCHED_POWER_SCALE * sds.total_load) / sds.total_pwr;
-if (sds.this_load &gt;= sds.avg_load)
-    goto out_balanced;
-</code></pre>
-
-<pre><code>在比较负载大小的过程中， 当发现当前运行的CPU所在的组中busiest为空时，或者当前正在运行的 CPU队列就是最忙的时， 或者当前 CPU队列的负载不小于本组内的平均负载时，或者不平衡的额度不大时，都会返回 NULL 值，即组组之间不需要进行平衡；当最忙的组的负载小于该调度域的平均负载时，只需要进行小范围的负载平衡；当要转移的任务量小于每个进程的平均负载时，如此便拿到了最忙的调度组。
-
-然后find_busiest_queue中找到最忙的调度队列，遍历该组中的所有 CPU 队列，经过依次比较各个队列的负载，找到最忙的那个队列。
-</code></pre>
-
-<pre><code>for_each_cpu(i, sched_group_cpus(group)) {
-    /*rq-&gt;cpu_power表示所在处理器的计算能力,在函式sched_init初始化时,会把这值设定为SCHED_LOAD_SCALE (=Nice 0的Load Weight=1024).并可透过函式update_cpu_power (in kernel/sched_fair.c)更新这个值.*/
-    unsigned long power = power_of(i);
-    unsigned long capacity = DIV_ROUND_CLOSEST(power,SCHED_POWER_SCALE);
-    unsigned long wl;
-    if (!cpumask_test_cpu(i, cpus))
-        continue;
-
-    rq = cpu_rq(i);
-</code></pre>
-
-<p>/<em>获取队列负载cpu_rq(cpu)->load.weight;</em>/
-        wl = weighted_cpuload(i);</p>
-
-<pre><code>    /*
-     * When comparing with imbalance, use weighted_cpuload()
-     * which is not scaled with the cpu power.
-     */
-    if (capacity &amp;&amp; rq-&gt;nr_running == 1 &amp;&amp; wl &gt; imbalance)
-        continue;
-
-    /*
-     * For the load comparisons with the other cpu's, consider
-     * the weighted_cpuload() scaled with the cpu power, so that
-     * the load can be moved away from the cpu that is potentially
-     * running at a lower capacity.
-     */
-    wl = (wl * SCHED_POWER_SCALE) / power;
-
-    if (wl &gt; max_load) {
-        max_load = wl;
-        busiest = rq;
-    }
-</code></pre>
-
-<pre><code>通过上面的计算，便拿到了最忙队列。  
-当busiest-&gt;nr_running运行数大于1的时候，进行pull操作，pull前对move_tasks,先进行double_rq_lock加锁处理。
-</code></pre>
-
-<pre><code>double_rq_lock(this_rq, busiest);
-ld_moved = move_tasks(this_rq, this_cpu, busiest,
-        imbalance, sd, idle, &amp;all_pinned);
-double_rq_unlock(this_rq, busiest);
-</code></pre>
-
-<pre><code>move_tasks进程pull task是允许失败的，即move_tasks-&gt;balance_tasks，在此处，有sysctl_sched_nr_migrate开关控制进程迁移个数，对应proc的是/proc/sys/kernel/sched_nr_migrate。
-
-下面有can_migrate_task函数检查选定的进程是否可以进行迁移，迁移失败的原因有3个，1.迁移的进程处于运行状态；2.进程被绑核了，不能迁移到目标CPU上；3.进程的cache仍然是hot，此处也是为了保证cache命中率。
-</code></pre>
-
-<pre><code>/*关于cache cold的情况下，如果迁移失败的个数太多，仍然进行迁移
- * Aggressive migration if:
- * 1) task is cache cold, or
- * 2) too many balance attempts have failed.
- */
-
-tsk_cache_hot = task_hot(p, rq-&gt;clock_task, sd);
-if (!tsk_cache_hot ||
-    sd-&gt;nr_balance_failed &gt; sd-&gt;cache_nice_tries) {
-</code></pre>
-
-<h1>ifdef CONFIG_SCHEDSTATS</h1>
-
-<pre><code>    if (tsk_cache_hot) {
-        schedstat_inc(sd, lb_hot_gained[idle]);
-        schedstat_inc(p, se.statistics.nr_forced_migrations);
-    }
-</code></pre>
-
-<h1>endif</h1>
-
-<pre><code>    return 1;
+    /* 本进程被唤醒，重新获得执行权，首要之事是将等待队列项从链表中删除 */
+    wq_write_lock_irq(&amp;q-&gt;lock);
+    __remove_wait_queue(q, &amp;wait);
+    wq_write_unlock_irqrestore(&amp;q-&gt;lock,flags);
+    /* 至此，等待过程结束，本进程可以正常执行下面的逻辑 */
 }
 </code></pre>
 
 <pre><code>
-判断进程cache是否有效，判断条件，进程的运行的时间大于proc控制开关sysctl_sched_migration_cost，对应目录/proc/sys/kernel/sched_migration_cost_ns
+对应的唤醒操作包括wake_up_interruptible和wake_up。wake_up函数不仅可以唤醒状态为TASK_UNINTERRUPTIBLE的进程，而且可以唤醒状态为TASK_INTERRUPTIBLE的进程。
+
+wake_up_interruptible只负责唤醒状态为TASK_INTERRUPTIBLE的进程。这两个宏的定义如下：
 </code></pre>
 
-<pre><code>static int
-task_hot(struct task_struct *p, u64 now, struct sched_domain *sd)
+<pre><code>#define wake_up(x)   __wake_up((x),TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE, 1)
+#define wake_up_interruptible(x) __wake_up((x),TASK_INTERRUPTIBLE, 1)
+</code></pre>
+
+<pre><code>
+__wake_up函数主要是获取队列操作的锁，具体工作是调用__wake_up_common完成的。
+</code></pre>
+
+<pre><code>void __wake_up(wait_queue_head_t *q, unsigned int mode, int nr)
 {
-        s64 delta;
-    delta = now - p-&gt;se.exec_start;
-    return delta &lt; (s64)sysctl_sched_migration_cost;
+    if (q) {
+        unsigned long flags;
+        wq_read_lock_irqsave(&amp;q-&gt;lock, flags);
+        __wake_up_common(q, mode, nr, 0);
+        wq_read_unlock_irqrestore(&amp;q-&gt;lock, flags);
+    }
 }
 </code></pre>
 
-<pre><code>在load_balance中，move_tasks返回失败也就是ld_moved==0，其中sd-&gt;nr_balance_failed++对应can_migrate_task中的”too many balance attempts have failed”,然后busiest-&gt;active_balance = 1设置，active_balance = 1。
+<pre><code>
+/* The core wakeup function.  Non-exclusive wakeups (nr_exclusive == 0) just wake everything up.  If it's an exclusive wakeup (nr_exclusive == small +ve number) then we wake all the non-exclusive tasks and one exclusive task.
+There are circumstances in which we can try to wake a task which has already started to run but is not in state TASK_RUNNING.  try_to_wake_up() returns zero in this (rare) case, and we handle it by contonuing to scan the queue. */
 </code></pre>
 
-<pre><code>if (active_balance)
-//如果pull失败了，开始触发push操作
-stop_one_cpu_nowait(cpu_of(busiest),
-    active_load_balance_cpu_stop, busiest,
-    &amp;busiest-&gt;active_balance_work);
+<pre><code>static inline void __wake_up_common (wait_queue_head_t *q, unsigned int mode, int nr_exclusive, const int sync)
 </code></pre>
 
-<pre><code>push整个触发操作代码机制比较绕，stop_one_cpu_nowait把active_load_balance_cpu_stop添加到cpu_stopper每CPU变量的任务队列里面，如下：
+<pre><code>
+参数q表示要操作的等待队列，mode表示要唤醒任务的状态，如TASK_UNINTERRUPTIBLE或TASK_INTERRUPTIBLE等。nr_exclusive是要唤醒的互斥进程数目，在这之前遇到的非互斥进程将被无条件唤醒。sync表示？？？
 </code></pre>
 
-<pre><code>void stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
-            struct cpu_stop_work *work_buf)
-{
-    *work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, };
-    cpu_stop_queue_work(&amp;per_cpu(cpu_stopper, cpu), work_buf);
+<pre><code>{
+    struct list_head *tmp;
+    struct task_struct *p;
+
+    CHECK_MAGIC_WQHEAD(q);
+    WQ_CHECK_LIST_HEAD(&amp;q-&gt;task_list);
+
+    /* 遍历等待队列 */
+    list_for_each(tmp,&amp;q-&gt;task_list) {
+        unsigned int state;
+        /* 获得当前等待队列项 */
+        wait_queue_t *curr = list_entry(tmp, wait_queue_t, task_list);
+
+        CHECK_MAGIC(curr-&gt;__magic);
+        /* 获得对应的进程 */
+        p = curr-&gt;task;
+        state = p-&gt;state;
+
+        /* 如果我们需要处理这种状态的进程 */
+        if (state &amp; mode) {
+            WQ_NOTE_WAKER(curr);
+            if (try_to_wake_up(p, sync) &amp;&amp; (curr-&gt;flags&amp;WQ_FLAG_EXCLUSIVE) &amp;&amp; !--nr_exclusive)
+                break;
+        }
+    }
 }
 </code></pre>
 
-<pre><code>而cpu_stopper则是cpu_stop_init函数通过cpu_stop_cpu_callback创建的migration内核线程，触发任务队列调度。因为migration内核线程是绑定每个核心上的，进程迁移失败的1和3问题就可以通过push解决。active_load_balance_cpu_stop则调用move_one_task函数迁移指定的进程。
-
-上面描述的则是整个pull和push的过程，需要补充的pull触发除了schedule后触发，还有scheduler_tick通过触发中断，调用run_rebalance_domains再调用rebalance_domains触发，不再细数。
+<pre><code>
+/* 唤醒一个进程，将它放到运行队列中，如果它还不在运行队列的话。"当前"进程总是在运行队列中的（except when the actual re-schedule is in progress)，and as such you're allowed to do the simpler "current-&gt;state = TASK_RUNNING" to mark yourself runnable without the overhead of this. */
 </code></pre>
 
-<pre><code>void __init sched_init(void)
+<pre><code>static inline int try_to_wake_up(struct task_struct * p, int synchronous)
 {
-      open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+    unsigned long flags;
+    int success = 0;
+
+    /* 由于我们需要操作运行队列，必须获得对应的锁 */
+    spin_lock_irqsave(&amp;runqueue_lock, flags);
+    /* 将进程状态设置为TASK_RUNNING */
+    p-&gt;state = TASK_RUNNING;
+    /* 如果进程已经在运行队列中，释放锁退出 */
+    if (task_on_runqueue(p))
+        goto out;
+    /* 否则将进程添加到运行队列中 */
+    add_to_runqueue(p);
+
+    /* 如果设置了同步标志 */
+    if (!synchronous || !(p-&gt;cpus_allowed &amp; (1UL &lt;&lt; smp_processor_id())))
+        reschedule_idle(p);
+    /* 唤醒成功，释放锁退出 */
+    success = 1;
+out:
+    spin_unlock_irqrestore(&amp;runqueue_lock, flags);
+    return success;
 }
+</code></pre>
+
+<pre><code>
+#### 等待队列应用模式
+
+等待队列的的应用涉及两个进程，假设为A和B。A是资源的消费者，B是资源的生产者。A在消费的时候必须确保资源已经生产出来，为此定义一个资源等待队列。这个队列同时要被进程A和进程B使用，我们可以将它定义为一个全局变量。
+</code></pre>
+
+<pre><code>DECLARE_WAIT_QUEUE_HEAD(rsc_queue); /* 全局变量 */
+</code></pre>
+
+<pre><code>
+在进程A中，执行逻辑如下：
+</code></pre>
+
+<pre><code>while (resource is unavaiable) {
+    interruptible_sleep_on( &amp;wq );
+}
+consume_resource();
+</code></pre>
+
+<pre><code>
+在进程B中，执行逻辑如下：
+</code></pre>
+
+<pre><code>produce_resource();
+wake_up_interruptible( &amp;wq );
 </code></pre>
 
 <p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux进程调度之FIFO和RR调度策略]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/03/13/kernel-sched-rt/"/>
+    <updated>2015-03-13T00:00:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/03/13/kernel-sched-rt</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-24774106-id-3379478.html">http://blog.chinaunix.net/uid-24774106-id-3379478.html</a></p>
+
+<p>严格地说，对于优先级对于实时进程和普通进程的意义是不一样的。</p>
+
+<p>1、在一定程度上，实时进程优先级高，实时进程存在，就没有普通进程占用CPU的机会，（但是前一篇博文也讲过了，实时组调度出现在内核以后，允许普通进程占用少量的CPU时间,取决于配置)。</p>
+
+<p>2、对于实时进程而言，高优先级的进程存在，低优先级的进程是轮不上的，没机会跑在CPU上，所谓实时进程的调度策略,指的是相同优先级之间的调度策略。如果是FIFO实时进程在占用CPU，除非出现以下事情，否则FIFO一条道跑到黑。<br/>
+  a）FIFO进程良心发现，调用了系统调用sched_yield 自愿让出CPU<br/>
+  b) 更高优先级的进程横空出世，抢占FIFO进程的CPU。有些人觉得很奇怪，怎么FIFO占着CPU，为啥还能有更高优先级的进程出现呢。别忘记，我们是多核多CPU ,如果其他CPU上出现了一个比FIFO优先级高的进程，可能会push到FIFO进程所在的CPU上。<br/>
+  c) FIFO进程停止（TASK_STOPPED or TASK_TRACED状态）或者被杀死（EXIT_ZOMBIE or EXIT_DEAD状态）<br/>
+  d) FIFO进程执行了阻塞调用并进入睡眠（TASK_INTERRUPTIBLE OR TASK_UNINTERRUPTIBLE）。</p>
+
+<p>  如果是进程的调度策略是时间片轮转RR，那么，除了前面提到的abcd，RR实时进程耗尽自己的时间片后，自动退到对应优先级实时队列的队尾，重新调度。</p>
+
+<pre><code>    struct sched_param {
+        /* ... */
+        int sched_priority;
+        /* ... */
+    };
+    int sched_setscheduler (pid_t pid,
+                            int policy,
+                            const struct sched_param *sp);
+</code></pre>
+
+<p>  sched_setscheduler函数的第二个参数调度方法 ：
+<code>
+    #define SCHED_OTHER 0
+    #define SCHED_FIFO 1
+    #define SCHED_RR 2
+    #ifdef __USE_GNU
+    # define SCHED_BATCH 3
+    #endif
+</code>
+  SCHED_OTHER表示普通进程，对于普通进程，第三个参数sp->sched_priority只能是0<br/>
+  SCHED_FIFO 和SCHED_RR表示实时进程的调度策略，第三个参数的取值范围为[1,99]。<br/>
+  如果sched_setscheduler 优先级设置的值和调度策略不符合的话，会返回失败的。</p>
+
+<p>应用层和内核层的优先级含义是不同的：<br/>
+  首先说实时进程：实时进程的优先级设置可以通过sched_setsheduler设置，也可以通过sched_setparam设置优先级的大小。
+int sched_setparam (pid_t pid, const struct sched_param *sp);</p>
+
+<p>  在用户层或者应用层，1表示优先级最低，99表示优先级最高。但是在内核中，[0,99]表示的实时进程的优先级，0最高，99最低。[100,139]是普通进程折腾的范围。应用层比较天真率直，就看大小，数字大，则优先级高。ps查看进程的优先级也是如此。有意思的是，应用层实时进程最高优先级的99，在ps看进程优先级的时候，输出的是139.</p>
+
+<p>  对于普通进程，是通过nice系统调用来调整优先级的。从内核角度讲[100,139]是普通进程的优先级的范围，100最高，139最低，默认是120。普通进程的优先级的作用和实时进程不同，普通进程优先级表示的是占的CPU时间。深入linux内核架构中提到，普通优先级越高（100最高，139最低），享受的CPU time越多，相邻的两个优先级，高一级的进程比低一级的进程多占用10%的CPU，比如内核优先级数值为120的进程要比数值是121的进程多占用10%的CPU。</p>
+
+<p>  内核中有一个数组：prio_to_weight[20]表示的是默认优先级120的权重，数值为1024，prio_to_weight[21]表示nice值为1，优先级为121的进程的权重，数值为820。这就到了CFS的原理了
+<code>
+    static const int prio_to_weight[40] = {
+     /* -20 */ 88761, 71755, 56483, 46273, 36291,
+     /* -15 */ 29154, 23254, 18705, 14949, 11916,
+     /* -10 */ 9548, 7620, 6100, 4904, 3906,
+     /* -5 */ 3121, 2501, 1991, 1586, 1277,
+     /* 0 */ 1024, 820, 655, 526, 423,
+     /* 5 */ 335, 272, 215, 172, 137,
+     /* 10 */ 110, 87, 70, 56, 45,
+     /* 15 */ 36, 29, 23, 18, 15,
+    };
+</code>
+  假如有1台电脑，10个人玩，怎么才公平。<br/>
+  1 约定好时间片，每人玩1小时，玩完后记账，张XX 1小时，谁玩的时间短，谁去玩<br/>
+  2 引入优先级的概念，李四有紧急情况，需要提高他玩电脑的时间，怎么办，玩1个小时，记账半小时，那么同等情况下，李四会比其他人被选中玩电脑的频率要高，就体现了这个优先级的概念。<br/>
+  3  王五也有紧急情况，但是以考察，不如李四的紧急，好吧，玩1个小时，记账45分钟。<br/>
+  4  情况有变化，听说这里有电脑，突然又来了10个人，如果按照每人玩1小时的时间片，排在最后的那哥们早就开始骂人了，怎么办？时间片动态变化，根据人数来确定时间片。人越多，每个人玩的时间越少，防止哥们老捞不着玩，耐心耗尽，开始骂人。</p>
+
+<p>  这个记账就是我们prio_to_weight的作用。我就不多说了，prio_to_weight[20]就是基准，玩一小时，记账一小时，数组20以前的值是特权一级，玩1小时记账20分钟之类的享有特权的，数组20之后是倒霉蛋，玩1小时，记账1.5小时之类的倒霉蛋。 CFS这种调度好在大家都能捞着玩。</p>
+
+<p>对于FIFO而言，一旦sleep过后，高优先级运行，低优先级是没戏运行的，同等优先级的进程，先运行的不运行完，后运行的也没戏。<br/>
+对于RR而言，高优先级的先运行，同等优先级的进程过家家，你玩完，我玩，我玩完你再玩，每个进程耗费一个时间片的时间。对于Linux，RR时间片是100ms：
+<code>
+    #define DEF_TIMESLICE        (100 * HZ / 1000)
+</code></p>
 ]]></content>
   </entry>
   
