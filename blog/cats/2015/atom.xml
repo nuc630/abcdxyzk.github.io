@@ -4,7 +4,7 @@
   <title><![CDATA[Category: 2015 | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/2015/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-06-02T18:38:46+08:00</updated>
+  <updated>2015-06-03T15:51:48+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,2088 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[Receive packet steering patch详解]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/06/03/kernel-net-rps/"/>
+    <updated>2015-06-03T15:39:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/06/03/kernel-net-rps</id>
+    <content type="html"><![CDATA[<p><a href="http://simohayha.iteye.com/blog/720850">http://simohayha.iteye.com/blog/720850</a></p>
+
+<p>Receive packet steering简称rps，是google贡献给linux kernel的一个patch，主要的功能是解决多核情况下，网络协议栈的软中断的负载均衡。这里的负载均衡也就是指能够将软中断均衡的放在不同的cpu核心上运行。</p>
+
+<p>简介在这里：<br/>
+<a href="http://lwn.net/Articles/362339/">http://lwn.net/Articles/362339/</a></p>
+
+<p>linux现在网卡的驱动支持两种模式，一种是NAPI，一种是非NAPI模式，这两种模式的区别，我前面的blog都有介绍，这里就再次简要的介绍下。</p>
+
+<p>在NAPI中，中断收到数据包后调用__napi_schedule调度软中断，然后软中断处理函数中会调用注册的poll回掉函数中调用netif_receive_skb将数据包发送到3层，没有进行任何的软中断负载均衡。</p>
+
+<p>在非NAPI中，中断收到数据包后调用netif_rx，这个函数会将数据包保存到input_pkt_queue，然后调度软中断，这里为了兼容NAPI的驱动，他的poll方法默认是process_backlog，最终这个函数会从input_pkt_queue中取得数据包然后发送到3层。</p>
+
+<p>通过比较我们可以看到，不管是NAPI还是非NAPI的话都无法做到软中断的负载均衡，因为软中断此时都是运行在在硬件中断相应的cpu上。也就是说如果始终是cpu0相应网卡的硬件中断，那么始终都是cpu0在处理软中断，而此时cpu1就被浪费了，因为无法并行的执行多个软中断。</p>
+
+<p>google的这个patch的基本原理是这样的,根据数据包的源地址，目的地址以及目的和源端口(这里它是将两个端口组合成一个4字节的无符数进行计算的，后面会看到)计算出一个hash值，然后根据这个hash值来选择软中断运行的cpu，从上层来看，也就是说将每个连接和cpu绑定，并通过这个hash值，来均衡软中断在多个cpu上。</p>
+
+<p>这个介绍比较简单，我们来看代码是如何实现的。</p>
+
+<p>它这里主要是hook了两个内核的函数，一个是netif_rx主要是针对非NAPI的驱动，一个是netif_receive_skb这个主要是针对NAPI的驱动，这两个函数我前面blog都有介绍过，想了解可以看我前面的blog，现在这里我只介绍打过patch的实现。</p>
+
+<p>在看netif_rx和netif_receive_skb之前，我们先来看这个patch中两个重要的函数get_rps_cpu和enqueue_to_backlog，我们一个个看。</p>
+
+<p>先来看相关的两个数据结构，首先是netdev_rx_queue，它表示对应的接收队列，因为有的网卡可能硬件上就支持多队列的模式，此时对应就会有多个rx队列，这个结构是挂载在net_device中的，也就是每个网络设备最终都会有一个或者多个rx队列。这个结构在sys文件系统中的表示类似这样的/sys/class/net/<device>/queues/rx-<n> 几个队列就是rx-n.
+<code>
+    struct netdev_rx_queue {
+        // 保存了当前队列的rps map
+        struct rps_map *rps_map;
+        // 对应的kobject
+        struct kobject kobj;
+        // 指向第一个rx队列
+        struct netdev_rx_queue *first;
+        // 引用计数
+        atomic_t count;
+    } ____cacheline_aligned_in_smp;
+</code></p>
+
+<p>然后就是rps_map，其实这个也就是保存了能够执行数据包的cpu。
+<code>
+    struct rps_map {
+        // cpu的个数，也就是cpus数组的个数
+        unsigned int len;
+        // RCU锁
+        struct rcu_head rcu;
+        // 保存了cpu的id.
+        u16 cpus[0];
+    };
+</code></p>
+
+<p>看完上面的结构，我们来看函数的实现。
+get_rps_cpu主要是通过传递进来的skb然后来选择这个skb所应该被处理的cpu。它的逻辑很简单，就是通过skb计算hash，然后通过hash从对应的队列的rps_mapping中取得对应的cpu id。</p>
+
+<p>这里有个要注意的就是这个hash值是可以交给硬件网卡去计算的，作者自己说是最好交由硬件去计算这个hash值，因为如果是软件计算的话会导致CPU 缓存不命中，带来一定的性能开销。</p>
+
+<p>还有就是rps_mapping这个值是可以通过sys 文件系统设置的，位置在这里：
+/sys/class/net/<device>/queues/rx-<n>/rps_cpus 。</p>
+
+<pre><code>    static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb)
+    {
+        struct ipv6hdr *ip6;
+        struct iphdr *ip;
+        struct netdev_rx_queue *rxqueue;
+        struct rps_map *map;
+        int cpu = -1;
+        u8 ip_proto;
+        u32 addr1, addr2, ports, ihl;
+        // rcu锁
+        rcu_read_lock();
+        // 取得设备对应的rx 队列
+        if (skb_rx_queue_recorded(skb)) {
+        ..........................................
+            rxqueue = dev-&gt;_rx + index;
+        } else
+            rxqueue = dev-&gt;_rx;
+
+        if (!rxqueue-&gt;rps_map)
+            goto done;
+        // 如果硬件已经计算，则跳过计算过程
+        if (skb-&gt;rxhash)
+            goto got_hash; /* Skip hash computation on packet header */
+
+        switch (skb-&gt;protocol) {
+        case __constant_htons(ETH_P_IP):
+            if (!pskb_may_pull(skb, sizeof(*ip)))
+                goto done;
+            // 得到计算hash的几个值
+            ip = (struct iphdr *) skb-&gt;data;
+            ip_proto = ip-&gt;protocol;
+            // 两个地址
+            addr1 = ip-&gt;saddr;
+            addr2 = ip-&gt;daddr;
+            // 得到ip头
+            ihl = ip-&gt;ihl;
+            break;
+        case __constant_htons(ETH_P_IPV6):
+            ..........................................
+            break;
+        default:
+            goto done;
+        }
+        ports = 0;
+        switch (ip_proto) {
+        case IPPROTO_TCP:
+        case IPPROTO_UDP:
+        case IPPROTO_DCCP:
+        case IPPROTO_ESP:
+        case IPPROTO_AH:
+        case IPPROTO_SCTP:
+        case IPPROTO_UDPLITE:
+            if (pskb_may_pull(skb, (ihl * 4) + 4))
+            // 我们知道tcp头的前4个字节就是源和目的端口，因此这里跳过ip头得到tcp头的前4个字节
+                ports = *((u32 *) (skb-&gt;data + (ihl * 4)));
+            break;
+
+        default:
+            break;
+        }
+        // 计算hash
+        skb-&gt;rxhash = jhash_3words(addr1, addr2, ports, hashrnd);
+        if (!skb-&gt;rxhash)
+            skb-&gt;rxhash = 1;
+
+    got_hash:
+        // 通过rcu得到对应rps map
+        map = rcu_dereference(rxqueue-&gt;rps_map);
+        if (map) {
+            // 取得对应的cpu
+            u16 tcpu = map-&gt;cpus[((u64) skb-&gt;rxhash * map-&gt;len) &gt;&gt; 32];
+            // 如果cpu是online的，则返回计算出的这个cpu，否则跳出循环。
+            if (cpu_online(tcpu)) {
+                cpu = tcpu;
+                goto done;
+            }
+        }
+
+    done:
+        rcu_read_unlock();
+        // 如果上面失败，则返回-1.
+        return cpu;
+    }
+</code></pre>
+
+<p>然后是enqueue_to_backlog这个方法，首先我们知道在每个cpu都有一个softnet结构，而他有一个input_pkt_queue的队列，以前这个主要是用于非NAPi的驱动的，而这个patch则将这个队列也用与NAPI的处理中了。也就是每个cpu现在都会有一个input_pkt_queue队列，用于保存需要处理的数据包队列。这个队列作用现在是，如果发现不属于当前cpu处理的数据包，则我们可以直接将数据包挂载到他所属的cpu的input_pkt_queue中。</p>
+
+<p>enqueue_to_backlog接受一个skb和cpu为参数，通过cpu来判断skb如何处理。要么加入所属的input_pkt_queue中，要么schecule 软中断。</p>
+
+<p>还有个要注意就是我们知道NAPI为了兼容非NAPI模式，有个backlog的napi_struct结构，也就是非NAPI驱动会schedule backlog这个napi结构，而在enqueue_to_backlog中则是利用了这个结构，也就是它会schedule backlog，因为它会将数据放到input_pkt_queue中，而backlog的pool方法process_backlog就是从input_pkt_queue中取得数据然后交给上层处理。</p>
+
+<p>这里还有一个会用到结构就是 rps_remote_softirq_cpus，它主要是保存了当前cpu上需要去另外的cpu schedule 软中断的cpu 掩码。因为我们可能将要处理的数据包放到了另外的cpu的input queue上，因此我们需要schedule 另外的cpu上的napi(也就是软中断),所以我们需要保存对应的cpu掩码，以便于后面遍历，然后schedule。</p>
+
+<p>而这里为什么mask有两个元素，注释写的很清楚：
+<code>
+    /*
+     * This structure holds the per-CPU mask of CPUs for which IPIs are scheduled
+     * to be sent to kick remote softirq processing.  There are two masks since
+     * the sending of IPIs must be done with interrupts enabled.  The select field
+     * indicates the current mask that enqueue_backlog uses to schedule IPIs.
+     * select is flipped before net_rps_action is called while still under lock,
+     * net_rps_action then uses the non-selected mask to send the IPIs and clears
+     * it without conflicting with enqueue_backlog operation.
+     */
+    struct rps_remote_softirq_cpus {
+        // 对应的cpu掩码
+        cpumask_t mask[2];
+        // 表示应该使用的数组索引
+        int select;
+    };
+</code></p>
+
+<pre><code>    static int enqueue_to_backlog(struct sk_buff *skb, int cpu)
+    {
+        struct softnet_data *queue;
+        unsigned long flags;
+        // 取出传递进来的cpu的softnet-data结构
+        queue = &amp;per_cpu(softnet_data, cpu);
+
+        local_irq_save(flags);
+        __get_cpu_var(netdev_rx_stat).total++;
+        // 自旋锁
+        spin_lock(&amp;queue-&gt;input_pkt_queue.lock);
+        // 如果保存的队列还没到上限
+        if (queue-&gt;input_pkt_queue.qlen &lt;= netdev_max_backlog) {
+        // 如果当前队列的输入队列长度不为空
+            if (queue-&gt;input_pkt_queue.qlen) {
+    enqueue:
+                // 将数据包加入到input_pkt_queue中,这里会有一个小问题，我们后面再说。
+                __skb_queue_tail(&amp;queue-&gt;input_pkt_queue, skb);
+                spin_unlock_irqrestore(&amp;queue-&gt;input_pkt_queue.lock,
+                    flags);
+                return NET_RX_SUCCESS;
+            }
+
+            /* Schedule NAPI for backlog device */
+            // 如果可以调度软中断
+            if (napi_schedule_prep(&amp;queue-&gt;backlog)) {
+                // 首先判断数据包该不该当前的cpu处理
+                if (cpu != smp_processor_id()) {
+                    // 如果不该，
+                    struct rps_remote_softirq_cpus *rcpus =
+                        &amp;__get_cpu_var(rps_remote_softirq_cpus);
+
+                    cpu_set(cpu, rcpus-&gt;mask[rcpus-&gt;select]);
+                    __raise_softirq_irqoff(NET_RX_SOFTIRQ);
+                } else
+                    // 如果就是应该当前cpu处理，则直接schedule 软中断，这里可以看到传递进去的是backlog
+                    __napi_schedule(&amp;queue-&gt;backlog);
+            }
+            goto enqueue;
+        }
+
+        spin_unlock(&amp;queue-&gt;input_pkt_queue.lock);
+
+        __get_cpu_var(netdev_rx_stat).dropped++;
+        local_irq_restore(flags);
+
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
+</code></pre>
+
+<p>这里会有一个小问题，那就是假设此时一个属于cpu0的包进入处理，此时我们运行在cpu1,此时将数据包加入到input队列，然后cpu0上面刚好又来了一个cpu0需要处理的数据包，此时由于qlen不为0则又将数据包加入到input队列中，我们会发现cpu0上的napi没机会进行调度了。</p>
+
+<p>google的patch对这个是这样处理的，在软中断处理函数中当数据包处理完毕，会调用net_rps_action来调度前面保存到其他cpu上的input队列。</p>
+
+<p>下面就是代码片断（net_rx_action）</p>
+
+<pre><code>    // 得到对应的rcpus.
+    rcpus = &amp;__get_cpu_var(rps_remote_softirq_cpus);
+        select = rcpus-&gt;select;
+        // 翻转select，防止和enqueue_backlog冲突
+        rcpus-&gt;select ^= 1;
+
+        // 打开中断，此时下面的调度才会起作用.
+        local_irq_enable();
+        // 这个函数里面调度对应的远程cpu的napi.
+        net_rps_action(&amp;rcpus-&gt;mask[select]);
+</code></pre>
+
+<p>然后就是net_rps_action，这个函数很简单，就是遍历所需要处理的cpu，然后调度napi
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+<span class='line-number'>412</span>
+<span class='line-number'>413</span>
+<span class='line-number'>414</span>
+<span class='line-number'>415</span>
+<span class='line-number'>416</span>
+<span class='line-number'>417</span>
+<span class='line-number'>418</span>
+<span class='line-number'>419</span>
+<span class='line-number'>420</span>
+<span class='line-number'>421</span>
+<span class='line-number'>422</span>
+<span class='line-number'>423</span>
+<span class='line-number'>424</span>
+<span class='line-number'>425</span>
+<span class='line-number'>426</span>
+<span class='line-number'>427</span>
+<span class='line-number'>428</span>
+<span class='line-number'>429</span>
+<span class='line-number'>430</span>
+<span class='line-number'>431</span>
+<span class='line-number'>432</span>
+<span class='line-number'>433</span>
+<span class='line-number'>434</span>
+<span class='line-number'>435</span>
+<span class='line-number'>436</span>
+<span class='line-number'>437</span>
+<span class='line-number'>438</span>
+<span class='line-number'>439</span>
+<span class='line-number'>440</span>
+<span class='line-number'>441</span>
+<span class='line-number'>442</span>
+<span class='line-number'>443</span>
+<span class='line-number'>444</span>
+<span class='line-number'>445</span>
+<span class='line-number'>446</span>
+<span class='line-number'>447</span>
+<span class='line-number'>448</span>
+<span class='line-number'>449</span>
+<span class='line-number'>450</span>
+<span class='line-number'>451</span>
+<span class='line-number'>452</span>
+<span class='line-number'>453</span>
+<span class='line-number'>454</span>
+<span class='line-number'>455</span>
+<span class='line-number'>456</span>
+<span class='line-number'>457</span>
+<span class='line-number'>458</span>
+<span class='line-number'>459</span>
+<span class='line-number'>460</span>
+<span class='line-number'>461</span>
+<span class='line-number'>462</span>
+<span class='line-number'>463</span>
+<span class='line-number'>464</span>
+<span class='line-number'>465</span>
+<span class='line-number'>466</span>
+<span class='line-number'>467</span>
+<span class='line-number'>468</span>
+<span class='line-number'>469</span>
+<span class='line-number'>470</span>
+<span class='line-number'>471</span>
+<span class='line-number'>472</span>
+<span class='line-number'>473</span>
+<span class='line-number'>474</span>
+<span class='line-number'>475</span>
+<span class='line-number'>476</span>
+<span class='line-number'>477</span>
+<span class='line-number'>478</span>
+<span class='line-number'>479</span>
+<span class='line-number'>480</span>
+<span class='line-number'>481</span>
+<span class='line-number'>482</span>
+<span class='line-number'>483</span>
+<span class='line-number'>484</span>
+<span class='line-number'>485</span>
+<span class='line-number'>486</span>
+<span class='line-number'>487</span>
+<span class='line-number'>488</span>
+<span class='line-number'>489</span>
+<span class='line-number'>490</span>
+<span class='line-number'>491</span>
+<span class='line-number'>492</span>
+<span class='line-number'>493</span>
+<span class='line-number'>494</span>
+<span class='line-number'>495</span>
+<span class='line-number'>496</span>
+<span class='line-number'>497</span>
+<span class='line-number'>498</span>
+<span class='line-number'>499</span>
+<span class='line-number'>500</span>
+<span class='line-number'>501</span>
+<span class='line-number'>502</span>
+<span class='line-number'>503</span>
+<span class='line-number'>504</span>
+<span class='line-number'>505</span>
+<span class='line-number'>506</span>
+<span class='line-number'>507</span>
+<span class='line-number'>508</span>
+<span class='line-number'>509</span>
+<span class='line-number'>510</span>
+<span class='line-number'>511</span>
+<span class='line-number'>512</span>
+<span class='line-number'>513</span>
+<span class='line-number'>514</span>
+<span class='line-number'>515</span>
+<span class='line-number'>516</span>
+<span class='line-number'>517</span>
+<span class='line-number'>518</span>
+<span class='line-number'>519</span>
+<span class='line-number'>520</span>
+<span class='line-number'>521</span>
+<span class='line-number'>522</span>
+<span class='line-number'>523</span>
+<span class='line-number'>524</span>
+<span class='line-number'>525</span>
+<span class='line-number'>526</span>
+<span class='line-number'>527</span>
+<span class='line-number'>528</span>
+<span class='line-number'>529</span>
+<span class='line-number'>530</span>
+<span class='line-number'>531</span>
+<span class='line-number'>532</span>
+<span class='line-number'>533</span>
+<span class='line-number'>534</span>
+<span class='line-number'>535</span>
+<span class='line-number'>536</span>
+<span class='line-number'>537</span>
+<span class='line-number'>538</span>
+<span class='line-number'>539</span>
+<span class='line-number'>540</span>
+<span class='line-number'>541</span>
+<span class='line-number'>542</span>
+<span class='line-number'>543</span>
+<span class='line-number'>544</span>
+<span class='line-number'>545</span>
+<span class='line-number'>546</span>
+<span class='line-number'>547</span>
+<span class='line-number'>548</span>
+<span class='line-number'>549</span>
+<span class='line-number'>550</span>
+<span class='line-number'>551</span>
+<span class='line-number'>552</span>
+<span class='line-number'>553</span>
+<span class='line-number'>554</span>
+<span class='line-number'>555</span>
+<span class='line-number'>556</span>
+<span class='line-number'>557</span>
+<span class='line-number'>558</span>
+<span class='line-number'>559</span>
+<span class='line-number'>560</span>
+<span class='line-number'>561</span>
+<span class='line-number'>562</span>
+<span class='line-number'>563</span>
+<span class='line-number'>564</span>
+<span class='line-number'>565</span>
+<span class='line-number'>566</span>
+<span class='line-number'>567</span>
+<span class='line-number'>568</span>
+<span class='line-number'>569</span>
+<span class='line-number'>570</span>
+<span class='line-number'>571</span>
+<span class='line-number'>572</span>
+<span class='line-number'>573</span>
+<span class='line-number'>574</span>
+<span class='line-number'>575</span>
+<span class='line-number'>576</span>
+<span class='line-number'>577</span>
+<span class='line-number'>578</span>
+<span class='line-number'>579</span>
+<span class='line-number'>580</span>
+<span class='line-number'>581</span>
+<span class='line-number'>582</span>
+<span class='line-number'>583</span>
+<span class='line-number'>584</span>
+<span class='line-number'>585</span>
+<span class='line-number'>586</span>
+<span class='line-number'>587</span>
+<span class='line-number'>588</span>
+<span class='line-number'>589</span>
+<span class='line-number'>590</span>
+<span class='line-number'>591</span>
+<span class='line-number'>592</span>
+<span class='line-number'>593</span>
+<span class='line-number'>594</span>
+<span class='line-number'>595</span>
+<span class='line-number'>596</span>
+<span class='line-number'>597</span>
+<span class='line-number'>598</span>
+<span class='line-number'>599</span>
+<span class='line-number'>600</span>
+<span class='line-number'>601</span>
+<span class='line-number'>602</span>
+<span class='line-number'>603</span>
+<span class='line-number'>604</span>
+<span class='line-number'>605</span>
+<span class='line-number'>606</span>
+<span class='line-number'>607</span>
+<span class='line-number'>608</span>
+<span class='line-number'>609</span>
+<span class='line-number'>610</span>
+<span class='line-number'>611</span>
+<span class='line-number'>612</span>
+<span class='line-number'>613</span>
+<span class='line-number'>614</span>
+<span class='line-number'>615</span>
+<span class='line-number'>616</span>
+<span class='line-number'>617</span>
+<span class='line-number'>618</span>
+<span class='line-number'>619</span>
+<span class='line-number'>620</span>
+<span class='line-number'>621</span>
+<span class='line-number'>622</span>
+<span class='line-number'>623</span>
+<span class='line-number'>624</span>
+<span class='line-number'>625</span>
+<span class='line-number'>626</span>
+<span class='line-number'>627</span>
+<span class='line-number'>628</span>
+<span class='line-number'>629</span>
+<span class='line-number'>630</span>
+<span class='line-number'>631</span>
+<span class='line-number'>632</span>
+<span class='line-number'>633</span>
+<span class='line-number'>634</span>
+<span class='line-number'>635</span>
+<span class='line-number'>636</span>
+<span class='line-number'>637</span>
+<span class='line-number'>638</span>
+<span class='line-number'>639</span>
+<span class='line-number'>640</span>
+<span class='line-number'>641</span>
+<span class='line-number'>642</span>
+<span class='line-number'>643</span>
+<span class='line-number'>644</span>
+<span class='line-number'>645</span>
+<span class='line-number'>646</span>
+<span class='line-number'>647</span>
+<span class='line-number'>648</span>
+<span class='line-number'>649</span>
+<span class='line-number'>650</span>
+<span class='line-number'>651</span>
+<span class='line-number'>652</span>
+<span class='line-number'>653</span>
+<span class='line-number'>654</span>
+<span class='line-number'>655</span>
+<span class='line-number'>656</span>
+<span class='line-number'>657</span>
+<span class='line-number'>658</span>
+<span class='line-number'>659</span>
+<span class='line-number'>660</span>
+<span class='line-number'>661</span>
+<span class='line-number'>662</span>
+<span class='line-number'>663</span>
+<span class='line-number'>664</span>
+<span class='line-number'>665</span>
+<span class='line-number'>666</span>
+<span class='line-number'>667</span>
+<span class='line-number'>668</span>
+<span class='line-number'>669</span>
+<span class='line-number'>670</span>
+<span class='line-number'>671</span>
+<span class='line-number'>672</span>
+<span class='line-number'>673</span>
+<span class='line-number'>674</span>
+<span class='line-number'>675</span>
+<span class='line-number'>676</span>
+<span class='line-number'>677</span>
+<span class='line-number'>678</span>
+<span class='line-number'>679</span>
+<span class='line-number'>680</span>
+<span class='line-number'>681</span>
+<span class='line-number'>682</span>
+<span class='line-number'>683</span>
+<span class='line-number'>684</span>
+<span class='line-number'>685</span>
+<span class='line-number'>686</span>
+<span class='line-number'>687</span>
+<span class='line-number'>688</span>
+<span class='line-number'>689</span>
+<span class='line-number'>690</span>
+<span class='line-number'>691</span>
+<span class='line-number'>692</span>
+<span class='line-number'>693</span>
+<span class='line-number'>694</span>
+<span class='line-number'>695</span>
+<span class='line-number'>696</span>
+<span class='line-number'>697</span>
+<span class='line-number'>698</span>
+<span class='line-number'>699</span>
+<span class='line-number'>700</span>
+<span class='line-number'>701</span>
+<span class='line-number'>702</span>
+<span class='line-number'>703</span>
+<span class='line-number'>704</span>
+<span class='line-number'>705</span>
+<span class='line-number'>706</span>
+<span class='line-number'>707</span>
+<span class='line-number'>708</span>
+<span class='line-number'>709</span>
+<span class='line-number'>710</span>
+<span class='line-number'>711</span>
+<span class='line-number'>712</span>
+<span class='line-number'>713</span>
+<span class='line-number'>714</span>
+<span class='line-number'>715</span>
+<span class='line-number'>716</span>
+<span class='line-number'>717</span>
+<span class='line-number'>718</span>
+<span class='line-number'>719</span>
+<span class='line-number'>720</span>
+<span class='line-number'>721</span>
+<span class='line-number'>722</span>
+<span class='line-number'>723</span>
+<span class='line-number'>724</span>
+<span class='line-number'>725</span>
+<span class='line-number'>726</span>
+<span class='line-number'>727</span>
+<span class='line-number'>728</span>
+<span class='line-number'>729</span>
+<span class='line-number'>730</span>
+<span class='line-number'>731</span>
+<span class='line-number'>732</span>
+<span class='line-number'>733</span>
+<span class='line-number'>734</span>
+<span class='line-number'>735</span>
+<span class='line-number'>736</span>
+<span class='line-number'>737</span>
+<span class='line-number'>738</span>
+<span class='line-number'>739</span>
+<span class='line-number'>740</span>
+<span class='line-number'>741</span>
+<span class='line-number'>742</span>
+<span class='line-number'>743</span>
+<span class='line-number'>744</span>
+<span class='line-number'>745</span>
+<span class='line-number'>746</span>
+<span class='line-number'>747</span>
+<span class='line-number'>748</span>
+<span class='line-number'>749</span>
+<span class='line-number'>750</span>
+<span class='line-number'>751</span>
+<span class='line-number'>752</span>
+<span class='line-number'>753</span>
+<span class='line-number'>754</span>
+<span class='line-number'>755</span>
+<span class='line-number'>756</span>
+<span class='line-number'>757</span>
+<span class='line-number'>758</span>
+<span class='line-number'>759</span>
+<span class='line-number'>760</span>
+<span class='line-number'>761</span>
+<span class='line-number'>762</span>
+<span class='line-number'>763</span>
+<span class='line-number'>764</span>
+<span class='line-number'>765</span>
+<span class='line-number'>766</span>
+<span class='line-number'>767</span>
+<span class='line-number'>768</span>
+<span class='line-number'>769</span>
+<span class='line-number'>770</span>
+<span class='line-number'>771</span>
+<span class='line-number'>772</span>
+<span class='line-number'>773</span>
+<span class='line-number'>774</span>
+<span class='line-number'>775</span>
+<span class='line-number'>776</span>
+<span class='line-number'>777</span>
+<span class='line-number'>778</span>
+<span class='line-number'>779</span>
+<span class='line-number'>780</span>
+<span class='line-number'>781</span>
+<span class='line-number'>782</span>
+<span class='line-number'>783</span>
+<span class='line-number'>784</span>
+<span class='line-number'>785</span>
+<span class='line-number'>786</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void net_rps_action(cpumask_t *mask)
+</span><span class='line'>{
+</span><span class='line'>    int cpu;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* Send pending IPI's to kick RPS processing on remote cpus. */
+</span><span class='line'>// 遍历
+</span><span class='line'>for_each_cpu_mask_nr(cpu, *mask) {
+</span><span class='line'>    struct softnet_data *queue = &amp;per_cpu(softnet_data, cpu);
+</span><span class='line'>    if (cpu_online(cpu))
+</span><span class='line'>        // 到对应的cpu调用csd方法。
+</span><span class='line'>        __smp_call_function_single(cpu, &amp;queue-&gt;csd, 0);
+</span><span class='line'>}
+</span><span class='line'>// 清理mask
+</span><span class='line'>cpus_clear(*mask);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>
+</span><span class='line'>上面我们看到会调用csd方法，而上面的csd回掉就是被初始化为trigger_softirq函数。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void trigger_softirq(void *data)
+</span><span class='line'>{
+</span><span class='line'>struct softnet_data *queue = data;
+</span><span class='line'>// 调度napi可以看到依旧是backlog 这个napi结构体。
+</span><span class='line'>__napi_schedule(&amp;queue-&gt;backlog);
+</span><span class='line'>__get_cpu_var(netdev_rx_stat).received_rps++;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>
+</span><span class='line'>上面的函数都分析完毕了，剩下的就很简单了。
+</span><span class='line'>
+</span><span class='line'>首先来看netif_rx如何被修改的，它被修改的很简单，首先是得到当前skb所应该被处理的cpu id，然后再通过比较这个cpu和当前正在处理的cpu id进行比较来做不同的处理。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;int netif_rx(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>int cpu;
+</span><span class='line'>
+</span><span class='line'>/* if netpoll wants it, pretend we never saw it */
+</span><span class='line'>if (netpoll_rx(skb))
+</span><span class='line'>    return NET_RX_DROP;
+</span><span class='line'>
+</span><span class='line'>if (!skb-&gt;tstamp.tv64)
+</span><span class='line'>    net_timestamp(skb);
+</span><span class='line'>// 得到cpu id。
+</span><span class='line'>cpu = get_rps_cpu(skb-&gt;dev, skb);
+</span><span class='line'>if (cpu &lt; 0)
+</span><span class='line'>    cpu = smp_processor_id();
+</span><span class='line'>// 通过cpu进行队列不同的处理
+</span><span class='line'>return enqueue_to_backlog(skb, cpu);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>
+</span><span class='line'>然后是netif_receive_skb,这里patch将内核本身的这个函数改写为__netif_receive_skb。然后当返回值小于0,则说明不需要对队列进行处理，此时直接发送到3层。
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;int netif_receive_skb(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>int cpu;
+</span><span class='line'>
+</span><span class='line'>cpu = get_rps_cpu(skb-&gt;dev, skb);
+</span><span class='line'>
+</span><span class='line'>if (cpu &lt; 0)
+</span><span class='line'>    return __netif_receive_skb(skb);
+</span><span class='line'>else
+</span><span class='line'>    return enqueue_to_backlog(skb, cpu);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后来总结一下，可以看到input_pkt_queue是一个FIFO的队列，而且如果当qlen有值的时候，也就是在另外的cpu有数据包放到input_pkt_queue中，则当前cpu不会调度napi，而是将数据包放到input_pkt_queue中，然后等待trigger_softirq来调度napi。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因此这个patch完美的解决了软中断在多核下的均衡问题，并且没有由于是同一个连接会map到相同的cpu，并且input_pkt_queue的使用，因此乱序的问题也不会出现。&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[内核协议栈tcp层的内存管理]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/03/kernel-net-mem/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-06-03T14:25:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/03/kernel-net-mem&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://simohayha.iteye.com/blog/532450"&gt;http://simohayha.iteye.com/blog/532450&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;a href="http://www.ibm.com/developerworks/cn/linux/l-hisock.html#table1"&gt;http://www.ibm.com/developerworks/cn/linux/l-hisock.html#table1&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.csdn.net/russell_tao/article/details/18711023"&gt;http://blog.csdn.net/russell_tao/article/details/18711023&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们先来看tcp内存管理相关的几个内核参数,这些都能通过proc文件系统来修改:
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>// 内核写buf的最大值.
+</span><span class='line'>extern __u32 sysctl_wmem_max;
+</span><span class='line'>// 协议栈读buf的最大值
+</span><span class='line'>extern __u32 sysctl_rmem_max;
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这两个值在/proc/sys/net/core 下。这里要注意，这两个值的单位是字节。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;它们的初始化在sk_init里面,这里可以看到这两个值的大小是依赖于num_physpages的，而这个值应该是物理页数。也就是说这两个值依赖于物理内存：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void __init sk_init(void)
+</span><span class='line'>{
+</span><span class='line'>    if (num_physpages &lt;= 4096) {
+</span><span class='line'>        sysctl_wmem_max = 32767;
+</span><span class='line'>        sysctl_rmem_max = 32767;
+</span><span class='line'>        sysctl_wmem_default = 32767;
+</span><span class='line'>        sysctl_rmem_default = 32767;
+</span><span class='line'>    } else if (num_physpages &gt;= 131072) {
+</span><span class='line'>        sysctl_wmem_max = 131071;
+</span><span class='line'>        sysctl_rmem_max = 131071;
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而我通过搜索源码，只有设置套接口选项的时候，才会用到这两个值，也就是setsockopt，optname为SO_SNDBUF或者SO_RCVBUF时，来限制设置的值:&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    case SO_SNDBUF:
+</span><span class='line'>        if (val &gt; sysctl_wmem_max)
+</span><span class='line'>            val = sysctl_wmem_max;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来就是整个tcp协议栈的socket的buf限制(也就是所有的socket).
+</span><span class='line'>这里要注意，这个东西的单位都是以页为单位的，我们下面就会看到。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>其中sysctl_tcp_mem[0]表示整个tcp sock的buf限制.
+</span><span class='line'>sysctl_tcp_mem[1]也就是tcp sock内存使用的警戒线.
+</span><span class='line'>sysctl_tcp_mem[2]也就是tcp sock内存使用的hard limit,当超过这个限制,我们就要禁止再分配buf.
+</span><span class='line'>extern int sysctl_tcp_mem[3];
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来就是针对每个sock的读写buf限制。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>// 其中依次为最小buf,中等buf,以及最大buf.
+</span><span class='line'>extern int sysctl_tcp_wmem[3];
+</span><span class='line'>extern int sysctl_tcp_rmem[3];
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;tcp_init&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这几个值的初始化在tcp_init里面，这里就能清晰的看到sysctl_tcp_mem的单位是页。而sysctl_tcp_wmem和sysctl_tcp_rmem的单位是字节。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void __init tcp_init(void)
+</span><span class='line'>{
+</span><span class='line'>    .................................
+</span><span class='line'>    // nr_pages就是页。
+</span><span class='line'>    nr_pages = totalram_pages - totalhigh_pages;
+</span><span class='line'>    limit = min(nr_pages, 1UL&lt;&lt;(28-PAGE_SHIFT)) &gt;&gt; (20-PAGE_SHIFT);
+</span><span class='line'>    limit = (limit * (nr_pages &gt;&gt; (20-PAGE_SHIFT))) &gt;&gt; (PAGE_SHIFT-11);
+</span><span class='line'>    limit = max(limit, 128UL);
+</span><span class='line'>    sysctl_tcp_mem[0] = limit / 4 * 3;
+</span><span class='line'>    sysctl_tcp_mem[1] = limit;
+</span><span class='line'>    sysctl_tcp_mem[2] = sysctl_tcp_mem[0] * 2;
+</span><span class='line'>
+</span><span class='line'>    /* Set per-socket limits to no more than 1/128 the pressure threshold */
+</span><span class='line'>    // 转换为字节。
+</span><span class='line'>    limit = ((unsigned long)sysctl_tcp_mem[1]) &lt;&lt; (PAGE_SHIFT - 7);
+</span><span class='line'>    max_share = min(4UL*1024*1024, limit);
+</span><span class='line'>
+</span><span class='line'>    sysctl_tcp_wmem[0] = SK_MEM_QUANTUM;
+</span><span class='line'>    sysctl_tcp_wmem[1] = 16*1024;
+</span><span class='line'>    sysctl_tcp_wmem[2] = max(64*1024, max_share);
+</span><span class='line'>
+</span><span class='line'>    sysctl_tcp_rmem[0] = SK_MEM_QUANTUM;
+</span><span class='line'>    sysctl_tcp_rmem[1] = 87380;
+</span><span class='line'>    sysctl_tcp_rmem[2] = max(87380, max_share);
+</span><span class='line'>    ................................
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后就是读写buf的最小值
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>#define SOCK_MIN_SNDBUF 2048
+</span><span class='line'>#define SOCK_MIN_RCVBUF 256
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后就是当前tcp协议栈已经分配了的buf的总大小。这里要注意，这个值也是以页为单位的。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>atomic_t tcp_memory_allocated
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而上面的这些值如何与协议栈关联起来呢，我们来看tcp_prot结构，可以看到这些值的地址都被放到对应的tcp_prot的域。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct proto tcp_prot = {
+</span><span class='line'>    .name = "TCP",
+</span><span class='line'>    .owner = THIS_MODULE,
+</span><span class='line'>    ...................................................
+</span><span class='line'>    .enter_memory_pressure = tcp_enter_memory_pressure,
+</span><span class='line'>    .sockets_allocated = &amp;tcp_sockets_allocated,
+</span><span class='line'>    .orphan_count = &amp;tcp_orphan_count,
+</span><span class='line'>    .memory_allocated = &amp;tcp_memory_allocated,
+</span><span class='line'>    .memory_pressure = &amp;tcp_memory_pressure,
+</span><span class='line'>    .sysctl_mem = sysctl_tcp_mem,
+</span><span class='line'>    .sysctl_wmem = sysctl_tcp_wmem,
+</span><span class='line'>    .sysctl_rmem = sysctl_tcp_rmem,
+</span><span class='line'>    ........................................................
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而对应的sock域中的几个值，这几个域非常重要，我们来看他们表示的含义&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;sk_rcvbuf和sk_sndbuf,这两个值分别代表每个sock的读写buf的最大限制&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;sk_rmem_alloc和sk_wmem_alloc这两个值分别代表已经提交的数据包的字节数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;读buf意味着进入tcp层的数据大小，而当数据提交给用户空间之后，这个值会相应的减去提交的大小（也就类似写buf的sk_wmem_queued)。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;写buf意味着提交给ip层。可以看到这个值的增加是在tcp_transmit_skb中进行的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而sk_wmem_queued也就代表skb的写队列write_queue的大小。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;还有一个sk_forward_alloc，这个值表示一个预分配置，也就是整个tcp协议栈的内存cache，第一次为一个缓冲区分配buf的时候，我们不会直接分配精确的大小，而是按页来分配，而分配的大小就是这个值，下面我们会看到这个。并且这个值初始是0.&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct sock {
+</span><span class='line'>    int sk_rcvbuf;
+</span><span class='line'>    atomic_t sk_rmem_alloc;
+</span><span class='line'>    atomic_t sk_wmem_alloc;
+</span><span class='line'>    int sk_forward_alloc;
+</span><span class='line'>    ..........................
+</span><span class='line'>    int sk_sndbuf;
+</span><span class='line'>    // 这个表示写buf已经分配的字节长度
+</span><span class='line'>    int sk_wmem_queued;
+</span><span class='line'>    ...........................
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;sk_sndbuf和sk_rcvbuf,这两个的初始化在这里：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>static int tcp_v4_init_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    ..................................
+</span><span class='line'>    sk-&gt;sk_sndbuf = sysctl_tcp_wmem[1];
+</span><span class='line'>    sk-&gt;sk_rcvbuf = sysctl_tcp_rmem[1];
+</span><span class='line'>    ..........................
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而当进入establish状态之后,sock会自己调整sndbuf和rcvbuf.他是通过tcp_init_buffer_space来进行调整的.这个函数会调用tcp_fixup_rcvbuf和tcp_fixup_sndbuf来调整读写buf的大小.&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里有用到sk_userlock这个标记，这个标记主要就是用来标记SO_SNDBUF 和SO_RCVBUF套接口选项是否被设置。而是否设置对应的值为：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define SOCK_SNDBUF_LOCK    1
+</span><span class='line'>#define SOCK_RCVBUF_LOCK    2
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们可以看下面的设置SO_SNDBUF 和SO_RCVBUF的代码片断：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    // 首先设置sk_userlocks.
+</span><span class='line'>sk-&gt;sk_userlocks |= SOCK_SNDBUF_LOCK;
+</span><span class='line'>if ((val * 2) &lt; SOCK_MIN_SNDBUF)
+</span><span class='line'>    sk-&gt;sk_sndbuf = SOCK_MIN_SNDBUF;
+</span><span class='line'>else
+</span><span class='line'>    sk-&gt;sk_sndbuf = val * 2;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因此内核里面的处理是这样的，如果用户已经通过套接字选项设置了读或者写buf的大小，那么这里将不会调整读写buf的大小，否则就进入tcp_fixup_XXX来调整大小。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;还有一个要注意的就是MAX_TCP_HEADER，这个值表示了TCP + IP + link layer headers 以及option的长度。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们来看代码。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void tcp_init_buffer_space(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    int maxwin;
+</span><span class='line'>
+</span><span class='line'>    // 判断sk_userlocks，来决定是否需要fix缓冲区大小。
+</span><span class='line'>    if (!(sk-&gt;sk_userlocks &amp; SOCK_RCVBUF_LOCK))
+</span><span class='line'>        tcp_fixup_rcvbuf(sk);
+</span><span class='line'>    if (!(sk-&gt;sk_userlocks &amp; SOCK_SNDBUF_LOCK))
+</span><span class='line'>        tcp_fixup_sndbuf(sk);
+</span><span class='line'>......................................
+</span><span class='line'>
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看这两个函数如何来调整读写buf的大小，不过这里还有些疑问，就是为什么是要和3&lt;em&gt;sndmem以及4&lt;/em&gt;rcvmem：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void tcp_fixup_sndbuf(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    // 首先通过mss，tcp头，以及sk_buff的大小，得到一个最小范围的sndmem。
+</span><span class='line'>    int sndmem = tcp_sk(sk)-&gt;rx_opt.mss_clamp + MAX_TCP_HEADER + 16 +sizeof(struct sk_buff);
+</span><span class='line'>
+</span><span class='line'>    // 然后取sysctl_tcp_wmem[2]和3倍的sndmem之间的最小值。
+</span><span class='line'>    if (sk-&gt;sk_sndbuf &lt; 3 * sndmem)
+</span><span class='line'>        sk-&gt;sk_sndbuf = min(3 * sndmem, sysctl_tcp_wmem[2]);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void tcp_fixup_rcvbuf(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    // 这里和上面类似，也是先得到最小的一个rcvmem段。
+</span><span class='line'>    int rcvmem = tp-&gt;advmss + MAX_TCP_HEADER + 16 + sizeof(struct sk_buff);
+</span><span class='line'>
+</span><span class='line'>    /* Try to select rcvbuf so that 4 mss-sized segments
+</span><span class='line'>     * will fit to window and corresponding skbs will fit to our rcvbuf.
+</span><span class='line'>     * (was 3; 4 is minimum to allow fast retransmit to work.)
+</span><span class='line'>     */
+</span><span class='line'>    // 这里则是通过sysctl_tcp_adv_win_scale来调整rcvmem的值。
+</span><span class='line'>    while (tcp_win_from_space(rcvmem) &lt; tp-&gt;advmss)
+</span><span class='line'>        rcvmem += 128;
+</span><span class='line'>    if (sk-&gt;sk_rcvbuf &lt; 4 * rcvmem)
+</span><span class='line'>        sk-&gt;sk_rcvbuf = min(4 * rcvmem, sysctl_tcp_rmem[2]);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ok，看完初始化，我们来看协议栈具体如何管理内存的，先来看发送端，发送端的主要实现是在tcp_sendmsg里面，这个函数我们前面已经详细的分析过了，我们这次只分析里面几个与内存相关的东西。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;来看代码片断：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int tcp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
+</span><span class='line'>        size_t size)
+</span><span class='line'>{
+</span><span class='line'>    ..................................
+</span><span class='line'>
+</span><span class='line'>    if (copy &lt;= 0) {
+</span><span class='line'>new_segment:
+</span><span class='line'>        if (!sk_stream_memory_free(sk))
+</span><span class='line'>            goto wait_for_sndbuf;
+</span><span class='line'>
+</span><span class='line'>        skb = sk_stream_alloc_skb(sk, select_size(sk),
+</span><span class='line'>        sk-&gt;sk_allocation);
+</span><span class='line'>        if (sk-&gt;sk_route_caps &amp; NETIF_F_ALL_CSUM)
+</span><span class='line'>            skb-&gt;ip_summed = CHECKSUM_PARTIAL;
+</span><span class='line'>
+</span><span class='line'>        skb_entail(sk, skb);
+</span><span class='line'>        copy = size_goal;
+</span><span class='line'>        max = size_goal;
+</span><span class='line'>    ..................
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;可以看到这里第一个sk_stream_memory_free用来判断是否还有空间来供我们分配，如果没有则跳到wait_for_sndbuf来等待buf的释放。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后如果有空间供我们分配，则调用sk_stream_alloc_skb来分配一个skb，然后这个大小的选择是通过select_size。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后调用skb_entail来更新相关的域。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;现在我们就来详细看上面的四个函数,先来看第一个：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int sk_stream_memory_free(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    return sk-&gt;sk_wmem_queued &lt; sk-&gt;sk_sndbuf;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;sk_stream_memory_free实现很简单，就是判断当前已经分配的写缓冲区的大小(sk_wmem_queued)是否小于当前写缓冲区(sk_sndbuf)的最大限制。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后是skb_entail，这个函数主要是当我们分配完buf后，进行一些相关域的更新，以及添加skb到writequeue。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline void skb_entail(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+</span><span class='line'>    ............................
+</span><span class='line'>    skb_header_release(skb);
+</span><span class='line'>    tcp_add_write_queue_tail(sk, skb);
+</span><span class='line'>    // 增加sk_wmem_queued.
+</span><span class='line'>    sk-&gt;sk_wmem_queued += skb-&gt;truesize;
+</span><span class='line'>    // 这里调整sk_forward_alloc的大小，也就是预分配buf的大小(减小).
+</span><span class='line'>    sk_mem_charge(sk, skb-&gt;truesize);
+</span><span class='line'>    if (tp-&gt;nonagle &amp; TCP_NAGLE_PUSH)
+</span><span class='line'>        tp-&gt;nonagle &amp;= ~TCP_NAGLE_PUSH;
+</span><span class='line'>}
+</span><span class='line'>// 这个函数很简单，就是将sk_forward_alloc - size.
+</span><span class='line'>static inline void sk_mem_charge(struct sock *sk, int size)
+</span><span class='line'>{
+</span><span class='line'>    if (!sk_has_account(sk))
+</span><span class='line'>        return;
+</span><span class='line'>    sk-&gt;sk_forward_alloc -= size;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后是select_size，在看这个之前我们先来坎SKB_MAX_HEAD的实现.
+</span><span class='line'>SKB_MAX_HEAD主要是得到要分配的tcp数据段（不包括头)在一页中最大为多少。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define SKB_WITH_OVERHEAD(X)    \
+</span><span class='line'>    ((X) - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+</span><span class='line'>#define SKB_MAX_ORDER(X, ORDER) \
+</span><span class='line'>    SKB_WITH_OVERHEAD((PAGE_SIZE &lt;&lt; (ORDER)) - (X))
+</span><span class='line'>#define SKB_MAX_HEAD(X)  (SKB_MAX_ORDER((X), 0))
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们带入代码来看，我们下面的代码是SKB_MAX_HEAD(MAX_TCP_HEADER)，展开这个宏可以看到就是PAGE_SIZE-MAX_TCP_HEADER-SKB_DATA_ALIGN(sizeof(struct skb_shared_info).其实也就是一页还能容纳多少tcp的数据。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int select_size(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    // 首先取得存储的mss。
+</span><span class='line'>    int tmp = tp-&gt;mss_cache;
+</span><span class='line'>
+</span><span class='line'>    // 然后判断是否使用scatter–gather(前面blog有介绍)
+</span><span class='line'>    if (sk-&gt;sk_route_caps &amp; NETIF_F_SG) {
+</span><span class='line'>        if (sk_can_gso(sk))
+</span><span class='line'>            tmp = 0;
+</span><span class='line'>        else {
+</span><span class='line'>            // 然后开始计算buf的长度。
+</span><span class='line'>            int pgbreak = SKB_MAX_HEAD(MAX_TCP_HEADER);
+</span><span class='line'>
+</span><span class='line'>            // 如果mss大于pgbreak,那么说明我们一页放不下当前需要的tcp数据，因此我们将会在skb的页区域分配，而skb的页区域是有限制的，因此tmp必须小于这个值。
+</span><span class='line'>            if (tmp &gt;= pgbreak &amp;&amp;
+</span><span class='line'>                    tmp &lt;= pgbreak + (MAX_SKB_FRAGS - 1) * PAGE_SIZE)
+</span><span class='line'>                tmp = pgbreak;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    return tmp;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;sk_stream_alloc_skb&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看sk_stream_alloc_skb的实现。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 它会调用alloc_skb_fclone来分配内存，这个函数就不详细分析了，我们只需要知道它会从slab里分配一块内存，而大小为size+max_header(上面的分析我们知道slect_size只计算数据段).&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 如果分配成功，则调用sk_wmem_schedule来判断我们所分配的skb的大小是否精确，是的话，就调整指针，然后返回。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3 否则调用tcp_enter_memory_pressure设置标志进入TCP memory pressure zone。然后再调用sk_stream_moderate_sndbuf调整sndbuf(缩小sndbuf)。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct sk_buff *sk_stream_alloc_skb(struct sock *sk, int size, gfp_t gfp)
+</span><span class='line'>{
+</span><span class='line'>    struct sk_buff *skb;
+</span><span class='line'>
+</span><span class='line'>    // 4字节对其
+</span><span class='line'>    size = ALIGN(size, 4);
+</span><span class='line'>    // 分配skb。
+</span><span class='line'>    skb = alloc_skb_fclone(size + sk-&gt;sk_prot-&gt;max_header, gfp);
+</span><span class='line'>    if (skb) {
+</span><span class='line'>        // 得到精确的大小。
+</span><span class='line'>        if (sk_wmem_schedule(sk, skb-&gt;truesize)) {
+</span><span class='line'>            // 返回skb。
+</span><span class='line'>            skb_reserve(skb, skb_tailroom(skb) - size);
+</span><span class='line'>                return skb;
+</span><span class='line'>        }
+</span><span class='line'>        __kfree_skb(skb);
+</span><span class='line'>    } else {
+</span><span class='line'>        // 否则设置全局标记进入pressure zone
+</span><span class='line'>        sk-&gt;sk_prot-&gt;enter_memory_pressure(sk);
+</span><span class='line'>        sk_stream_moderate_sndbuf(sk);
+</span><span class='line'>    }
+</span><span class='line'>    return NULL;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ok,现在就来看上面的几个函数的实现。先来看几个简单的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先是tcp_enter_memory_pressure,这个函数很简单，就是判断全局标记tcp_memory_pressure,然后设置这个标记。这个标记主要是用来通知其他模块调整的，比如窗口大小等等，详细的话自己搜索这个值，就知道了。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>void tcp_enter_memory_pressure(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    if (!tcp_memory_pressure) {
+</span><span class='line'>        NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPMEMORYPRESSURES);
+</span><span class='line'>        // 设置压力标志。
+</span><span class='line'>        tcp_memory_pressure = 1;
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后是sk_stream_moderate_sndbuf，这个函数也是要使用sk_userlocks,来判断是否已经被用户设置了。可以看到如果我们自己设置过了snd_buf的话，内核就不会帮我们调整它的大小了。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline void sk_stream_moderate_sndbuf(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    if (!(sk-&gt;sk_userlocks &amp; SOCK_SNDBUF_LOCK)) {
+</span><span class='line'>        // 它的大小调整为大于最小值，小于sk-&gt;sk_wmem_queued &gt;&gt; 1。
+</span><span class='line'>        sk-&gt;sk_sndbuf = min(sk-&gt;sk_sndbuf, sk-&gt;sk_wmem_queued &gt;&gt; 1);
+</span><span class='line'>        sk-&gt;sk_sndbuf = max(sk-&gt;sk_sndbuf, SOCK_MIN_SNDBUF);
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;sk_wmem_schedule&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后来看最核心的一个函数sk_wmem_schedule，这个函数只是对&lt;code&gt;__sk_mem_schedule&lt;/code&gt;的简单封装。这里要知道传递进来的size是skb-&gt;truesize，也就是所分配的skb的真实大小。并且第一次进入这个函数，也就是分配第一个缓冲区包时，sk_forward_alloc是为0的，也就是说，第一次必然会执行&lt;code&gt;__sk_mem_schedule&lt;/code&gt;函数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int sk_wmem_schedule(struct sock *sk, int size)
+</span><span class='line'>{
+</span><span class='line'>    if (!sk_has_account(sk))
+</span><span class='line'>        return 1;
+</span><span class='line'>    // 先比较size(也就是skb-&gt;truesize)和预分配的内存大小。如果小于等于预分配的大小，则直接返回，否则调用__sk_mem_schedule进行调整。
+</span><span class='line'>    return size &lt;= sk-&gt;sk_forward_alloc ||
+</span><span class='line'>        __sk_mem_schedule(sk, size, SK_MEM_SEND);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;来看&lt;code&gt;__sk_mem_schedule&lt;/code&gt;，这个函数的功能注释写的很清楚：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;increase sk_forward_alloc and memory_allocated&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后来看源码。这里在看之前，我们要知道，协议栈通过读写buf的使用量，划分了3个区域，或者说标志。不同标志进行不同处理。这里的区域的划分是通过sysctl_tcp_mem，也就是prot-&gt;sysctl_mem这个数组进行的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    // 页的大小
+</span><span class='line'>#define SK_MEM_QUANTUM ((int)PAGE_SIZE)
+</span><span class='line'>
+</span><span class='line'>int __sk_mem_schedule(struct sock *sk, int size, int kind)
+</span><span class='line'>{
+</span><span class='line'>    struct proto *prot = sk-&gt;sk_prot;
+</span><span class='line'>    // 首先得到size占用几个内存页。
+</span><span class='line'>    int amt = sk_mem_pages(size);
+</span><span class='line'>    int allocated;
+</span><span class='line'>    // 更新sk_forward_alloc，可以看到这个值是页的大小的倍数。
+</span><span class='line'>    sk-&gt;sk_forward_alloc += amt * SK_MEM_QUANTUM;
+</span><span class='line'>
+</span><span class='line'>    // amt+memory_allocated也就是当前的总得内存使用量加上将要分配的内存的话，现在的tcp协议栈的总得内存使用量。（可以看到是以页为单位的。
+</span><span class='line'>    allocated = atomic_add_return(amt, prot-&gt;memory_allocated);
+</span><span class='line'>
+</span><span class='line'>    // 然后开始判断，将会落入哪一个区域。通过上面的分析我们知道sysctl_mem也就是sysctl_tcp_mem.
+</span><span class='line'>
+</span><span class='line'>    // 先判断是否小于等于内存最小使用限额。
+</span><span class='line'>    if (allocated &lt;= prot-&gt;sysctl_mem[0]) {
+</span><span class='line'>        // 这里取消memory_pressure，然后返回。
+</span><span class='line'>        if (prot-&gt;memory_pressure &amp;&amp; *prot-&gt;memory_pressure)
+</span><span class='line'>            *prot-&gt;memory_pressure = 0;
+</span><span class='line'>        return 1;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    // 然后判断Under pressure。
+</span><span class='line'>    if (allocated &gt; prot-&gt;sysctl_mem[1])
+</span><span class='line'>        // 大于sysctl_mem[1]说明，已经进入pressure，一次你需要调用tcp_enter_memory_pressure来设置标志。
+</span><span class='line'>        if (prot-&gt;enter_memory_pressure)
+</span><span class='line'>            prot-&gt;enter_memory_pressure(sk);
+</span><span class='line'>
+</span><span class='line'>    // 如果超过的hard limit。则进入另外的处理。
+</span><span class='line'>    if (allocated &gt; prot-&gt;sysctl_mem[2])
+</span><span class='line'>        goto suppress_allocation;
+</span><span class='line'>
+</span><span class='line'>    // 判断类型，这里只有两种类型，读和写。总的内存大小判断完，这里开始判断单独的sock的读写内存。
+</span><span class='line'>    if (kind == SK_MEM_RECV) {
+</span><span class='line'>        if (atomic_read(&amp;sk-&gt;sk_rmem_alloc) &lt; prot-&gt;sysctl_rmem[0])
+</span><span class='line'>            return 1;
+</span><span class='line'>    } else { /* SK_MEM_SEND */
+</span><span class='line'>        // 这里当为tcp的时候，写队列的大小只有当对端数据确认后才会更新，因此我们要用sk_wmem_queued来判断。
+</span><span class='line'>        if (sk-&gt;sk_type == SOCK_STREAM) {
+</span><span class='line'>            if (sk-&gt;sk_wmem_queued &lt; prot-&gt;sysctl_wmem[0])
+</span><span class='line'>                return 1;
+</span><span class='line'>        } else if (atomic_read(&amp;sk-&gt;sk_wmem_alloc) &lt;
+</span><span class='line'>               prot-&gt;sysctl_wmem[0])
+</span><span class='line'>                return 1;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    // 程序到达这里说明总的内存大小在sysctl_mem[0]和sysctl_mem[2]之间，因此我们再次判断memory_pressure
+</span><span class='line'>    if (prot-&gt;memory_pressure) {
+</span><span class='line'>        int alloc;
+</span><span class='line'>
+</span><span class='line'>        // 如果没有在memory_pressure区域，则我们直接返回1。
+</span><span class='line'>        if (!*prot-&gt;memory_pressure)
+</span><span class='line'>            return 1;
+</span><span class='line'>        // 这个其实也就是计算整个系统分配的socket的多少。
+</span><span class='line'>        alloc = percpu_counter_read_positive(prot-&gt;sockets_allocated);
+</span><span class='line'>        // 这里假设其余的每个sock所占用的buf都和当前的sock一样大的时候，如果他们的总和小于sysctl_mem[2],也就是hard limit。那么我们也认为这次内存请求是成功的。
+</span><span class='line'>        if (prot-&gt;sysctl_mem[2] &gt; alloc *
+</span><span class='line'>            sk_mem_pages(sk-&gt;sk_wmem_queued +
+</span><span class='line'>             atomic_read(&amp;sk-&gt;sk_rmem_alloc) +
+</span><span class='line'>                 sk-&gt;sk_forward_alloc))
+</span><span class='line'>            return 1;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>suppress_allocation:
+</span><span class='line'>
+</span><span class='line'>    // 到达这里说明，我们超过了hard limit或者说处于presure 区域。
+</span><span class='line'>    if (kind == SK_MEM_SEND &amp;&amp; sk-&gt;sk_type == SOCK_STREAM) {
+</span><span class='line'>        // 调整sk_sndbuf(减小).这个函数前面已经分析过了。
+</span><span class='line'>        sk_stream_moderate_sndbuf(sk);
+</span><span class='line'>        // 然后比较和sk_sndbuf的大小，如果大于的话，就说明下次我们再次要分配buf的时候会在tcp_memory_free阻塞住，因此这次我们返回1.
+</span><span class='line'>        if (sk-&gt;sk_wmem_queued + size &gt;= sk-&gt;sk_sndbuf)
+</span><span class='line'>            return 1;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    /* Alas. Undo changes. */
+</span><span class='line'>    // 到达这里说明，请求内存是不被接受的，因此undo所有的操作。然后返回0.
+</span><span class='line'>    sk-&gt;sk_forward_alloc -= amt * SK_MEM_QUANTUM;
+</span><span class='line'>    atomic_sub(amt, prot-&gt;memory_allocated);
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看个很重要的函数skb_set_owner_w。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;顾名思义，这个函数也就是将一个skb和scok关联起来。只不过关联的时候更新sock相应的域。我们来看源码：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    skb_orphan(skb);
+</span><span class='line'>    // 与传递进来的sock关联起来
+</span><span class='line'>    skb-&gt;sk = sk;
+</span><span class='line'>    // 设置skb的析构函数
+</span><span class='line'>    skb-&gt;destructor = sock_wfree;
+</span><span class='line'>    // 更新sk_wmem_alloc域，就是sk_wmem_alloc+truesize.
+</span><span class='line'>    atomic_add(skb-&gt;truesize, &amp;sk-&gt;sk_wmem_alloc);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ok，接下来来看个scok_wfree函数，这个函数做得基本和上面函数相反。这个函数都是被kfree_skb自动调用的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void sock_wfree(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    struct sock *sk = skb-&gt;sk;
+</span><span class='line'>    int res;
+</span><span class='line'>
+</span><span class='line'>    // 更新sk_wmem_alloc,减去skb的大小。
+</span><span class='line'>    res = atomic_sub_return(skb-&gt;truesize, &amp;sk-&gt;sk_wmem_alloc);
+</span><span class='line'>    if (!sock_flag(sk, SOCK_USE_WRITE_QUEUE))
+</span><span class='line'>    // 唤醒等待队列，也就是唤醒等待内存分配。
+</span><span class='line'>        sk-&gt;sk_write_space(sk);
+</span><span class='line'>    if (res == 0)
+</span><span class='line'>        __sk_free(sk);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而skb_set_owner_w是什么时候被调用呢，我们通过搜索代码可以看到，它是在tcp_transmit_skb中被调用的。而tcp_transmit_skb我们知道是传递数据包到ip层的函数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而kfree_skb被调用也就是在对端已经确认完我们发送的包后才会被调用来释放skb。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;tcp_rcv_established&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看接收数据的内存管理。我们主要来看tcp_rcv_established这个函数，我前面的blog已经断断续续的分析过了，因此这里我们只看一些重要的代码片断。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里我们要知道，代码能到达下面的位置，则说明，数据并没有直接拷贝到用户空间。否则的话，是不会进入下面的片断的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (!eaten) {
+</span><span class='line'>    ..........................................
+</span><span class='line'>
+</span><span class='line'>    // 如果skb的大小大于预分配的值,如果大于则要另外处理。
+</span><span class='line'>    if ((int)skb-&gt;truesize &gt; sk-&gt;sk_forward_alloc)
+</span><span class='line'>            goto step5;
+</span><span class='line'>    __skb_pull(skb, tcp_header_len);
+</span><span class='line'>    __skb_queue_tail(&amp;sk-&gt;sk_receive_queue, skb);
+</span><span class='line'>    // 这里关联skb和对应的sk，并且更新相关的域，我们下面会分析这个函数。
+</span><span class='line'>    skb_set_owner_r(skb, sk);
+</span><span class='line'>    tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>}
+</span><span class='line'>...............................................
+</span><span class='line'>
+</span><span class='line'>step5:
+</span><span class='line'>    if (th-&gt;ack &amp;&amp; tcp_ack(sk, skb, FLAG_SLOWPATH) &lt; 0)
+</span><span class='line'>        goto discard;
+</span><span class='line'>
+</span><span class='line'>    tcp_rcv_rtt_measure_ts(sk, skb);
+</span><span class='line'>
+</span><span class='line'>    /* Process urgent data. */
+</span><span class='line'>    tcp_urg(sk, skb, th);
+</span><span class='line'>
+</span><span class='line'>    /* step 7: process the segment text */
+</span><span class='line'>    // 最核心的函数就是这个。我们接下来会详细分析这个函数。
+</span><span class='line'>    tcp_data_queue(sk, skb);
+</span><span class='line'>
+</span><span class='line'>    tcp_data_snd_check(sk);
+</span><span class='line'>    tcp_ack_snd_check(sk);
+</span><span class='line'>    return 0;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;先来看skb_set_owner_r函数，这个函数关联skb和sk其实它和skb_set_owner_w类似：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline void skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>    skb_orphan(skb);
+</span><span class='line'>    // 关联sk
+</span><span class='line'>    skb-&gt;sk = sk;
+</span><span class='line'>    // 设置析构函数
+</span><span class='line'>    skb-&gt;destructor = sock_rfree;
+</span><span class='line'>    // 更新rmem_alloc
+</span><span class='line'>    atomic_add(skb-&gt;truesize, &amp;sk-&gt;sk_rmem_alloc);
+</span><span class='line'>    // 改变forward_alloc.
+</span><span class='line'>    sk_mem_charge(sk, skb-&gt;truesize);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;tcp_data_queue&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后是tcp_data_queue，这个函数主要用来排队接收数据，并update相关的读buf。由于这个函数比较复杂，我们只关心我们感兴趣的部分：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    struct tcphdr *th = tcp_hdr(skb);
+</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>    int eaten = -1;
+</span><span class='line'>    .......................................
+</span><span class='line'>    // 首先判断skb的开始序列号和我们想要接收的序列号。如果相等开始处理这个数据包(也就是拷贝到用户空间).
+</span><span class='line'>    if (TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt) {
+</span><span class='line'>        if (tcp_receive_window(tp) == 0)
+</span><span class='line'>            goto out_of_window;
+</span><span class='line'>
+</span><span class='line'>        // tp的ucopy我前面的blog已经详细分析过了。这里就不解释了。
+</span><span class='line'>        if (tp-&gt;ucopy.task == current &amp;&amp;
+</span><span class='line'>            tp-&gt;copied_seq == tp-&gt;rcv_nxt &amp;&amp; tp-&gt;ucopy.len &amp;&amp;sock_owned_by_user(sk) &amp;&amp; !tp-&gt;urg_data)
+</span><span class='line'>        {
+</span><span class='line'>            // 计算将要拷贝给用户空间的大小。
+</span><span class='line'>            int chunk = min_t(unsigned int, skb-&gt;len,tp-&gt;ucopy.len);
+</span><span class='line'>
+</span><span class='line'>            // 设置状态，说明我们处于进程上下文。
+</span><span class='line'>            __set_current_state(TASK_RUNNING);
+</span><span class='line'>
+</span><span class='line'>            local_bh_enable();
+</span><span class='line'>            // 拷贝skb
+</span><span class='line'>            if (!skb_copy_datagram_iovec(skb, 0, tp-&gt;ucopy.iov, chunk)) {
+</span><span class='line'>                tp-&gt;ucopy.len -= chunk;
+</span><span class='line'>                tp-&gt;copied_seq += chunk;
+</span><span class='line'>                // 更新eaten，它的默认值为-1.
+</span><span class='line'>                eaten = (chunk == skb-&gt;len &amp;&amp; !th-&gt;fin);
+</span><span class='line'>                tcp_rcv_space_adjust(sk);
+</span><span class='line'>            }
+</span><span class='line'>            local_bh_disable();
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        // 如果小于0则说明没有拷贝成功，或者说就没有进行拷贝。此时需要更新sock的相关域。
+</span><span class='line'>        if (eaten &lt;= 0) {
+</span><span class='line'>queue_and_out:
+</span><span class='line'>            // 最关键的tcp_try_rmem_schedule函数。接下来会详细分析。
+</span><span class='line'>            if (eaten &lt; 0 &amp;&amp;
+</span><span class='line'>                    tcp_try_rmem_schedule(sk, skb-&gt;truesize))
+</span><span class='line'>                goto drop;
+</span><span class='line'>
+</span><span class='line'>            // 关联skb和sk。到达这里说明tcp_try_rmem_schedule成功，也就是返回0.
+</span><span class='line'>            skb_set_owner_r(skb, sk);
+</span><span class='line'>            // 加skb到receive_queue.
+</span><span class='line'>            __skb_queue_tail(&amp;sk-&gt;sk_receive_queue, skb);
+</span><span class='line'>        }
+</span><span class='line'>        // 更新期待序列号。
+</span><span class='line'>        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>        ..............................................
+</span><span class='line'>
+</span><span class='line'>        .....................................
+</span><span class='line'>
+</span><span class='line'>        tcp_fast_path_check(sk);
+</span><span class='line'>
+</span><span class='line'>        if (eaten &gt; 0)
+</span><span class='line'>            __kfree_skb(skb);
+</span><span class='line'>        else if (!sock_flag(sk, SOCK_DEAD))
+</span><span class='line'>            sk-&gt;sk_data_ready(sk, 0);
+</span><span class='line'>        return;
+</span><span class='line'>    }
+</span><span class='line'>    // 下面就是处理乱序包。以后会详细分析。
+</span><span class='line'>    ......................................
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;tcp_try_rmem_schedule&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来我们就来看tcp_try_rmem_schedule这个函数,这个函数如果返回0则说明sk_rmem_schedule返回1,而sk_rmem_schedule和sk_wmem_schedule是一样的。也就是看当前的skb加入后有没有超过读buf的限制。并更新相关的域。：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int tcp_try_rmem_schedule(struct sock *sk, unsigned int size)
+</span><span class='line'>{
+</span><span class='line'>    // 首先判断rmem_alloc(当前的读buf字节数)是否大于最大buf字节数，如果大于则调用tcp_prune_queue调整分配的buf。否则调用sk_rmem_schedule来调整相关域（sk_forward_alloc）。
+</span><span class='line'>    if (atomic_read(&amp;sk-&gt;sk_rmem_alloc) &gt; sk-&gt;sk_rcvbuf ||!sk_rmem_schedule(sk, size)) {
+</span><span class='line'>
+</span><span class='line'>        // 调整分配的buf。
+</span><span class='line'>        if (tcp_prune_queue(sk) &lt; 0)
+</span><span class='line'>            return -1;
+</span><span class='line'>        // 更新sk的相关域。
+</span><span class='line'>        if (!sk_rmem_schedule(sk, size)) {
+</span><span class='line'>            if (!tcp_prune_ofo_queue(sk))
+</span><span class='line'>                return -1;
+</span><span class='line'>
+</span><span class='line'>            if (!sk_rmem_schedule(sk, size))
+</span><span class='line'>                return -1;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;来看sk_rmem_schedule，这个函数很简单，就是封装了&lt;code&gt;__sk_mem_schedule&lt;/code&gt;。而这个函数我们上面已经分析过了。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>static inline int sk_rmem_schedule(struct sock *sk, int size)
+</span><span class='line'>{
+</span><span class='line'>    if (!sk_has_account(sk))
+</span><span class='line'>        return 1;
+</span><span class='line'>    return size &lt;= sk-&gt;sk_forward_alloc ||
+</span><span class='line'>        __sk_mem_schedule(sk, size, SK_MEM_RECV);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;tcp_prune_queue&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后是tcp_prune_queue，这个函数主要是用来丢掉一些skb，因为到这个函数就说明我们的内存使用已经到极限了，因此我们要合并一些buf。这个合并也就是将序列号连续的段进行合并。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里我们要知道tcp的包是有序的，因此内核中tcp专门有一个队列来保存那些Out of order segments。因此我们这里会先处理这个队列里面的skb。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后调用tcp_collapse来处理接收队列里面的skb。和上面的类似。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里要注意，合并的话都是按页来合并，也就是先分配一页大小的内存，然后将老的skb复制进去，最后free掉老的buf。</span></code></pre></td></tr></table></div></figure>
+    static int tcp_prune_queue(struct sock <em>sk)
+    {
+        struct tcp_sock </em>tp = tcp_sk(sk);
+        &hellip;&hellip;&hellip;&hellip;&hellip;&hellip;&hellip;&hellip;&hellip;&hellip;&hellip;.
+        // 如果rmem_alloc过于大，则重新计算窗口的大小。一半都会缩小窗口。
+        if (atomic_read(&amp;sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
+            tcp_clamp_window(sk);
+        // 如果处于pressure区域，则调整窗口大小。这里也是缩小窗口。
+        else if (tcp_memory_pressure)
+            tp->rcv_ssthresh = min(tp->rcv_ssthresh, 4U * tp->advmss);</p>
+
+<pre><code>    // 处理ofo队列。
+    tcp_collapse_ofo_queue(sk);
+    // 如果接收队列为非空，则调用tcp_collapse来处理sk_receive_queue
+    if (!skb_queue_empty(&amp;sk-&gt;sk_receive_queue))
+        tcp_collapse(sk, &amp;sk-&gt;sk_receive_queue,
+                 skb_peek(&amp;sk-&gt;sk_receive_queue),
+                 NULL,
+                 tp-&gt;copied_seq, tp-&gt;rcv_nxt);
+    // 更新全局的已分配内存的大小，也就是memory_allocated，接下来会详细介绍这个函数。
+    sk_mem_reclaim(sk);
+
+    // 如果调整后小于sk_rcvbuf,则返回0.
+    if (atomic_read(&amp;sk-&gt;sk_rmem_alloc) &lt;= sk-&gt;sk_rcvbuf)
+        return 0;
+
+    ......................................
+    return -1;
+}
+</code></pre>
+
+<pre><code>
+#### tcp_collapse_ofo_queue 尝试减小ofo queue占内存的大小
+</code></pre>
+
+<pre><code>/* Collapse ofo queue. Algorithm: select contiguous sequence of skbs
+ * and tcp_collapse() them until all the queue is collapsed.
+ */
+static void tcp_collapse_ofo_queue(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *skb = skb_peek(&amp;tp-&gt;out_of_order_queue);
+    struct sk_buff *head;
+    u32 start, end;
+
+    if (skb == NULL)
+        return;
+
+    start = TCP_SKB_CB(skb)-&gt;seq;
+    end = TCP_SKB_CB(skb)-&gt;end_seq;
+    head = skb;
+
+    for (;;) {
+        struct sk_buff *next = NULL;
+
+        if (!skb_queue_is_last(&amp;tp-&gt;out_of_order_queue, skb))
+            next = skb_queue_next(&amp;tp-&gt;out_of_order_queue, skb);
+        skb = next;
+
+        /* Segment is terminated when we see gap or when
+         * we are at the end of all the queue. */
+        if (!skb ||
+            after(TCP_SKB_CB(skb)-&gt;seq, end) ||
+            before(TCP_SKB_CB(skb)-&gt;end_seq, start)) {  // 找到ofo queue中连续的一段skb，即 prev-&gt;end_seq &gt;= next-&gt;seq
+            tcp_collapse(sk, &amp;tp-&gt;out_of_order_queue,
+                     head, skb, start, end);            // 尝试减小这一段连续skb占用的内存
+            head = skb;
+            if (!skb)
+                break;
+            /* Start new segment */
+            start = TCP_SKB_CB(skb)-&gt;seq;               // 下个skb就是新的一段的开始
+            end = TCP_SKB_CB(skb)-&gt;end_seq;
+        } else {
+            if (before(TCP_SKB_CB(skb)-&gt;seq, start))    // 这种情况只可能是tcp_collapse中大包拆成小包，拆到一半内存不够，没拆完导致。
+                start = TCP_SKB_CB(skb)-&gt;seq;
+            if (after(TCP_SKB_CB(skb)-&gt;end_seq, end))
+                end = TCP_SKB_CB(skb)-&gt;end_seq;
+        }
+    }
+}
+</code></pre>
+
+<pre><code>
+#### tcp_collapse，gro上来的包有可能是大于4k的包，所以这个函数有时是在拆包，利弊难定
+</code></pre>
+
+<pre><code>// 删除一个skb，返回下个skb
+static struct sk_buff *tcp_collapse_one(struct sock *sk, struct sk_buff *skb,
+                    struct sk_buff_head *list)
+{
+    struct sk_buff *next = NULL;
+
+    if (!skb_queue_is_last(list, skb))
+        next = skb_queue_next(list, skb);
+
+    __skb_unlink(skb, list);
+    __kfree_skb(skb);
+    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPRCVCOLLAPSED);
+
+    return next;
+}
+
+/* Collapse contiguous sequence of skbs head..tail with
+ * sequence numbers start..end.
+ *
+ * If tail is NULL, this means until the end of the list.
+ *
+ * Segments with FIN/SYN are not collapsed (only because this
+ * simplifies code)
+ */
+static void
+tcp_collapse(struct sock *sk, struct sk_buff_head *list,
+         struct sk_buff *head, struct sk_buff *tail,
+         u32 start, u32 end)
+{
+    struct sk_buff *skb, *n;
+    bool end_of_skbs;
+
+    /* First, check that queue is collapsible and find
+     * the point where collapsing can be useful. */
+    skb = head;
+restart:
+    end_of_skbs = true;
+    skb_queue_walk_from_safe(list, skb, n) {
+        if (skb == tail)
+            break;
+        /* No new bits? It is possible on ofo queue. */
+        if (!before(start, TCP_SKB_CB(skb)-&gt;end_seq)) { // 这种情况现在是不会出现的，以前代码有可能出现？？
+            skb = tcp_collapse_one(sk, skb, list);
+            if (!skb)
+                break;
+            goto restart;
+        }
+
+        /* The first skb to collapse is:
+         * - not SYN/FIN and
+         * - bloated or contains data before "start" or
+         *   overlaps to the next one.
+         */
+        if (!tcp_hdr(skb)-&gt;syn &amp;&amp; !tcp_hdr(skb)-&gt;fin &amp;&amp;         // SYN，FIN 不合并，简化操作
+            (tcp_win_from_space(skb-&gt;truesize) &gt; skb-&gt;len ||    // 合并后可能减小空间的情况才合并
+             before(TCP_SKB_CB(skb)-&gt;seq, start))) {            // seq到start的数据已经被读走了，有减小空间的可能
+            end_of_skbs = false;
+            break;
+        }
+
+        if (!skb_queue_is_last(list, skb)) {
+            struct sk_buff *next = skb_queue_next(list, skb);
+            if (next != tail &amp;&amp;
+                TCP_SKB_CB(skb)-&gt;end_seq != TCP_SKB_CB(next)-&gt;seq) { // 两个skb之间有交集，有减小空间可能
+                end_of_skbs = false;
+                break;
+            }
+        }
+
+        /* Decided to skip this, advance start seq. */
+        start = TCP_SKB_CB(skb)-&gt;end_seq;     // 否则向后继续找可能减小空间的第一个skb
+    }
+    if (end_of_skbs || tcp_hdr(skb)-&gt;syn || tcp_hdr(skb)-&gt;fin)
+        return;
+
+    while (before(start, end)) {  // 落在在start到end的包就是这次要合并的
+        struct sk_buff *nskb;
+        unsigned int header = skb_headroom(skb); // skb中协议头的大小
+        int copy = SKB_MAX_ORDER(header, 0);     // 一个页（4k）中出去协议头空间的大小，也就是能容下的数据大小
+
+        /* Too big header? This can happen with IPv6. */
+        if (copy &lt; 0)
+            return;
+        if (end - start &lt; copy)
+            copy = end - start;
+        nskb = alloc_skb(copy + header, GFP_ATOMIC);
+        if (!nskb)
+            return;
+
+        skb_set_mac_header(nskb, skb_mac_header(skb) - skb-&gt;head);
+        skb_set_network_header(nskb, (skb_network_header(skb) -
+                          skb-&gt;head));
+        skb_set_transport_header(nskb, (skb_transport_header(skb) -
+                        skb-&gt;head));
+        skb_reserve(nskb, header);
+        memcpy(nskb-&gt;head, skb-&gt;head, header);
+        memcpy(nskb-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));
+        TCP_SKB_CB(nskb)-&gt;seq = TCP_SKB_CB(nskb)-&gt;end_seq = start;
+        __skb_queue_before(list, skb, nskb);
+        skb_set_owner_r(nskb, sk);
+
+        /* Copy data, releasing collapsed skbs. */
+        while (copy &gt; 0) {    // 如果copy = 0，这里就会出BUG，但如果没有认为改，是不会的。ipv6会吗？？？。后面版本改进这函数了，也不会出现copy=0了
+            int offset = start - TCP_SKB_CB(skb)-&gt;seq;
+            int size = TCP_SKB_CB(skb)-&gt;end_seq - start;
+
+            BUG_ON(offset &lt; 0);
+            if (size &gt; 0) { // copy旧的skb数据到新的skb上
+                size = min(copy, size);
+                if (skb_copy_bits(skb, offset, skb_put(nskb, size), size))
+                    BUG();
+                TCP_SKB_CB(nskb)-&gt;end_seq += size;
+                copy -= size;
+                start += size;
+            }
+            if (!before(start, TCP_SKB_CB(skb)-&gt;end_seq)) { // 旧的skb被copy完了就删掉
+                skb = tcp_collapse_one(sk, skb, list);
+                if (!skb ||
+                    skb == tail ||
+                    tcp_hdr(skb)-&gt;syn ||
+                    tcp_hdr(skb)-&gt;fin)
+                    return;
+            }
+        }
+    }
+}
+</code></pre>
+
+<pre><code>
+来看sk_mem_reclaim函数，它只是简单的封装了`__sk_mem_reclaim`：
+</code></pre>
+
+<pre><code>static inline void sk_mem_reclaim(struct sock *sk)
+{
+    if (!sk_has_account(sk))
+        return;
+    // 如果sk_forward_alloc大于1页则调用__sk_mem_reclaim，我们知道sk_forward_alloc是以页为单位的，因此这里也就是和大于0一样。
+    if (sk-&gt;sk_forward_alloc &gt;= SK_MEM_QUANTUM)
+        __sk_mem_reclaim(sk);
+}
+</code></pre>
+
+<pre><code>
+`__sk_mem_reclaim`就是真正操作的函数，它会更新memory_allocated：
+</code></pre>
+
+<pre><code>void __sk_mem_reclaim(struct sock *sk)
+{
+    struct proto *prot = sk-&gt;sk_prot;
+    // 更新memory_allocated，这里我们知道memory_allocated也是以页为单位的，因此需要将sk_forward_alloc转化为页。
+    atomic_sub(sk-&gt;sk_forward_alloc &gt;&gt; SK_MEM_QUANTUM_SHIFT,prot-&gt;memory_allocated);
+
+    // 更新这个sk的sk_forward_alloc为一页。
+    sk-&gt;sk_forward_alloc &amp;= SK_MEM_QUANTUM - 1;
+    // 判断是否处于pressure区域，是的话更新memory_pressure变量。
+    if (prot-&gt;memory_pressure &amp;&amp; *prot-&gt;memory_pressure &amp;&amp;(atomic_read(prot-&gt;memory_allocated) &lt; （prot-&gt;sysctl_mem[0]))
+        *prot-&gt;memory_pressure = 0;
+}
+</code></pre>
+
+<pre><code>
+
+最后看一下读buf的释放。这个函数会在kfree_skb中被调用。
+</code></pre>
+
+<pre><code>void sock_rfree(struct sk_buff *skb)
+{
+
+    struct sock *sk = skb-&gt;sk;
+    // 更新rmem_alloc
+    atomic_sub(skb-&gt;truesize, &amp;sk-&gt;sk_rmem_alloc);
+    // 更新forward_alloc.
+    sk_mem_uncharge(skb-&gt;sk, skb-&gt;truesize);
+}
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[TREE RCU实现]]></title>
@@ -2615,2007 +4697,100 @@ VMALLOC_START   VMALLOC_END-1    vmalloc() / ioremap() space. Memory returned by
 <p>开机的时候early_vmalloc()会去读取vmalloc这个值。</p>
 
 <p>File: kernel/arch/arm/mm/mmu.c
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-<span class='line-number'>195</span>
-<span class='line-number'>196</span>
-<span class='line-number'>197</span>
-<span class='line-number'>198</span>
-<span class='line-number'>199</span>
-<span class='line-number'>200</span>
-<span class='line-number'>201</span>
-<span class='line-number'>202</span>
-<span class='line-number'>203</span>
-<span class='line-number'>204</span>
-<span class='line-number'>205</span>
-<span class='line-number'>206</span>
-<span class='line-number'>207</span>
-<span class='line-number'>208</span>
-<span class='line-number'>209</span>
-<span class='line-number'>210</span>
-<span class='line-number'>211</span>
-<span class='line-number'>212</span>
-<span class='line-number'>213</span>
-<span class='line-number'>214</span>
-<span class='line-number'>215</span>
-<span class='line-number'>216</span>
-<span class='line-number'>217</span>
-<span class='line-number'>218</span>
-<span class='line-number'>219</span>
-<span class='line-number'>220</span>
-<span class='line-number'>221</span>
-<span class='line-number'>222</span>
-<span class='line-number'>223</span>
-<span class='line-number'>224</span>
-<span class='line-number'>225</span>
-<span class='line-number'>226</span>
-<span class='line-number'>227</span>
-<span class='line-number'>228</span>
-<span class='line-number'>229</span>
-<span class='line-number'>230</span>
-<span class='line-number'>231</span>
-<span class='line-number'>232</span>
-<span class='line-number'>233</span>
-<span class='line-number'>234</span>
-<span class='line-number'>235</span>
-<span class='line-number'>236</span>
-<span class='line-number'>237</span>
-<span class='line-number'>238</span>
-<span class='line-number'>239</span>
-<span class='line-number'>240</span>
-<span class='line-number'>241</span>
-<span class='line-number'>242</span>
-<span class='line-number'>243</span>
-<span class='line-number'>244</span>
-<span class='line-number'>245</span>
-<span class='line-number'>246</span>
-<span class='line-number'>247</span>
-<span class='line-number'>248</span>
-<span class='line-number'>249</span>
-<span class='line-number'>250</span>
-<span class='line-number'>251</span>
-<span class='line-number'>252</span>
-<span class='line-number'>253</span>
-<span class='line-number'>254</span>
-<span class='line-number'>255</span>
-<span class='line-number'>256</span>
-<span class='line-number'>257</span>
-<span class='line-number'>258</span>
-<span class='line-number'>259</span>
-<span class='line-number'>260</span>
-<span class='line-number'>261</span>
-<span class='line-number'>262</span>
-<span class='line-number'>263</span>
-<span class='line-number'>264</span>
-<span class='line-number'>265</span>
-<span class='line-number'>266</span>
-<span class='line-number'>267</span>
-<span class='line-number'>268</span>
-<span class='line-number'>269</span>
-<span class='line-number'>270</span>
-<span class='line-number'>271</span>
-<span class='line-number'>272</span>
-<span class='line-number'>273</span>
-<span class='line-number'>274</span>
-<span class='line-number'>275</span>
-<span class='line-number'>276</span>
-<span class='line-number'>277</span>
-<span class='line-number'>278</span>
-<span class='line-number'>279</span>
-<span class='line-number'>280</span>
-<span class='line-number'>281</span>
-<span class='line-number'>282</span>
-<span class='line-number'>283</span>
-<span class='line-number'>284</span>
-<span class='line-number'>285</span>
-<span class='line-number'>286</span>
-<span class='line-number'>287</span>
-<span class='line-number'>288</span>
-<span class='line-number'>289</span>
-<span class='line-number'>290</span>
-<span class='line-number'>291</span>
-<span class='line-number'>292</span>
-<span class='line-number'>293</span>
-<span class='line-number'>294</span>
-<span class='line-number'>295</span>
-<span class='line-number'>296</span>
-<span class='line-number'>297</span>
-<span class='line-number'>298</span>
-<span class='line-number'>299</span>
-<span class='line-number'>300</span>
-<span class='line-number'>301</span>
-<span class='line-number'>302</span>
-<span class='line-number'>303</span>
-<span class='line-number'>304</span>
-<span class='line-number'>305</span>
-<span class='line-number'>306</span>
-<span class='line-number'>307</span>
-<span class='line-number'>308</span>
-<span class='line-number'>309</span>
-<span class='line-number'>310</span>
-<span class='line-number'>311</span>
-<span class='line-number'>312</span>
-<span class='line-number'>313</span>
-<span class='line-number'>314</span>
-<span class='line-number'>315</span>
-<span class='line-number'>316</span>
-<span class='line-number'>317</span>
-<span class='line-number'>318</span>
-<span class='line-number'>319</span>
-<span class='line-number'>320</span>
-<span class='line-number'>321</span>
-<span class='line-number'>322</span>
-<span class='line-number'>323</span>
-<span class='line-number'>324</span>
-<span class='line-number'>325</span>
-<span class='line-number'>326</span>
-<span class='line-number'>327</span>
-<span class='line-number'>328</span>
-<span class='line-number'>329</span>
-<span class='line-number'>330</span>
-<span class='line-number'>331</span>
-<span class='line-number'>332</span>
-<span class='line-number'>333</span>
-<span class='line-number'>334</span>
-<span class='line-number'>335</span>
-<span class='line-number'>336</span>
-<span class='line-number'>337</span>
-<span class='line-number'>338</span>
-<span class='line-number'>339</span>
-<span class='line-number'>340</span>
-<span class='line-number'>341</span>
-<span class='line-number'>342</span>
-<span class='line-number'>343</span>
-<span class='line-number'>344</span>
-<span class='line-number'>345</span>
-<span class='line-number'>346</span>
-<span class='line-number'>347</span>
-<span class='line-number'>348</span>
-<span class='line-number'>349</span>
-<span class='line-number'>350</span>
-<span class='line-number'>351</span>
-<span class='line-number'>352</span>
-<span class='line-number'>353</span>
-<span class='line-number'>354</span>
-<span class='line-number'>355</span>
-<span class='line-number'>356</span>
-<span class='line-number'>357</span>
-<span class='line-number'>358</span>
-<span class='line-number'>359</span>
-<span class='line-number'>360</span>
-<span class='line-number'>361</span>
-<span class='line-number'>362</span>
-<span class='line-number'>363</span>
-<span class='line-number'>364</span>
-<span class='line-number'>365</span>
-<span class='line-number'>366</span>
-<span class='line-number'>367</span>
-<span class='line-number'>368</span>
-<span class='line-number'>369</span>
-<span class='line-number'>370</span>
-<span class='line-number'>371</span>
-<span class='line-number'>372</span>
-<span class='line-number'>373</span>
-<span class='line-number'>374</span>
-<span class='line-number'>375</span>
-<span class='line-number'>376</span>
-<span class='line-number'>377</span>
-<span class='line-number'>378</span>
-<span class='line-number'>379</span>
-<span class='line-number'>380</span>
-<span class='line-number'>381</span>
-<span class='line-number'>382</span>
-<span class='line-number'>383</span>
-<span class='line-number'>384</span>
-<span class='line-number'>385</span>
-<span class='line-number'>386</span>
-<span class='line-number'>387</span>
-<span class='line-number'>388</span>
-<span class='line-number'>389</span>
-<span class='line-number'>390</span>
-<span class='line-number'>391</span>
-<span class='line-number'>392</span>
-<span class='line-number'>393</span>
-<span class='line-number'>394</span>
-<span class='line-number'>395</span>
-<span class='line-number'>396</span>
-<span class='line-number'>397</span>
-<span class='line-number'>398</span>
-<span class='line-number'>399</span>
-<span class='line-number'>400</span>
-<span class='line-number'>401</span>
-<span class='line-number'>402</span>
-<span class='line-number'>403</span>
-<span class='line-number'>404</span>
-<span class='line-number'>405</span>
-<span class='line-number'>406</span>
-<span class='line-number'>407</span>
-<span class='line-number'>408</span>
-<span class='line-number'>409</span>
-<span class='line-number'>410</span>
-<span class='line-number'>411</span>
-<span class='line-number'>412</span>
-<span class='line-number'>413</span>
-<span class='line-number'>414</span>
-<span class='line-number'>415</span>
-<span class='line-number'>416</span>
-<span class='line-number'>417</span>
-<span class='line-number'>418</span>
-<span class='line-number'>419</span>
-<span class='line-number'>420</span>
-<span class='line-number'>421</span>
-<span class='line-number'>422</span>
-<span class='line-number'>423</span>
-<span class='line-number'>424</span>
-<span class='line-number'>425</span>
-<span class='line-number'>426</span>
-<span class='line-number'>427</span>
-<span class='line-number'>428</span>
-<span class='line-number'>429</span>
-<span class='line-number'>430</span>
-<span class='line-number'>431</span>
-<span class='line-number'>432</span>
-<span class='line-number'>433</span>
-<span class='line-number'>434</span>
-<span class='line-number'>435</span>
-<span class='line-number'>436</span>
-<span class='line-number'>437</span>
-<span class='line-number'>438</span>
-<span class='line-number'>439</span>
-<span class='line-number'>440</span>
-<span class='line-number'>441</span>
-<span class='line-number'>442</span>
-<span class='line-number'>443</span>
-<span class='line-number'>444</span>
-<span class='line-number'>445</span>
-<span class='line-number'>446</span>
-<span class='line-number'>447</span>
-<span class='line-number'>448</span>
-<span class='line-number'>449</span>
-<span class='line-number'>450</span>
-<span class='line-number'>451</span>
-<span class='line-number'>452</span>
-<span class='line-number'>453</span>
-<span class='line-number'>454</span>
-<span class='line-number'>455</span>
-<span class='line-number'>456</span>
-<span class='line-number'>457</span>
-<span class='line-number'>458</span>
-<span class='line-number'>459</span>
-<span class='line-number'>460</span>
-<span class='line-number'>461</span>
-<span class='line-number'>462</span>
-<span class='line-number'>463</span>
-<span class='line-number'>464</span>
-<span class='line-number'>465</span>
-<span class='line-number'>466</span>
-<span class='line-number'>467</span>
-<span class='line-number'>468</span>
-<span class='line-number'>469</span>
-<span class='line-number'>470</span>
-<span class='line-number'>471</span>
-<span class='line-number'>472</span>
-<span class='line-number'>473</span>
-<span class='line-number'>474</span>
-<span class='line-number'>475</span>
-<span class='line-number'>476</span>
-<span class='line-number'>477</span>
-<span class='line-number'>478</span>
-<span class='line-number'>479</span>
-<span class='line-number'>480</span>
-<span class='line-number'>481</span>
-<span class='line-number'>482</span>
-<span class='line-number'>483</span>
-<span class='line-number'>484</span>
-<span class='line-number'>485</span>
-<span class='line-number'>486</span>
-<span class='line-number'>487</span>
-<span class='line-number'>488</span>
-<span class='line-number'>489</span>
-<span class='line-number'>490</span>
-<span class='line-number'>491</span>
-<span class='line-number'>492</span>
-<span class='line-number'>493</span>
-<span class='line-number'>494</span>
-<span class='line-number'>495</span>
-<span class='line-number'>496</span>
-<span class='line-number'>497</span>
-<span class='line-number'>498</span>
-<span class='line-number'>499</span>
-<span class='line-number'>500</span>
-<span class='line-number'>501</span>
-<span class='line-number'>502</span>
-<span class='line-number'>503</span>
-<span class='line-number'>504</span>
-<span class='line-number'>505</span>
-<span class='line-number'>506</span>
-<span class='line-number'>507</span>
-<span class='line-number'>508</span>
-<span class='line-number'>509</span>
-<span class='line-number'>510</span>
-<span class='line-number'>511</span>
-<span class='line-number'>512</span>
-<span class='line-number'>513</span>
-<span class='line-number'>514</span>
-<span class='line-number'>515</span>
-<span class='line-number'>516</span>
-<span class='line-number'>517</span>
-<span class='line-number'>518</span>
-<span class='line-number'>519</span>
-<span class='line-number'>520</span>
-<span class='line-number'>521</span>
-<span class='line-number'>522</span>
-<span class='line-number'>523</span>
-<span class='line-number'>524</span>
-<span class='line-number'>525</span>
-<span class='line-number'>526</span>
-<span class='line-number'>527</span>
-<span class='line-number'>528</span>
-<span class='line-number'>529</span>
-<span class='line-number'>530</span>
-<span class='line-number'>531</span>
-<span class='line-number'>532</span>
-<span class='line-number'>533</span>
-<span class='line-number'>534</span>
-<span class='line-number'>535</span>
-<span class='line-number'>536</span>
-<span class='line-number'>537</span>
-<span class='line-number'>538</span>
-<span class='line-number'>539</span>
-<span class='line-number'>540</span>
-<span class='line-number'>541</span>
-<span class='line-number'>542</span>
-<span class='line-number'>543</span>
-<span class='line-number'>544</span>
-<span class='line-number'>545</span>
-<span class='line-number'>546</span>
-<span class='line-number'>547</span>
-<span class='line-number'>548</span>
-<span class='line-number'>549</span>
-<span class='line-number'>550</span>
-<span class='line-number'>551</span>
-<span class='line-number'>552</span>
-<span class='line-number'>553</span>
-<span class='line-number'>554</span>
-<span class='line-number'>555</span>
-<span class='line-number'>556</span>
-<span class='line-number'>557</span>
-<span class='line-number'>558</span>
-<span class='line-number'>559</span>
-<span class='line-number'>560</span>
-<span class='line-number'>561</span>
-<span class='line-number'>562</span>
-<span class='line-number'>563</span>
-<span class='line-number'>564</span>
-<span class='line-number'>565</span>
-<span class='line-number'>566</span>
-<span class='line-number'>567</span>
-<span class='line-number'>568</span>
-<span class='line-number'>569</span>
-<span class='line-number'>570</span>
-<span class='line-number'>571</span>
-<span class='line-number'>572</span>
-<span class='line-number'>573</span>
-<span class='line-number'>574</span>
-<span class='line-number'>575</span>
-<span class='line-number'>576</span>
-<span class='line-number'>577</span>
-<span class='line-number'>578</span>
-<span class='line-number'>579</span>
-<span class='line-number'>580</span>
-<span class='line-number'>581</span>
-<span class='line-number'>582</span>
-<span class='line-number'>583</span>
-<span class='line-number'>584</span>
-<span class='line-number'>585</span>
-<span class='line-number'>586</span>
-<span class='line-number'>587</span>
-<span class='line-number'>588</span>
-<span class='line-number'>589</span>
-<span class='line-number'>590</span>
-<span class='line-number'>591</span>
-<span class='line-number'>592</span>
-<span class='line-number'>593</span>
-<span class='line-number'>594</span>
-<span class='line-number'>595</span>
-<span class='line-number'>596</span>
-<span class='line-number'>597</span>
-<span class='line-number'>598</span>
-<span class='line-number'>599</span>
-<span class='line-number'>600</span>
-<span class='line-number'>601</span>
-<span class='line-number'>602</span>
-<span class='line-number'>603</span>
-<span class='line-number'>604</span>
-<span class='line-number'>605</span>
-<span class='line-number'>606</span>
-<span class='line-number'>607</span>
-<span class='line-number'>608</span>
-<span class='line-number'>609</span>
-<span class='line-number'>610</span>
-<span class='line-number'>611</span>
-<span class='line-number'>612</span>
-<span class='line-number'>613</span>
-<span class='line-number'>614</span>
-<span class='line-number'>615</span>
-<span class='line-number'>616</span>
-<span class='line-number'>617</span>
-<span class='line-number'>618</span>
-<span class='line-number'>619</span>
-<span class='line-number'>620</span>
-<span class='line-number'>621</span>
-<span class='line-number'>622</span>
-<span class='line-number'>623</span>
-<span class='line-number'>624</span>
-<span class='line-number'>625</span>
-<span class='line-number'>626</span>
-<span class='line-number'>627</span>
-<span class='line-number'>628</span>
-<span class='line-number'>629</span>
-<span class='line-number'>630</span>
-<span class='line-number'>631</span>
-<span class='line-number'>632</span>
-<span class='line-number'>633</span>
-<span class='line-number'>634</span>
-<span class='line-number'>635</span>
-<span class='line-number'>636</span>
-<span class='line-number'>637</span>
-<span class='line-number'>638</span>
-<span class='line-number'>639</span>
-<span class='line-number'>640</span>
-<span class='line-number'>641</span>
-<span class='line-number'>642</span>
-<span class='line-number'>643</span>
-<span class='line-number'>644</span>
-<span class='line-number'>645</span>
-<span class='line-number'>646</span>
-<span class='line-number'>647</span>
-<span class='line-number'>648</span>
-<span class='line-number'>649</span>
-<span class='line-number'>650</span>
-<span class='line-number'>651</span>
-<span class='line-number'>652</span>
-<span class='line-number'>653</span>
-<span class='line-number'>654</span>
-<span class='line-number'>655</span>
-<span class='line-number'>656</span>
-<span class='line-number'>657</span>
-<span class='line-number'>658</span>
-<span class='line-number'>659</span>
-<span class='line-number'>660</span>
-<span class='line-number'>661</span>
-<span class='line-number'>662</span>
-<span class='line-number'>663</span>
-<span class='line-number'>664</span>
-<span class='line-number'>665</span>
-<span class='line-number'>666</span>
-<span class='line-number'>667</span>
-<span class='line-number'>668</span>
-<span class='line-number'>669</span>
-<span class='line-number'>670</span>
-<span class='line-number'>671</span>
-<span class='line-number'>672</span>
-<span class='line-number'>673</span>
-<span class='line-number'>674</span>
-<span class='line-number'>675</span>
-<span class='line-number'>676</span>
-<span class='line-number'>677</span>
-<span class='line-number'>678</span>
-<span class='line-number'>679</span>
-<span class='line-number'>680</span>
-<span class='line-number'>681</span>
-<span class='line-number'>682</span>
-<span class='line-number'>683</span>
-<span class='line-number'>684</span>
-<span class='line-number'>685</span>
-<span class='line-number'>686</span>
-<span class='line-number'>687</span>
-<span class='line-number'>688</span>
-<span class='line-number'>689</span>
-<span class='line-number'>690</span>
-<span class='line-number'>691</span>
-<span class='line-number'>692</span>
-<span class='line-number'>693</span>
-<span class='line-number'>694</span>
-<span class='line-number'>695</span>
-<span class='line-number'>696</span>
-<span class='line-number'>697</span>
-<span class='line-number'>698</span>
-<span class='line-number'>699</span>
-<span class='line-number'>700</span>
-<span class='line-number'>701</span>
-<span class='line-number'>702</span>
-<span class='line-number'>703</span>
-<span class='line-number'>704</span>
-<span class='line-number'>705</span>
-<span class='line-number'>706</span>
-<span class='line-number'>707</span>
-<span class='line-number'>708</span>
-<span class='line-number'>709</span>
-<span class='line-number'>710</span>
-<span class='line-number'>711</span>
-<span class='line-number'>712</span>
-<span class='line-number'>713</span>
-<span class='line-number'>714</span>
-<span class='line-number'>715</span>
-<span class='line-number'>716</span>
-<span class='line-number'>717</span>
-<span class='line-number'>718</span>
-<span class='line-number'>719</span>
-<span class='line-number'>720</span>
-<span class='line-number'>721</span>
-<span class='line-number'>722</span>
-<span class='line-number'>723</span>
-<span class='line-number'>724</span>
-<span class='line-number'>725</span>
-<span class='line-number'>726</span>
-<span class='line-number'>727</span>
-<span class='line-number'>728</span>
-<span class='line-number'>729</span>
-<span class='line-number'>730</span>
-<span class='line-number'>731</span>
-<span class='line-number'>732</span>
-<span class='line-number'>733</span>
-<span class='line-number'>734</span>
-<span class='line-number'>735</span>
-<span class='line-number'>736</span>
-<span class='line-number'>737</span>
-<span class='line-number'>738</span>
-<span class='line-number'>739</span>
-<span class='line-number'>740</span>
-<span class='line-number'>741</span>
-<span class='line-number'>742</span>
-<span class='line-number'>743</span>
-<span class='line-number'>744</span>
-<span class='line-number'>745</span>
-<span class='line-number'>746</span>
-<span class='line-number'>747</span>
-<span class='line-number'>748</span>
-<span class='line-number'>749</span>
-<span class='line-number'>750</span>
-<span class='line-number'>751</span>
-<span class='line-number'>752</span>
-<span class='line-number'>753</span>
-<span class='line-number'>754</span>
-<span class='line-number'>755</span>
-<span class='line-number'>756</span>
-<span class='line-number'>757</span>
-<span class='line-number'>758</span>
-<span class='line-number'>759</span>
-<span class='line-number'>760</span>
-<span class='line-number'>761</span>
-<span class='line-number'>762</span>
-<span class='line-number'>763</span>
-<span class='line-number'>764</span>
-<span class='line-number'>765</span>
-<span class='line-number'>766</span>
-<span class='line-number'>767</span>
-<span class='line-number'>768</span>
-<span class='line-number'>769</span>
-<span class='line-number'>770</span>
-<span class='line-number'>771</span>
-<span class='line-number'>772</span>
-<span class='line-number'>773</span>
-<span class='line-number'>774</span>
-<span class='line-number'>775</span>
-<span class='line-number'>776</span>
-<span class='line-number'>777</span>
-<span class='line-number'>778</span>
-<span class='line-number'>779</span>
-<span class='line-number'>780</span>
-<span class='line-number'>781</span>
-<span class='line-number'>782</span>
-<span class='line-number'>783</span>
-<span class='line-number'>784</span>
-<span class='line-number'>785</span>
-<span class='line-number'>786</span>
-<span class='line-number'>787</span>
-<span class='line-number'>788</span>
-<span class='line-number'>789</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int__init early_vmalloc(char &lt;em&gt;arg)
-</span><span class='line'>{
-</span><span class='line'>    /&lt;/em&gt;cmdline中的vmalloc会被解析到vmlloc_reserve中。*/
-</span><span class='line'>    unsigned long vmalloc_reserve = memparse(arg, NULL);&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /*小于16M则用16M。*/
-</span><span class='line'>if (vmalloc_reserve &lt; SZ_16M) {
-</span><span class='line'>    vmalloc_reserve = SZ_16M;
-</span><span class='line'>    printk(KERN_WARNING
-</span><span class='line'>            "vmalloc area too small, limiting to %luMB\n",
-</span><span class='line'>            vmalloc_reserve &gt;&gt; 20);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/*大于可用虚拟地址内存则使用可用地址部分再减去32M。*/
-</span><span class='line'>if (vmalloc_reserve &gt; VMALLOC_END - (PAGE_OFFSET + SZ_32M)) {
-</span><span class='line'>    vmalloc_reserve = VMALLOC_END - (PAGE_OFFSET + SZ_32M);
-</span><span class='line'>    printk(KERN_WARNING
-</span><span class='line'>            "vmalloc area is too big, limiting to %luMB\n",
-</span><span class='line'>            vmalloc_reserve &gt;&gt; 20);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/*计算偏移起始地址。*/
-</span><span class='line'>vmalloc_min = (void *)(VMALLOC_END - vmalloc_reserve);
-</span><span class='line'>return 0;
-</span><span class='line'>}
-</span><span class='line'>early_param("vmalloc",early_vmalloc);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>vmalloc_min会影响arm_lowmem_limit,arm_lowmem_limit其实就是high_memory。因为此过程不是我们要分析的重点，如果有兴趣可分析kernel/arch/arm/mm/mmu.c中的sanity_check_meminfo()函数。
-</span><span class='line'>
-</span><span class='line'>所以，VMALLOC_START受到了hight_memory的影响而发生了变化，最终使得vmalloc size也变化了！
-</span><span class='line'>
-</span><span class='line'>##### 2. 开机默认分配：
-</span><span class='line'>
-</span><span class='line'>File: kernel/arch/arm/mm/mmu.c
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void * __initdata vmalloc_min =
-</span><span class='line'>(void *)(VMALLOC_END - (240 &lt;&lt; 20) - VMALLOC_OFFSET);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>当cmdline无vmalloc参数传进来的时候，early_vmalloc()函数也不会调用到，vmalloc_min的值就会被默认传进来了，默认是240M。
-</span><span class='line'>
-</span><span class='line'>后面的步骤和方法1一样了！
-</span><span class='line'>
-</span><span class='line'>开机log有memory layout 信息：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;[    0.000000] [cpuid: 0] Virtual kernelmemory layout:
-</span><span class='line'>[    0.000000] [cpuid:0]     vector  : 0xffff0000 - 0xffff1000  (   4 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]     fixmap  : 0xfff00000 - 0xfffe0000   (896 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]     vmalloc : 0xf3000000 - 0xff000000   ( 192MB)
-</span><span class='line'>[    0.000000] [cpuid:0]     lowmem  : 0xc0000000 - 0xf2800000   (808 MB)
-</span><span class='line'>[    0.000000] [cpuid:0]     pkmap   : 0xbfe00000 -0xc0000000   (   2 MB)
-</span><span class='line'>[    0.000000] [cpuid:0]     modules : 0xbf000000 - 0xbfe00000  (  14 MB)
-</span><span class='line'>[    0.000000] [cpuid:0]       .text : 0xc0008000 -0xc0893034   (8749 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]       .init : 0xc0894000 -0xc08cdc00   ( 231 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]       .data : 0xc08ce000 -0xc09f8eb8   (1196 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]        .bss : 0xc0a78eec -0xc0f427a8   (4903 kB)
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;其中看到vmalloc为192MB , cmdline中使用vmllaoc就是200M。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Lowmem为地段内存部分，可见lowmem和vmalloc中间有8M空隙。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;Vmalloc该分配多大?&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Linux内核版本从3.2到3.3 默认的vmalloc size由128M 增大到了240M，3.4.0上的&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;修改Commit信息如下：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;To accommodate all static mappings on machines withpossible highmem usage, the default vmalloc area size is changed to 240 MB sothat VMALLOC_START is no higher than 0xf0000000 by default.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;看其意思是因为开机的静态映射增加了，所以要扩大。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外3.2到3.3版本的一个重大变化是将android引入到主线内核中。我想增大vmalloc size到240M是基于此考虑吧。当然，各家厂商都也可以基于自己平台来动态修改size的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;那么如何判断当前vmalloc size不足呢？&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;/proc/meminfo中有vmalloc信息:&lt;br/&gt;
-</span><span class='line'>VmallocTotal:     540672 kB&lt;br/&gt;
-</span><span class='line'>VmallocUsed:      165268 kB&lt;br/&gt;
-</span><span class='line'>VmallocChunk:     118788kB&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;事实上这里的VmallocUsed只是表示已经被真正使用掉的vmalloc区域，但是区域之前的空隙也就是碎片没有被计算进去。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;所以，回到前面说的/proc/vmallocinfo，假设我们的vmalloc size就是200M。那么区域为0xf3000000- 0xff000000，从vmallocinfo中可以看到，前面大部分虚拟地址空间都用掉了，剩下0xfb600000到0xfefdc000这57M空间，假如申请了64M，那么就会失败了。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;开机分配使用掉vmalloc之后到底该剩余多少目前没有具体依据，一般来说1GB RAM可以设置为400~600M。&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux-2.6.32 NUMA架构之内存和调度]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc-numa/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-06-02T15:32:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc-numa&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.chinaunix.net/uid-7295895-id-3076420.html"&gt;http://blog.chinaunix.net/uid-7295895-id-3076420.html&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Linux-2.6.32 NUMA架构之内存和调度&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  本文将以XLP832通过ICI互连形成的NUMA架构进行分析，主要包括内存管理和调度两方面，参考内核版本2.6.32.9；NUMA架构常见配置选项有：CONFIG_SMP, CONFIG_NUMA, CONFIG_NEED_MULTIPLE_NODES, CONFIG_NODES_SHIFT, CONFIG_SPARSEMEM, CONFIG_CGROUPS, CONFIG_CPUSETS, CONFIG_MIGRATION等。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本文试图从原理上介绍，尽量避免涉及代码的实现细节。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;1 NUMA架构简介&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;NUMA(Non Uniform Memory Access)即非一致内存访问架构，市面上主要有X86_64(JASPER)和MIPS64(XLP)体系。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;1.1 概念&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;NUMA具有多个节点(Node)，每个节点可以拥有多个CPU(每个CPU可以具有多个核或线程)，节点内使用共有的内存控制器，因此节点的所有内存对于本节点的所有CPU都是等同的，而对于其它节点中的所有CPU都是不同的。节点可分为本地节点(Local Node)、邻居节点(Neighbour Node)和远端节点(Remote Node)三种类型。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本地节点：对于某个节点中的所有CPU，此节点称为本地节点；&lt;br/&gt;
-</span><span class='line'>邻居节点：与本地节点相邻的节点称为邻居节点；&lt;br/&gt;
-</span><span class='line'>远端节点：非本地节点或邻居节点的节点，称为远端节点。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;邻居节点和远端节点，称作非本地节点(Off Node)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPU访问不同类型节点内存的速度是不相同的：本地节点&gt;邻居节点&gt;远端节点。访问本地节点的速度最快，访问远端节点的速度最慢，即访问速度与节点的距离有关，距离越远访问速度越慢，此距离称作Node Distance。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;常用的NUMA系统中：硬件设计已保证系统中所有的Cache是一致的(Cache Coherent, ccNUMA)；不同类型节点间的Cache同步时间不一样，会导致资源竞争不公平，对于某些特殊的应用，可以考虑使用FIFO Spinlock保证公平性。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;1.2 关键信息&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) 物理内存区域与Node号之间的映射关系；&lt;br/&gt;
-</span><span class='line'>2) 各Node之间的Node Distance；&lt;br/&gt;
-</span><span class='line'>3) 逻辑CPU号与Node号之间的映射关系。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;2 XLP832 NUMA初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;首先需要完成1.2节中描述的3个关键信息的初始化。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2.1 CPU和Node的关系&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;start_kernel()-&gt;setup_arch()-&gt;prom_init():&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #ifdef CONFIG_NUMA
-</span><span class='line'>    build_node_cpu_map();
-</span><span class='line'>#endif
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;build_node_cpu_map()函数工作：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a) 确定CPU与Node的相互关系，做法很简单：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define cpu_to_node(cpu)       (cpu &gt;&gt; 5)
-</span><span class='line'>#define cpumask_of_node    (NODE_CPU_MASK(node)) /* node0:0~31; node1: 32~63 */
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;说明：XLP832每个节点有1个物理CPU，每个物理CPU有8个核，每个核有4个超线程，因此每个节点对应32个逻辑CPU，按节点依次展开。另外，实际物理存在的CPU数目是通过DTB传递给内核的；numa_node_id()可以获取当前CPU所处的Node号。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;b) 设置每个物理存在的节点的在线状态，具体是通过node_set_online()函数来设置全局变量&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;nodemask_t node_states[];&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这样，类似于CPU号，Node号也就具有如下功能宏：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>for_each_node(node);
-</span><span class='line'>for_each_online_node(node);
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;详细可参考include/linux/nodemask.h&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2.2 Node Distance确立&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;作用：建立buddy时用，可以依此来构建zonelist，以及zone relaim(zone_reclaim_mode)使用，详见后面的4.2.2节。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2.3 内存区域与Node的关系&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;start_kernel()-&gt;setup_arch()-&gt;arch_mem_init-&gt;bootmem_init()-&gt;nlm_numa_bootmem_init():&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;nlm_get_dram_mapping();&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;XLP832上电后的默认memory-mapped物理地址空间分布：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-30.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  其中PCIE配置空间映射地址范围为[0x1800_0000, 0x1BFF_FFFF]，由寄存器ECFG_BASE和ECFG_LIMIT指定(注：但这2个寄存器本身是处于PCIE配置空间之中的)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;PCIE配置空间：&lt;br/&gt;
-</span><span class='line'>  PCIE配置空间与memory-mapped物理地址的映射方式：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-31.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;XLP832实现了所有设备都位于虚拟总线0上，每个节点有8个设备，按节点依次排开。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;DRAM映射寄存器组：&lt;br/&gt;
-</span><span class='line'>  每个节点都独立实现有几组不同类型的DRAM(每组有8个相同类型的)寄存器可以配置DRAM空间映射到物理地址空间中的基址和大小，以及所属的节点信息(这些寄存器的值事先会由bootloader设好)；这组寄存器位于虚拟总线0的设备0/8/16/24(依次对应每个节点的第一个设备号)的Function0(每个设备最多可定义8个Function，每个Function有着独立的PCIE 4KB的配置空间)的PCIE配置空间中(这个配置空间实现的是DRAM/Bridge控制器)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本小节涉及到的3组不同类型的寄存器(注：按索引对应即DRAM_BAR&lt;n&gt;,DRAM_LIMIT&lt;n&gt;和 DRAM_NODE_TRANSLATION&lt;n&gt;描述一个内存区域属性)：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;第一组(DRAM空间映射物理空间基址)：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>DRAM_BAR0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x54
-</span><span class='line'>DRAM_BAR1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x55
-</span><span class='line'>DRAM_BAR2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x56
-</span><span class='line'>DRAM_BAR3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x57
-</span><span class='line'>DRAM_BAR4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x58
-</span><span class='line'>DRAM_BAR5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x59
-</span><span class='line'>DRAM_BAR6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5A
-</span><span class='line'>DRAM_BAR7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5B
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;第二组(DRAM空间映射物理空间长度)：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>DRAM_LIMIT0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5C
-</span><span class='line'>DRAM_LIMIT1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5D
-</span><span class='line'>DRAM_LIMIT2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5E
-</span><span class='line'>DRAM_LIMIT3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5F
-</span><span class='line'>DRAM_LIMIT4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x60
-</span><span class='line'>DRAM_LIMIT5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x61
-</span><span class='line'>DRAM_LIMIT6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x62
-</span><span class='line'>DRAM_LIMIT7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x63
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;第三组(节点相关)：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>DRAM_NODE_TRANSLATION0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x64
-</span><span class='line'>DRAM_NODE_TRANSLATION1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x65
-</span><span class='line'>DRAM_NODE_TRANSLATION2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x66
-</span><span class='line'>DRAM_NODE_TRANSLATION3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x67
-</span><span class='line'>DRAM_NODE_TRANSLATION4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x68
-</span><span class='line'>DRAM_NODE_TRANSLATION5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x69
-</span><span class='line'>DRAM_NODE_TRANSLATION6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6A
-</span><span class='line'>DRAM_NODE_TRANSLATION7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6B
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;根据上述的PCIE配置空间memory-mapped映射方式便可直接获取寄存器中的值，就可以建立各个节点中的所有内存区域(最多8个区域)信息。关于这些寄存器的使用可以参考“XLP® Processor Family Programming Reference Manual”的“Chapter 7 Memory and I/O Subsystem”。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;3 Bootmem初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;bootmem_init()-&gt;…-&gt;init_bootmem_node()-&gt;init_bootmem_core():&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-32.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;每个节点拥有各自的bootmem管理(code&amp;data之前可以为空闲页面)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;4 Buddy初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;初始化流程最后会设置全局struct node_active_region early_node_map[]用于初始化Buddy系统，for_each_online_node()遍历所有在线节点调用free_area_init_node()初始化，主要初始化每个zone的大小和所涉及页面的struct page结构(flags中初始化有所属zone和node信息，由set_page_links()函数设置)等。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;4.1 NUMA带来的变化&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) pglist_data
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>typedef struct pglist_data {
-</span><span class='line'>    struct zone node_zones[MAX_NR_ZONES];
-</span><span class='line'>    struct zonelist node_zonelists[MAX_ZONELISTS];
-</span><span class='line'>    int nr_zones;
-</span><span class='line'>    struct bootmem_data *bdata;
-</span><span class='line'>    unsigned long node_start_pfn;
-</span><span class='line'>    unsigned long node_present_pages; /* total number of physical pages */
-</span><span class='line'>    unsigned long node_spanned_pages; /* total size of physical pagerange, including holes */
-</span><span class='line'>    int node_id;
-</span><span class='line'>    wait_queue_head_t kswapd_wait;
-</span><span class='line'>    struct task_struct *kswapd;
-</span><span class='line'>    int kswapd_max_order;
-</span><span class='line'>} pg_data_t;
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a)上节的bootmem结构的描述信息存放在NODE_DATA(node)-&gt; bdata中；NODE_DATA(i)宏返回节点i的struct pglist_data结构，需要在架构相关的mmzone.h中实现；&lt;br/&gt;
-</span><span class='line'>b) #define MAX_ZONELISTS 2，请参考后面的“zonelist初始化”。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2) zone
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct zone {
-</span><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>    int node;
-</span><span class='line'>    /*
-</span><span class='line'>     * zone reclaim becomes active if more unmapped pages exist.
-</span><span class='line'>     */
-</span><span class='line'>    unsigned long        min_unmapped_pages;
-</span><span class='line'>    unsigned long        min_slab_pages;
-</span><span class='line'>    struct per_cpu_pageset   *pageset[NR_CPUS];
-</span><span class='line'>#else
-</span><span class='line'>    … …
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a)最终调用kmalloc_node()为pageset成员在每个CPU的对应的内存节点分配内存；&lt;br/&gt;
-</span><span class='line'>b)min_unmapped_pages 对应/proc/sys/vm/min_unmapped_ratio，默认值为1；&lt;br/&gt;
-</span><span class='line'>  min_slab_pages对应/proc/sys/vm/min_slab_ratio，默认值为5；&lt;br/&gt;
-</span><span class='line'>  作用：当剩余可回收的非文件映射和SLAB页面超过这2个值时，才激活当前zone回收；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;c) 增加了zone对应的节点号。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;4.2 zonelist初始化&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  本节讲述zonelist的构建方式，实现位于start_kernel()-&gt;build_all_zonelists()中，zonelist的组织方式非常关键(这一点与以前的2.6.21内核版本不一样，2.6.32组织得更清晰)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4.2.1 zonelist order&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;NUMA系统中存在多个节点，每个节点对应一个struct pglist_data结构，此结构中可以包含多个zone，如：ZONE_DMA, ZONE_NORMAL，这样就产生几种排列顺序，以2个节点2个zone为例(zone从高到低排列, ZONE_DMA0表示节点0的ZONE_DMA，其它类似)：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a) Legacy方式&lt;br/&gt;
-</span><span class='line'>&lt;img src="/images/kernel/2015-06-02-33.jpg" alt="" /&gt;&lt;br/&gt;
-</span><span class='line'>  每个节点只排列自己的zone；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;b)Node方式&lt;br/&gt;
-</span><span class='line'>&lt;img src="/images/kernel/2015-06-02-34.jpg" alt="" /&gt;&lt;br/&gt;
-</span><span class='line'>  按节点顺序依次排列，先排列本地节点的所有zone，再排列其它节点的所有zone。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;c) Zone方式&lt;br/&gt;
-</span><span class='line'>&lt;img src="/images/kernel/2015-06-02-35.jpg" alt="" /&gt;&lt;br/&gt;
-</span><span class='line'>  按zone类型从高到低依次排列各节点的同相类型zone。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;可通过启动参数“numa_zonelist_order”来配置zonelist order，内核定义了3种配置：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define ZONELIST_ORDER_DEFAULT  0 /* 智能选择Node或Zone方式 */
-</span><span class='line'>#define ZONELIST_ORDER_NODE     1 /* 对应Node方式 */
-</span><span class='line'>#define ZONELIST_ORDER_ZONE     2 /* 对应Zone方式 */
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;默认配置为ZONELIST_ORDER_DEFAULT，由内核通过一个算法来判断选择Node或Zone方式，算法思想：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a) alloc_pages()分配内存是按照ZONE从高到低的顺序进行的，例如上节“Node方式”的图示中，从ZONE_NORMAL0中分配内存时，ZONE_NORMAL0中无内存时将落入较低的ZONE_DMA0中分配，这样当ZONE_DMA0比较小的时候，很容易将ZONE_DMA0中的内存耗光，这样是很不理智的，因为还有更好的分配方式即从ZONE_NORMAL1中分配；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;b) 内核会检测各ZONE的页面数来选择Zone组织方式，当ZONE_DMA很小时，选择ZONELIST_ORDER_DEFAULT时，内核将倾向于选择ZONELIST_ORDER_ZONE方式，否则选择ZONELIST_ORDER_NODE方式。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，可以通过/proc/sys/vm/numa_zonelist_order动态改变zonelist order的分配方式。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4.2.2 Node Distance&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上节中的例子是以2个节点为例，如果有&gt;2个节点存在，就需要考虑不同节点间的距离来安排节点，例如以4个节点2个ZONE为例，各节点的布局(如4个XLP832物理CPU级联)值如下：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-36.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上图中，Node0和Node2的Node Distance为25，Node1和Node3的Node Distance为25，其它的Node Distance为15。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h6&gt;4.2.2.1 优先进行Zone Reclaim&lt;/h6&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，当Node Distance超过20的时候，内核会在某个zone分配内存不足的时候，提前激活本zone的内存回收工作，由全局变量zone_reclaim_mode控制，build_zonelists()中：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /*
-</span><span class='line'> * If another node is sufficiently far away then it is better
-</span><span class='line'> * to reclaim pages in a zone before going off node.
-</span><span class='line'> */
-</span><span class='line'>if (distance &gt; RECLAIM_DISTANCE)
-</span><span class='line'>    zone_reclaim_mode = 1;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;通过/proc/sys/vm/zone_reclaim_mode可以动态调整zone_reclaim_mode的值来控制回收模式，含义如下：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define RECLAIM_OFF    0
-</span><span class='line'>#define RECLAIM_ZONE  (1&lt;&lt;0)     /* Run shrink_inactive_list on the zone */
-</span><span class='line'>#define RECLAIM_WRITE (1&lt;&lt;1)     /* Writeout pages during reclaim */
-</span><span class='line'>#define RECLAIM_SWAP  (1&lt;&lt;2)     /* Swap pages out during reclaim */
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h6&gt;4.2.2.2 影响zonelist方式&lt;/h6&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;采用Node方式组织的zonelist为：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-37.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  即各节点按照与本节点的Node Distance距离大小来排序，以达到更优的内存分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4.2.3 zonelist[2]&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后，每个节点将关联2个zonelist：&lt;br/&gt;
-</span><span class='line'>  1) zonelist[0]中存放以Node方式或Zone方式组织的zonelist，包括所有节点的zone；&lt;br/&gt;
-</span><span class='line'>  2) zonelist[1]中只存放本节点的zone即Legacy方式；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;zonelist[1]用来实现仅从节点自身zone中的内存分配(参考&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标志)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;5 SLAB初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后对SLAB(本文不涉及SLOB或SLUB)的初始化影响不大，只是在分配一些变量采用类似Buddy系统的per_cpu_pageset(单面页缓存)在CPU本地节点进行内存分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;5.1 NUMA带来的变化&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct kmem_cache {
-</span><span class='line'>    struct array_cache *array[NR_CPUS];
-</span><span class='line'>    … …
-</span><span class='line'>    struct kmem_list3 *nodelists[MAX_NUMNODES];
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct kmem_list3 {
-</span><span class='line'>    … …
-</span><span class='line'>    struct array_cache *shared;    /* shared per node */
-</span><span class='line'>    struct array_cache **alien;    /* on other nodes */
-</span><span class='line'>    … …
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct slab {
-</span><span class='line'>    … …
-</span><span class='line'>    unsigned short nodeid;
-</span><span class='line'>    … …
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上面的4种类型的指针变量在SLAB初始化完毕后将改用kmalloc_node()分配的内存。具体实现请参考enable_cpucache()，此函数最终调用alloc_arraycache()和alloc_kmemlist()来分配这些变量代表的空间。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  nodelists[MAX_NUMNODES]存放的是所有节点对应的相关数据，本文称作SLAB节点。每个节点拥有各自的数据；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：有些非NUMA系统比如非连续内存系统可能根据不同的内存区域定义多个节点(实际上Node Distance都是0即物理内存访问速度相同)，所以这些变量并没有采用CONFIG_NUMA宏来控制，本文暂称为NUMA带来的变化。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;5.2 SLAB缓存&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后，SLAB将有三种类型的缓存：本地缓存(当前CPU的缓存)，共享缓存(节点内的缓存)和外部缓存(节点间的缓存)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB系统分配对象时，先从本地缓存中查找，如果本地缓存为空，则将共享缓存中的缓存搬运本地缓存中，重新从本地缓存中分配；如果共享缓存为空，则从SLAB中进行分配；如果SLAB中已经无空闲对象，则分配新的SLAB后重新分配本地缓存。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB系统释放对象时，先不归还给SLAB (简化分配流程，也可充分利用CPU Cache)，如果是同节点的SLAB对象先放入本地缓存中，如果本地缓存溢出(满)，则转移一部分(以batch为单位)至共享缓存中；如果是跨节点释放，则先放入外部缓存中，如果外部缓存溢出，则转移一部分至共享缓存中，以供后续分配时使用；如果共享缓存溢出，则调用free_block()函数释放溢出的缓存对象。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;关于这三种类型缓存的大小以及参数设置，不在本文的讨论范围。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本地缓存&lt;br/&gt;
-</span><span class='line'>  kmem_cache-&gt; array[] 中缓存每个CPU的SLAB cached objects；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;共享缓存&lt;br/&gt;
-</span><span class='line'>  kmem_list3[]-&gt;shared(如果存在shared缓存)中缓存与当前CPU同节点的所有CPU (如XLP832 NUMA系统中的Node0包含为CPU0~CPU31) 本地缓存溢出的缓存，详细实现请参考cache_flusharray()；另外，大对象SLAB不存在共享缓存。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;外部缓存&lt;br/&gt;
-</span><span class='line'>  kmem_list3[]-&gt;alien中存放其它节点的SLAB cached objects，当在某个节点上分配的SLAB 的object在另外一个节点上被释放的时候(即slab-&gt;nodeid与numa_node_id()当前节点不相等时)，将加入到对象所在节点的alien缓存中(如果不存在此alien缓存，此对象不会被缓存，而是直接释放给此对象所属SLAB)，否则加入本地缓存或共享缓存(本地缓存溢出且存在shared缓存时)；当alien缓存满的时候，会调用cache_free_alien()搬迁至shared缓存中(如果不存在shared缓存，直接释放给SLAB)；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;slab-&gt;nodeid记录本SLAB内存块(若干个页面)所在的节点。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;示例&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;例如2个节点，CPU0~31位于Node0，CPU32~CPU63位于Node1：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;64个(依次对应于CPU0~CPU63)本地缓存&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;array[0~31]:在Node0分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;array[32~63]:在Node1分配“array_cache结构+cached Objs指针”；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2个SLAB节点&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]:在Node0分配“kmem_list3结构”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]:在Node1分配“kmem_list3结构”；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB节点0(CPU0~CPU31)共享缓存和外部缓存alien[1]&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;shared:在Node0分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;alien:在Node0分配“节点数&lt;em&gt;sizeof(void&lt;/em&gt;)”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;alien[0]:置为NULL；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;alien[1]:在Node0分配“array_cache结构+cached Objs指针”；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB节点1(CPU32~CPU63)共享缓存和外部缓存alien[0]&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;shared:在Node1分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;alien:在Node1分配“节点数&lt;em&gt;sizeof(void&lt;/em&gt;)”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;alien[0]:在Node1分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;alien[1]:置为NULL；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，可以用内核启动参数“use_alien_caches”来控制是否开启alien缓存：默认值为1，当系统中的节点数目为1时，use_alien_caches初始化为0；use_alien_caches目的是用于某些多节点非连续内存(访问速度相同)的非NUMA系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;由上可见，随着节点个数的增加，SLAB明显会开销越来越多的缓存，这也是SLUB涎生的一个重要原因。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;5.3 __GFP_THISNODE&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB在某个节点创建新的SLAB时，都会置&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标记向Buddy系统提交页面申请，Buddy系统中看到此标记，选用申请节点的Legacy zonelist[1]，仅从申请节点的zone中分配内存，并且不会走内存不足流程，也不会重试或告警，这一点需要引起注意。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB在申请页面的时候会置GFP_THISNODE标记后调用cache_grow()来增长SLAB；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;GFP_THISNODE定义如下：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>#define GFP_THISNODE     (__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;6 调度初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后负载均衡会多一层NUMA调度域，根据需要在topology.h中定义，示例：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define SD_NODE_INIT (struct sched_domain) {                 \
-</span><span class='line'>    .parent             = NULL,                              \
-</span><span class='line'>    .child              = NULL,                              \
-</span><span class='line'>    .groups             = NULL,                              \
-</span><span class='line'>    .min_interval       = 8,                                 \
-</span><span class='line'>    .max_interval       = 32,                                \
-</span><span class='line'>    .busy_factor        = 32,                                \
-</span><span class='line'>    .imbalance_pct      = 125,                               \
-</span><span class='line'>    .cache_nice_tries   = 1,                                 \
-</span><span class='line'>    .flags              = SD_LOAD_BALANCE | SD_BALANCE_EXEC, \
-</span><span class='line'>    .last_balance       = jiffies,                           \
-</span><span class='line'>    .balance_interval   = 1,                                 \
-</span><span class='line'>    .nr_balance_failed  = 0,                                 \
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  顺便提一下，2.6.32对于实时任务不走负载均衡流程，采用了全局优先级调度的思想，保证实时任务的及时运行；这样的做法同时也解决了低版本内核在处理同一个逻辑CPU上相同最高优先级实时任务的负载均衡的时延。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;7 NUMA内存分配&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Zonelist[2]组织方式在NUMA内存分配过程中起着至关重要的作用，它决定了整个页面在不同节点间的申请顺序和流程。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;7.1显式分配&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;显式分配即指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages_node()和SLAB系统的kmem_cache_alloc_node()，其它的函数都可以从这2个派生出来。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;例如，kmalloc_node()最终调用kmem_cache_alloc_node()进行分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.1.1 Buddy显式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;alloc_pages_node(node, gfp_flags, order)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 如果node小于0，node取本地节点号(node = numa_node_id())；&lt;br/&gt;
-</span><span class='line'>  2) NODE_DATA(node)得到node对应的struct pglist_data结构，从而得到zonelist[2]；&lt;br/&gt;
-</span><span class='line'>  3) 如果gfp_flags含有&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标志，仅在此节点分配内存，使用node节点的Legacy zonelist[1]，否则使用其包含所有节点zone的zonelist[0] (见4.2.2.3节)；&lt;br/&gt;
-</span><span class='line'>  4) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如&lt;code&gt;__GFP_HIGHMEM&lt;/code&gt;表示最高的zone为ZONE_HIGH；&lt;br/&gt;
-</span><span class='line'>  5) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.1.2 SLAB显式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;kmem_cache_alloc_node(cachep, gfp_flags, node)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 如果node值为-1，node取本地节点号(node = numa_node_id())；&lt;br/&gt;
-</span><span class='line'>  2) 如果node &lt; -1，则执行fall back行为，此行为与用户策略有关，有点类似隐式分配：&lt;br/&gt;
-</span><span class='line'>a) 根据用户策略(包括CPUSET和内存策略)依次选取节点，根据gfp_flags选取合适的zonelist进行分配；&lt;br/&gt;
-</span><span class='line'>b) 如果内存不足分配失败，则跳过内存策略直接进行隐式Buddy页面分配(仍受CPUSET的限定，关于CPUSET和内存策略后面会介绍)，最终构建成新的SLAB并完成本次分配；转5)；&lt;br/&gt;
-</span><span class='line'>  3) 如果node是正常节点号，则先在node节点上根据gfp_flags选取合适的zonelist进行分配；&lt;br/&gt;
-</span><span class='line'>  4) 如果3)中node节点内存不足分配失败，转2) a)执行fall back行为。&lt;br/&gt;
-</span><span class='line'>  5) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：fall back行为指的是某个节点上内存不足时会落到此节点的zonelist[0]中定义的其它节点zone分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.1.3 设备驱动&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置CONFIG_NUMA后，设备会关联一个NUMA节点信息，struct device结构中会多一个numa_node字段记录本设备所在的节点，这个结构嵌套在各种类型的驱动中，如struct net_device结构。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct device {
-</span><span class='line'>    … …
-</span><span class='line'>    #ifdef CONFIG_NUMA
-</span><span class='line'>        int          numa_node;    /* NUMA node this device is close to */
-</span><span class='line'>    #endif
-</span><span class='line'>    … …
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;附&lt;code&gt;__netdev_alloc_skb()&lt;/code&gt;的实现：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
-</span><span class='line'>        unsigned int length, gfp_t gfp_mask)
-</span><span class='line'>{
-</span><span class='line'>    int node = dev-&gt;dev.parent ? dev_to_node(dev-&gt;dev.parent) : -1;
-</span><span class='line'>    struct sk_buff *skb;
-</span><span class='line'>
-</span><span class='line'>    skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, node);
-</span><span class='line'>    if (likely(skb)) {
-</span><span class='line'>        skb_reserve(skb, NET_SKB_PAD);
-</span><span class='line'>        skb-&gt;dev = dev;
-</span><span class='line'>    }
-</span><span class='line'>    return skb;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;code&gt;__alloc_skb()&lt;/code&gt;最终调用kmem_cache_alloc_node()和kmalloc_node()在此node上分配内存。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;7.2 隐式分配和内存策略&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;隐式分配即不指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages()和SLAB系统的kmem_cache_alloc()，其它的函数都可以从这2个派生出来。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;隐式分配涉及到NUMA内存策略(Memory Policy)，内核定义了四种内存策略。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：隐式分配还涉及到CPUSET，本文后面会介绍。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.2.1 内存策略&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核mm/mempolicy.c中实现了NUMA内存的四种内存分配策略：MPOL_DEFAULT, MPOL_PREFERRED, MPOL_INTERLEAVE和MPOL_BIND，内存策略会从父进程继承。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;MPOL_DEFAULT：使用本地节点的zonelist；&lt;br/&gt;
-</span><span class='line'>MPOL_PREFERRED：使用指定节点的zonelist；&lt;br/&gt;
-</span><span class='line'>MPOL_BIND： 设置一个节点集合，只能从这个集合中节点的zone申请内存：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  1)无&lt;code&gt;__GFP_THISNODE&lt;/code&gt;申请标记，使用本地节点的zonelist[0]；&lt;br/&gt;
-</span><span class='line'>  2)置有&lt;code&gt;__GFP_THISNODE&lt;/code&gt;申请标记，如果本地节点：&lt;br/&gt;
-</span><span class='line'>a)在集合中，使用本地节点的zonelist[1]；&lt;br/&gt;
-</span><span class='line'>b)不在集合中，使用集合中最小节点号的zonelist[1]；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;MPOL_INTERLEAVE：采用Round-Robin方式从设定的节点集合中选出某个节点，使用此节点的zonelist；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核实现的内存策略，用struct mempolicy结构来描述：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct mempolicy {
-</span><span class='line'>    atomic_t refcnt;
-</span><span class='line'>    unsigned short mode;              /* See MPOL_* above */
-</span><span class='line'>    unsigned short flags;             /* See set_mempolicy() MPOL_F_* above */
-</span><span class='line'>    union {
-</span><span class='line'>        short         preferred_node; /* preferred */
-</span><span class='line'>        nodemask_t    nodes;          /* interleave/bind */
-</span><span class='line'>        /* undefined for default */
-</span><span class='line'>    } v;
-</span><span class='line'>    union {
-</span><span class='line'>        nodemask_t cpuset_mems_allowed;     /* relative to these nodes */
-</span><span class='line'>        nodemask_t user_nodemask;           /* nodemask passed by user */
-</span><span class='line'>    } w;
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;成员mode表示使用四种分配策略中的哪一种，联合体v根据不同的分配策略记录相应的分配信息。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，MPOL_PREFERRED策略有一种特殊的模式，当其flags置上MPOL_F_LOCAL标志后，将等同于MPOL_DEFAULT策略，内核默认使用此种策略，见全局变量default_policy。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内存策略涉及的分配函数有2个：alloc_pages_current()和alloc_page_vma()，可以分别为不同任务以及任务的不同VMA设置内存策略。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.2.2 Buddy隐式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;以默认的NUMA内存策略为例讲解，alloc_pages(gfp_flags, order)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 得到本地节点对应的struct pglist_data结构，从而得到zonelist[2]；&lt;br/&gt;
-</span><span class='line'>  2) 如果gfp_flags含有&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标志，仅在此节点分配内存即使用本地节点的Legacy zonelist[1]，否则使用zonelist[0] (见4.2.2.3节)；&lt;br/&gt;
-</span><span class='line'>  3) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如&lt;code&gt;__GFP_HIGHMEM&lt;/code&gt;表示最高的zone为ZONE_HIGH；&lt;br/&gt;
-</span><span class='line'>  4) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.2.3 SLAB隐式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;以默认的NUMA内存策略为例讲解，kmem_cache_alloc(cachep, gfp_flags)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 调用&lt;code&gt;____cache_alloc()&lt;/code&gt;函数在本地节点local_node分配，此函数无fall back行为；&lt;br/&gt;
-</span><span class='line'>  2) 如果1)中本地节点内存不足分配失败，调用&lt;code&gt;____cache_alloc_node&lt;/code&gt;(cachep, gfp_flags,local_node)再次尝试在本地节点分配，如果还失败此函数会进行fall back行为；&lt;br/&gt;
-</span><span class='line'>  3) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;7.3 小结&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上文提到的所有的内存分配函数都允许fall back行为，但有2种情况例外：&lt;br/&gt;
-</span><span class='line'>  1) &lt;code&gt;__GFP_THISNODE&lt;/code&gt;分配标记限制了只能从某一个节点上分配内存；&lt;br/&gt;
-</span><span class='line'>  2) MPOL_BIND策略，限制了只能从一个节点集合中的节点上分配内存；&lt;br/&gt;
-</span><span class='line'>   (gfp_zone(gfp_flags) &lt; policy_zone的情况，MPOL_BIND不限制节点)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：还有一种情况，CPUSET限制的内存策略，后面会介绍。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;8 CPUSET&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPUSET基于CGROUP的框架构建的子系统，有如下特点：&lt;br/&gt;
-</span><span class='line'>  1) 限定一组任务所允许使用的内存Node和CPU资源；&lt;br/&gt;
-</span><span class='line'>  2) CPUSET在内核各子系统中添加的检测代码很少，对内核没有性能影响；&lt;br/&gt;
-</span><span class='line'>  3) CPUSET的限定优先级高于内存策略(针对于Node)和绑定(针对于CPU)；&lt;br/&gt;
-</span><span class='line'>  4) 没有额外实现系统调用接口，只能通过/proc文件系统和用户交互。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本节只讲述CPUSET的使用方法和说明。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.1 创建CPUSET&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;因为CPUSET只能使用/proc文件系统访问，所以第一步就要先mount cpuset文件系统，配置CONFIG_CGROUPS和CONFIG_CPUSETS后/proc/filesystems中将有这个文件系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPUSET是分层次的，可以在cpuset文件系统根目录是最顶层的CPUSET，可以在其下创建CPUSET子项，创建方式很简单即创建一个新的目录。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;mount命令：mount nodev –t cpuset /your_dir或mount nodev –t cgroup –o cpuset /your_dir&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Mount成功后，进入mount目录，这个就是最顶层的CPUSET了(top_cpuset)，下面附一个演示例子：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-38.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.2 CPUSET文件&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;介绍几个重要的CPUSET文件：&lt;br/&gt;
-</span><span class='line'>1) tasks，实际上是CGROUPS文件，为此CPUSET包含的线程pid集合；&lt;br/&gt;
-</span><span class='line'>  echo 100 &gt; tasks&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2) cgroup.procs是CGROUPS文件，为此CPUSET包含的线程组tgid集合；&lt;br/&gt;
-</span><span class='line'>  echo 100 &gt; cgroup.procs&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;3) cpus是CPUSET文件，表示此CPUSET允许的CPU；&lt;br/&gt;
-</span><span class='line'>  echo 0-8 &gt; cpus&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;4) mems是CPUSET文件，表示此CPUSET允许的内存节点；
-</span><span class='line'>  echo 0-1 &gt; mems  (对应于struct task_struct中的mems_allowed字段)&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;5) sched_load_balance，为CPUSET文件，设置cpus集合的CPU是否参与负载均衡；
-</span><span class='line'>  echo 0 &gt; sched_load_balance (禁止负载均衡)；默认值为1表示开启负载均衡；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;6) sched_relax_domain_level，为CPUSET文件，数值代表某个调度域级别，大于此级别的调度域层次将禁用闲时均衡和唤醒均衡，而其余级别的调度域都开启；
-</span><span class='line'>也可以通过启动参数“relax_domain_level”设置，其值含义：&lt;br/&gt;
-</span><span class='line'>  -1 : 无效果，此为默认值&lt;br/&gt;
-</span><span class='line'>   0 - 设置此值会禁用所有调度域的闲时均衡和唤醒均衡&lt;br/&gt;
-</span><span class='line'>   1 - 超线程域&lt;br/&gt;
-</span><span class='line'>   2 - 核域&lt;br/&gt;
-</span><span class='line'>   3 - 物理域&lt;br/&gt;
-</span><span class='line'>   4 - NUMA域&lt;br/&gt;
-</span><span class='line'>   5 - ALLNODES模式的NUMA域&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;7) mem_exclusive和mem_hardwall，为CPUSET文件，表示内存硬墙标记；默认为0，表示软墙；有关CPUSET的内存硬墙(HardWall)和内存软墙(SoftWall)，下文会介绍；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;8) memory_spread_page和memory_spread_slab，为CPUSET文件，设定CPUSET中的任务PageCache和SLAB(创建时置有SLAB_MEM_SPREAD)以Round-Robin方式使用内存节点(类似于MPOL_INTERLEAVE)；默认为0，表示未开启；struct task_struct结构中增加成员cpuset_mem_spread_rotor记录下次使用的节点号；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;9) memory_migrate，为CPUSET文件，表明开启此CPUSET的内存迁移，默认为0；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  当一个任务从一个CPUSET1(mems值为0)迁移至另一个CPUSET2(mems值为1)的时候，此任务在节点0上分配的页面内容将迁移至节点1上分配新的页面(将数据同步到新页面)，这样就避免了此任务的非本地节点的内存访问。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-39.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上图为单Node，8个CPU的系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) 顶层CPUSET包含了系统中的所有CPU以及Node，而且是只读的，不能更改；&lt;br/&gt;
-</span><span class='line'>2) 顶层CPUSET包含了系统中的所有任务，可以更改；&lt;br/&gt;
-</span><span class='line'>3) child为新创建的子CPUSET，子CPUSET的资源不能超过父CPUSET的资源；&lt;br/&gt;
-</span><span class='line'>4) 新创建的CPUSET的mems和cpus都是空的，使用前必须先初始化；&lt;br/&gt;
-</span><span class='line'>5) 添加任务：设置tasks和cgroup.procs文件；&lt;br/&gt;
-</span><span class='line'>6) 删除任务：将任务重新添加至其它CPUSET(如顶层)就可以从本CPUSET删除任务。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.3 利用CPUSET限定CPU和Node&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;设置步骤：&lt;br/&gt;
-</span><span class='line'>1) 在某个父CPUSET中创建子CPUSET；&lt;br/&gt;
-</span><span class='line'>2) 在子CPUSET目录下，输入指定的Node号至mems文件；&lt;br/&gt;
-</span><span class='line'>3) 在子CPUSET目录下，输入指定的Node号至mems文件；&lt;br/&gt;
-</span><span class='line'>4) 在子CPUSET目录下，设定任务至tasks或group.procs文件；&lt;br/&gt;
-</span><span class='line'>5) 还可以设置memory_migrate为1，激活内存页面的迁移功能。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这样限定后，此CPUSET中所有的任务都将使用限定的CPU和Node，但毕竟系统中的任务并不能完全孤立，比如还是可能会全局共享Page Cache，动态库等资源，因此内核在某些情况下还是可以允许打破这个限制，如果不允许内核打破这个限制，需要设定CPUSET的内存硬墙标志即mem_exclusive或mem_hardwall置1即可；CPUSET默认是软墙。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;硬软墙用于Buddy系统的页面分配，优先级高于内存策略，请参考内核函数：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;cpuset_zone_allowed_hardwall()和cpuset_zone_allowed_softwall()&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，当内核分不到内存将导致Oops的时候，CPUSET所有规则将被打破，毕竟一个系统的正常运行才是最重要的：&lt;br/&gt;
-</span><span class='line'>  1) &lt;code&gt;__GFP_THISNODE&lt;/code&gt;标记分配内存的时候(通常是SLAB系统)；&lt;br/&gt;
-</span><span class='line'>  2) 中断中分配内存的时候；&lt;br/&gt;
-</span><span class='line'>  3) 任务置有TIF_MEMDIE标记即被内核OOM杀死的任务。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.4 利用CPUSET动态改变调度域结构&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;利用sched_load_balance文件可以禁用掉某些CPU的负载均衡，同时重新构建调度域，此功能类似启动参数“isolcpus”的功能。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;8个CPU的系统中，系统中存在一个物理域，现需要禁掉CPU4~CPU7的负载均衡，配置步骤为：&lt;br/&gt;
-</span><span class='line'>  1) “mkdir child”在顶层CPUSET中创建子CPUSET，记为child；&lt;br/&gt;
-</span><span class='line'>  2) “echo 0-3 &gt; child/cpus ”(新建CPUSET的sched_load_balance默认是是打开的)；&lt;br/&gt;
-</span><span class='line'>  3) “echo 0 &gt; sched_load_balance”关闭顶层CPUSET的负载均衡。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;操作过程见下图：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-40.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;由图可见，CPU4~CPU7的调度域已经不存在了，具体效果是将CPU4~CPU7从负载均衡中隔离出来。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;9 NUMA杂项&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) /sys/devices/system/node/中记录有系统中的所有内存节点信息；&lt;br/&gt;
-</span><span class='line'>2)任务额外关联一个/proc/&lt;tid&gt;/numa_smaps文件信息；&lt;br/&gt;
-</span><span class='line'>3) tmpfs可以指定在某个Node上创建；&lt;br/&gt;
-</span><span class='line'>4) libnuma库和其numactl小工具可以方便操作NUMA内存；&lt;br/&gt;
-</span><span class='line'>5) … …&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;10 参考资料&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;ol&gt;
-</span><span class='line'>&lt;li&gt;www.kernel.org&lt;/li&gt;
-</span><span class='line'>&lt;li&gt;ULK3&lt;/li&gt;
-</span><span class='line'>&lt;li&gt;XLP® Processor Family Programming Reference Manual&lt;/li&gt;
-</span><span class='line'>&lt;/ol&gt;
-</span><span class='line'>
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux内存管理]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-06-02T15:05:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/myarrow/article/details/8624687"&gt;http://blog.csdn.net/myarrow/article/details/8624687&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.csdn.net/myarrow/article/details/8682819"&gt;http://blog.csdn.net/myarrow/article/details/8682819&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;1. Linux物理内存三级架构&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-20.png" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;对于内存管理，Linux采用了与具体体系架构不相关的设计模型，实现了良好的可伸缩性。它主要由内存节点node、内存区域zone和物理页框page三级架构组成。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;内存节点node&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  内存节点node是计算机系统中对物理内存的一种描述方法，一个总线主设备访问位于同一个节点中的任意内存单元所花的代价相同，而访问任意两个不同节点中的内存单元所花的代价不同。在一致存储结构(Uniform Memory Architecture，简称UMA)计算机系统中只有一个节点，而在非一致性存储结构(NUMA)计算机系统中有多个节点。Linux内核中使用数据结构pg_data_t来表示内存节点node。如常用的ARM架构为UMA架构。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;内存区域zone&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  内存区域位于同一个内存节点之内，由于各种原因它们的用途和使用方法并不一样。如基于IA32体系结构的个人计算机系统中，由于历史原因使得ISA设备只能使用最低16MB来进行DMA传输。又如，由于Linux内核采用&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt; • 物理页框page&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2. Linux虚拟内存三级页表&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Linux虚拟内存三级管理由以下三级组成：&lt;br/&gt;
-</span><span class='line'> • PGD: Page Global Directory (页目录)&lt;br/&gt;
-</span><span class='line'> • PMD: Page Middle Directory (页目录)&lt;br/&gt;
-</span><span class='line'> • PTE:  Page Table Entry     (页表项)&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;每一级有以下三个关键描述宏：&lt;br/&gt;
-</span><span class='line'> • SHIFT&lt;br/&gt;
-</span><span class='line'> • SIZE&lt;br/&gt;
-</span><span class='line'> • MASK&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;如页的对应描述为：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>/* PAGE_SHIFT determines the page size  asm/page.h */  
-</span><span class='line'>#define PAGE_SHIFT      12  
-</span><span class='line'>#define PAGE_SIZE       (_AC(1,UL) &lt;&lt; PAGE_SHIFT)  
-</span><span class='line'>#define PAGE_MASK       (~(PAGE_SIZE-1))  
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;数据结构定义如下：</span></code></pre></td></tr></table></div></figure>
-    /<em> asm/page.h </em>/<br/>
-    typedef unsigned long pteval_t;</p>
+```
+    static int__init early_vmalloc(char <em>arg)
+    {
+        /</em>cmdline中的vmalloc会被解析到vmlloc_reserve中。*/
+        unsigned long vmalloc_reserve = memparse(arg, NULL);</p>
 
-<pre><code>typedef pteval_t pte_t;  
-typedef unsigned long pmd_t;  
-typedef unsigned long pgd_t[2];  
-typedef unsigned long pgprot_t;  
+<pre><code>    /*小于16M则用16M。*/
+    if (vmalloc_reserve &lt; SZ_16M) {
+        vmalloc_reserve = SZ_16M;
+        printk(KERN_WARNING
+                "vmalloc area too small, limiting to %luMB\n",
+                vmalloc_reserve &gt;&gt; 20);
+    }
 
-#define pte_val(x)      (x)  
-#define pmd_val(x)      (x)  
-#define pgd_val(x)  ((x)[0])  
-#define pgprot_val(x)   (x)  
+    /*大于可用虚拟地址内存则使用可用地址部分再减去32M。*/
+    if (vmalloc_reserve &gt; VMALLOC_END - (PAGE_OFFSET + SZ_32M)) {
+        vmalloc_reserve = VMALLOC_END - (PAGE_OFFSET + SZ_32M);
+        printk(KERN_WARNING
+                "vmalloc area is too big, limiting to %luMB\n",
+                vmalloc_reserve &gt;&gt; 20);
+    }
 
-#define __pte(x)        (x)  
-#define __pmd(x)        (x)  
-#define __pgprot(x)     (x)  
-</code></pre>
-
-<pre><code>
-##### 2.1 Page Directory (PGD and PMD)
-
-  每个进程有它自己的PGD( Page Global Directory)，它是一个物理页，并包含一个pgd_t数组。其定义见&lt;asm/page.h&gt;。 进程的pgd_t数据见 task_struct -&gt; mm_struct -&gt; pgd_t * pgd;    
-
-  ARM架构的PGD和PMD的定义如下&lt;arch/arm/include/asm/pgtable.h&gt;：
-</code></pre>
-
-<pre><code>#define PTRS_PER_PTE  512    // PTE中可包含的指针&lt;u32&gt;数 (21-12=9bit)  
-#define PTRS_PER_PMD  1  
-#define PTRS_PER_PGD  2048   // PGD中可包含的指针&lt;u32&gt;数 (32-21=11bit)&lt;/p&gt;&lt;p&gt;#define PTE_HWTABLE_PTRS (PTRS_PER_PTE)  
-#define PTE_HWTABLE_OFF  (PTE_HWTABLE_PTRS * sizeof(pte_t))  
-#define PTE_HWTABLE_SIZE (PTRS_PER_PTE * sizeof(u32))
-/*  
- * PMD_SHIFT determines the size of the area a second-level page table can map  
- * PGDIR_SHIFT determines what a third-level page table entry can map  
- */  
-#define PMD_SHIFT  21  
-#define PGDIR_SHIFT  21
-</code></pre>
-
-<pre><code>
-虚拟地址SHIFT宏图：
-
-![](/images/kernel/2015-06-02-21.png)  
-
-虚拟地址MASK和SIZE宏图：
-
-![](/images/kernel/2015-06-02-22.png)  
-
-
-##### 2.2 Page Table Entry
-
-PTEs, PMDs和PGDs分别由pte_t, pmd_t 和pgd_t来描述。为了存储保护位，pgprot_t被定义，它拥有相关的flags并经常被存储在page table entry低位(lower bits)，其具体的存储方式依赖于CPU架构。
-
-每个pte_t指向一个物理页的地址，并且所有的地址都是页对齐的。因此在32位地址中有PAGE_SHIFT(12)位是空闲的，它可以为PTE的状态位。
-
-PTE的保护和状态位如下图所示：
-
-![](/images/kernel/2015-06-02-23.png)  
-
-##### 2.3 如何通过3级页表访问物理内存
-为了通过PGD、PMD和PTE访问物理内存，其相关宏在asm/pgtable.h中定义。
-
-• pgd_offset 
-
-根据当前虚拟地址和当前进程的mm_struct获取pgd项的宏定义如下： 
-</code></pre>
-
-<pre><code>/* to find an entry in a page-table-directory */  
-#define pgd_index(addr)     ((addr) &gt;&gt; PGDIR_SHIFT)  //获得在pgd表中的索引  
-
-#define pgd_offset(mm, addr)    ((mm)-&gt;pgd + pgd_index(addr)) //获得pmd表的起始地址  
-
-/* to find an entry in a kernel page-table-directory */  
-#define pgd_offset_k(addr)  pgd_offset(&amp;init_mm, addr)  
-</code></pre>
-
-<pre><code>
-• pmd_offset
-
-根据通过pgd_offset获取的pgd 项和虚拟地址，获取相关的pmd项(即pte表的起始地址) 
-</code></pre>
-
-<pre><code>/* Find an entry in the second-level page table.. */  
-#define pmd_offset(dir, addr)   ((pmd_t *)(dir))   //即为pgd项的值  
-</code></pre>
-
-<pre><code>
-• pte_offset
-
-  根据通过pmd_offset获取的pmd项和虚拟地址，获取相关的pte项(即物理页的起始地址)
-</code></pre>
-
-<pre><code>#ifndef CONFIG_HIGHPTE  
-#define __pte_map(pmd)      pmd_page_vaddr(*(pmd))  
-#define __pte_unmap(pte)    do { } while (0)  
-#else  
-#define __pte_map(pmd)      (pte_t *)kmap_atomic(pmd_page(*(pmd)))  
-#define __pte_unmap(pte)    kunmap_atomic(pte)  
-#endif  
-
-#define pte_index(addr)     (((addr) &gt;&gt; PAGE_SHIFT) &amp; (PTRS_PER_PTE - 1))  
-
-#define pte_offset_kernel(pmd,addr) (pmd_page_vaddr(*(pmd)) + pte_index(addr))  
-
-#define pte_offset_map(pmd,addr)    (__pte_map(pmd) + pte_index(addr))  
-#define pte_unmap(pte)          __pte_unmap(pte)  
-
-#define pte_pfn(pte)        (pte_val(pte) &gt;&gt; PAGE_SHIFT)  
-#define pfn_pte(pfn,prot)   __pte(__pfn_to_phys(pfn) | pgprot_val(prot))  
-
-#define pte_page(pte)       pfn_to_page(pte_pfn(pte))  
-#define mk_pte(page,prot)   pfn_pte(page_to_pfn(page), prot)  
-
-#define set_pte_ext(ptep,pte,ext) cpu_set_pte_ext(ptep,pte,ext)  
-#define pte_clear(mm,addr,ptep) set_pte_ext(ptep, __pte(0), 0)  
-</code></pre>
-
-<pre><code>其示意图如下图所示：
-
-![](/images/kernel/2015-06-02-24.png)  
-
-##### 2.4 根据虚拟地址获取物理页的示例代码
-
-  根据虚拟地址获取物理页的示例代码详见&lt;mm/memory.c中的函数follow_page&gt;。
-</code></pre>
-
-<pre><code>/** 
- * follow_page - look up a page descriptor from a user-virtual address 
- * @vma: vm_area_struct mapping @address 
- * @address: virtual address to look up 
- * @flags: flags modifying lookup behaviour 
- * 
- * @flags can have FOLL_ flags set, defined in &lt;linux/mm.h&gt; 
- * 
- * Returns the mapped (struct page *), %NULL if no mapping exists, or 
- * an error pointer if there is a mapping to something not represented 
- * by a page descriptor (see also vm_normal_page()). 
- */  
-struct page *follow_page(struct vm_area_struct *vma, unsigned long address,  
-            unsigned int flags)  
-{  
-    pgd_t *pgd;  
-    pud_t *pud;  
-    pmd_t *pmd;  
-    pte_t *ptep, pte;  
-    spinlock_t *ptl;  
-    struct page *page;  
-    struct mm_struct *mm = vma-&gt;vm_mm;  
-
-    page = follow_huge_addr(mm, address, flags &amp; FOLL_WRITE);  
-    if (!IS_ERR(page)) {  
-        BUG_ON(flags &amp; FOLL_GET);  
-        goto out;  
-    }  
-
-    page = NULL;  
-    pgd = pgd_offset(mm, address);  
-    if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))  
-        goto no_page_table;  
-
-    pud = pud_offset(pgd, address);  
-    if (pud_none(*pud))  
-        goto no_page_table;  
-    if (pud_huge(*pud) &amp;&amp; vma-&gt;vm_flags &amp; VM_HUGETLB) {  
-        BUG_ON(flags &amp; FOLL_GET);  
-        page = follow_huge_pud(mm, address, pud, flags &amp; FOLL_WRITE);  
-        goto out;  
-    }  
-    if (unlikely(pud_bad(*pud)))  
-        goto no_page_table;  
-
-    pmd = pmd_offset(pud, address);  
-    if (pmd_none(*pmd))  
-        goto no_page_table;  
-    if (pmd_huge(*pmd) &amp;&amp; vma-&gt;vm_flags &amp; VM_HUGETLB) {  
-        BUG_ON(flags &amp; FOLL_GET);  
-        page = follow_huge_pmd(mm, address, pmd, flags &amp; FOLL_WRITE);  
-        goto out;  
-    }  
-    if (pmd_trans_huge(*pmd)) {  
-        if (flags &amp; FOLL_SPLIT) {  
-            split_huge_page_pmd(mm, pmd);  
-            goto split_fallthrough;  
-        }  
-        spin_lock(&amp;mm-&gt;page_table_lock);  
-        if (likely(pmd_trans_huge(*pmd))) {  
-            if (unlikely(pmd_trans_splitting(*pmd))) {  
-                spin_unlock(&amp;mm-&gt;page_table_lock);  
-                wait_split_huge_page(vma-&gt;anon_vma, pmd);  
-            } else {  
-                page = follow_trans_huge_pmd(mm, address,  
-                                 pmd, flags);  
-                spin_unlock(&amp;mm-&gt;page_table_lock);  
-                goto out;  
-            }  
-        } else  
-            spin_unlock(&amp;mm-&gt;page_table_lock);  
-        /* fall through */  
-    }  
-split_fallthrough:  
-    if (unlikely(pmd_bad(*pmd)))  
-        goto no_page_table;  
-
-    ptep = pte_offset_map_lock(mm, pmd, address, &amp;ptl);  
-
-    pte = *ptep;  
-    if (!pte_present(pte))  
-        goto no_page;  
-    if ((flags &amp; FOLL_WRITE) &amp;&amp; !pte_write(pte))  
-        goto unlock;  
-
-    page = vm_normal_page(vma, address, pte);  
-    if (unlikely(!page)) {  
-        if ((flags &amp; FOLL_DUMP) ||  
-            !is_zero_pfn(pte_pfn(pte)))  
-            goto bad_page;  
-        page = pte_page(pte);  
-    }  
-
-    if (flags &amp; FOLL_GET)  
-        get_page(page);  
-    if (flags &amp; FOLL_TOUCH) {  
-        if ((flags &amp; FOLL_WRITE) &amp;&amp;  
-            !pte_dirty(pte) &amp;&amp; !PageDirty(page))  
-            set_page_dirty(page);  
-        /* 
-         * pte_mkyoung() would be more correct here, but atomic care 
-         * is needed to avoid losing the dirty bit: it is easier to use 
-         * mark_page_accessed(). 
-         */  
-        mark_page_accessed(page);  
-    }  
-    if ((flags &amp; FOLL_MLOCK) &amp;&amp; (vma-&gt;vm_flags &amp; VM_LOCKED)) {  
-        /* 
-         * The preliminary mapping check is mainly to avoid the 
-         * pointless overhead of lock_page on the ZERO_PAGE 
-         * which might bounce very badly if there is contention. 
-         * 
-         * If the page is already locked, we don't need to 
-         * handle it now - vmscan will handle it later if and 
-         * when it attempts to reclaim the page. 
-         */  
-        if (page-&gt;mapping &amp;&amp; trylock_page(page)) {  
-            lru_add_drain();  /* push cached pages to LRU */  
-            /* 
-             * Because we lock page here and migration is 
-             * blocked by the pte's page reference, we need 
-             * only check for file-cache page truncation. 
-             */  
-            if (page-&gt;mapping)  
-                mlock_vma_page(page);  
-            unlock_page(page);  
-        }  
-    }  
-unlock:  
-    pte_unmap_unlock(ptep, ptl);  
-out:  
-    return page;  
-
-bad_page:  
-    pte_unmap_unlock(ptep, ptl);  
-    return ERR_PTR(-EFAULT);  
-
-no_page:  
-    pte_unmap_unlock(ptep, ptl);  
-    if (!pte_none(pte))  
-        return page;  
-
-no_page_table:  
-    /* 
-     * When core dumping an enormous anonymous area that nobody 
-     * has touched so far, we don't want to allocate unnecessary pages or 
-     * page tables.  Return error instead of NULL to skip handle_mm_fault, 
-     * then get_dump_page() will return NULL to leave a hole in the dump. 
-     * But we can only make this optimization where a hole would surely 
-     * be zero-filled if handle_mm_fault() actually did handle it. 
-     */  
-    if ((flags &amp; FOLL_DUMP) &amp;&amp;  
-        (!vma-&gt;vm_ops || !vma-&gt;vm_ops-&gt;fault))  
-        return ERR_PTR(-EFAULT);  
-    return page;  
+    /*计算偏移起始地址。*/
+    vmalloc_min = (void *)(VMALLOC_END - vmalloc_reserve);
+    return 0;
 }
+early_param("vmalloc",early_vmalloc);
 </code></pre>
 
 <pre><code>
--------------
+vmalloc_min会影响arm_lowmem_limit,arm_lowmem_limit其实就是high_memory。因为此过程不是我们要分析的重点，如果有兴趣可分析kernel/arch/arm/mm/mmu.c中的sanity_check_meminfo()函数。
 
-#### 1. First Fit分配器
+所以，VMALLOC_START受到了hight_memory的影响而发生了变化，最终使得vmalloc size也变化了！
 
-  First Fit分配器是最基本的内存分配器，它使用bitmap而不是空闲块列表来表示内存。在bitmap中，如果page对应位为1，则表示此page已经被分配，为0则表示此page没有被分配。为了分配小于一个page的内存块，First Fit分配器记录了最后被分配的PFN (Page Frame Number)和分配的结束地址在页内的偏移量。随后小的内存分配被Merge到一起并存储到同一页中。
+##### 2. 开机默认分配：
 
-  First Fit分配器不会造成严重的内存碎片，但其效率较低，由于内存经常通过线性地址进行search，而First Fit中的小块内存经常在物理内存的开始处，为了分配大块内存而不得不扫描前面大量的内存。
-
-#### 2. Boot Memory分配器
-
-  物理内存分配器如何分配内存来初始化其自己呢？
-
-  答案是：通过Boot Memory分配器来实现，而Boot Memory分配器则通过最基本的First Fit分配器来实现。
-
-##### 2.1 Boot Map定义 
-
-  Boot Map通过数据结构bootmem_data来定义，详见&lt;linux/bootmem.h&gt;，其定义如下所示： 
+File: kernel/arch/arm/mm/mmu.c
 </code></pre>
 
-<pre><code>typedef struct bootmem_data {  
-    unsigned long node_boot_start; // 描述的物理内存的起始地址  
-    unsigned long node_low_pfn;    // 结束物理地址，即ZONE_NORMAL的结束  
-    void *node_bootmem_map;        // 描述“使用或空闲的位图”的地址  
-    unsigned long last_offset;     // 最后被分配的页内偏移量，即在llast_pos描述的物理页中，  
-                                 // 从last_offset开始，没有被分配   
-    unsigned long last_pos;        // 最后被分配的页的PFN  
-} bootmem_data_t;  
+<pre><code>static void * __initdata vmalloc_min =
+    (void *)(VMALLOC_END - (240 &lt;&lt; 20) - VMALLOC_OFFSET);
 </code></pre>
 
 <pre><code>
-所有bootmem_data被放于全局变量bdata_list中。
+当cmdline无vmalloc参数传进来的时候，early_vmalloc()函数也不会调用到，vmalloc_min的值就会被默认传进来了，默认是240M。
 
-##### 2.2 Boot Memory分配器初始化
+后面的步骤和方法1一样了！
 
-  每一个CPU架构被要求提供setup_arch函数，它负责获取初始化boot memory分配器的必要参数。不同的CPU架构通过不同的函数来实现，如ARM通过bootmem_init来实现。它负责获取以下参数：
+开机log有memory layout 信息：
 </code></pre>
 
-<pre><code>• min_low_pfn： 系统中可获得的最小的PFN，装载kernel image结束之后的第一页，在mm/bootmem.c中定义
-• max_low_pfn：低端内存(ZONE_NORMAL)中可获得的最大PFN
-• highstart_pfn：高端内存(ZONE_HIGHMEM)的起始PFN
-• highend_pfn：高端内存(ZONE_HIGHMEM)的结束PFN
-• max_pfn：系统中可获得的最大的PFN， 在mm/bootmem.c中定义
-</code></pre>
-
-<pre><code>
-PFN是在物理内存map的偏移量，以page为单位。Kernel可直接访问ZONE_NORMAL，其偏移量为：PAGE_OFFSET。
-
-通过以上5个参数明确了可用物理内存之后，调用init_bootmem-&gt;init_bootmem_core来初始化contig_page_data。它主要完成以下两件事：  
-  1) 将把与此node对应pgdat_data_t插入到pgdat_list中  
-  2) 初始化bootmem_data_t的中参数，并分配表示页分配状态的bitmap，其大小为: (end_pfn-start_pfn+7)/8  
-
-bitmap的物理地址为：bootmem_data_t-&gt;node_boot_start  
-bitmap的虚拟地直为：bootmem_data_t-&gt;node_bootmem_map  
-
-##### 2.3 分配内存
- • reserve_bootmem：用于预留物理页面。但用于通用的内存分配是低率的，它主要用于各种驱动(如：Video Codec)预留内存。
-
-常用的内存分配函数如下(in UMA架构，我们常的ARM架构为UMA架构)：
-</code></pre>
-
-<pre><code>• alloc_bootmem
-• alloc_bootmem_low
-• alloc_bootmem_pages
-• alloc_bootmem_low_pages
-</code></pre>
-
-<pre><code>
-其调用关系如下图所示：
-
-###### 2.3.1 `__alloc_bootmem`
-
-`__alloc_bootmem()` 需要以下参数：  
- • pgdat 用于分配内存块的节点，在UMA架构中，它被忽略，因为它总是为：contig_page_data  
- • size  指定请求分配的内存大小，以字节为单位  
- • align 请求以多少字节对齐，地于小块内存分配，一般以SMP_CACHE_BYTES对齐，如在X86上，与L1硬件cache对齐  
- • goal  偏好的分配内存的起始地址,  
-
-###### 2.3.2 __alloc_bootmem_core
-
-它从goal指定的地址开始，线性地扫描内存，以寻找可以满足内存分配要求的内存块。它的另外一项功能是决定是否需要把新分配的内存块与以前已经分配的内存块merge到一起。
-
-分配内存常用函数定义如下： 
-</code></pre>
-
-<pre><code>#ifdef CONFIG_NO_BOOTMEM  
-/* We are using top down, so it is safe to use 0 here */  
-#define BOOTMEM_LOW_LIMIT 0  
-#else  
-#define BOOTMEM_LOW_LIMIT __pa(MAX_DMA_ADDRESS)  
-#endif  
-
-#define alloc_bootmem(x) \  
-    __alloc_bootmem(x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_align(x, align) \  
-    __alloc_bootmem(x, align, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_nopanic(x) \  
-    __alloc_bootmem_nopanic(x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages(x) \  
-    __alloc_bootmem(x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages_nopanic(x) \  
-    __alloc_bootmem_nopanic(x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_node(pgdat, x) \  
-    __alloc_bootmem_node(pgdat, x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_node_nopanic(pgdat, x) \  
-    __alloc_bootmem_node_nopanic(pgdat, x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages_node(pgdat, x) \  
-    __alloc_bootmem_node(pgdat, x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages_node_nopanic(pgdat, x) \  
-    __alloc_bootmem_node_nopanic(pgdat, x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-
-#define alloc_bootmem_low(x) \  
-    __alloc_bootmem_low(x, SMP_CACHE_BYTES, 0)  
-#define alloc_bootmem_low_pages(x) \  
-    __alloc_bootmem_low(x, PAGE_SIZE, 0)  
-#define alloc_bootmem_low_pages_node(pgdat, x) \  
-    __alloc_bootmem_low_node(pgdat, x, PAGE_SIZE, 0)  
-</code></pre>
-
-<pre><code>
-##### 2.4 释放内存
-
-调用free_bootmem来释放内存。
-</code></pre>
-
-<pre><code>void __init free_bootmem(unsigned long addr, unsigned long size)  
-{  
-    unsigned long start, end;  
-
-    kmemleak_free_part(__va(addr), size);  
-
-    start = PFN_UP(addr);  
-    end = PFN_DOWN(addr + size);  
-
-    mark_bootmem(start, end, 0, 0);  
-}
+<pre><code>[    0.000000] [cpuid: 0] Virtual kernelmemory layout:
+[    0.000000] [cpuid:0]     vector  : 0xffff0000 - 0xffff1000  (   4 kB)
+[    0.000000] [cpuid:0]     fixmap  : 0xfff00000 - 0xfffe0000   (896 kB)
+[    0.000000] [cpuid:0]     vmalloc : 0xf3000000 - 0xff000000   ( 192MB)
+[    0.000000] [cpuid:0]     lowmem  : 0xc0000000 - 0xf2800000   (808 MB)
+[    0.000000] [cpuid:0]     pkmap   : 0xbfe00000 -0xc0000000   (   2 MB)
+[    0.000000] [cpuid:0]     modules : 0xbf000000 - 0xbfe00000  (  14 MB)
+[    0.000000] [cpuid:0]       .text : 0xc0008000 -0xc0893034   (8749 kB)
+[    0.000000] [cpuid:0]       .init : 0xc0894000 -0xc08cdc00   ( 231 kB)
+[    0.000000] [cpuid:0]       .data : 0xc08ce000 -0xc09f8eb8   (1196 kB)
+[    0.000000] [cpuid:0]        .bss : 0xc0a78eec -0xc0f427a8   (4903 kB)
 </code></pre>
 
 <p>```</p>
+
+<p>其中看到vmalloc为192MB , cmdline中使用vmllaoc就是200M。</p>
+
+<p>Lowmem为地段内存部分，可见lowmem和vmalloc中间有8M空隙。</p>
+
+<h5>Vmalloc该分配多大?</h5>
+
+<p>Linux内核版本从3.2到3.3 默认的vmalloc size由128M 增大到了240M，3.4.0上的</p>
+
+<p>修改Commit信息如下：</p>
+
+<p>To accommodate all static mappings on machines withpossible highmem usage, the default vmalloc area size is changed to 240 MB sothat VMALLOC_START is no higher than 0xf0000000 by default.</p>
+
+<p>看其意思是因为开机的静态映射增加了，所以要扩大。</p>
+
+<p>另外3.2到3.3版本的一个重大变化是将android引入到主线内核中。我想增大vmalloc size到240M是基于此考虑吧。当然，各家厂商都也可以基于自己平台来动态修改size的。</p>
+
+<p>那么如何判断当前vmalloc size不足呢？</p>
+
+<p>/proc/meminfo中有vmalloc信息:<br/>
+VmallocTotal:     540672 kB<br/>
+VmallocUsed:      165268 kB<br/>
+VmallocChunk:     118788kB</p>
+
+<p>事实上这里的VmallocUsed只是表示已经被真正使用掉的vmalloc区域，但是区域之前的空隙也就是碎片没有被计算进去。</p>
+
+<p>所以，回到前面说的/proc/vmallocinfo，假设我们的vmalloc size就是200M。那么区域为0xf3000000- 0xff000000，从vmallocinfo中可以看到，前面大部分虚拟地址空间都用掉了，剩下0xfb600000到0xfefdc000这57M空间，假如申请了64M，那么就会失败了。</p>
+
+<p>开机分配使用掉vmalloc之后到底该剩余多少目前没有具体依据，一般来说1GB RAM可以设置为400~600M。</p>
 ]]></content>
   </entry>
   

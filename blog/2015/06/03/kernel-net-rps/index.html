@@ -1,0 +1,677 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>Receive packet steering patch详解 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>学习中......</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" id="query" type="text" placeholder="search...">
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+<script type="text/javascript">
+var query = GetRequest("query");
+if (query != null) {
+	document.getElementById("query").value = query;
+}
+</script>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">Receive packet steering patch详解</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-03T15:39:00+08:00'><span class='date'>2015-06-03</span> <span class='time'>15:39:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="http://simohayha.iteye.com/blog/720850">http://simohayha.iteye.com/blog/720850</a></p>
+
+<p>Receive packet steering简称rps，是google贡献给linux kernel的一个patch，主要的功能是解决多核情况下，网络协议栈的软中断的负载均衡。这里的负载均衡也就是指能够将软中断均衡的放在不同的cpu核心上运行。</p>
+
+<p>简介在这里：<br/>
+<a href="http://lwn.net/Articles/362339/">http://lwn.net/Articles/362339/</a></p>
+
+<p>linux现在网卡的驱动支持两种模式，一种是NAPI，一种是非NAPI模式，这两种模式的区别，我前面的blog都有介绍，这里就再次简要的介绍下。</p>
+
+<p>在NAPI中，中断收到数据包后调用__napi_schedule调度软中断，然后软中断处理函数中会调用注册的poll回掉函数中调用netif_receive_skb将数据包发送到3层，没有进行任何的软中断负载均衡。</p>
+
+<p>在非NAPI中，中断收到数据包后调用netif_rx，这个函数会将数据包保存到input_pkt_queue，然后调度软中断，这里为了兼容NAPI的驱动，他的poll方法默认是process_backlog，最终这个函数会从input_pkt_queue中取得数据包然后发送到3层。</p>
+
+<p>通过比较我们可以看到，不管是NAPI还是非NAPI的话都无法做到软中断的负载均衡，因为软中断此时都是运行在在硬件中断相应的cpu上。也就是说如果始终是cpu0相应网卡的硬件中断，那么始终都是cpu0在处理软中断，而此时cpu1就被浪费了，因为无法并行的执行多个软中断。</p>
+
+<p>google的这个patch的基本原理是这样的,根据数据包的源地址，目的地址以及目的和源端口(这里它是将两个端口组合成一个4字节的无符数进行计算的，后面会看到)计算出一个hash值，然后根据这个hash值来选择软中断运行的cpu，从上层来看，也就是说将每个连接和cpu绑定，并通过这个hash值，来均衡软中断在多个cpu上。</p>
+
+<p>这个介绍比较简单，我们来看代码是如何实现的。</p>
+
+<p>它这里主要是hook了两个内核的函数，一个是netif_rx主要是针对非NAPI的驱动，一个是netif_receive_skb这个主要是针对NAPI的驱动，这两个函数我前面blog都有介绍过，想了解可以看我前面的blog，现在这里我只介绍打过patch的实现。</p>
+
+<p>在看netif_rx和netif_receive_skb之前，我们先来看这个patch中两个重要的函数get_rps_cpu和enqueue_to_backlog，我们一个个看。</p>
+
+<p>先来看相关的两个数据结构，首先是netdev_rx_queue，它表示对应的接收队列，因为有的网卡可能硬件上就支持多队列的模式，此时对应就会有多个rx队列，这个结构是挂载在net_device中的，也就是每个网络设备最终都会有一个或者多个rx队列。这个结构在sys文件系统中的表示类似这样的/sys/class/net/<device>/queues/rx-<n> 几个队列就是rx-n.</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct netdev_rx_queue {
+</span><span class='line'>    // 保存了当前队列的rps map
+</span><span class='line'>    struct rps_map *rps_map;
+</span><span class='line'>    // 对应的kobject
+</span><span class='line'>    struct kobject kobj;
+</span><span class='line'>    // 指向第一个rx队列
+</span><span class='line'>    struct netdev_rx_queue *first;
+</span><span class='line'>    // 引用计数
+</span><span class='line'>    atomic_t count;
+</span><span class='line'>} ____cacheline_aligned_in_smp;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后就是rps_map，其实这个也就是保存了能够执行数据包的cpu。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct rps_map {
+</span><span class='line'>    // cpu的个数，也就是cpus数组的个数
+</span><span class='line'>    unsigned int len;
+</span><span class='line'>    // RCU锁
+</span><span class='line'>    struct rcu_head rcu;
+</span><span class='line'>    // 保存了cpu的id.
+</span><span class='line'>    u16 cpus[0];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>看完上面的结构，我们来看函数的实现。
+get_rps_cpu主要是通过传递进来的skb然后来选择这个skb所应该被处理的cpu。它的逻辑很简单，就是通过skb计算hash，然后通过hash从对应的队列的rps_mapping中取得对应的cpu id。</p>
+
+<p>这里有个要注意的就是这个hash值是可以交给硬件网卡去计算的，作者自己说是最好交由硬件去计算这个hash值，因为如果是软件计算的话会导致CPU 缓存不命中，带来一定的性能开销。</p>
+
+<p>还有就是rps_mapping这个值是可以通过sys 文件系统设置的，位置在这里：
+/sys/class/net/<device>/queues/rx-<n>/rps_cpus 。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    struct ipv6hdr *ip6;
+</span><span class='line'>    struct iphdr *ip;
+</span><span class='line'>    struct netdev_rx_queue *rxqueue;
+</span><span class='line'>    struct rps_map *map;
+</span><span class='line'>    int cpu = -1;
+</span><span class='line'>    u8 ip_proto;
+</span><span class='line'>    u32 addr1, addr2, ports, ihl;
+</span><span class='line'>    // rcu锁
+</span><span class='line'>    rcu_read_lock();
+</span><span class='line'>    // 取得设备对应的rx 队列
+</span><span class='line'>    if (skb_rx_queue_recorded(skb)) {
+</span><span class='line'>    ..........................................
+</span><span class='line'>        rxqueue = dev-&gt;_rx + index;
+</span><span class='line'>    } else
+</span><span class='line'>        rxqueue = dev-&gt;_rx;
+</span><span class='line'>
+</span><span class='line'>    if (!rxqueue-&gt;rps_map)
+</span><span class='line'>        goto done;
+</span><span class='line'>    // 如果硬件已经计算，则跳过计算过程
+</span><span class='line'>    if (skb-&gt;rxhash)
+</span><span class='line'>        goto got_hash; /* Skip hash computation on packet header */
+</span><span class='line'>
+</span><span class='line'>    switch (skb-&gt;protocol) {
+</span><span class='line'>    case __constant_htons(ETH_P_IP):
+</span><span class='line'>        if (!pskb_may_pull(skb, sizeof(*ip)))
+</span><span class='line'>            goto done;
+</span><span class='line'>        // 得到计算hash的几个值
+</span><span class='line'>        ip = (struct iphdr *) skb-&gt;data;
+</span><span class='line'>        ip_proto = ip-&gt;protocol;
+</span><span class='line'>        // 两个地址
+</span><span class='line'>        addr1 = ip-&gt;saddr;
+</span><span class='line'>        addr2 = ip-&gt;daddr;
+</span><span class='line'>        // 得到ip头
+</span><span class='line'>        ihl = ip-&gt;ihl;
+</span><span class='line'>        break;
+</span><span class='line'>    case __constant_htons(ETH_P_IPV6):
+</span><span class='line'>        ..........................................
+</span><span class='line'>        break;
+</span><span class='line'>    default:
+</span><span class='line'>        goto done;
+</span><span class='line'>    }
+</span><span class='line'>    ports = 0;
+</span><span class='line'>    switch (ip_proto) {
+</span><span class='line'>    case IPPROTO_TCP:
+</span><span class='line'>    case IPPROTO_UDP:
+</span><span class='line'>    case IPPROTO_DCCP:
+</span><span class='line'>    case IPPROTO_ESP:
+</span><span class='line'>    case IPPROTO_AH:
+</span><span class='line'>    case IPPROTO_SCTP:
+</span><span class='line'>    case IPPROTO_UDPLITE:
+</span><span class='line'>        if (pskb_may_pull(skb, (ihl * 4) + 4))
+</span><span class='line'>        // 我们知道tcp头的前4个字节就是源和目的端口，因此这里跳过ip头得到tcp头的前4个字节
+</span><span class='line'>            ports = *((u32 *) (skb-&gt;data + (ihl * 4)));
+</span><span class='line'>        break;
+</span><span class='line'>
+</span><span class='line'>    default:
+</span><span class='line'>        break;
+</span><span class='line'>    }
+</span><span class='line'>    // 计算hash
+</span><span class='line'>    skb-&gt;rxhash = jhash_3words(addr1, addr2, ports, hashrnd);
+</span><span class='line'>    if (!skb-&gt;rxhash)
+</span><span class='line'>        skb-&gt;rxhash = 1;
+</span><span class='line'>
+</span><span class='line'>got_hash:
+</span><span class='line'>    // 通过rcu得到对应rps map
+</span><span class='line'>    map = rcu_dereference(rxqueue-&gt;rps_map);
+</span><span class='line'>    if (map) {
+</span><span class='line'>        // 取得对应的cpu
+</span><span class='line'>        u16 tcpu = map-&gt;cpus[((u64) skb-&gt;rxhash * map-&gt;len) &gt;&gt; 32];
+</span><span class='line'>        // 如果cpu是online的，则返回计算出的这个cpu，否则跳出循环。
+</span><span class='line'>        if (cpu_online(tcpu)) {
+</span><span class='line'>            cpu = tcpu;
+</span><span class='line'>            goto done;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>done:
+</span><span class='line'>    rcu_read_unlock();
+</span><span class='line'>    // 如果上面失败，则返回-1.
+</span><span class='line'>    return cpu;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是enqueue_to_backlog这个方法，首先我们知道在每个cpu都有一个softnet结构，而他有一个input_pkt_queue的队列，以前这个主要是用于非NAPi的驱动的，而这个patch则将这个队列也用与NAPI的处理中了。也就是每个cpu现在都会有一个input_pkt_queue队列，用于保存需要处理的数据包队列。这个队列作用现在是，如果发现不属于当前cpu处理的数据包，则我们可以直接将数据包挂载到他所属的cpu的input_pkt_queue中。</p>
+
+<p>enqueue_to_backlog接受一个skb和cpu为参数，通过cpu来判断skb如何处理。要么加入所属的input_pkt_queue中，要么schecule 软中断。</p>
+
+<p>还有个要注意就是我们知道NAPI为了兼容非NAPI模式，有个backlog的napi_struct结构，也就是非NAPI驱动会schedule backlog这个napi结构，而在enqueue_to_backlog中则是利用了这个结构，也就是它会schedule backlog，因为它会将数据放到input_pkt_queue中，而backlog的pool方法process_backlog就是从input_pkt_queue中取得数据然后交给上层处理。</p>
+
+<p>这里还有一个会用到结构就是 rps_remote_softirq_cpus，它主要是保存了当前cpu上需要去另外的cpu schedule 软中断的cpu 掩码。因为我们可能将要处理的数据包放到了另外的cpu的input queue上，因此我们需要schedule 另外的cpu上的napi(也就是软中断),所以我们需要保存对应的cpu掩码，以便于后面遍历，然后schedule。</p>
+
+<p>而这里为什么mask有两个元素，注释写的很清楚：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * This structure holds the per-CPU mask of CPUs for which IPIs are scheduled
+</span><span class='line'> * to be sent to kick remote softirq processing.  There are two masks since
+</span><span class='line'> * the sending of IPIs must be done with interrupts enabled.  The select field
+</span><span class='line'> * indicates the current mask that enqueue_backlog uses to schedule IPIs.
+</span><span class='line'> * select is flipped before net_rps_action is called while still under lock,
+</span><span class='line'> * net_rps_action then uses the non-selected mask to send the IPIs and clears
+</span><span class='line'> * it without conflicting with enqueue_backlog operation.
+</span><span class='line'> */
+</span><span class='line'>struct rps_remote_softirq_cpus {
+</span><span class='line'>    // 对应的cpu掩码
+</span><span class='line'>    cpumask_t mask[2];
+</span><span class='line'>    // 表示应该使用的数组索引
+</span><span class='line'>    int select;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int enqueue_to_backlog(struct sk_buff *skb, int cpu)
+</span><span class='line'>{
+</span><span class='line'>    struct softnet_data *queue;
+</span><span class='line'>    unsigned long flags;
+</span><span class='line'>    // 取出传递进来的cpu的softnet-data结构
+</span><span class='line'>    queue = &per_cpu(softnet_data, cpu);
+</span><span class='line'>
+</span><span class='line'>    local_irq_save(flags);
+</span><span class='line'>    __get_cpu_var(netdev_rx_stat).total++;
+</span><span class='line'>    // 自旋锁
+</span><span class='line'>    spin_lock(&queue-&gt;input_pkt_queue.lock);
+</span><span class='line'>    // 如果保存的队列还没到上限
+</span><span class='line'>    if (queue-&gt;input_pkt_queue.qlen &lt;= netdev_max_backlog) {
+</span><span class='line'>    // 如果当前队列的输入队列长度不为空
+</span><span class='line'>        if (queue-&gt;input_pkt_queue.qlen) {
+</span><span class='line'>enqueue:
+</span><span class='line'>            // 将数据包加入到input_pkt_queue中,这里会有一个小问题，我们后面再说。
+</span><span class='line'>            __skb_queue_tail(&queue-&gt;input_pkt_queue, skb);
+</span><span class='line'>            spin_unlock_irqrestore(&queue-&gt;input_pkt_queue.lock,
+</span><span class='line'>                flags);
+</span><span class='line'>            return NET_RX_SUCCESS;
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        /* Schedule NAPI for backlog device */
+</span><span class='line'>        // 如果可以调度软中断
+</span><span class='line'>        if (napi_schedule_prep(&queue-&gt;backlog)) {
+</span><span class='line'>            // 首先判断数据包该不该当前的cpu处理
+</span><span class='line'>            if (cpu != smp_processor_id()) {
+</span><span class='line'>                // 如果不该，
+</span><span class='line'>                struct rps_remote_softirq_cpus *rcpus =
+</span><span class='line'>                    &__get_cpu_var(rps_remote_softirq_cpus);
+</span><span class='line'>
+</span><span class='line'>                cpu_set(cpu, rcpus-&gt;mask[rcpus-&gt;select]);
+</span><span class='line'>                __raise_softirq_irqoff(NET_RX_SOFTIRQ);
+</span><span class='line'>            } else
+</span><span class='line'>                // 如果就是应该当前cpu处理，则直接schedule 软中断，这里可以看到传递进去的是backlog
+</span><span class='line'>                __napi_schedule(&queue-&gt;backlog);
+</span><span class='line'>        }
+</span><span class='line'>        goto enqueue;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    spin_unlock(&queue-&gt;input_pkt_queue.lock);
+</span><span class='line'>
+</span><span class='line'>    __get_cpu_var(netdev_rx_stat).dropped++;
+</span><span class='line'>    local_irq_restore(flags);
+</span><span class='line'>
+</span><span class='line'>    kfree_skb(skb);
+</span><span class='line'>    return NET_RX_DROP;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里会有一个小问题，那就是假设此时一个属于cpu0的包进入处理，此时我们运行在cpu1,此时将数据包加入到input队列，然后cpu0上面刚好又来了一个cpu0需要处理的数据包，此时由于qlen不为0则又将数据包加入到input队列中，我们会发现cpu0上的napi没机会进行调度了。</p>
+
+<p>google的patch对这个是这样处理的，在软中断处理函数中当数据包处理完毕，会调用net_rps_action来调度前面保存到其他cpu上的input队列。</p>
+
+<p>下面就是代码片断（net_rx_action）</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>// 得到对应的rcpus.
+</span><span class='line'>rcpus = &__get_cpu_var(rps_remote_softirq_cpus);
+</span><span class='line'>    select = rcpus-&gt;select;
+</span><span class='line'>    // 翻转select，防止和enqueue_backlog冲突
+</span><span class='line'>    rcpus-&gt;select ^= 1;
+</span><span class='line'>
+</span><span class='line'>    // 打开中断，此时下面的调度才会起作用.
+</span><span class='line'>    local_irq_enable();
+</span><span class='line'>    // 这个函数里面调度对应的远程cpu的napi.
+</span><span class='line'>    net_rps_action(&rcpus-&gt;mask[select]);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后就是net_rps_action，这个函数很简单，就是遍历所需要处理的cpu，然后调度napi</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void net_rps_action(cpumask_t *mask)
+</span><span class='line'>{
+</span><span class='line'>    int cpu;
+</span><span class='line'>
+</span><span class='line'>    /* Send pending IPI's to kick RPS processing on remote cpus. */
+</span><span class='line'>    // 遍历
+</span><span class='line'>    for_each_cpu_mask_nr(cpu, *mask) {
+</span><span class='line'>        struct softnet_data *queue = &per_cpu(softnet_data, cpu);
+</span><span class='line'>        if (cpu_online(cpu))
+</span><span class='line'>            // 到对应的cpu调用csd方法。
+</span><span class='line'>            __smp_call_function_single(cpu, &queue-&gt;csd, 0);
+</span><span class='line'>    }
+</span><span class='line'>    // 清理mask
+</span><span class='line'>    cpus_clear(*mask);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面我们看到会调用csd方法，而上面的csd回掉就是被初始化为trigger_softirq函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void trigger_softirq(void *data)
+</span><span class='line'>{
+</span><span class='line'>    struct softnet_data *queue = data;
+</span><span class='line'>    // 调度napi可以看到依旧是backlog 这个napi结构体。
+</span><span class='line'>    __napi_schedule(&queue-&gt;backlog);
+</span><span class='line'>    __get_cpu_var(netdev_rx_stat).received_rps++;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的函数都分析完毕了，剩下的就很简单了。</p>
+
+<p>首先来看netif_rx如何被修改的，它被修改的很简单，首先是得到当前skb所应该被处理的cpu id，然后再通过比较这个cpu和当前正在处理的cpu id进行比较来做不同的处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int netif_rx(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    int cpu;
+</span><span class='line'>
+</span><span class='line'>    /* if netpoll wants it, pretend we never saw it */
+</span><span class='line'>    if (netpoll_rx(skb))
+</span><span class='line'>        return NET_RX_DROP;
+</span><span class='line'>
+</span><span class='line'>    if (!skb-&gt;tstamp.tv64)
+</span><span class='line'>        net_timestamp(skb);
+</span><span class='line'>    // 得到cpu id。
+</span><span class='line'>    cpu = get_rps_cpu(skb-&gt;dev, skb);
+</span><span class='line'>    if (cpu &lt; 0)
+</span><span class='line'>        cpu = smp_processor_id();
+</span><span class='line'>    // 通过cpu进行队列不同的处理
+</span><span class='line'>    return enqueue_to_backlog(skb, cpu);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是netif_receive_skb,这里patch将内核本身的这个函数改写为__netif_receive_skb。然后当返回值小于0,则说明不需要对队列进行处理，此时直接发送到3层。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int netif_receive_skb(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    int cpu;
+</span><span class='line'>
+</span><span class='line'>    cpu = get_rps_cpu(skb-&gt;dev, skb);
+</span><span class='line'>
+</span><span class='line'>    if (cpu &lt; 0)
+</span><span class='line'>        return __netif_receive_skb(skb);
+</span><span class='line'>    else
+</span><span class='line'>        return enqueue_to_backlog(skb, cpu);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后来总结一下，可以看到input_pkt_queue是一个FIFO的队列，而且如果当qlen有值的时候，也就是在另外的cpu有数据包放到input_pkt_queue中，则当前cpu不会调度napi，而是将数据包放到input_pkt_queue中，然后等待trigger_softirq来调度napi。</p>
+
+<p>因此这个patch完美的解决了软中断在多核下的均衡问题，并且没有由于是同一个连接会map到相同的cpu，并且input_pkt_queue的使用，因此乱序的问题也不会出现。</p>
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2015-06-03T15:39:00+08:00'><span class='date'>2015-06-03</span> <span class='time'>15:39:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~net/'>net</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2015/06/03/kernel-net-mem/" title="Previous Post: 内核协议栈tcp层的内存管理">&laquo; 内核协议栈tcp层的内存管理</a>
+      
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2015 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+<!--  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script> -->
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>
