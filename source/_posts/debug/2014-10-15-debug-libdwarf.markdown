@@ -16,13 +16,35 @@ tags:
 
 dwarf格式文档[http://www.dwarfstd.org/Home.php](http://www.dwarfstd.org/Home.php)
 
-编译
+#### 动态编译
+直接./configure，make就好。
 ```
-make CFLAGS+="-static -I`pwd`/libdwarf -I`pwd`/dwarfdump" LDFLAGS+="-static -L`pwd`/libdwarf -ldwarf -lelf"
+	./configure
+	make
+```
+
+#### 静态编译
+比较新的版本要替换 optind 和 opterr ，因为会和libc.a冲突
+```
+	find . -name '*.[c|h]' -exec sed -i -e 's/optind/optind_kk/g' {} \;
+	find . -name '*.[c|h]' -exec sed -i -e 's/opterr/opterr_kk/g' {} \;
+```
+
+先动态编译，为了生成libdwarf/libdwarf.a
+```
+	./configure
+	make
+```
+
+静态编译
+```
+	rm -rf dwarfdump/dwarfdump
+	make CFLAGS+="-static -I`pwd`/libdwarf -I`pwd`/dwarfdump" LDFLAGS+="-static -L`pwd`/libdwarf -ldwarf -lelf"
 ```
 
 使用
 ```
-./dwarfdump2/dwarfdump -Wc -S match=dev_queue_xmit /tmp/vmlinux
+	./dwarfdump/dwarfdump -Wc -S match=dev_queue_xmit /tmp/vmlinux
 ```
 获取vmlinux中dev_queue_xmit函数的.debug信息
+
