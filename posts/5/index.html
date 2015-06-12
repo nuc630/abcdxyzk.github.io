@@ -62,7 +62,7 @@ if (query != null) {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/21/kernel-sched-waitqueue/">Linux内核中的等待队列</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/06/01/kernel-net-shark-hand/">TCP三次握手源码详解</a></h2>
     
     
       <p class="meta">
@@ -71,46 +71,90 @@ if (query != null) {
 
 
 
-<time class='entry-date' datetime='2015-05-21T15:58:00+08:00'><span class='date'>2015-05-21</span> <span class='time'>15:58:00</span></time>
+<time class='entry-date' datetime='2015-06-01T14:24:00+08:00'><span class='date'>2015-06-01</span> <span class='time'>14:24:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_49d5604e010008bn.html">http://blog.sina.com.cn/s/blog_49d5604e010008bn.html</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/qy532846454/article/details/7882819">http://blog.csdn.net/qy532846454/article/details/7882819</a></p>
 
-<p>等待队列可以参考net/ipv4/tcp_probe.c的实现</p>
+<p><a href="http://m.bianceng.cn/OS/Linux/201301/35179_6.htm">http://m.bianceng.cn/OS/Linux/201301/35179_6.htm</a></p>
 
-<p><a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/">简单样例</a></p>
+<p>内核：2.6.34</p>
 
-<h4>Linux内核中的等待队列</h4>
+<p>TCP是应用最广泛的传输层协议，其提供了面向连接的、可靠的字节流服务，但也正是因为这些特性，使得TCP较之UDP异常复杂，还是分两部分[创建与使用]来进行分析。这篇主要包括TCP的创建及三次握手的过程。</p>
 
-<p>  Linux内核的等待队列是以双循环链表为基础数据结构，与进程调度机制紧密结合，能够用于实现核心的异步事件通知机制。在Linux2.4.21中，等待队列在源代码树include/linux/wait.h中，这是一个通过list_head连接的典型双循环链表，</p>
+<p>编程时一般用如下语句创建TCP Socket：</p>
 
-<p>如下图所示。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)  </span></code></pre></td></tr></table></div></figure>
 
-<p><img src="/images/kernel/2015-05-21.jpg" alt="" /></p>
 
-<p>  在这个链表中，有两种数据结构：等待队列头（wait_queue_head_t）和等待队列项（wait_queue_t）。等待队列头和等待队列项中都包含一个list_head类型的域作为"连接件"。由于我们只需要对队列进行添加和删除操作，并不会修改其中的对象（等待队列项），因此，我们只需要提供一把保护整个基础设施和所有对象的锁，这把锁保存在等待队列头中，为wq_lock_t类型。在实现中，可以支持读写锁（rwlock）或自旋锁（spinlock）两种类型，通过一个宏定义来切换。如果使用读写锁，将wq_lock_t定义为rwlock_t类型；如果是自旋锁，将wq_lock_t定义为spinlock_t类型。无论哪种情况，分别相应设置wq_read_lock、wq_read_unlock、wq_read_lock_irqsave、wq_read_unlock_irqrestore、wq_write_lock_irq、wq_write_unlock、wq_write_lock_irqsave和wq_write_unlock_irqrestore等宏。</p>
+<p>由此开始分析，调用接口[net/socket.c]: SYSCALL_DEFINE3(socket)</p>
 
-<h5>等待队列头</h5>
+<p>其中执行两步关键操作：sock_create()与sock_map_fd()</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct __wait_queue_head {
-</span><span class='line'>    wq_lock_t lock;
-</span><span class='line'>    struct list_head task_list;
-</span><span class='line'>};
-</span><span class='line'>typedef struct __wait_queue_head wait_queue_head_t;</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>retval = sock_create(family, type, protocol, &sock);  
+</span><span class='line'>if (retval &lt; 0)  
+</span><span class='line'>    goto out;  
+</span><span class='line'>retval = sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));  
+</span><span class='line'>if (retval &lt; 0)  
+</span><span class='line'>    goto out_release;  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>  前面已经说过，等待队列的主体是进程，这反映在每个等待队列项中，是一个任务结构指针（struct task_struct * task）。flags为该进程的等待标志，当前只支持互斥。</p>
+<p>  sock_create()用于创建socket，sock_map_fd()将之映射到文件描述符，使socket能通过fd进行访问，着重分析sock_create()的创建过程。</p>
 
-<h5>等待队列项</h5>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sock_create() -&gt; __sock_create()</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  从__sock_create()代码看到创建包含两步：sock_alloc()和pf->create()。sock_alloc()分配了sock内存空间并初始化inode；pf->create()初始化了sk。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sock = sock_alloc();  
+</span><span class='line'>sock-&gt;type = type;  
+</span><span class='line'>……  
+</span><span class='line'>pf = rcu_dereference(net_families[family]);  
+</span><span class='line'>……  
+</span><span class='line'>pf-&gt;create(net, sock, protocol, kern);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>sock_alloc()</h4>
+
+<p>  分配空间，通过new_inode()分配了节点(包括socket)，然后通过SOCKET_I宏获得sock，实际上inode和sock是在new_inode()中一起分配的，结构体叫作sock_alloc。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>inode = new_inode(sock_mnt-&gt;mnt_sb);  
+</span><span class='line'>sock = SOCKET_I(inode);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  设置inode的参数，并返回sock。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>inode-&gt;i_mode = S_IFSOCK | S_IRWXUGO;  
+</span><span class='line'>inode-&gt;i_uid = current_fsuid();  
+</span><span class='line'>inode-&gt;i_gid = current_fsgid();  
+</span><span class='line'>return sock;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  继续往下看具体的创建过程：new_inode()，在分配后，会设置i_ino和i_state的值。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -119,134 +163,42 @@ if (query != null) {
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct __wait_queue {
-</span><span class='line'>    unsigned int flags;
-</span><span class='line'>#define WQ_FLAG_EXCLUSIVE 0x01
-</span><span class='line'>    struct task_struct * task;
-</span><span class='line'>    struct list_head task_list;
-</span><span class='line'>};
-</span><span class='line'>typedef struct __wait_queue wait_queue_t;</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inode *new_inode(struct super_block *sb)  
+</span><span class='line'>{  
+</span><span class='line'>    ……  
+</span><span class='line'>    inode = alloc_inode(sb);  
+</span><span class='line'>    if (inode) {  
+</span><span class='line'>        spin_lock(&inode_lock);  
+</span><span class='line'>        __inode_add_to_lists(sb, NULL, inode);  
+</span><span class='line'>        inode-&gt;i_ino = ++last_ino;  
+</span><span class='line'>        inode-&gt;i_state = 0;  
+</span><span class='line'>        spin_unlock(&inode_lock);  
+</span><span class='line'>    }  
+</span><span class='line'>    return inode;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<h5>声明和初始化</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DECLARE_WAITQUEUE(name, tsk)            \
-</span><span class='line'>    wait_queue_t name = __WAITQUEUE_INITIALIZER(name, tsk)
-</span><span class='line'>#define __WAITQUEUE_INITIALIZER(name, tsk) {    \
-</span><span class='line'>    task:  tsk,                                 \
-</span><span class='line'>    task_list: { NULL, NULL },                  \
-</span><span class='line'>    __WAITQUEUE_DEBUG_INIT(name)}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  通过DECLARE_WAITQUEUE宏将等待队列项初始化成对应的任务结构，并且用于连接的相关指针均设置为空。其中加入了调试相关代码。</p>
+<p>  其中的alloc_inode() -> sb->s_op->alloc_inode()，sb是sock_mnt->mnt_sb，所以alloc_inode()指向的是sockfs的操作函数sock_alloc_inode。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DECLARE_WAIT_QUEUE_HEAD(name)                    \
-</span><span class='line'>    wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
-</span><span class='line'>#define __WAIT_QUEUE_HEAD_INITIALIZER(name) {            \
-</span><span class='line'>    lock:  WAITQUEUE_RW_LOCK_UNLOCKED,                   \
-</span><span class='line'>    task_list: { &(name).task_list, &(name).task_list }, \
-</span><span class='line'>    __WAITQUEUE_HEAD_DEBUG_INIT(name)}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct super_operations sockfs_ops = {  
+</span><span class='line'>    .alloc_inode = sock_alloc_inode,  
+</span><span class='line'>    .destroy_inode =sock_destroy_inode,  
+</span><span class='line'>    .statfs = simple_statfs,  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>  通过DECLARE_WAIT_QUEUE_HEAD宏初始化一个等待队列头，使得其所在链表为空，并设置链表为"未上锁"状态。其中加入了调试相关代码。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void init_waitqueue_head(wait_queue_head_t *q)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>该函数初始化一个已经存在的等待队列头，它将整个队列设置为"未上锁"状态，并将链表指针prev和next指向它自身。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    q-&gt;lock = WAITQUEUE_RW_LOCK_UNLOCKED;
-</span><span class='line'>    INIT_LIST_HEAD(&q-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void init_waitqueue_entry(wait_queue_t *q, struct task_struct *p)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>该函数初始化一个已经存在的等待队列项，它设置对应的任务结构，同时将标志位清0。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    q-&gt;flags = 0;
-</span><span class='line'>    q-&gt;task = p;
-</span><span class='line'>}
-</span><span class='line'>static inline int waitqueue_active(wait_queue_head_t *q)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>该函数检查等待队列是否为空。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    return !list_empty(&q-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>将指定的等待队列项new添加到等待队列头head所在的链表头部，该函数假设已经获得锁。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    list_add(&new-&gt;task_list, &head-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>将指定的等待队列项new添加到等待队列头head所在的链表尾部，该函数假设已经获得锁。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    list_add_tail(&new-&gt;task_list, &head-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>将函数从等待队列头head所在的链表中删除指定等待队列项old，该函数假设已经获得锁，并且old在head所在链表中。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    list_del(&old-&gt;task_list);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>睡眠和唤醒操作</h4>
-
-<p>对等待队列的操作包括睡眠和唤醒（相关函数保存在源代码树的/kernel/sched.c和include/linux/sched.h中）。思想是更改当前进程（CURRENT）的任务状态，并要求重新调度，因为这时这个进程的状态已经改变，不再在调度表的就绪队列中，因此无法再获得执行机会，进入"睡眠"状态，直至被"唤醒"，即其任务状态重新被修改回就绪态。</p>
-
-<p>常用的睡眠操作有interruptible_sleep_on和sleep_on。两个函数类似，只不过前者将进程的状态从就绪态（TASK_RUNNING）设置为TASK_INTERRUPTIBLE，允许通过发送signal唤醒它（即可中断的睡眠状态）；而后者将进程的状态设置为TASK_UNINTERRUPTIBLE，在这种状态下，不接收任何singal。</p>
-
-<p>以interruptible_sleep_on为例，其展开后的代码是：</p>
+<p>  sock_alloc_inode()中通过kmem_cache_alloc()分配了struct socket_alloc结构体大小的空间，而struct socket_alloc结构体定义如下，但只返回了inode，实际上socket和inode都已经分配了空间，在之后就可以通过container_of取到socket。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -266,49 +218,30 @@ if (query != null) {
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void interruptible_sleep_on(wait_queue_head_t *q)
-</span><span class='line'>{
-</span><span class='line'>    unsigned long flags;
-</span><span class='line'>    wait_queue_t wait;
-</span><span class='line'>    /* 构造当前进程对应的等待队列项 */
-</span><span class='line'>    init_waitqueue_entry(&wait, current);
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct inode *sock_alloc_inode(struct super_block *sb)  
+</span><span class='line'>{  
+</span><span class='line'>    struct socket_alloc *ei;  
+</span><span class='line'>    ei = kmem_cache_alloc(sock_inode_cachep, GFP_KERNEL);  
+</span><span class='line'>    ......  
+</span><span class='line'>    return &ei-&gt;vfs_inode;  
+</span><span class='line'>}  
+</span><span class='line'>struct socket_alloc {  
+</span><span class='line'>    struct socket socket;  
+</span><span class='line'>    struct inode vfs_inode;  
+</span><span class='line'>};  
 </span><span class='line'>
-</span><span class='line'>    /* 将当前进程的状态从TASK_RUNNING改为TASK_INTERRUPTIBLE */
-</span><span class='line'>    current-&gt;state = TASK_INTERRUPTIBLE;
-</span><span class='line'>
-</span><span class='line'>    /* 将等待队列项添加到指定链表中 */
-</span><span class='line'>    wq_write_lock_irqsave(&q-&gt;lock,flags);
-</span><span class='line'>    __add_wait_queue(q, &wait); 
-</span><span class='line'>    wq_write_unlock(&q-&gt;lock);
-</span><span class='line'>
-</span><span class='line'>    /* 进程重新调度，放弃执行权 */
-</span><span class='line'>    schedule();
-</span><span class='line'>
-</span><span class='line'>    /* 本进程被唤醒，重新获得执行权，首要之事是将等待队列项从链表中删除 */
-</span><span class='line'>    wq_write_lock_irq(&q-&gt;lock);
-</span><span class='line'>    __remove_wait_queue(q, &wait);
-</span><span class='line'>    wq_write_unlock_irqrestore(&q-&gt;lock,flags);
-</span><span class='line'>    /* 至此，等待过程结束，本进程可以正常执行下面的逻辑 */
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>net_families[AF_INET]:  
+</span><span class='line'>static const struct net_proto_family inet_family_ops = {  
+</span><span class='line'>    .family = PF_INET,  
+</span><span class='line'>    .create = inet_create,  
+</span><span class='line'>    .owner = THIS_MODULE,  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>对应的唤醒操作包括wake_up_interruptible和wake_up。wake_up函数不仅可以唤醒状态为TASK_UNINTERRUPTIBLE的进程，而且可以唤醒状态为TASK_INTERRUPTIBLE的进程。</p>
+<p>err = pf->create(net, sock, protocol, kern); ==> inet_create()
+这段代码就是从inetsw[]中取到适合的协议类型answer，sock->type就是传入socket()函数的type参数SOCK_DGRAM，最终取得结果answer->ops==inet_stream_ops，从上面这段代码还可以看出以下问题：</p>
 
-<p>wake_up_interruptible只负责唤醒状态为TASK_INTERRUPTIBLE的进程。这两个宏的定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define wake_up(x)   __wake_up((x),TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE, 1)
-</span><span class='line'>#define wake_up_interruptible(x) __wake_up((x),TASK_INTERRUPTIBLE, 1)</span></code></pre></td></tr></table></div></figure>
-
-
-<p><strong>wake_up函数主要是获取队列操作的锁，具体工作是调用</strong>wake_up_common完成的。</p>
+<p>  socket(AF_INET, SOCK_RAW, IPPROTO_IP)这样是不合法的，因为SOCK_RAW没有默认的协议类型；同样socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)与socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)是一样的，因为TCP的默认协议类型是IPPTOTO_TCP；SOCK_STREAM与IPPROTO_UDP同上。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -319,25 +252,187 @@ if (query != null) {
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __wake_up(wait_queue_head_t *q, unsigned int mode, int nr)
-</span><span class='line'>{
-</span><span class='line'>    if (q) {
-</span><span class='line'>        unsigned long flags;
-</span><span class='line'>        wq_read_lock_irqsave(&q-&gt;lock, flags);
-</span><span class='line'>        __wake_up_common(q, mode, nr, 0);
-</span><span class='line'>        wq_read_unlock_irqrestore(&q-&gt;lock, flags);
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sock-&gt;state = SS_UNCONNECTED;  
+</span><span class='line'>list_for_each_entry_rcu(answer, &inetsw[sock-&gt;type], list) {  
+</span><span class='line'>    err = 0;  
+</span><span class='line'>    /* Check the non-wild match. */  
+</span><span class='line'>    if (protocol == answer-&gt;protocol) {  
+</span><span class='line'>        if (protocol != IPPROTO_IP)  
+</span><span class='line'>            break;  
+</span><span class='line'>    } else {  
+</span><span class='line'>        /* Check for the two wild cases. */  
+</span><span class='line'>        if (IPPROTO_IP == protocol) {  
+</span><span class='line'>            protocol = answer-&gt;protocol;  
+</span><span class='line'>            break;  
+</span><span class='line'>        }  
+</span><span class='line'>        if (IPPROTO_IP == answer-&gt;protocol)  
+</span><span class='line'>            break;  
+</span><span class='line'>    }  
+</span><span class='line'>    err = -EPROTONOSUPPORT;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>/<em> The core wakeup function.  Non-exclusive wakeups (nr_exclusive == 0) just wake everything up.  If it&rsquo;s an exclusive wakeup (nr_exclusive == small +ve number) then we wake all the non-exclusive tasks and one exclusive task.
-There are circumstances in which we can try to wake a task which has already started to run but is not in state TASK_RUNNING.  try_to_wake_up() returns zero in this (rare) case, and we handle it by contonuing to scan the queue. </em>/</p>
+<p>sock->ops指向inet_stream_ops，然后创建sk，sk->proto指向tcp_prot，注意这里分配的大小是struct tcp_sock，而不仅仅是struct sock大小</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __wake_up_common (wait_queue_head_t *q, unsigned int mode, int nr_exclusive, const int sync)</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sock-&gt;ops = answer-&gt;ops;  
+</span><span class='line'>answer_prot = answer-&gt;prot;  
+</span><span class='line'>……  
+</span><span class='line'>sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot);  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>参数q表示要操作的等待队列，mode表示要唤醒任务的状态，如TASK_UNINTERRUPTIBLE或TASK_INTERRUPTIBLE等。nr_exclusive是要唤醒的互斥进程数目，在这之前遇到的非互斥进程将被无条件唤醒。sync表示？？？</p>
+<p>然后设置inet的一些参数，这里直接将sk类型转换为inet，因为在sk_alloc()中分配的是struct tcp_sock结构大小，返回的是struct sock，利用了第一个成员的特性，三者之间的关系如下图：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>inet = inet_sk(sk);  
+</span><span class='line'>……  
+</span><span class='line'>inet-&gt;inet_id = 0;  
+</span><span class='line'>sock_init_data(sock, sk);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中有些设置是比较重要的，如</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sk-&gt;sk_state = TCP_CLOSE;  
+</span><span class='line'>sk_set_socket(sk, sock);  
+</span><span class='line'>sk-&gt;sk_protocol = protocol;  
+</span><span class='line'>sk-&gt;sk_backlog_rcv = sk-&gt;sk_prot-&gt;backlog_rcv;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>创建socket后，接下来的流程会因为客户端或服务器的不同而有所差异，下面着重于分析建立连接的三次握手过程。典型的客户端流程：<br/>
+connect() -> send() -> recv()</p>
+
+<p>典型的服务器流程：<br/>
+bind() -> listen() -> accept() -> recv() -> send()</p>
+
+<h4>客户端流程</h4>
+
+<p>发送SYN报文，向服务器发起tcp连接</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>        connect(fd, servaddr, addrlen);
+</span><span class='line'>            -&gt; SYSCALL＿DEFINE3() 
+</span><span class='line'>            -&gt; sock-&gt;ops-&gt;connect() == inet_stream_connect (sock-&gt;ops即inet_stream_ops)
+</span><span class='line'>            -&gt; tcp_v4_connect()</span></code></pre></td></tr></table></div></figure>
+
+
+<p>查找到达[daddr, dport]的路由项，路由项的查找与更新与”路由表”章节所述一样。要注意的是由于是作为客户端调用，创建socket后调用connect，因而saddr, sport都是0，同样在未查找路由前，要走的出接口oif也是不知道的，因此也是0。在查找完路由表后(注意不是路由缓存)，可以得知出接口，但并未存储到sk中。因此插入的路由缓存是特别要注意的：它的键值与实际值是不相同的，这个不同点就在于oif与saddr，键值是[saddr=0, sport=0, daddr, dport, oif=0]，而缓存项值是[saddr, sport=0, daddr, dport, oif]。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tmp = ip_route_connect(&rt, nexthop, inet-&gt;inet_saddr,  
+</span><span class='line'>                        RT_CONN_FLAGS(sk), sk-&gt;sk_bound_dev_if,  
+</span><span class='line'>                        IPPROTO_TCP,  
+</span><span class='line'>                        inet-&gt;inet_sport, usin-&gt;sin_port, sk, 1);  
+</span><span class='line'>if (tmp &lt; 0) {  
+</span><span class='line'>    if (tmp == -ENETUNREACH)  
+</span><span class='line'>        IP_INC_STATS_BH(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);  
+</span><span class='line'>    return tmp;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过查找到的路由项，对inet进行赋值，可以看到，除了sport，都赋予了值，sport的选择复杂点，因为它要随机从未使用的本地端口中选择一个。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!inet-&gt;inet_saddr)  
+</span><span class='line'>    inet-&gt;inet_saddr = rt_rt_src;   
+</span><span class='line'>inet-&gt;inet_rcv_addr = inet-&gt;inet_saddr;  
+</span><span class='line'>……  
+</span><span class='line'>inet-&gt;inet_dport = usin-&gt;sin_port;  
+</span><span class='line'>inet-&gt;inet_daddr = daddr;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>状态从CLOSING转到TCP_SYN_SENT，也就是我们熟知的TCP的状态转移图。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_set_state(sk, TCP_SYN_SENT);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>插入到bind链表中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>err = inet_hash_connect(&tcp_death_row, sk); //== &gt; __inet_hash_connect()  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>当snum==0时，表明此时源端口没有指定，此时会随机选择一个空闲端口作为此次连接的源端口。low和high分别表示可用端口的下限和上限，remaining表示可用端口的数，注意这里的可用只是指端口可以用作源端口，其中部分端口可能已经作为其它socket的端口号在使用了，所以要循环1~remaining，直到查找到空闲的源端口。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!snum) {  
+</span><span class='line'>    inet_get_local_port_range(&low, &high);  
+</span><span class='line'>    remaining = (high - low) + 1;  
+</span><span class='line'>    ……  
+</span><span class='line'>    for (i = 1; i &lt;= remaining; i++) {  
+</span><span class='line'>        ……// choose a valid port  
+</span><span class='line'>    }  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面来看下对每个端口的检查，即//choose a valid port部分的代码。这里要先了解下tcp的内核表组成，udp的表内核表udptable只是一张hash表，tcp的表则稍复杂，它的名字是tcp_hashinfo，在tcp_init()中被初始化，这个数据结构定义如下(省略了不相关的数据)：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_hashinfo {  
+</span><span class='line'>    struct inet_ehash_bucket *ehash;  
+</span><span class='line'>    ……  
+</span><span class='line'>    struct inet_bind_hashbucket *bhash;  
+</span><span class='line'>    ……  
+</span><span class='line'>    struct inet_listen_hashbucket  listening_hash[INET_LHTABLE_SIZE]  
+</span><span class='line'>                    ____cacheline_aligned_in_smp;  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>从定义可以看出，tcp表又分成了三张表ehash, bhash, listening_hash，其中ehash, listening_hash对应于socket处在TCP的ESTABLISHED, LISTEN状态，bhash对应于socket已绑定了本地地址。三者间并不互斥，如一个socket可同时在bhash和ehash中，由于TIME_WAIT是一个比较特殊的状态，所以ehash又分成了chain和twchain，为TIME_WAIT的socket单独形成一张表。</p>
+
+<p>回到刚才的代码，现在还只是建立socket连接，使用的就应该是tcp表中的bhash。首先取得内核tcp表的bind表 – bhash，查看是否已有socket占用：<br/>
+  如果没有，则调用inet_bind_bucket_create()创建一个bind表项tb，并插入到bind表中，跳转至goto ok代码段；<br/>
+  如果有，则跳转至goto ok代码段。<br/>
+  进入ok代码段表明已找到合适的bind表项(无论是创建的还是查找到的)，调用inet_bind_hash()赋值源端口inet_num。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -365,35 +460,217 @@ There are circumstances in which we can try to wake a task which has already sta
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>{
-</span><span class='line'>    struct list_head *tmp;
-</span><span class='line'>    struct task_struct *p;
-</span><span class='line'>
-</span><span class='line'>    CHECK_MAGIC_WQHEAD(q);
-</span><span class='line'>    WQ_CHECK_LIST_HEAD(&q-&gt;task_list);
-</span><span class='line'>
-</span><span class='line'>    /* 遍历等待队列 */
-</span><span class='line'>    list_for_each(tmp,&q-&gt;task_list) {
-</span><span class='line'>        unsigned int state;
-</span><span class='line'>        /* 获得当前等待队列项 */
-</span><span class='line'>        wait_queue_t *curr = list_entry(tmp, wait_queue_t, task_list);
-</span><span class='line'>
-</span><span class='line'>        CHECK_MAGIC(curr-&gt;__magic);
-</span><span class='line'>        /* 获得对应的进程 */
-</span><span class='line'>        p = curr-&gt;task;
-</span><span class='line'>        state = p-&gt;state;
-</span><span class='line'>
-</span><span class='line'>        /* 如果我们需要处理这种状态的进程 */
-</span><span class='line'>        if (state & mode) {
-</span><span class='line'>            WQ_NOTE_WAKER(curr);
-</span><span class='line'>            if (try_to_wake_up(p, sync) && (curr-&gt;flags&WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
-</span><span class='line'>                break;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (i = 1; i &lt;= remaining; i++) {  
+</span><span class='line'>    port = low + (i + offset) % remaining;  
+</span><span class='line'>    head = &hinfo-&gt;bhash[inet_bhashfn(net, port, hinfo-&gt;bhash_size)];  
+</span><span class='line'>    ……  
+</span><span class='line'>    inet_bind_bucket_for_each(tb, node, &head-&gt;chain) {  
+</span><span class='line'>        if (net_eq(ib_net(tb), net) && tb-&gt;port == port) {  
+</span><span class='line'>            if (tb-&gt;fastreuse &gt;= 0)  
+</span><span class='line'>                goto next_port;  
+</span><span class='line'>            WARN_ON(hlist_empty(&tb-&gt;owners));  
+</span><span class='line'>            if (!check_established(death_row, sk, port, &tw))  
+</span><span class='line'>                goto ok;  
+</span><span class='line'>            goto next_port;  
+</span><span class='line'>        }  
+</span><span class='line'>    }  
+</span><span class='line'>        
+</span><span class='line'>    tb = inet_bind_bucket_create(hinfo-&gt;bind_bucket_cachep, net, head, port);  
+</span><span class='line'>    ……  
+</span><span class='line'>    next_port:  
+</span><span class='line'>        spin_unlock(&head-&gt;lock);  
+</span><span class='line'>}  
+</span><span class='line'>        
+</span><span class='line'>ok:  
+</span><span class='line'>    ……  
+</span><span class='line'>inet_bind_hash(sk, tb, port);  
+</span><span class='line'>    ……  
+</span><span class='line'>    goto out;  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>/<em> 唤醒一个进程，将它放到运行队列中，如果它还不在运行队列的话。"当前"进程总是在运行队列中的（except when the actual re-schedule is in progress)，and as such you&rsquo;re allowed to do the simpler &ldquo;current->state = TASK_RUNNING&rdquo; to mark yourself runnable without the overhead of this. </em>/</p>
+<p>在获取到合适的源端口号后，会重建路由项来进行更新：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>err = ip_route_newports(&rt, IPPROTO_TCP, inet-&gt;inet_sport, inet-&gt;inet_dport, sk);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>函数比较简单，在获取sport前已经查找过一次路由表，并插入了key=[saddr=0, sport=0, daddr, dport, oif=0]的路由缓存项；现在获取到了sport，调用ip_route_output_flow()再次更新路由缓存表，它会添加key=[saddr=0, sport, daddr, dport, oif=0]的路由缓存项。这里可以看出一个策略选择，查询路由表->获取sport->查询路由表，为什么不是获取sport->查询路由表的原因可能是效率的问题。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (sport != (*rp)-&gt;fl.fl_ip_sport ||  
+</span><span class='line'>                dport != (*rp)-&gt;fl.fl_ip_dport) {  
+</span><span class='line'>    struct flowi fl;  
+</span><span class='line'>        
+</span><span class='line'>    memcpy(&fl, &(*rp)-&gt;fl, sizeof(fl));  
+</span><span class='line'>    fl.fl_ip_sport = sport;  
+</span><span class='line'>    fl.fl_ip_dport = dport;  
+</span><span class='line'>    fl.proto = protocol;  
+</span><span class='line'>    ip_rt_put(*rp);  
+</span><span class='line'>    *rp = NULL;  
+</span><span class='line'>    security_sk_classify_flow(sk, &fl);  
+</span><span class='line'>    return ip_route_output_flow(sock_net(sk), rp, &fl, sk, 0);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>write_seq相当于第一次发送TCP报文的ISN，如果为0，则通过计算获取初始值，否则延用上次的值。在获取完源端口号，并查询过路由表后，TCP正式发送SYN报文，注意在这之前TCP状态已经更新成了TCP_SYN_SENT，而在函数最后才调用tcp_connect(sk)发送SYN报文，这中间是有时差的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;write_seq)  
+</span><span class='line'>    tp-&gt;write_seq = secure_tcp_sequence_number(inet-&gt;inet_saddr,  
+</span><span class='line'>                                    inet-&gt;inet_daddr,  
+</span><span class='line'>                                    inet-&gt;inet_sport,  
+</span><span class='line'>                                    usin-&gt;sin_port);  
+</span><span class='line'>inet-&gt;inet_id = tp-&gt;write_seq ^ jiffies;  
+</span><span class='line'>err = tcp_connect(sk);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>tcp_connect()　发送SYN报文</h5>
+
+<p>几步重要的代码如下，tcp_connect_init()中设置了tp->rcv_nxt=0，tcp_transmit_skb()负责发送报文，其中seq=tcb->seq=tp->write_seq，ack_seq=tp->rcv_nxt。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_connect_init(sk);  
+</span><span class='line'>tp-&gt;snd_nxt = tp-&gt;write_seq;  
+</span><span class='line'>……  
+</span><span class='line'>tcp_transmit_skb(sk, buff, 1, sk-&gt;sk_allocation);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>收到服务端的SYN+ACK，发送ACK</h5>
+
+<h5>tcp_rcv_synsent_state_process()</h5>
+
+<p>此时已接收到对方的ACK，状态变迁到TCP_ESTABLISHED。最后发送对方SYN的ACK报文。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_set_state(sk, TCP_ESTABLISHED);  
+</span><span class='line'>tcp_send_ack(sk);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>服务端流程</h4>
+
+<h5>bind() -> inet_bind()</h5>
+
+<p>  bind操作的主要作用是将创建的socket与给定的地址相绑定，这样创建的服务才能公开的让外部调用。当然对于socket服务器的创建来说，这一步不是必须的，在listen()时如果没有绑定地址，系统会选择一个随机可用地址作为服务器地址。</p>
+
+<p>  一个socket地址分为ip和port，inet->inet_saddr赋值了传入的ip，snum是传入的port，对于端口，要检查它是否已被占用，这是由sk->sk_prot->get_port()完成的(这个函数前面已经分析过，在传入port时它检查是否被占用；传入port=0时它选择未用的端口)。如果没有被占用，inet->inet_sport被赋值port，因为是服务监听端，不需要远端地址，inet_daddr和inet_dport都置0。</p>
+
+<p>  注意bind操作不会改变socket的状态，仍为创建时的TCP_CLOSE。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>snum = ntohs(addr-&gt;sin_port);  
+</span><span class='line'>……  
+</span><span class='line'>inet-&gt;inet_rcv_saddr = inet-&gt;inet_saddr = addr-&gt;sin_addr.s_addr;  
+</span><span class='line'>if (sk-&gt;sk_prot-&gt;get_port(sk, snum)) {  
+</span><span class='line'>    inet-&gt;inet_saddr = inet-&gt;inet_rcv_saddr = 0;  
+</span><span class='line'>    err = -EADDRINUSE;  
+</span><span class='line'>    goto out_release_sock;  
+</span><span class='line'>}  
+</span><span class='line'>……  
+</span><span class='line'>inet-&gt;inet_sport = htons(inet-&gt;inet_num);  
+</span><span class='line'>inet-&gt;inet_daddr = 0;  
+</span><span class='line'>inet-&gt;inet_dport = 0;  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>listen() -> inet_listen()</h5>
+
+<p>  listen操作开始服务器的监听，此时服务就可以接受到外部连接了。在开始监听前，要检查状态是否正确，sock->state==SS_UNCONNECTED确保仍是未连接的socket，sock->type==SOCK_STREAM确保是TCP协议，old_state确保此时状态是TCP_CLOSE或TCP_LISTEN，在其它状态下进行listen都是错误的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (sock-&gt;state != SS_UNCONNECTED || sock-&gt;type != SOCK_STREAM)  
+</span><span class='line'>    goto out;  
+</span><span class='line'>old_state = sk-&gt;sk_state;  
+</span><span class='line'>if (!((1 &lt;&lt; old_state) & (TCPF_CLOSE | TCPF_LISTEN)))  
+</span><span class='line'>    goto out;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  如果已是TCP_LISTEN态，则直接跳过，不用再执行listen了，而只是重新设置listen队列长度sk_max_ack_backlog，改变listen队列长也是多次执行listen的作用。如果还没有执行listen，则还要调用inet_csk_listen_start()开始监听。</p>
+
+<p>  inet_csk_listen_start()变迁状态至TCP_LISTEN，分配监听队列，如果之前没有调用bind()绑定地址，则这里会分配一个随机地址。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (old_state != TCP_LISTEN) {  
+</span><span class='line'>    err = inet_csk_listen_start(sk, backlog);  
+</span><span class='line'>    if (err)  
+</span><span class='line'>        goto out;  
+</span><span class='line'>}  
+</span><span class='line'>sk-&gt;sk_max_ack_backlog = backlog;  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>accept()</h5>
+
+<p>accept() -> sys_accept4() -> inet_accept() -> inet_csk_accept()</p>
+
+<p>  accept()实际要做的事件并不多，它的作用是返回一个已经建立连接的socket(即经过了三次握手)，这个过程是异步的，accept()并不亲自去处理三次握手过程，而只是监听icsk_accept_queue队列，当有socket经过了三次握手，它就会被加到icsk_accept_queue中，所以accept要做的就是等待队列中插入socket，然后被唤醒并返回这个socket。而三次握手的过程完全是协议栈本身去完成的。换句话说，协议栈相当于写者，将socket写入队列，accept()相当于读者，将socket从队列读出。这个过程从listen就已开始，所以即使不调用accept()，客户仍可以和服务器建立连接，但由于没有处理，队列很快会被占满。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (reqsk_queue_empty(&icsk-&gt;icsk_accept_queue)) {  
+</span><span class='line'>    long timeo = sock_rcvtimeo(sk, flags & O_NONBLOCK);  
+</span><span class='line'>    ……  
+</span><span class='line'>    error = inet_csk_wait_for_connect(sk, timeo);  
+</span><span class='line'>    ……  
+</span><span class='line'>}  
+</span><span class='line'>        
+</span><span class='line'>newsk = reqsk_queue_get_child(&icsk-&gt;icsk_accept_queue, sk);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  协议栈向队列中加入socket的过程就是完成三次握手的过程，客户端通过向已知的listen fd发起连接请求，对于到来的每个连接，都会创建一个新的sock，当它经历了TCP_SYN_RCV -> TCP_ESTABLISHED后，就会被添加到icsk_accept_queue中，而监听的socket状态始终为TCP_LISTEN，保证连接的建立不会影响socket的接收。</p>
+
+<h4>接收客户端发来的SYN，发送SYN+ACK</h4>
+
+<h5>tcp_v4_do_rcv()</h5>
+
+<p>  tcp_v4_do_rcv()是TCP模块接收的入口函数，客户端发起请求的对象是listen fd，所以sk->sk_state == TCP_LISTEN，调用tcp_v4_hnd_req()来检查是否处于半连接，只要三次握手没有完成，这样的连接就称为半连接，具体而言就是收到了SYN，但还没有收到ACK的连接，所以对于这个查找函数，如果是SYN报文，则会返回listen的socket(连接尚未创建)；如果是ACK报文，则会返回SYN报文处理中插入的半连接socket。其中存储这些半连接的数据结构是syn_table，它在listen()调用时被创建，大小由sys_ctl_max_syn_backlog和listen()传入的队列长度决定。</p>
+
+<p>此时是收到SYN报文，tcp_v4_hnd_req()返回的仍是sk，调用tcp_rcv_state_process()来接收SYN报文，并发送SYN+ACK报文，同时向syn_table中插入一项表明此次连接的sk。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -412,68 +689,168 @@ There are circumstances in which we can try to wake a task which has already sta
 <span class='line-number'>15</span>
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int try_to_wake_up(struct task_struct * p, int synchronous)
-</span><span class='line'>{
-</span><span class='line'>    unsigned long flags;
-</span><span class='line'>    int success = 0;
-</span><span class='line'>
-</span><span class='line'>    /* 由于我们需要操作运行队列，必须获得对应的锁 */
-</span><span class='line'>    spin_lock_irqsave(&runqueue_lock, flags);
-</span><span class='line'>    /* 将进程状态设置为TASK_RUNNING */
-</span><span class='line'>    p-&gt;state = TASK_RUNNING;
-</span><span class='line'>    /* 如果进程已经在运行队列中，释放锁退出 */
-</span><span class='line'>    if (task_on_runqueue(p))
-</span><span class='line'>        goto out;
-</span><span class='line'>    /* 否则将进程添加到运行队列中 */
-</span><span class='line'>    add_to_runqueue(p);
-</span><span class='line'>
-</span><span class='line'>    /* 如果设置了同步标志 */
-</span><span class='line'>    if (!synchronous || !(p-&gt;cpus_allowed & (1UL &lt;&lt; smp_processor_id())))
-</span><span class='line'>        reschedule_idle(p);
-</span><span class='line'>    /* 唤醒成功，释放锁退出 */
-</span><span class='line'>    success = 1;
-</span><span class='line'>out:
-</span><span class='line'>    spin_unlock_irqrestore(&runqueue_lock, flags);
-</span><span class='line'>    return success;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk-&gt;sk_state == TCP_LISTEN) {  
+</span><span class='line'>    struct sock *nsk = tcp_v4_hnd_req(sk, skb);  
+</span><span class='line'>    if (!nsk)  
+</span><span class='line'>        goto discard;  
+</span><span class='line'>    if (nsk != sk) {  
+</span><span class='line'>        if (tcp_child_process(sk, nsk, skb)) {  
+</span><span class='line'>            rsk = nsk;  
+</span><span class='line'>            goto reset;  
+</span><span class='line'>        }  
+</span><span class='line'>        return 0;  
+</span><span class='line'>    }  
+</span><span class='line'>}  
+</span><span class='line'>TCP_CHECK_TIMER(sk);  
+</span><span class='line'>if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb-&gt;len)) {  
+</span><span class='line'>    rsk = sk;  
+</span><span class='line'>    goto reset;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<h4>等待队列应用模式</h4>
-
-<p>等待队列的的应用涉及两个进程，假设为A和B。A是资源的消费者，B是资源的生产者。A在消费的时候必须确保资源已经生产出来，为此定义一个资源等待队列。这个队列同时要被进程A和进程B使用，我们可以将它定义为一个全局变量。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>DECLARE_WAIT_QUEUE_HEAD(rsc_queue); /* 全局变量 */</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在进程A中，执行逻辑如下：</p>
+<p>  tcp_rcv_state_process()处理各个状态上socket的情况。下面是处于TCP_LISTEN的代码段，处于TCP_LISTEN的socket不会再向其它状态变迁，它负责监听，并在连接建立时创建新的socket。实际上，当收到第一个SYN报文时，会执行这段代码，conn_request() => tcp_v4_conn_request。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>while (resource is unavaiable) {
-</span><span class='line'>    interruptible_sleep_on( &wq );
-</span><span class='line'>}
-</span><span class='line'>consume_resource();</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>case TCP_LISTEN:  
+</span><span class='line'>……  
+</span><span class='line'>    if (th-&gt;syn) {  
+</span><span class='line'>        if (icsk-&gt;icsk_af_ops-&gt;conn_request(sk, skb) &lt; 0)  
+</span><span class='line'>            return 1;  
+</span><span class='line'>        kfree_skb(skb);  
+</span><span class='line'>        return 0;  
+</span><span class='line'>    }  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>在进程B中，执行逻辑如下：</p>
+<p>  tcp_v4_conn_request()中注意两个函数就可以了：tcp_v4_send_synack()向客户端发送了SYN+ACK报文，inet_csk_reqsk_queue_hash_add()将sk添加到了syn_table中，填充了该客户端相关的信息。这样，再次收到客户端的ACK报文时，就可以在syn_table中找到相应项了。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>produce_resource();
-</span><span class='line'>wake_up_interruptible( &wq );</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (tcp_v4_send_synack(sk, dst, req, (struct request_values *)&tmp_ext) || want_cookie)  
+</span><span class='line'>    goto drop_and_free;  
+</span><span class='line'>inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);  </span></code></pre></td></tr></table></div></figure>
 
 
+<h4>接收客户端发来的ACK</h4>
 
+<h5>tcp_v4_do_rcv()</h5>
+
+<p>  过程与收到SYN报文相同，不同点在于syn_table中已经插入了有关该连接的条目，tcp_v4_hnd_req()会返回一个新的sock: nsk，然后会调用tcp_child_process()来进行处理。在tcp_v4_hnd_req()中会创建新的sock，下面详细看下这个函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk-&gt;sk_state == TCP_LISTEN) {  
+</span><span class='line'>    struct sock *nsk = tcp_v4_hnd_req(sk, skb);  
+</span><span class='line'>    if (!nsk)  
+</span><span class='line'>        goto discard;  
+</span><span class='line'>    if (nsk != sk) {  
+</span><span class='line'>        if (tcp_child_process(sk, nsk, skb)) {  
+</span><span class='line'>            rsk = nsk;  
+</span><span class='line'>            goto reset;  
+</span><span class='line'>        }  
+</span><span class='line'>        return 0;  
+</span><span class='line'>    }  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>tcp_v4_hnd_req()</h5>
+
+<p>之前已经分析过，inet_csk_search_req()会在syn_table中找到req，此时进入tcp_check_req()</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct request_sock *req = inet_csk_search_req(sk, &prev, th-&gt;source, iph-&gt;saddr, iph-&gt;daddr);  
+</span><span class='line'>if (req)  
+</span><span class='line'>    return tcp_check_req(sk, skb, req, prev);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>tcp_check_req()</h5>
+
+<p>  syn_recv_sock() -> tcp_v4_syn_recv_sock()会创建一个新的sock并返回，创建的sock状态被直接设置为TCP_SYN_RECV，然后因为此时socket已经建立，将它添加到icsk_accept_queue中。</p>
+
+<p>  状态TCP_SYN_RECV的设置可能比较奇怪，按照TCP的状态转移图，在服务端收到SYN报文后变迁为TCP_SYN_RECV，但看到在实现中收到ACK后才有了状态TCP_SYN_RECV，并且马上会变为TCP_ESTABLISHED，所以这个状态变得无足轻重。这样做的原因是listen和accept返回的socket是不同的，而只有真正连接建立时才会创建这个新的socket，在收到SYN报文时新的socket还没有建立，就无从谈状态变迁了。这里同样是一个平衡的存在，你也可以在收到SYN时创建一个新的socket，代价就是无用的socket大大增加了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);  
+</span><span class='line'>if (child == NULL)  
+</span><span class='line'>    goto listen_overflow;  
+</span><span class='line'>inet_csk_reqsk_queue_unlink(sk, req, prev);  
+</span><span class='line'>inet_csk_reqsk_queue_removed(sk, req);  
+</span><span class='line'>inet_csk_reqsk_queue_add(sk, req, child);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>tcp_child_process()</h5>
+
+<p>如果此时sock: child被用户进程锁住了，那么就先添加到backlog中__sk_add_backlog()，待解锁时再处理backlog上的sock；如果此时没有被锁住，则先调用tcp_rcv_state_process()进行处理，处理完后，如果child状态到达TCP_ESTABLISHED，则表明其已就绪，调用sk_data_ready()唤醒等待在isck_accept_queue上的函数accept()。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sock_owned_by_user(child)) {  
+</span><span class='line'>    ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb-&gt;len);  
+</span><span class='line'>    if (state == TCP_SYN_RECV && child-&gt;sk_state != state)  
+</span><span class='line'>        parent-&gt;sk_data_ready(parent, 0);  
+</span><span class='line'>} else {  
+</span><span class='line'>    __sk_add_backlog(child, skb);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  tcp_rcv_state_process()处理各个状态上socket的情况。下面是处于TCP_SYN_RECV的代码段，注意此时传入函数的sk已经是新创建的sock了(在tcp_v4_hnd_req()中)，并且状态是TCP_SYN_RECV，而不再是listen socket，在收到ACK后，sk状态变迁为TCP_ESTABLISHED，而在tcp_v4_hnd_req()中也已将sk插入到了icsk_accept_queue上，此时它就已经完全就绪了，回到tcp_child_process()便可执行sk_data_ready()。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>case TCP_SYN_RECV:  
+</span><span class='line'>    if (acceptable) {  
+</span><span class='line'>        ……  
+</span><span class='line'>        tcp_set_state(sk, TCP_ESTABLISHED);  
+</span><span class='line'>        sk-&gt;sk_state_change(sk);  
+</span><span class='line'>        ……  
+</span><span class='line'>        tp-&gt;snd_una = TCP_SKB_CB(skb)-&gt;ack_seq;  
+</span><span class='line'>        tp-&gt;snd_wnd = ntohs(th-&gt;window) &lt;&lt; tp-&gt;rx_opt.snd_wscale;  
+</span><span class='line'>        tcp_init_wl(tp, TCP_SKB_CB(skb)-&gt;seq);   
+</span><span class='line'>        ……  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后总结三次握手的过程</p>
+
+<p><img src="/images/kernel/2015-06-01.png" alt="" /></p>
 </div>
   
   
@@ -486,7 +863,7 @@ There are circumstances in which we can try to wake a task which has already sta
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/21/kernel-base-chardev/">字符设备驱动程序</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-ext/">RHEL5/CentOS5 上支持 Ext4</a></h2>
     
     
       <p class="meta">
@@ -495,1316 +872,177 @@ There are circumstances in which we can try to wake a task which has already sta
 
 
 
-<time class='entry-date' datetime='2015-05-21T15:58:00+08:00'><span class='date'>2015-05-21</span> <span class='time'>15:58:00</span></time>
+<time class='entry-date' datetime='2015-05-29T15:40:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>15:40:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://techlife.blog.51cto.com/212583/39225">http://techlife.blog.51cto.com/212583/39225</a></p>
-
-<p><a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/">简单样例</a></p>
-
-<p>实现如下的功能:<br/>
-  -字符设备驱动程序的结构及驱动程序需要实现的系统调用<br/>
-  -可以使用cat命令或者自编的readtest命令读出"设备"里的内容<br/>
-  -以8139网卡为例，演示了I/O端口和I/O内存的使用</p>
-
-<p>本文中的大部分内容在Linux Device Driver这本书中都可以找到，这本书是Linux驱动开发者的唯一圣经。</p>
-
-<hr />
-
-<p>先来看看整个驱动程序的入口，是char8139_init()这个函数，如果不指定MODULE_LICENSE(&ldquo;GPL&rdquo;), 在模块插入内核的时候会出错，因为将非"GPL"的模块插入内核就沾污了内核的"GPL"属性。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>module_init(char8139_init);
-</span><span class='line'>module_exit(char8139_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");
-</span><span class='line'>MODULE_AUTHOR("ypixunil");
-</span><span class='line'>MODULE_DESCRIPTION("Wierd char device driver for Realtek 8139 NIC");</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接着往下看char8139_init()</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int __init char8139_init(void)
-</span><span class='line'>{
-</span><span class='line'>    int result;
-</span><span class='line'>
-</span><span class='line'>    PDBG("hello. init.\n");
-</span><span class='line'>
-</span><span class='line'>    /* register our char device */
-</span><span class='line'>    result = register_chrdev(char8139_major, "char8139", &char8139_fops);
-</span><span class='line'>    if (result &lt; 0) {
-</span><span class='line'>        PDBG("Cannot allocate major device number!\n");
-</span><span class='line'>        return result;
-</span><span class='line'>    }
-</span><span class='line'>    /* register_chrdev() will assign a major device number and return if it called
-</span><span class='line'>     * with "major" parameter set to 0 */
-</span><span class='line'>    if(char8139_major == 0)
-</span><span class='line'>        char8139_major=result;
-</span><span class='line'>
-</span><span class='line'>    /* allocate some kernel memory we need */
-</span><span class='line'>    buffer = (unsigned char*)(kmalloc(CHAR8139_BUFFER_SIZE, GFP_KERNEL));
-</span><span class='line'>    if (!buffer) {
-</span><span class='line'>        PDBG("Cannot allocate memory!\n");
-</span><span class='line'>        result = -ENOMEM;
-</span><span class='line'>        goto init_fail;
-</span><span class='line'>    }
-</span><span class='line'>    memset(buffer, 0, CHAR8139_BUFFER_SIZE);
-</span><span class='line'>    p_buf = buffer;
-</span><span class='line'>
-</span><span class='line'>    return 0; /* everything's ok */
-</span><span class='line'>
-</span><span class='line'>init_fail:
-</span><span class='line'>    char8139_exit();
-</span><span class='line'>    return result;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个函数首先的工作就是使用register_chrdev()注册我们的设备的主设备号和系统调用。系统调用对于字符设备驱动程序来说就是file_operations接口。</p>
-
-<p>我们先来看看char8139_major的定义，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFAULT_MAJOR 145         /* data structure used by our driver */
-</span><span class='line'>int char8139_major=DEFAULT_MAJOR; /* major device number. if initial value is 0,
-</span><span class='line'>                                   * the kernel will dynamically assign a major device
-</span><span class='line'>                                   * number in register_chrdev() */</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里我们指定我们的设备的主设备号是145,你必须找到一个系统中没有用的主设备号，可以通过"cat /proc/devices"命令来查看系统中已经使用的主设备号。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[michael@char8139]$ cat /proc/devices
-</span><span class='line'>Character devices:
-</span><span class='line'>1 mem
-</span><span class='line'>2 pty
-</span><span class='line'>3 ttyp
-</span><span class='line'>4 ttyS
-</span><span class='line'>5 cua
-</span><span class='line'>7 vcs
-</span><span class='line'>10 misc
-</span><span class='line'>14 sound
-</span><span class='line'>116 alsa
-</span><span class='line'>128 ptm
-</span><span class='line'>136 pts
-</span><span class='line'>162 raw
-</span><span class='line'>180 usb
-</span><span class='line'>195 nvidia
-</span><span class='line'>226 drm
-</span><span class='line'>
-</span><span class='line'>Block devices:
-</span><span class='line'>2 fd
-</span><span class='line'>3 ide0
-</span><span class='line'>22 ide1
-</span><span class='line'>[michael@char8139]$</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可见在我的系统中，145还没有被使用。</p>
-
-<p>指定主设备号值得考虑。像上面这样指定一个主设备号显然缺乏灵活性，而且不能保证一个驱动程序在所有的机器上都能用。可以在调用register_chrdev()时将第一个参数，即主设备号指定为0,这样register_chrdev()会分配一个空闲的主设备号作为返回值。 但是这样也有问题，我们只有在将模块插入内核之后才能得到我们设备的主设备号(使用 &ldquo;cat /proc/devices&rdquo;)，但是要操作设备需要在系统/dev目录下建立设备结点，而建立结点时要指定主设备号。当然，你可以写一个脚本来自动完成这些事情。</p>
-
-<p>总之，作为一个演示，我们还是指定主设备号为145，这样我们可以在/dev/目录下建立几个设备节点。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@char8139]$ mknod /dev/char8139_0 c 145 0
-</span><span class='line'>[root@char8139]$ mknod /dev/char8139_0 c 145 17
-</span><span class='line'>[root@char8139]$ mknod /dev/char8139_0 c 145 36
-</span><span class='line'>[root@char8139]$ mknod /dev/char8139_0 c 145 145</span></code></pre></td></tr></table></div></figure>
-
-
-<p>看一下我们建立的节点</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[michael@char8139]$ ll /dev/char8139*
-</span><span class='line'>crw-r--r-- 1 root root 145, 0 2004-12-26 20:33 /dev/char8139_0
-</span><span class='line'>crw-r--r-- 1 root root 145, 17 2004-12-26 20:34 /dev/char8139_1
-</span><span class='line'>crw-r--r-- 1 root root 145, 36 2004-12-26 20:34 /dev/char8139_2
-</span><span class='line'>crw-r--r-- 1 root root 145, 145 2004-12-26 20:34 /dev/char8139_3
-</span><span class='line'>[michael@char8139]$</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们建立了四个节点，使用了四个次设备号，后面我们会说明次设备号的作用。</p>
-
-<p>再来看看我们的file_operations的定义。这里其实只实现了read()，open()，release()三个系统调用，ioctl()只是简单返回。更有write()等函数甚至根本没有声明，没有声明的函数系统可能会调用默认的操作。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct file_operations char8139_fops =
-</span><span class='line'>{
-</span><span class='line'>    owner: THIS_MODULE,
-</span><span class='line'>    read: char8139_read,
-</span><span class='line'>    ioctl: char8139_ioctl,
-</span><span class='line'>    open: char8139_open,
-</span><span class='line'>    release: char8139_release,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>file_operations是每个字符设备驱动程序必须实现的系统调用，当用户对/dev中我们的设备对应结点进行操作时，linux就会调用我们驱动程序中提供的系统调用。比如用户敲入"cat /dev/char8139_0"命令，想想cat这个应用程序的实现，首先它肯定调用C语言库里的open()函数去打开/dev/char8139_0这个文件，到了系统这一层，系统会看到/dev/char8139_0不是普通磁盘文件，而是一个代表字符设备的节点，所以系统会根据/dev/char8139_0的主设备号来查找是不是已经有驱动程序使用这个相同的主设备号进行了注册，如果有，就调用驱动程序的open()实现。</p>
-
-<p>为什么要这样干？因为要提供抽象，提供统一的接口，别忘了操作系统的作用之一就是这个。因为我们的设备提供的统一的接口，所以cat这个应用程序使用一般的文件操作就能从我们的设备中读出数据，
-而且more, less这些应用程序都能从我们的设备中读出数据。</p>
-
-<p>现在来看看我们的设备</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define CHAR8139_BUFFER_SIZE 2000
-</span><span class='line'>unsigned char *buffer=NULL; /* driver data buffer */
-</span><span class='line'>unsigned char *p_buf;
-</span><span class='line'>unsigned int data_size=0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们的设备很简单，一个2000字节的缓冲区， data_size指定缓冲区中有效数据的字节数。我们的设备只支持读不支持写。我们在char8139_init()中为缓冲区分配空间。</p>
-
-<p>char8139_exit()里面的操作就是char8139_init()里面操作的反向操作。</p>
-
-<p>现在我们来看看，假如用户调用了"cat /dev/char8139_3"这个命令会发生什么事情。</p>
-
-<p>根据前面的介绍，我们驱动程序中的open()函数会被调用。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int char8139_open(struct inode *node, struct file *flip)
-</span><span class='line'>{
-</span><span class='line'>    int type = MINOR(node-&gt;i_rdev)&gt;&gt;4;
-</span><span class='line'>    int num = MINOR(node-&gt;i_rdev) & 0x0F;
-</span><span class='line'>
-</span><span class='line'>    /* put some char in buffer to reflect the minor device number */
-</span><span class='line'>    *buffer=(unsigned char)('0');
-</span><span class='line'>    *(buffer+1)=(unsigned char)('x');
-</span><span class='line'>    *(buffer+2)=(unsigned char)('0'+type);
-</span><span class='line'>    *(buffer+3)=(unsigned char)('0'+num);
-</span><span class='line'>    *(buffer+4)=(unsigned char)('\n');
-</span><span class='line'>    data_size+=5;
-</span><span class='line'>
-</span><span class='line'>    PDBG("Ok. Find treasure! 8139 I/O port base: %x\n", detect_8139_io_port());
-</span><span class='line'>    PDBG("OK. Find treasure! 8139 I/O memory base address: %lx\n",
-</span><span class='line'>    detect_8139_io_mem());
-</span><span class='line'>
-</span><span class='line'>    MOD_INC_USE_COUNT;
-</span><span class='line'>
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里演示了次设备号的作用，它让我们知道用户操作的是哪一个"次设备"，是/dev/char8139_0还是/dev/char8139_3，因为对不同的"次设备"，具体的操作方法可能是不一样的，这样就为一个驱动程序控制多个类似的设备提供了可能。</p>
-
-<p>我们根据次设备号的不同，在buffer中填入不同的字符(次设备号的16进制表示)。</p>
-
-<p>接着驱动程序中的read()函数会被调用，因为cat程序的实现就是读取文件中的内容。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ssize_t char8139_read (struct file *filp, char *buf, size_t count, loff_t *f_pos)
-</span><span class='line'>{
-</span><span class='line'>    ssize_t ret=0;
-</span><span class='line'>
-</span><span class='line'>    PDBG("copy to user. count=%d, f_pos=%ld\n", (int)count, (long)*f_pos);
-</span><span class='line'>    if (*f_pos&gt;= data_size)
-</span><span class='line'>        return ret;
-</span><span class='line'>    if (*f_pos + count &gt; data_size)
-</span><span class='line'>        count = data_size-*f_pos;
-</span><span class='line'>    if (copy_to_user(buf, p_buf, count))
-</span><span class='line'>    {
-</span><span class='line'>        PDBG("OOps, copy to user error.\n");
-</span><span class='line'>        return -EFAULT;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    p_buf += count;
-</span><span class='line'>    *f_pos += count;
-</span><span class='line'>    ret = count;
-</span><span class='line'>
-</span><span class='line'>    return ret;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>要正确的实现一个read()调用，你得想一想一个应用程序是如何调用read()从文件中读取数据的。如果你想明白了就很简单，驱动程序所要做的就是把恰当的数据传递给应用程序，这是使用copy_to_user()函数完成的。</p>
-
-<p>另外，我们必须得意识到，这里只是一个很简单的演示。还有很多复杂的问题有待考虑，比如两个应用程序可能同时打开我们设备，我们的设备应该怎样反应(这取决于具体的设备应有的行为)，还有互斥的问题。</p>
-
-<p>然后我们看看I/O端口和I/O内存的操作。这里使用8139网卡作为一个硬件实例来演示I/O端口和I/O内存的操作。没有什么特别的，都是标准的步骤。在使用时需要注意，如果你的系统中已经有8139网卡的驱动程序，必须先关掉网络设备，卸载驱动，然后再使用本驱动程序。</p>
-
-<p>使用程序包的步骤：(在我的Debian系统上如此，你的可能不同)<br/>
-1. 解压<br/>
-2. 编译(/usr/src/linux处必须要有内核源代码)<br/>
-3. ifconfig eth0 down 关掉网络设备<br/>
-rmmod 8139too 卸载原来的8139网卡驱动<br/>
-insmod char8139.o 插入我们的模块<br/>
-(insmod会出错， 如果你现在运行的linux版本不是你编译本驱动程序时使用的内核源代码的版本，insmod时会报告模块版本与内核版本不一致。这时，你得看看内核源代码中/include/linux/version.h文件，这个文件中的UTS_RELEASE定义了内核的版本号，你可以在驱动程序中预先定义这个宏为当前运行的内核的版本号，这样就能避免上述错误。)<br/>
-4. mknode(见本文前述)<br/>
-5. 试试我们的设备<br/>
-./readtest<br/>
-或者<br/>
-cat /dev/char8139_0或<br/>
-cat /dev/char8139_1或<br/>
-cat /dev/char8139_2或<br/>
-cat /dev/char8139_3<br/>
-6. 恢复系统<br/>
-rmmod char8139<br/>
-modprobe 8139too<br/>
-ifconfig eth0 up<br/>
-如果你使用dhcp可能还需要运行dhclient</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/20/android-4.4.2/">编译android4.4.2源码</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-20T15:17:00+08:00'><span class='date'>2015-05-20</span> <span class='time'>15:17:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>android4.4.2和jdk下载 <a href="http://pan.baidu.com/share/home?uk=3691037096&amp;view=share#category/type=0">http://pan.baidu.com/share/home?uk=3691037096&amp;view=share#category/type=0</a></p>
-
-<p><a href="http://www.cnblogs.com/zhx831/p/3550688.html">http://www.cnblogs.com/zhx831/p/3550688.html</a></p>
-
-<p>这篇文章主要记录了我是如何搭建Android编译环境，以及搭建当中遇到的问题以及解决方法。搭建环境依照官网进行，整个搭建环境分为两步：<br/>
-1. 安装JDK<br/>
-2. 安装相对应的库以及软件</p>
-
-<h4>1、安装JDK</h4>
-
-<p>官网上给出的办法是使用apt进行jdk的安装</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo add-apt-repository "deb http://archive.canonical.com/ lucid partner"
-</span><span class='line'>$ sudo apt-get update
-</span><span class='line'>$ sudo apt-get install sun-java6-jdk</span></code></pre></td></tr></table></div></figure>
-
-
-<p>但是我在按照这个方法进行安装是apt提示无法找到jdk安装包。 在更换了好几个source后都无法下载jdk。因此只能考虑手动安装。</p>
-
-<h5>1. 首先在Orecal官网下载JDK：</h5>
-
-<p><a href="http://www.oracle.com/technetwork/java/javase/downloads/java-archive-downloads-javase6-419409.html">http://www.oracle.com/technetwork/java/javase/downloads/java-archive-downloads-javase6-419409.html</a></p>
-
-<p>需要注意的是，现在官方网站上最新的版本的JDK7， 但是这个这个版本是不能用于Android的编译的，一定要去下载JDK6. 希望看到的朋友不要在走我的弯路。</p>
-
-<h5>2. 创建jvm文件夹</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mkdir /usr/lib/jvm</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>3. 安装JDK6</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo cp jdk-6u45-linux-x64.bin /usr/lib/jvm/
-</span><span class='line'>sudo chmod +x jdk-6u45-linux-x64.bin
-</span><span class='line'>sudo ./jdk-6u45-linux-x64.bin</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>4. 设置环境变量</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mv jdk1.6.0_45/ jdk6
-</span><span class='line'>export JAVA_HOME=/usr/lib/jvm/jdk6
-</span><span class='line'>export JRE_HOME=${JAVA_HOME}/jre
-</span><span class='line'>export CLASSPATH=.:${JAVA_HOME}/lib:${JRE_HOME}/lib
-</span><span class='line'>export PATH=${JAVA_HOME}/bin:$PATH</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>5. 使能环境变量</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>source ~/.bashrc</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>6. 设置JDK6为系统默认JDK</h5>
-
-<p>因为在ubuntu中默认JDK可能是OpenJDK,这里我们设置JDK6为我们默认的JDK</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo update-alternatives --install /usr/bin/java java /usr/lib/jvm/jdk6/bin/java 300
-</span><span class='line'>sudo update-alternatives --install /usr/bin/javac javac /usr/lib/jvm/jdk6/bin/javac 300
-</span><span class='line'>sudo update-alternatives --install /usr/bin/javaws javaws /usr/lib/jvm/jdk6/bin/javaws 300
-</span><span class='line'>sudo update-alternatives --install /usr/bin/jar jar /usr/lib/jvm/jdk6/bin/jar 300
-</span><span class='line'>sudo update-alternatives --config java</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>7. 至此JDK就安装好了，现在就可以在shell中查看Java版本</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>java -version</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果编译还提示java错误，就把java路径加到PATH中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>PATH=$PATH:/usr/lib/jvm/jdk6/bin</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2、安装相对应的库以及软件</h4>
-
-<p>根据官网上的指示我们需要安装如下软件包和lib</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo apt-get install git gnupg flex bison gperf build-essential \
-</span><span class='line'>  zip curl libc6-dev libncurses5-dev:i386 x11proto-core-dev \
-</span><span class='line'>  libx11-dev:i386 libreadline6-dev:i386 libgl1-mesa-glx:i386 \
-</span><span class='line'>  libgl1-mesa-dev g++-multilib mingw32 tofrodos \
-</span><span class='line'>  python-markdown libxml2-utils xsltproc zlib1g-dev:i386
-</span><span class='line'>$ sudo ln -s /usr/lib/i386-linux-gnu/mesa/libGL.so.1 /usr/lib/i386-linux-gnu/libGL.so</span></code></pre></td></tr></table></div></figure>
-
-
-<ul>
-<li>我安装<code>libgl1-mesa-glx:i386</code>的时候提示要卸掉很多软件，就没装这个，也是能正常编译。</li>
+  <div class="entry-content"><ul>
+<li><p>记住，只能改数据分区，<code>/</code> 和 <code>/boot</code> 分区不要试，至少我没成功，启动参数加rootfstype=ext4也起不来。</p></li>
+<li><p><code>/</code> 分区要改成ext4的话，可以直接改<code>/etc/fstab</code>文件，ext3支持以ext4形式挂载。</p></li>
+<li><p>extents属性加上后去不掉，所以该不会ext3的，除非不加这个属性？？，去掉属性<code>tune4fs -O ^flex_bg /dev/sdb1</code></p></li>
 </ul>
 
 
-<p>但是在安装过程中遇到了如下错误：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Errors were encountered while processing:
-</span><span class='line'>libc6-dev:i386
-</span><span class='line'> 
-</span><span class='line'>E: Sub-process /usr/bin/dpkg returned an error code (1)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>解决方法如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo apt-get install linux-libc-dev:i386
-</span><span class='line'>$ sudo apt-get install libc6-dev:i386</span></code></pre></td></tr></table></div></figure>
-
-
 <hr />
 
-<p><a href="http://blog.csdn.net/yf210yf/article/details/9206269">http://blog.csdn.net/yf210yf/article/details/9206269</a></p>
+<p><a href="http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html">http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html</a></p>
 
-<p><a href="http://www.cnblogs.com/qianxudetianxia/p/3681890.html">http://www.cnblogs.com/qianxudetianxia/p/3681890.html</a></p>
-
-<h4>编译代码</h4>
-
-<p>进入源码根目录,编译初始化,在终端中执行：</p>
+<p>根据我以前的测试 Ext4 的性能好过 Ext3,在 RHEL5 上的 2.6.18-110 也有加入 Ext4 了.但默认没有让我们使用,怎么样才能不重起,能使用这个啦.
+其实我们只要加入一个包e4fsprogs 就行,它其实和 e2fsprogs 是一样的功能,这 RHEL-6 中,会变成一个默认的包的.所以我们目前还只能使用这个包来调整和设置Ext4.</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>source build/envsetup.sh</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>yum -y install e4fsprogs</span></code></pre></td></tr></table></div></figure>
 
 
-<p>选择编译目标：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lunch </span></code></pre></td></tr></table></div></figure>
-
-
-<p>选择第一个吧，或者直接</p>
+<p>在 RHEL 和 Centos5 中使用 Ext4 前,很多想可能想先给现有的文件系统转换成 Ext4 ,只要运行下面的命令就行了</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lunch aosp_arm-eng</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tune4fs -O extents,uninit_bg,dir_index,flex_bg /dev/sdb1</span></code></pre></td></tr></table></div></figure>
 
 
-<p>开始编译</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make -j4</span></code></pre></td></tr></table></div></figure>
-
-
-<p>3、5个小时左右吧</p>
-
-<p>Android 完成编译的时候先执行  source build/envsetup.sh。  在这个shell 脚本中定义了 help,  croot, m, mm, mmm 等 function</p>
-
-<h4>运行模拟器</h4>
-
-<p>在终端中执行：emulator</p>
-
-<p><img src="/images/android/2015-05-20.png" alt="" /></p>
-
-<h5>修改和编译系统应用代码</h5>
-
-<p>我们修改一下系统应用Mms的标题：</p>
-
-<p><img src="/images/android/2015-05-21.png" alt="" /></p>
-
-<p>使用mm命令编译：</p>
+<p>记住，转换成 ext4 后必须用 fsck 扫描，否则不能 mount，-p 参数说明 “自动修复” 文件系统：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>xxx@ubuntu:~/Data/android/packages/apps/Mms$ mm
-</span><span class='line'>============================================
-</span><span class='line'>PLATFORM_VERSION_CODENAME=REL
-</span><span class='line'>PLATFORM_VERSION=4.4.3.2.1.000.000
-</span><span class='line'>TARGET_PRODUCT=aosp_arm
-</span><span class='line'>TARGET_BUILD_VARIANT=eng
-</span><span class='line'>TARGET_BUILD_TYPE=release
-</span><span class='line'>TARGET_BUILD_APPS=
-</span><span class='line'>TARGET_ARCH=arm
-</span><span class='line'>TARGET_2ND_ARCH=
-</span><span class='line'>TARGET_ARCH_VARIANT=armv7-a
-</span><span class='line'>TARGET_CPU_VARIANT=generic
-</span><span class='line'>HOST_ARCH=x86
-</span><span class='line'>HOST_OS=linux
-</span><span class='line'>HOST_OS_EXTRA=Linux-3.13.0-24-generic-x86_64-with-Ubuntu-14.04-trusty
-</span><span class='line'>HOST_BUILD_TYPE=release
-</span><span class='line'>BUILD_ID=OPENMASTER
-</span><span class='line'>OUT_DIR=out
-</span><span class='line'>============================================
-</span><span class='line'>make:进入目录'/home/xxx/Data/android'
-</span><span class='line'>target R.java/Manifest.java: Mms (out/target/common/obj/APPS/Mms_intermediates/src/R.stamp)
-</span><span class='line'>warning: string 'menu_insert_smiley' has no default translation.
-</span><span class='line'>target Java: Mms (out/target/common/obj/APPS/Mms_intermediates/classes)
-</span><span class='line'>注: 某些输入文件使用或覆盖了已过时的 API。
-</span><span class='line'>注: 有关详细信息, 请使用 -Xlint:deprecation 重新编译。
-</span><span class='line'>注: 某些输入文件使用了未经检查或不安全的操作。
-</span><span class='line'>注: 有关详细信息, 请使用 -Xlint:unchecked 重新编译。
-</span><span class='line'>Copying: out/target/common/obj/APPS/Mms_intermediates/classes-jarjar.jar
-</span><span class='line'>Copying: out/target/common/obj/APPS/Mms_intermediates/emma_out/lib/classes-jarjar.jar
-</span><span class='line'>Copying: out/target/common/obj/APPS/Mms_intermediates/classes.jar
-</span><span class='line'>Proguard: out/target/common/obj/APPS/Mms_intermediates/proguard.classes.jar
-</span><span class='line'>ProGuard, version 4.10
-</span><span class='line'>Reading program jar [/home/xxx/Data/android/out/target/common/obj/APPS/Mms_intermediates/classes.jar]
-</span><span class='line'>// ... ...
-</span><span class='line'>target Dex: Mms
-</span><span class='line'>Copying: out/target/common/obj/APPS/Mms_intermediates/classes.dex
-</span><span class='line'>target Package: Mms (out/target/product/generic/obj/APPS/Mms_intermediates/package.apk)
-</span><span class='line'>nothing matches overlay file ic_contact_picture.png, for flavor ,,,,,,,,,,,,mdpi,,,,,,,
-</span><span class='line'>libpng warning: iCCP: known incorrect sRGB profile
-</span><span class='line'>libpng warning: iCCP: known incorrect sRGB profile
-</span><span class='line'>warning: string 'menu_insert_smiley' has no default translation.
-</span><span class='line'>warning: string 'menu_insert_smiley' is missing 19 required localizations: az_AZ en_AU en_CA en_GB en_IN en_NZ en_SG en_US eo_EU hy_AM ka_GE km_KH lo_LA mn_MN ne_NP si_LK zh_CN zh_HK zh_TW
-</span><span class='line'>dex2oatd I 21424 21424 art/dex2oat/dex2oat.cc:1082] dex2oat: out/host/linux-x86/bin/dex2oatd --runtime-arg -Xms64m --runtime-arg -Xmx64m --boot-image=out/target/product/generic/dex_bootjars/system/framework/boot.art --dex-file=out/target/product/generic/obj/APPS/Mms_intermediates/package.apk --dex-location=/system/priv-app/Mms.apk --oat-file=out/target/product/generic/obj/APPS/Mms_intermediates/package.odex --android-root=out/target/product/generic/system --instruction-set=arm --instruction-set-features=default
-</span><span class='line'>dex2oatd I 21424 21424 art/dex2oat/dex2oat.cc:252] dex2oat took 1.189425041s (threads: 8)
-</span><span class='line'>Notice file: packages/apps/Mms/NOTICE -- out/target/product/generic/obj/NOTICE_FILES/src//system/priv-app/Mms.apk.txt
-</span><span class='line'>Install: out/target/product/generic/system/priv-app/Mms.apk
-</span><span class='line'>Install: out/target/product/generic/system/priv-app/Mms.odex
-</span><span class='line'>// ... ...
-</span><span class='line'>Install: out/target/product/generic/data/app/MmsTests.apk
-</span><span class='line'>Install: out/target/product/generic/data/app/MmsTests.odex
-</span><span class='line'>make:离开目录“/home/xxx/Data/android”</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>fsck -pf /dev/sdb1 或 fsck -y /dev/sdb1</span></code></pre></td></tr></table></div></figure>
 
 
-<p>主要是生成了两个文件：<br/>
-out/target/product/generic/system/priv-app/Mms.apk<br/>
-out/target/product/generic/system/priv-app/Mms.odex</p>
+<h5>下面这个好像不需要</h5>
 
-<h5>安装到手机</h5>
+<p>在重起前,我还要让内核支持 Ext4 的文件系统,需要修改 initrd 的文件本身的内容.如下命令来生成 支持 Ext4 的 initrd.</p>
 
-<p>因为是系统应用，为了重启有效，使用push命令把两个文件push到模拟器中对应的位置：</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mkinitrd --with=ext4 --with=ext3 -f /boot/initrd-2.6.18-404.el5.img 2.6.18-404.el5</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-net-nfs/">网络硬盘NFS的安装与配置</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-29T14:23:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>14:23:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2014-11/109637.htm">http://www.linuxidc.com/Linux/2014-11/109637.htm</a></p>
+
+<p>NFS 是共享文件的服务的一种协议 下面给大家介绍一下这个服务器的的安装和配置。</p>
+
+<h4>安装</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sudo apt-get install nfs-common nfs-kernel-server</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>配置</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>vim /etc/exprots</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在正文的最下面输入一行</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 注意现在一些核心的应用的位置由以前的system/app调整为了system/priv-app，不要push错了
-</span><span class='line'>/*
-</span><span class='line'>xxx@ubuntu:~/Data/android$ adb push out/target/product/generic/system/priv-app/Mms.odex /system/priv-app
-</span><span class='line'>2893 KB/s (2085348 bytes in 0.703s)
-</span><span class='line'>xxx@ubuntu:~/Data/android$ adb push out/target/product/generic/system/priv-app/Mms.apk /system/priv-app
-</span><span class='line'>3315 KB/s (1785258 bytes in 0.525s)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>看模拟器的标题被替换了。类似了，你可以修改framework，替换内核</p>
-
-<p>在  ~/.bashrc</p>
-
-<p>添加环境变量：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>export ANDROID_PRODUCT_OUT=~/code/android-4.2/out/target/product/generic
-</span><span class='line'>export ANDROID_SWT=~/code/android-4.2/out/host/linux-x86/framework/</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>备注：</h4>
-
-<p>执行emulator，出现如下错误：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>emulator: ERROR: You did not specify a virtual device name, and the system
-</span><span class='line'>directory could not be found.
+</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share *(rw)
 </span><span class='line'>
-</span><span class='line'>If you are an Android SDK user, please use '@&lt;name&gt;' or '-avd &lt;name&gt;'
-</span><span class='line'>to start a given virtual device (see -help-avd for details).
-</span><span class='line'>Otherwise, follow the instructions in -help-disk-images to start the emulator</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>/srv/nfs_share 表示的是我们要共享的文件目录
+</span><span class='line'>* 表示互联网上任何主机都可以访问 
+</span><span class='line'>(rw) 表示对服务器进行访问的主机可以进行的操作 也就是可读可写</span></code></pre></td></tr></table></div></figure>
 
 
-<p>解决：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>source build/envsetup.sh 
-</span><span class='line'>lunch sdk-eng</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后再执行</p>
+<p>如果我们只想让我们本地局域网上的主机对我们的服务器进行访问的话  可以这样写</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>emulator</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share 192.168.*.*(rw)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>可以启动模拟器</p>
+<h4>访问</h4>
+
+<p>本机访问</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -o rw locahost:/srv/nfs_share /mnt/nfs</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的意思是把本地的目录/srv/nfs_share 挂载到 目录/mnt/nfs上 ，这时候我们体会不到挂载点发生了变化 我们可以自己用相关的命令查询，我就不多介绍了</p>
+
+<p>非本地的主机</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -o rw 域名:/srv/nfs_share /mnt/nfs</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个时候我们会发现NFS太简单了，所以系统管理员就麻烦了</p>
+
+<h5>假如在共享的目录中有我们的重要的文件，怎么办？</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share/secret (noaccess)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>就是任何主机都不能访问/srv/nfs_share/secret 这个子目录</p>
+
+<h5>如何限制root的权限</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share 192.168.*。*（rw,root-aquash）</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>查看客户端挂载共享目录的状态</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ nfsstat -c</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>查看服务器的状态</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ nfsstat -s</span></code></pre></td></tr></table></div></figure>
+
 
 <hr />
 
-<p><a href="http://senrsl.blogspot.com/2015/03/s4shv-e300lkernelrom.html">http://senrsl.blogspot.com/2015/03/s4shv-e300lkernelrom.html</a></p>
+<p><a href="http://stevenz.blog.hexun.com/16127677_d.html">http://stevenz.blog.hexun.com/16127677_d.html</a></p>
 
-<h3>三星S4韩版SHV-E300L源码编译(内核Kernel+ROM)</h3>
+<p>服务器IP：172.0.0.1，主机名：p470-1, 通过NFS共享/disk1目录</p>
 
-<h4>编译ROM</h4>
-
-<h5>①准备工作</h5>
-
-<p>先看说明README_Platform.txt</p>
+<p>在客户端使用 <code>mount -t nfs p470-1:/disk1 /disk1</code> 时出现</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    How to build Module for Platform
-</span><span class='line'>    - It is only for modules are needed to using Android build system.
-</span><span class='line'>    - Please check its own install information under its folder for other module.
-</span><span class='line'>    [Step to build]
-</span><span class='line'>    1. Get android open source.
-</span><span class='line'>        : version info - Android 4.4
-</span><span class='line'>        ( Download site : http://source.android.com )
-</span><span class='line'>    2. Copy module that you want to build - to original android open source
-</span><span class='line'>       If same module exist in android open source, you should replace it. (no overwrite)
-</span><span class='line'>        # It is possible to build all modules at once.
-</span><span class='line'>    3. You should add module name to 'PRODUCT_PACKAGES' in 'build\target\product\core.mk' as following case.
-</span><span class='line'>        case 1) e2fsprog : should add 'e2fsck' to PRODUCT_PACKAGES
-</span><span class='line'>        case 2) blkid : should add 'libkeyutils' to PRODUCT_PACKAGES
-</span><span class='line'>        case 3) libhyphenation : should add 'libkeyutils' to PRODUCT_PACKAGES
-</span><span class='line'>        case 4) KeyUtils : should add 'libkeyutils' to PRODUCT_PACKAGES
-</span><span class='line'>        case 5) libexifa : should add 'libexifa' to PRODUCT_PACKAGES
-</span><span class='line'>        case 6) libjpega : should add 'libjpega' to PRODUCT_PACKAGES
-</span><span class='line'>        ex.) [build\target\product\core.mk] - add all module name for case 1 ~ 5 at once
-</span><span class='line'>            PRODUCT_PACKAGES += \
-</span><span class='line'>                e2fsck \
-</span><span class='line'>                blkid \
-</span><span class='line'>                libhyphenation \
-</span><span class='line'>                libkeyutils \
-</span><span class='line'>                libexifa \
-</span><span class='line'>                libjpega \
-</span><span class='line'>                ebtables
-</span><span class='line'>    4. excute build command
-</span><span class='line'>        ./build_platform.sh
-</span><span class='line'>    Note :
-</span><span class='line'>    to build SBrowser (vendor/samsung/packages/apps/SBrowser),
-</span><span class='line'>    please refer to Buildme.txt at the folder mentioned above.</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mount: mount to NFS server 'p470-1' failed: RPC Error: Program not registered.</span></code></pre></td></tr></table></div></figure>
 
 
-<p>意思就是说分4部走，后面加了个注释。</p>
+<p>错误提示。</p>
 
-<p>分别是下载4.4的源码，把包里的要编译的模块拷进去(替换,非覆盖),增加要编译的模块到core.mk进行注册,执行编译脚本。</p>
+<p>出错原因：p470-1由于网络原因nfs服务被中断，重新开启p470-1的nfs服务然后在客户端重新mount disk1即可</p>
 
-<p>查看当前源码版本</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>senrsl@senrsl-ubuntu:~$ cd android/source/WORKING_DIRECTORY/
-</span><span class='line'>senrsl@senrsl-ubuntu:~/android/source/WORKING_DIRECTORY$ repo branches
-</span><span class='line'>*  android-4.4.2_r2          | in all projects
-</span><span class='line'>    master                    | in:
-</span><span class='line'>                                      abi/cpp
-</span><span class='line'>                                      ....</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所有的版本号里没有叫4.4的，只有4.4.*的。。。。</p>
-
-<p>好吧，就用这个。</p>
-
-<h5>②替换模块</h5>
-
-<p>1)external目录,把这些目录剪出来</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/test/三星替换 /external$ ll
-</span><span class='line'>    总用量 40
-</span><span class='line'>    drwxrwxr-x 10 senrsl senrsl 4096  3月 30 14:53 ./
-</span><span class='line'>    drwxrwxr-x  4 senrsl senrsl 4096  3月 30 15:02 ../
-</span><span class='line'>    drwxrwxr-x 17 senrsl senrsl 4096  3月 20 13:35 chromium/
-</span><span class='line'>    drwxrwxr-x  9 senrsl senrsl 4096  3月 20 13:36 dnsmasq/
-</span><span class='line'>    drwxrwxr-x 19 senrsl senrsl 4096  3月 20 13:36 e2fsprogs/
-</span><span class='line'>    drwxrwxr-x  3 senrsl senrsl 4096  3月 20 13:36 gcc-demangle/
-</span><span class='line'>    drwxrwxr-x  4 senrsl senrsl 4096  3月 20 13:36 hyphenation/
-</span><span class='line'>    drwxrwxr-x 15 senrsl senrsl 4096  3月 20 13:36 iproute2/
-</span><span class='line'>    drwxrwxr-x 11 senrsl senrsl 4096  3月 20 13:36 iptables/
-</span><span class='line'>    drwxrwxr-x  4 senrsl senrsl 4096  3月 20 13:36 junit/</span></code></pre></td></tr></table></div></figure>
-
-
-<p>把这些目录放进去</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    senrsl@senrsl-ubuntu:~$ cd android/source/SHV-E300L_KK_Opensource/Platform/external/
-</span><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/SHV-E300L_KK_Opensource/Platform/external$ ll
-</span><span class='line'>    总用量 44
-</span><span class='line'>    drwxrwxr-x 11 senrsl senrsl 4096 10月 14 09:23 ./
-</span><span class='line'>    drwxrwxr-x  5 senrsl senrsl 4096  3月 30 13:10 ../
-</span><span class='line'>    drwxrwxr-x 17 senrsl senrsl 4096 10月  8 12:16 chromium/
-</span><span class='line'>    drwxrwxr-x  9 senrsl senrsl 4096 10月  8 09:07 dnsmasq/
-</span><span class='line'>    drwxrwxr-x 18 senrsl senrsl 4096 10月  8 09:07 e2fsprogs/
-</span><span class='line'>    drwxrwxr-x  2 senrsl senrsl 4096 10月  8 09:07 gcc-demangle/
-</span><span class='line'>    drwxrwxr-x  3 senrsl senrsl 4096 10月  8 09:07 hyphenation/
-</span><span class='line'>    drwxrwxr-x 14 senrsl senrsl 4096 10月  8 09:07 iproute2/
-</span><span class='line'>    drwxrwxr-x 10 senrsl senrsl 4096 10月  8 09:07 iptables/
-</span><span class='line'>    drwxrwxr-x  3 senrsl senrsl 4096 10月  8 09:07 junit/
-</span><span class='line'>    drwxrwxr-x 10 senrsl senrsl 4096 10月  8 12:23 webkit/</span></code></pre></td></tr></table></div></figure>
-
-
-<p>2)vendor目录，把vendor/samsung放进去</p>
-
-<p>3)build目录，把这俩文件剪出来，把Platform里的放进去</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/SHV-E300L_KK_Opensource/Platform/build$ tree
-</span><span class='line'>    .
-</span><span class='line'>    └── target
-</span><span class='line'>        ├── board
-</span><span class='line'>        │   └── generic
-</span><span class='line'>        │       └── BoardConfig.mk
-</span><span class='line'>        └── product
-</span><span class='line'>            └── core.mk
-</span><span class='line'>    4 directories, 2 files</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>③执行编译</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/WORKING_DIRECTORY$ ./build_platform.sh</span></code></pre></td></tr></table></div></figure>
-
-
-<p>报错</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    Export includes file: frameworks/opt/emoji/Android.mk -- out/target/product/generic/obj/SHARED_LIBRARIES/libemoji_intermediates/export_includes
-</span><span class='line'>    Export includes file: external/harfbuzz/Android.mk -- out/target/product/generic/obj/SHARED_LIBRARIES/libharfbuzz_intermediates/export_includes
-</span><span class='line'>    Export includes file: external/webkit/Android.mk -- out/target/product/generic/obj/STATIC_LIBRARIES/libwebcore_intermediates/export_includes
-</span><span class='line'>    Export includes file: external/libxml2/Android.mk -- out/target/product/generic/obj/STATIC_LIBRARIES/libxml2_intermediates/export_includes
-</span><span class='line'>    Export includes file: external/libxslt/Android.mk -- out/target/product/generic/obj/STATIC_LIBRARIES/libxslt_intermediates/export_includes
-</span><span class='line'>    Export includes file: external/hyphenation/Android.mk -- out/target/product/generic/obj/STATIC_LIBRARIES/libhyphenation_intermediates/export_includes
-</span><span class='line'>    Import includes file: out/target/product/generic/obj/SHARED_LIBRARIES/libemoji_intermediates/import_includes
-</span><span class='line'>    Import includes file: out/target/product/generic/obj/SHARED_LIBRARIES/libharfbuzz_intermediates/import_includes
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/html/DocTypeStrings.gperf
-</span><span class='line'>    Generating HTMLEntityTable.cpp
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/platform/ColorData.gperf
-</span><span class='line'>    WebCore Yacc: libwebcore &lt;= external/webkit/Source/WebCore/css/CSSGrammar.y
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    WebCore Yacc: libwebcore &lt;= external/webkit/Source/WebCore/xml/XPathGrammar.y
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/dom/make_names.pl
-</span><span class='line'>    Can't locate Switch.pm in @INC (you may need to install the Switch module) (@INC contains: /etc/perl /usr/local/lib/perl/5.18.2 /usr/local/share/perl/5.18.2 /usr/lib/perl5 /usr/share/perl5 /usr/lib/perl/5.18 /usr/share/perl/5.18 /usr/local/lib/site_perl .) at external/webkit/Source/WebCore/make-hash-tools.pl line 23.
-</span><span class='line'>    BEGIN failed--compilation aborted at external/webkit/Source/WebCore/make-hash-tools.pl line 23.
-</span><span class='line'>    Can't locate Switch.pm in @INC (you may need to install the Switch module) (@INC contains: /etc/perl /usr/local/lib/perl/5.18.2 /usr/local/share/perl/5.18.2 /usr/lib/perl5 /usr/share/perl5 /usr/lib/perl/5.18 /usr/share/perl/5.18 /usr/local/lib/site_perl .) at external/webkit/Source/WebCore/make-hash-tools.pl line 23.
-</span><span class='line'>    BEGIN failed--compilation aborted at external/webkit/Source/WebCore/make-hash-tools.pl line 23.
-</span><span class='line'>    make: *** [out/target/product/generic/obj/STATIC_LIBRARIES/libwebcore_intermediates/Source/WebCore/html/DocTypeStrings.cpp] 错误 2
-</span><span class='line'>    make: *** 正在等待未完成的任务....
-</span><span class='line'>    make: *** [out/target/product/generic/obj/STATIC_LIBRARIES/libwebcore_intermediates/Source/WebCore/platform/ColorData.cpp] 错误 2
-</span><span class='line'>    target Generated: libwebcore &lt;= external/webkit/Source/WebCore/html/parser/HTMLEntityNames.in
-</span><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/WORKING_DIRECTORY$ ./build_platform.sh</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在core.mk里把    libwebcore \删掉，再build，报错</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansKhmerUI-Bold.ttf
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansKhmerUI-Regular.ttf
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansLao-Bold.ttf
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansLao-Regular.ttf
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansLaoUI-Bold.ttf
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansLaoUI-Regular.ttf
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansMalayalam-Bold.ttf
-</span><span class='line'>    collect2: error: ld returned 1 exit status
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansMalayalam-Regular.ttf
-</span><span class='line'>    make: *** [out/target/product/generic/obj/EXECUTABLES/dnsmasq_intermediates/LINKED/dnsmasq] 错误 1
-</span><span class='line'>    make: *** 正在等待未完成的任务....
-</span><span class='line'>    Install: out/target/product/generic/system/fonts/NotoSansMalayalamUI-Bold.ttf
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:339: error: undefined reference to 'ext2fs_test_bit64'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:390: error: undefined reference to 'ext2fs_test_bit64'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:186: error: undefined reference to 'ext2fs_test_bit64'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:281: error: undefined reference to 'ext2fs_mem_is_zero'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:178: error: undefined reference to 'ext2fs_clear_bit64'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:170: error: undefined reference to 'ext2fs_set_bit64'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:141: error: undefined reference to 'ext2fs_clear_bit64'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/gen_bitmap64.c:735: error: undefined reference to 'ext2fs_get_bitmap_granularity'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/gen_bitmap64.c:790: error: undefined reference to 'ext2fs_find_first_zero_generic_bitmap'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/mmp.c:57: error: undefined reference to 'ext2fs_get_dio_alignment'
-</span><span class='line'>    external/e2fsprogs/lib/ext2fs/mmp.c:213: error: undefined reference to 'ext2fs_alloc_block2'
-</span><span class='line'>    collect2: error: ld returned 1 exit status
-</span><span class='line'>    make: *** [out/target/product/generic/obj/SHARED_LIBRARIES/libext2fs_intermediates/LINKED/libext2fs.so] 错误 1
-</span><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/WORKING_DIRECTORY$</span></code></pre></td></tr></table></div></figure>
-
-
-<p>再把 libexifa \删掉，报错</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/blkmap64_ba.o: In function `ba_find_first_zero':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:339: undefined reference to `ext2fs_test_bit64'
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:390: undefined reference to `ext2fs_test_bit64'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/blkmap64_ba.o: In function `ba_test_bmap':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:186: undefined reference to `ext2fs_test_bit64'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/blkmap64_ba.o: In function `ba_test_clear_bmap_extent':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:281: undefined reference to `ext2fs_mem_is_zero'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/blkmap64_ba.o: In function `ba_unmark_bmap':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:178: undefined reference to `ext2fs_clear_bit64'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/blkmap64_ba.o: In function `ba_mark_bmap':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:170: undefined reference to `ext2fs_set_bit64'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/blkmap64_ba.o: In function `ba_resize_bmap':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/blkmap64_ba.c:141: undefined reference to `ext2fs_clear_bit64'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/gen_bitmap64.o: In function `ext2fs_convert_subcluster_bitmap':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/gen_bitmap64.c:735: undefined reference to `ext2fs_get_bitmap_granularity'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/gen_bitmap64.o: In function `ext2fs_find_first_zero_generic_bmap':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/gen_bitmap64.c:790: undefined reference to `ext2fs_find_first_zero_generic_bitmap'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/mmp.o: In function `ext2fs_mmp_read':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/mmp.c:57: undefined reference to `ext2fs_get_dio_alignment'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/mmp.o: In function `ext2fs_mmp_init':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/mmp.c:213: undefined reference to `ext2fs_alloc_block2'
-</span><span class='line'>    collect2: ld returned 1 exit status
-</span><span class='line'>    make: *** [out/host/linux-x86/obj/lib/libext2fs_host.so] 错误 1
-</span><span class='line'>    make: *** 正在等待未完成的任务....
-</span><span class='line'>    1 warning generated.
-</span><span class='line'>    external/openssl/ssl/s2_clnt.c:1027:38: warning: unused parameter 'type' [-Wunused-parameter]
-</span><span class='line'>    int ssl2_set_certificate(SSL *s, int type, int len, const unsigned char *data)
-</span><span class='line'>                                         ^
-</span><span class='line'>    1 warning generated.
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:385:38: warning: unused parameter 'larg' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctrl(SSL *s, int cmd, long larg, void *parg)
-</span><span class='line'>                                         ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:385:50: warning: unused parameter 'parg' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctrl(SSL *s, int cmd, long larg, void *parg)
-</span><span class='line'>                                                     ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:400:30: warning: unused parameter 's' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_callback_ctrl(SSL *s, int cmd, void (*fp)(void))
-</span><span class='line'>                                 ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:400:37: warning: unused parameter 'cmd' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_callback_ctrl(SSL *s, int cmd, void (*fp)(void))
-</span><span class='line'>                                        ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:400:49: warning: unused parameter 'fp' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_callback_ctrl(SSL *s, int cmd, void (*fp)(void))
-</span><span class='line'>                                                    ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:405:29: warning: unused parameter 'ctx' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
-</span><span class='line'>                                ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:405:38: warning: unused parameter 'cmd' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
-</span><span class='line'>                                         ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:405:48: warning: unused parameter 'larg' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
-</span><span class='line'>                                                   ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:405:60: warning: unused parameter 'parg' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
-</span><span class='line'>                                                               ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:410:38: warning: unused parameter 'ctx' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_callback_ctrl(SSL_CTX *ctx, int cmd, void (*fp)(void))
-</span><span class='line'>                                         ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:410:47: warning: unused parameter 'cmd' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_callback_ctrl(SSL_CTX *ctx, int cmd, void (*fp)(void))
-</span><span class='line'>                                                  ^
-</span><span class='line'>    external/openssl/ssl/s2_lib.c:410:59: warning: unused parameter 'fp' [-Wunused-parameter]
-</span><span class='line'>    long ssl2_ctx_callback_ctrl(SSL_CTX *ctx, int cmd, void (*fp)(void))
-</span><span class='line'>                                                              ^
-</span><span class='line'>    12 warnings generated.
-</span><span class='line'>    1 warning generated.
-</span><span class='line'>    make: *** wait: 没有子进程。 停止。
-</span><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/WORKING_DIRECTORY$</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后把之前的core.mk第二部分替换成README里的，报错</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/mmp.c:57: undefined reference to `ext2fs_get_dio_alignment'
-</span><span class='line'>    out/host/linux-x86/obj/SHARED_LIBRARIES/libext2fs_host_intermediates/mmp.o: In function `ext2fs_mmp_init':
-</span><span class='line'>    /home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/mmp.c:213: undefined reference to `ext2fs_alloc_block2'
-</span><span class='line'>    collect2: ld returned 1 exit status
-</span><span class='line'>    make: *** [out/host/linux-x86/obj/lib/libext2fs_host.so] 错误 1
-</span><span class='line'>    make: *** 正在等待未完成的任务....
-</span><span class='line'>    Processing target/product/generic/dex_bootjars/system/framework/core.jar
-</span><span class='line'>    Done!</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后把core.mk里第二部分全都删掉，报的错还是上面那个。</p>
-
-<p>恢复下core.mk重来，</p>
-
-<p>报1：报错external/webkit/Source/WebCore/make-hash-tools.pl line 23.，core.mk砍掉 libwebcore \ 代码砍掉external/webkit.</p>
-
-<p>报2：/home/senrsl/android/source/WORKING_DIRECTORY/external/e2fsprogs/lib/ext2fs/mmp.c:213: undefined reference to `ext2fs_alloc_block2'，external/e2fsprogs 代码换回原版。</p>
-
-<p>报3：/home/senrsl/android/source/WORKING_DIRECTORY/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.7/bin/../lib/gcc/arm-linux-androideabi/4.7/../../../../arm-linux-androideabi/bin/ld: error: out/target/product/generic/obj/EXECUTABLES/dnsmasq_intermediates/dhcp-common.o: multiple definition of &lsquo;option_string&rsquo;
-/home/senrsl/android/source/WORKING_DIRECTORY/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.7/bin/../lib/gcc/arm-linux-androideabi/4.7/../../../../arm-linux-androideabi/bin/ld: out/target/product/generic/obj/EXECUTABLES/dnsmasq_intermediates/option.o: previous definition here，external/dnsmasq换回原版。</p>
-
-<p>然后编译</p>
-
-<p>这样竟编译成功</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    Creating filesystem with parameters:
-</span><span class='line'>        Size: 576716800
-</span><span class='line'>        Block size: 4096
-</span><span class='line'>        Blocks per group: 32768
-</span><span class='line'>        Inodes per group: 7040
-</span><span class='line'>        Inode size: 256
-</span><span class='line'>        Journal blocks: 2200
-</span><span class='line'>        Label:
-</span><span class='line'>        Blocks: 140800
-</span><span class='line'>        Block groups: 5
-</span><span class='line'>        Reserved block group size: 39
-</span><span class='line'>    Created filesystem with 892/35200 inodes and 65272/140800 blocks
-</span><span class='line'>    + '[' 0 -ne 0 ']'
-</span><span class='line'>    Install system fs image: out/target/product/generic/system.img
-</span><span class='line'>    out/target/product/generic/system.img+ maxsize=588791808 blocksize=2112 total=576716800 reserve=5947392</span></code></pre></td></tr></table></div></figure>
-
-
-<p>镜像文件输出到了/home/senrsl/android/source/WORKING_DIRECTORY/out/target /product/generic</p>
-
-<p>4)封包</p>
-
-<p>查看下官方提供的E300LKLUFNE4_E300LLGTFNE4_E300LKLUFNC1_HOME.tar</p>
-
-<p>依次罗列了这几个img.</p>
-
-<p>尝试封装</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    senrsl@senrsl-ubuntu:~/android/source/WORKING_DIRECTORY/out/target/product/generic$ tar cvf p.tar cache.img ramdisk.img system.img userdata.img
-</span><span class='line'>    cache.img
-</span><span class='line'>    ramdisk.img
-</span><span class='line'>    system.img
-</span><span class='line'>    userdata.img</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后重启系统去烧。</p>
-
-<p>//TODO 未成功，无法烧入</p>
-
-<hr />
-
-<h4>I9507V 的external/e2fsprogs，external/dnsmasq换回原版，就能编译成功，没试过烧进真机。</h4>
+<p>service nfs restart 或 /etc/rc.d/init.d/nfs restart</p>
 </div>
   
   
@@ -1817,7 +1055,7 @@ out/target/product/generic/system/priv-app/Mms.odex</p>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/15/kernel-net-ipv6/">ipv6初始化和处理流程分析</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/29/debug-kdump-vm/">VMware 'Host SMBus controller not enabled!'</a></h2>
     
     
       <p class="meta">
@@ -1826,14 +1064,41 @@ out/target/product/generic/system/priv-app/Mms.odex</p>
 
 
 
-<time class='entry-date' datetime='2015-05-15T15:57:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>15:57:00</span></time>
+<time class='entry-date' datetime='2015-05-29T14:21:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>14:21:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="/download/kernel/ipv6%E5%88%9D%E5%A7%8B%E5%8C%96%E5%92%8C%E5%A4%84%E7%90%86%E6%B5%81%E7%A8%8B%E5%88%86%E6%9E%90.pdf">ipv6初始化和处理流程分析.pdf</a></p>
+  <div class="entry-content"><p><a href="https://www.centos.bz/faq/111/">https://www.centos.bz/faq/111/</a></p>
+
+<p>Ubuntu/CentOS guest instances in VMware sometimes come up with the boot error message:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>piix4_smbus 0000:00:007.3: Host SMBus controller not enabled!</span></code></pre></td></tr></table></div></figure>
+
+
+<p>This error is being caused because VMware doesn’t actually provide that level interface for CPU access, but Ubuntu try to load the kernel module anyway.</p>
+
+<p>How to fix it: <br/>
+在虚拟机中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sudo vim /etc/modprobe.d/blacklist.conf</span></code></pre></td></tr></table></div></figure>
+
+
+<p>add the line:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>blacklist i2c-piix4</span></code></pre></td></tr></table></div></figure>
+
+
+<p>reboot</p>
+
+<hr />
+
+<p>似乎这个错误在centos6 + 3.10* 的内核，有时kdump不起作用。</p>
 </div>
   
   
@@ -1846,7 +1111,7 @@ out/target/product/generic/system/priv-app/Mms.odex</p>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/15/kernel-net-tcp_urg/">TCP的URG标志和内核实现</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/">字符设备驱动和等待队列样例</a></h2>
     
     
       <p class="meta">
@@ -1855,67 +1120,19 @@ out/target/product/generic/system/priv-app/Mms.odex</p>
 
 
 
-<time class='entry-date' datetime='2015-05-15T13:51:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>13:51:00</span></time>
+<time class='entry-date' datetime='2015-05-21T15:58:00+08:00'><span class='date'>2015-05-21</span> <span class='time'>15:58:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/phenix_lord/article/details/42012931">TCP的URG标志和内核实现之一：协议</a><br/>
-<a href="http://blog.csdn.net/phenix_lord/article/details/42046125">TCP的URG标志和内核实现之二：发送的实现</a><br/>
-<a href="http://blog.csdn.net/phenix_lord/article/details/42065897">TCP的URG标志和内核实现之三：接收的实现</a></p>
+  <div class="entry-content"><p>前两篇的样例</p>
 
-<hr />
+<p><a href="/blog/2015/05/21/kernel-base-chardev/">字符设备驱动程序</a><br/>
+<a href="/blog/2015/05/21/kernel-sched-waitqueue/">Linux内核中的等待队列</a></p>
 
-<h3>TCP的URG标志和内核实现之一：协议</h3>
-
-<p>定义urgent数据的目的：<br/>
-urgent机制，是用于通知应用层需要接收urgent data，在urgent data接收完成后，通知应用层urgent data数据接收完毕。相关协议文本RFC793 RFC1122 RFC6093</p>
-
-<h4>哪些数据是urgent data？</h4>
-
-<h5>协议规定</h5>
-
-<p>在TCP报头的URG位有效的时候，通过TCP报头中的urgent pointer来标识urgent data的位置，但是在urgent pointer的解析方式上各个协议文本的描述有差异：</p>
-
-<p>解读一：RFC793  P17，描述是“The urgent pointer points to the sequence number of the octet following the urgent data.”，在P41有描述“This mechanism permits a point in the data stream to be designated as the end of urgent information. Whenever this point is in advance of the receive sequence number (RCV.NXT) at the receiving TCP, that TCP must tell the user to go into &ldquo;urgent mode&rdquo;; when the receive sequence number catches up to the urgent pointer, the TCP must tell user to go”，可以认为是：当前接收的报文中SEQ在SEG.SEQ+Urgent Pointer之前的都是,而urgent pointer是第一个非urgent data（ TCP已经接受，但是还没有提交给应用的数据是不是呢？）</p>
-
-<p>解读二：在P56的描述是“If the urgent flag is set, then SND.UP &lt;-SND.NXT-1 and set the urgent pointer in the outgoing segments”，也就是urgent pointer是最后一个urgent data字节。而在RFC1122中消除了这一歧义：在P84中说明“the urgent pointer points to the sequence number of the LAST octet (not LAST+1) in a sequence of urgent data”</p>
-
-<h5>linux实现</h5>
-
-<p>虽然在RFC1122中消除了这一歧义，linux仍然使用了解读一的解析方式，如果要使用解读二定义的方式，需要使用tcp_stdurg这个配置项。</p>
-
-<h4>urgent data数据能有多长？</h4>
-
-<h5>协议规定</h5>
-
-<p>按照RFC793 P41的描述，长度不受限，RFC1122 P84中，更是明确了“A TCP MUST support a sequence of urgent data of any length”</p>
-
-<h5>linux实现</h5>
-
-<p>其实，linux只支持1BYTE的urgent data</p>
-
-<h4>urgent data与OOB数据</h4>
-
-<p>OOB数据说的是带外数据，也就是这些数据不是放到TCP流供读取的，而是通过额外的接口来获取，linux默认把urgent data实现为OOB数据；而按照协议的规定，urgent data不是out of band data</p>
-
-<p>由于OOB数据的协议和实现上存在很多不确定因素，因此现在已经不建议使用了</p>
-
-<hr />
-
-<h3>TCP的URG标志和内核实现之二：发送的实现</h3>
-
-<p>Linxu内核在默认情况下，把urgent data实现为OOB数据</p>
-
-<h4>发送URG数据的接口</h4>
-
-<p>在内核态，使用kernel_sendmsg/kernel_sendpage完成发送，只不过需要加上MSG_OOB标志，表示要发送的URG数据。</p>
-
-<h4>URG数据发送接口的实现</h4>
-
-<p>分片主要在kernel_sendmsg中完成，在OOB数据的处理上，它和kernel_sendpage是一致</p>
+<h4>waitqueue.c</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -2012,475 +1229,104 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
 <span class='line-number'>93</span>
 <span class='line-number'>94</span>
 <span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,  
-</span><span class='line'>        size_t size)  
-</span><span class='line'>{  
-</span><span class='line'>    。。。。。。。。。。。。。。  
-</span><span class='line'>    /*如果flags设置了MSG_OOB该接口其实返回的mss_now关闭了TSO功能*/  
-</span><span class='line'>    mss_now = tcp_send_mss(sk, &size_goal, flags);  
-</span><span class='line'>    。。。。。。。。。。。。。。  
-</span><span class='line'>    while (--iovlen &gt;= 0) {  
-</span><span class='line'>        size_t seglen = iov-&gt;iov_len;  
-</span><span class='line'>        unsigned char __user *from = iov-&gt;iov_base;  
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/init.h&gt;
+</span><span class='line'>#include &lt;linux/fs.h&gt;
+</span><span class='line'>#include &lt;asm/uaccess.h&gt;
+</span><span class='line'>#include &lt;linux/wait.h&gt;
+</span><span class='line'>#include &lt;linux/semaphore.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
 </span><span class='line'>
-</span><span class='line'>        iov++;  
+</span><span class='line'>#include &lt;linux/socket.h&gt;
+</span><span class='line'>#include &lt;linux/tcp.h&gt;
+</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
+</span><span class='line'>#include &lt;net/net_namespace.h&gt;
 </span><span class='line'>
-</span><span class='line'>        while (seglen &gt; 0) {  
-</span><span class='line'>            int copy = 0;  
-</span><span class='line'>            int max = size_goal;  
+</span><span class='line'>#include &lt;net/tcp.h&gt;
 </span><span class='line'>
-</span><span class='line'>            skb = tcp_write_queue_tail(sk);  
-</span><span class='line'>            if (tcp_send_head(sk)) {  
-</span><span class='line'>                if (skb-&gt;ip_summed == CHECKSUM_NONE)  
-</span><span class='line'>                    max = mss_now;  
-</span><span class='line'>                copy = max - skb-&gt;len;  
-</span><span class='line'>            }  
 </span><span class='line'>
-</span><span class='line'>            if (copy &lt;= 0) {  
-</span><span class='line'>new_segment:  
-</span><span class='line'>                /* Allocate new segment. If the interface is SG, 
-</span><span class='line'>                 * allocate skb fitting to single page. 
-</span><span class='line'>                 */  
-</span><span class='line'>                if (!sk_stream_memory_free(sk))  
-</span><span class='line'>                    goto wait_for_sndbuf;  
+</span><span class='line'>static ssize_t globalvar_read(struct file *, char *, size_t, loff_t*);
+</span><span class='line'>static ssize_t globalvar_write(struct file *, const char *, size_t, loff_t*);
 </span><span class='line'>
-</span><span class='line'>                skb = sk_stream_alloc_skb(sk,  
-</span><span class='line'>                              select_size(sk, sg),  
-</span><span class='line'>                              sk-&gt;sk_allocation);  
-</span><span class='line'>                if (!skb)  
-</span><span class='line'>                    goto wait_for_memory;  
-</span><span class='line'>
-</span><span class='line'>                /* 
-</span><span class='line'>                 * Check whether we can use HW checksum. 
-</span><span class='line'>                 */  
-</span><span class='line'>                if (sk-&gt;sk_route_caps & NETIF_F_ALL_CSUM)  
-</span><span class='line'>                    skb-&gt;ip_summed = CHECKSUM_PARTIAL;  
-</span><span class='line'>
-</span><span class='line'>                skb_entail(sk, skb);  
-</span><span class='line'>                copy = size_goal;  
-</span><span class='line'>                max = size_goal;  
-</span><span class='line'>            }  
-</span><span class='line'>
-</span><span class='line'>            /* Try to append data to the end of skb. */  
-</span><span class='line'>            if (copy &gt; seglen)  
-</span><span class='line'>                copy = seglen;  
-</span><span class='line'>
-</span><span class='line'>            /* Where to copy to? */  
-</span><span class='line'>            if (skb_availroom(skb) &gt; 0) {  
-</span><span class='line'>                /* We have some space in skb head. Superb! */  
-</span><span class='line'>                copy = min_t(int, copy, skb_availroom(skb));  
-</span><span class='line'>                err = skb_add_data_nocache(sk, skb, from, copy);  
-</span><span class='line'>                if (err)  
-</span><span class='line'>                    goto do_fault;  
-</span><span class='line'>            } else {  
-</span><span class='line'>                int merge = 0;  
-</span><span class='line'>                int i = skb_shinfo(skb)-&gt;nr_frags;  
-</span><span class='line'>                struct page *page = sk-&gt;sk_sndmsg_page;  
-</span><span class='line'>                int off;  
-</span><span class='line'>
-</span><span class='line'>                if (page && page_count(page) == 1)  
-</span><span class='line'>                    sk-&gt;sk_sndmsg_off = 0;  
-</span><span class='line'>
-</span><span class='line'>                off = sk-&gt;sk_sndmsg_off;  
-</span><span class='line'>
-</span><span class='line'>                if (skb_can_coalesce(skb, i, page, off) &&  
-</span><span class='line'>                    off != PAGE_SIZE) {  
-</span><span class='line'>                    /* We can extend the last page 
-</span><span class='line'>                     * fragment. */  
-</span><span class='line'>                    merge = 1;  
-</span><span class='line'>                } else if (i == MAX_SKB_FRAGS || !sg) {  
-</span><span class='line'>                    /* Need to add new fragment and cannot 
-</span><span class='line'>                     * do this because interface is non-SG, 
-</span><span class='line'>                     * or because all the page slots are 
-</span><span class='line'>                     * busy. */  
-</span><span class='line'>                    tcp_mark_push(tp, skb);  
-</span><span class='line'>                    goto new_segment;  
-</span><span class='line'>                } else if (page) {  
-</span><span class='line'>                    if (off == PAGE_SIZE) {  
-</span><span class='line'>                        put_page(page);  
-</span><span class='line'>                        sk-&gt;sk_sndmsg_page = page = NULL;  
-</span><span class='line'>                        off = 0;  
-</span><span class='line'>                    }  
-</span><span class='line'>                } else  
-</span><span class='line'>                    off = 0;  
-</span><span class='line'>
-</span><span class='line'>                if (copy &gt; PAGE_SIZE - off)  
-</span><span class='line'>                    copy = PAGE_SIZE - off;  
-</span><span class='line'>                if (!sk_wmem_schedule(sk, copy))  
-</span><span class='line'>                    goto wait_for_memory;  
-</span><span class='line'>
-</span><span class='line'>                if (!page) {  
-</span><span class='line'>                    /* Allocate new cache page. */  
-</span><span class='line'>                    if (!(page = sk_stream_alloc_page(sk)))  
-</span><span class='line'>                        goto wait_for_memory;  
-</span><span class='line'>                }  
-</span><span class='line'>
-</span><span class='line'>                /* Time to copy data. We are close to 
-</span><span class='line'>                 * the end! */  
-</span><span class='line'>                err = skb_copy_to_page_nocache(sk, from, skb,  
-</span><span class='line'>                                   page, off, copy);  
-</span><span class='line'>                if (err) {  
-</span><span class='line'>                    /* If this page was new, give it to the 
-</span><span class='line'>                     * socket so it does not get leaked. 
-</span><span class='line'>                     */  
-</span><span class='line'>                    if (!sk-&gt;sk_sndmsg_page) {  
-</span><span class='line'>                        sk-&gt;sk_sndmsg_page = page;  
-</span><span class='line'>                        sk-&gt;sk_sndmsg_off = 0;  
-</span><span class='line'>                    }  
-</span><span class='line'>                    goto do_error;  
-</span><span class='line'>                }  
-</span><span class='line'>
-</span><span class='line'>                /* Update the skb. */  
-</span><span class='line'>                if (merge) {  
-</span><span class='line'>                    skb_frag_size_add(&skb_shinfo(skb)-&gt;frags[i - 1], copy);  
-</span><span class='line'>                } else {  
-</span><span class='line'>                    skb_fill_page_desc(skb, i, page, off, copy);  
-</span><span class='line'>                    if (sk-&gt;sk_sndmsg_page) {  
-</span><span class='line'>                        get_page(page);  
-</span><span class='line'>                    } else if (off + copy &lt; PAGE_SIZE) {  
-</span><span class='line'>                        get_page(page);  
-</span><span class='line'>                        sk-&gt;sk_sndmsg_page = page;  
-</span><span class='line'>                    }  
-</span><span class='line'>                }  
-</span><span class='line'>
-</span><span class='line'>                sk-&gt;sk_sndmsg_off = off + copy;  
-</span><span class='line'>            }  
-</span><span class='line'>
-</span><span class='line'>            if (!copied)  
-</span><span class='line'>                TCP_SKB_CB(skb)-&gt;tcp_flags &= ~TCPHDR_PSH;  
-</span><span class='line'>
-</span><span class='line'>            tp-&gt;write_seq += copy;  
-</span><span class='line'>            TCP_SKB_CB(skb)-&gt;end_seq += copy;  
-</span><span class='line'>            skb_shinfo(skb)-&gt;gso_segs = 0;  
-</span><span class='line'>
-</span><span class='line'>            from += copy;  
-</span><span class='line'>            copied += copy;  
-</span><span class='line'>            if ((seglen -= copy) == 0 && iovlen == 0)  
-</span><span class='line'>                goto out;  
-</span><span class='line'>            /*对于OOB数据，即使一个分片用光，如果还有 
-</span><span class='line'>            send_buff和OOB数据，就继续积累分片*/  
-</span><span class='line'>            if (skb-&gt;len &lt; max || (flags & MSG_OOB))  
-</span><span class='line'>                continue;  
-</span><span class='line'>
-</span><span class='line'>            if (forced_push(tp)) {  
-</span><span class='line'>                tcp_mark_push(tp, skb);  
-</span><span class='line'>                __tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);  
-</span><span class='line'>            } else if (skb == tcp_send_head(sk))  
-</span><span class='line'>                tcp_push_one(sk, mss_now);  
-</span><span class='line'>            continue;  
-</span><span class='line'>
-</span><span class='line'>wait_for_sndbuf:  
-</span><span class='line'>            set_bit(SOCK_NOSPACE, &sk-&gt;sk_socket-&gt;flags);  
-</span><span class='line'>wait_for_memory:  
-</span><span class='line'>            if (copied)  
-</span><span class='line'>                tcp_push(sk, flags & ~MSG_MORE, mss_now, TCP_NAGLE_PUSH);  
-</span><span class='line'>
-</span><span class='line'>            if ((err = sk_stream_wait_memory(sk, &timeo)) != 0)  
-</span><span class='line'>                goto do_error;  
-</span><span class='line'>
-</span><span class='line'>            mss_now = tcp_send_mss(sk, &size_goal, flags);  
-</span><span class='line'>        }  
-</span><span class='line'>    }  
-</span><span class='line'>
-</span><span class='line'>out:  
-</span><span class='line'>    if (copied)  
-</span><span class='line'>        tcp_push(sk, flags, mss_now, tp-&gt;nonagle);  
-</span><span class='line'>    release_sock(sk);  
-</span><span class='line'>    return copied;  
-</span><span class='line'>
-</span><span class='line'>do_fault:  
-</span><span class='line'>    if (!skb-&gt;len) {  
-</span><span class='line'>        tcp_unlink_write_queue(skb, sk);  
-</span><span class='line'>        /* It is the one place in all of TCP, except connection 
-</span><span class='line'>         * reset, where we can be unlinking the send_head. 
-</span><span class='line'>         */  
-</span><span class='line'>        tcp_check_send_head(sk, skb);  
-</span><span class='line'>        sk_wmem_free_skb(sk, skb);  
-</span><span class='line'>    }  
-</span><span class='line'>
-</span><span class='line'>do_error:  
-</span><span class='line'>    if (copied)  
-</span><span class='line'>        goto out;  
-</span><span class='line'>out_err:  
-</span><span class='line'>    err = sk_stream_error(sk, flags, err);  
-</span><span class='line'>    release_sock(sk);  
-</span><span class='line'>    return err;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>tcp_sendmsg中，涉及对OOB数据的处理主要有：</p>
-
-<h5>1、在调用tcp_send_mss确定分片大小的时候：</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_send_mss(struct sock *sk,int *size_goal, int flags)
+</span><span class='line'>struct file_operations globalvar_fops =
 </span><span class='line'>{
-</span><span class='line'>    intmss_now;
-</span><span class='line'>    mss_now= tcp_current_mss(sk);
+</span><span class='line'>    .owner     = THIS_MODULE,
+</span><span class='line'>    .read = globalvar_read,
+</span><span class='line'>    .write = globalvar_write,
+</span><span class='line'>};
 </span><span class='line'>
-</span><span class='line'>    /*如果是OOB数据，large_allowed=0，关闭TSO*/
-</span><span class='line'>    *size_goal= tcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
-</span><span class='line'>    returnmss_now;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果是OOB数据，其实是关闭了TSO功能，这样做的原因是：天知道各个网卡芯片在执行分片的时候咋个处理TCP报头中的URG标志和urgent point</p>
-
-<h5>2、在确定何时开始执行分片的发送的时候：</h5>
-
-<p>如果是OOB数据，即使当前已经积累了一整个分片，也不会想普通的数据一样执行发送(tcp_push)，而是继续积累直到用户下发的数据全部分片或者snd_buf/内存用尽。</p>
-
-<h5>3、执行tcp_push的时候：</h5>
-
-<p>在用户下发的数据全部分片或者snd_buf/内存用尽后，进入tcp_push执行发送操作(所有的OOB数据，都会通过这个接口来执行发送)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void tcp_push(struct sock*sk, int flags, int mss_now,
-</span><span class='line'>                         int nonagle)
+</span><span class='line'>#define LEN 1024
+</span><span class='line'>static char global_var[LEN];
+</span><span class='line'>static int read_index = 0;
+</span><span class='line'>static int write_index = 0;
+</span><span class='line'>static spinlock_t var_lock;
+</span><span class='line'>static wait_queue_head_t waitq;
+</span><span class='line'>static int flag = 0;
+</span><span class='line'>static int major;
+</span><span class='line'>
+</span><span class='line'>static const char procname[] = "testvar";
+</span><span class='line'>
+</span><span class='line'>static int __init globalvar_init(void)
 </span><span class='line'>{
-</span><span class='line'>    if(tcp_send_head(sk)) {
-</span><span class='line'>        structtcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>        if(!(flags & MSG_MORE) || forced_push(tp))
-</span><span class='line'>            tcp_mark_push(tp,tcp_write_queue_tail(sk));      
-</span><span class='line'>              /*tcp_mark_urg设置tp-&gt;snd_up，标识进入OOB数据发送模式，设置urgent point
-</span><span class='line'>              指向urgentdata接受后的第一个字符*/
-</span><span class='line'>        tcp_mark_urg(tp,flags);
-</span><span class='line'>        __tcp_push_pending_frames(sk,mss_now,
-</span><span class='line'>                      (flags & MSG_MORE) ? TCP_NAGLE_CORK :nonagle);
+</span><span class='line'>    init_waitqueue_head(&waitq);
+</span><span class='line'>    spin_lock_init(&var_lock);
+</span><span class='line'>//    if (!proc_net_fops_create(&init_net, procname, S_IRUSR, &globalvar_fops)) {
+</span><span class='line'>    if (!(major = register_chrdev(0, "globalvar", &globalvar_fops))) {
+</span><span class='line'>        printk("globalvar register failure\n");
+</span><span class='line'>        return -1;
 </span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>发送处理</h4>
-
-<p>使用struct tcp_sock中的snd_up来标识当前的urgent point，同时也使用该数据来判断当前是否处于urgent data发送模式，在普通数据的发送模式中tcp_sock::snd_up总是和tcp_sock::snd_una相等，只有在有urgent data发送的时候，才在tcp_push&mdash;>tcp_mark_urg中设置为urgentpoint，进入到urgent data的处理模式</p>
-
-<p>在tcp_transmit_skb中的以下代码段负责urgent data相关的处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(tcp_urg_mode(tp) && before(tcb-&gt;seq, tp-&gt;snd_up))) {  
-</span><span class='line'>    if (before(tp-&gt;snd_up, tcb-&gt;seq + 0x10000)) {  
-</span><span class='line'>        th-&gt;urg_ptr = htons(tp-&gt;snd_up - tcb-&gt;seq);  
-</span><span class='line'>        th-&gt;urg = 1;  
-</span><span class='line'>    } else if (after(tcb-&gt;seq + 0xFFFF, tp-&gt;snd_nxt)) {  
-</span><span class='line'>        th-&gt;urg_ptr = htons(0xFFFF);  
-</span><span class='line'>        th-&gt;urg = 1;  
-</span><span class='line'>    }  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>只要当前待发送的skb的seq在tcp_sock记录的urgent point前面，就需要在报头中对URG标志置位，同时如果tcp_sock记录的urgent point。如果该报文的seq距离大于16为能表示的最大值，就置TCP报头中的urgent point为65535。</p>
-
-<h4>切换回普通模式：</h4>
-
-<p>在收到对方ACK的处理流程tcp_ack&mdash;>tcp_clean_rtx_queue中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (likely(between(tp-&gt;snd_up, prior_snd_una, tp-&gt;snd_una)))  
-</span><span class='line'>    tp-&gt;snd_up = tp-&gt;snd_una;  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>报文体现</h4>
-
-<p>根据对发送代码的分析，可以看到：如果用户使用MSG_OOB数据发送一段比较长(若干个MSS)的数据，那么线路上的报文应该是分成了若干组，每组由若干个长度为MSS的报文构成，组内的每个报文有一样的urgent pointer，指向下一组报文的起始seq，每一组的长度最长为65535。</p>
-
-<hr />
-
-<h3>TCP的URG标志和内核实现之三：接收的实现</h3>
-
-<p>大致的处理过程</p>
-
-<p>TCP的接收流程：在tcp_v4_do_rcv中的相关处理(网卡收到报文触发)中，会首先通过tcp_check_urg设置tcp_sock的urg_data为TCP_URG_NOTYET(urgent point指向的可能不是本报文，而是后续报文或者前面收到的乱序报文)，并保存最新的urgent data的sequence和对于的1 BYTE urgent data到tcp_sock的urg_data (如果之前的urgent data没有读取，就会被覆盖)。</p>
-
-<p>用户接收流程：在tcp_recvmsg流程中，如果发现当前的skb的数据中有urgent data，首先拷贝urgent data之前的数据，然后tcp_recvmsg退出，提示用户来接收OOB数据；在用户下一次调用tcp_recvmsg来接收数据的时候，会跳过urgent data，并设置urgent data数据接收完成。
-相关的数据结构和定义</p>
-
-<p>tcp_sock结构：</p>
-
-<p>1、 urg_data成员，其高8bit为urgent data的接收状态；其低8位为保存的1BYTE urgent数据。urgent data的接收状态对应的宏的含义描述：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#defineTCP_URG_VALID 0x0100  /*urgent data已经读到了tcp_sock::urg_data*/
+</span><span class='line'>    printk("major = %d\n", major);
+</span><span class='line'>    return 0;
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>#defineTCP_URG_NOTYET   0x0200  /*已经发现有urgent data，还没有读取到tcp_sock::urg_data*/
+</span><span class='line'>static void __exit globalvar_exit(void)
+</span><span class='line'>{
+</span><span class='line'>//    proc_net_remove(&init_net, procname);
+</span><span class='line'>    unregister_chrdev(major, "globalvar");
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>#defineTCP_URG_READ       0x0400  /*urgent data已经被用户通过MSG_OOB读取了*/</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>static ssize_t globalvar_read(struct file *filp, char *buf, size_t len, loff_t *off)
+</span><span class='line'>{
+</span><span class='line'>    int read_len;
+</span><span class='line'>    //等待数据可获得
+</span><span class='line'>    if (wait_event_interruptible(waitq, flag != 0))
+</span><span class='line'>        return -ERESTARTSYS;
+</span><span class='line'>
+</span><span class='line'>    spin_lock(&var_lock);
+</span><span class='line'>    read_len = write_index - read_index;
+</span><span class='line'>    if (copy_to_user(buf, global_var+read_index, read_len)) {
+</span><span class='line'>        spin_unlock(&var_lock);
+</span><span class='line'>        return -EFAULT;
+</span><span class='line'>    }
+</span><span class='line'>    read_index = write_index;
+</span><span class='line'>    flag = 0;
+</span><span class='line'>    spin_unlock(&var_lock);
+</span><span class='line'>    return read_len;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static ssize_t globalvar_write(struct file *filp, const char *buf, size_t len, loff_t *off)
+</span><span class='line'>{
+</span><span class='line'>    spin_lock(&var_lock);
+</span><span class='line'>    if (copy_from_user(global_var+write_index, buf, len)) {
+</span><span class='line'>        spin_unlock(&var_lock);
+</span><span class='line'>        return -EFAULT;
+</span><span class='line'>    }
+</span><span class='line'>    write_index += len;
+</span><span class='line'>    spin_unlock(&var_lock);
+</span><span class='line'>
+</span><span class='line'>    flag = 1;
+</span><span class='line'>    //通知数据可获得
+</span><span class='line'>    wake_up_interruptible(&waitq);
+</span><span class='line'>    return len;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(globalvar_init);
+</span><span class='line'>module_exit(globalvar_exit);
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
 
 
-<p>2、 urg_seq成员，为当前的urgent data的sequence</p>
-
-<p>流程详情</p>
-
-<h4>TCP的接收过程</h4>
-
-<p>在tcp_rcv_established的slow_path中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>slow_path:  
-</span><span class='line'>    if (len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete_user(sk, skb))  
-</span><span class='line'>        goto csum_error;  
-</span><span class='line'>    /* 
-</span><span class='line'>     *  Standard slow path. 
-</span><span class='line'>     */  
-</span><span class='line'>    if (!tcp_validate_incoming(sk, skb, th, 1))  
-</span><span class='line'>        return 0;  
-</span><span class='line'>step5:  
-</span><span class='line'>    if (th-&gt;ack &&  
-</span><span class='line'>        tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT) &lt; 0)  
-</span><span class='line'>        goto discard;  
-</span><span class='line'>    tcp_rcv_rtt_measure_ts(sk, skb);  
-</span><span class='line'>    /* 处理紧急数据. */  
-</span><span class='line'>    tcp_urg(sk, skb, th);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>也就是在报文的CRC验证和sequence验证完成后，就会通过tcp_urg来处理接收到的urgent data ：</p>
+<h4>Makefile</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -2489,414 +1335,52 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_urg(struct sock *sk, struct sk_buff *skb, const struct tcphdr *th)  
-</span><span class='line'>{  
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>  
-</span><span class='line'>    /*收到了urgent data,则检查和设置urg_data和urg_seq成员*/  
-</span><span class='line'>    if (th-&gt;urg)  
-</span><span class='line'>        tcp_check_urg(sk, th);  
-</span><span class='line'>  
-</span><span class='line'>    /* Do we wait for any urgent data? - normally not... 
-</span><span class='line'>    发现了有urgent data，但是还没有保存到tp-&gt;urg_data*/  
-</span><span class='line'>    if (tp-&gt;urg_data == TCP_URG_NOTYET) {  
-</span><span class='line'>        u32 ptr = tp-&gt;urg_seq - ntohl(th-&gt;seq) + (th-&gt;doff * 4) -  
-</span><span class='line'>              th-&gt;syn;  
-</span><span class='line'>  
-</span><span class='line'>        /* Is the urgent pointer pointing into this packet? */  
-</span><span class='line'>        if (ptr &lt; skb-&gt;len) {  
-</span><span class='line'>            u8 tmp;  
-</span><span class='line'>            if (skb_copy_bits(skb, ptr, &tmp, 1))  
-</span><span class='line'>                BUG();  
-</span><span class='line'>            tp-&gt;urg_data = TCP_URG_VALID | tmp;  
-</span><span class='line'>            if (!sock_flag(sk, SOCK_DEAD))  
-</span><span class='line'>                sk-&gt;sk_data_ready(sk, 0);  
-</span><span class='line'>        }  
-</span><span class='line'>    }  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>obj-m += waitqueue.o
+</span><span class='line'>
+</span><span class='line'>PWD = $(shell pwd)
+</span><span class='line'>KERNEL := /lib/modules/`uname -r`/build
+</span><span class='line'>
+</span><span class='line'>all:
+</span><span class='line'>    make -C $(KERNEL) M=$(PWD) modules</span></code></pre></td></tr></table></div></figure>
 
 
-<p>检查和设置urg_data和urg_seq成员的处理函数tcp_check_urg的具体流程</p>
+<h5>安装模块</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>insmod ./waitqueue.ko</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>查看对应的设备号</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ cat /proc/devices | grep globalvar
+</span><span class='line'>$ 249 globalvar</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>建立文件</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mknod /dev/globalvar c 249 0</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>终端1: cat文件</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /dev/globalvar</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>终端2: echo数据到文件</h5>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_check_urg(struct sock *sk, const struct tcphdr *th)  
-</span><span class='line'>{  
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>    u32 ptr = ntohs(th-&gt;urg_ptr);  
-</span><span class='line'>    /*两种urgent point的解析方式: 
-</span><span class='line'>    一是指向urgent data之后的第一个字节 
-</span><span class='line'>    二是执行urgent data的结束字节(RFC1122) 
-</span><span class='line'>    sysctl_tcp_stdurg被设置表示当前采用的是第二种模式 
-</span><span class='line'>    不需要把urgent point -1来指向urgent data的结束字节*/  
-</span><span class='line'>    if (ptr && !sysctl_tcp_stdurg)  
-</span><span class='line'>        ptr--;  
-</span><span class='line'>    ptr += ntohl(th-&gt;seq);  
-</span><span class='line'>  
-</span><span class='line'>    /* Ignore urgent data that we've already seen and read.  
-</span><span class='line'>    如果copied_seq已经大于urgent point，那么对于从tcp_rcv_established 
-</span><span class='line'>    来执行的，前面的tcp_validate_incoming已经拒绝了这种报文( 
-</span><span class='line'>    接收窗口外)，这里要处理的是哪种情形?*/  
-</span><span class='line'>    if (after(tp-&gt;copied_seq, ptr))  
-</span><span class='line'>        return;  
-</span><span class='line'>  
-</span><span class='line'>    /* Do not replay urg ptr. 
-</span><span class='line'>     * 
-</span><span class='line'>     * NOTE: interesting situation not covered by specs. 
-</span><span class='line'>     * Misbehaving sender may send urg ptr, pointing to segment, 
-</span><span class='line'>     * which we already have in ofo queue. We are not able to fetch 
-</span><span class='line'>     * such data and will stay in TCP_URG_NOTYET until will be eaten 
-</span><span class='line'>     * by recvmsg(). Seems, we are not obliged to handle such wicked 
-</span><span class='line'>     * situations. But it is worth to think about possibility of some 
-</span><span class='line'>     * DoSes using some hypothetical application level deadlock. 
-</span><span class='line'>     */  
-</span><span class='line'>    /*  这种情况什么时候发生?没搞明白*/  
-</span><span class='line'>    if (before(ptr, tp-&gt;rcv_nxt))  
-</span><span class='line'>        return;  
-</span><span class='line'>  
-</span><span class='line'>    /* Do we already have a newer (or duplicate) urgent pointer?  
-</span><span class='line'>    如果当前已经进入urg数据读取模式，且urgent point不大于当前 
-</span><span class='line'>    保存的值，那么之前已经开始了读取tp-&gt;urg_seq对应的 
-</span><span class='line'>    urgent 数据，无需重复处理了*/  
-</span><span class='line'>    if (tp-&gt;urg_data && !after(ptr, tp-&gt;urg_seq))  
-</span><span class='line'>        return;  
-</span><span class='line'>  
-</span><span class='line'>    /* Tell the world about our new urgent pointer.*/  
-</span><span class='line'>    sk_send_sigurg(sk);  
-</span><span class='line'>  
-</span><span class='line'>    /* We may be adding urgent data when the last byte read was 
-</span><span class='line'>     * urgent. To do this requires some care. We cannot just ignore 
-</span><span class='line'>     * tp-&gt;copied_seq since we would read the last urgent byte again 
-</span><span class='line'>     * as data, nor can we alter copied_seq until this data arrives 
-</span><span class='line'>     * or we break the semantics of SIOCATMARK (and thus sockatmark()) 
-</span><span class='line'>     * 
-</span><span class='line'>     * NOTE. Double Dutch. Rendering to plain English: author of comment 
-</span><span class='line'>     * above did something sort of  send("A", MSG_OOB); send("B", MSG_OOB); 
-</span><span class='line'>     * and expect that both A and B disappear from stream. This is _wrong_. 
-</span><span class='line'>     * Though this happens in BSD with high probability, this is occasional. 
-</span><span class='line'>     * Any application relying on this is buggy. Note also, that fix "works" 
-</span><span class='line'>     * only in this artificial test. Insert some normal data between A and B and we will 
-</span><span class='line'>     * decline of BSD again. Verdict: it is better to remove to trap 
-</span><span class='line'>     * buggy users. 
-</span><span class='line'>     */  
-</span><span class='line'>     /*用户下一次要读取的数据就是用户还没有读取的urgent数据 
-</span><span class='line'>    且当前存在新的用户未读取数据*/  
-</span><span class='line'>    if (tp-&gt;urg_seq == tp-&gt;copied_seq && tp-&gt;urg_data &&  
-</span><span class='line'>        !sock_flag(sk, SOCK_URGINLINE) && tp-&gt;copied_seq != tp-&gt;rcv_nxt) {  
-</span><span class='line'>        struct sk_buff *skb = skb_peek(&sk-&gt;sk_receive_queue);  
-</span><span class='line'>        tp-&gt;copied_seq++;  
-</span><span class='line'>        if (skb && !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq)) {  
-</span><span class='line'>            __skb_unlink(skb, &sk-&gt;sk_receive_queue);  
-</span><span class='line'>            __kfree_skb(skb);  
-</span><span class='line'>        }  
-</span><span class='line'>    }  
-</span><span class='line'>  
-</span><span class='line'>    tp-&gt;urg_data = TCP_URG_NOTYET;  
-</span><span class='line'>    tp-&gt;urg_seq = ptr;  
-</span><span class='line'>  
-</span><span class='line'>    /* Disable header prediction. */  
-</span><span class='line'>    tp-&gt;pred_flags = 0;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 123 &gt; /dev/globalvar
+</span><span class='line'>echo 1234567 &gt; /dev/globalvar
+</span><span class='line'>echo 123 &gt; /dev/globalvar</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>用户接收数据接口</h4>
-
-<h5>用户接收URG数据的接口</h5>
-
-<p>在用户接收数据的tcp_recvmsg函数中，如果用户通过MSG_OOB来接收数据，会进入tcp_recv_urg处理</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_recv_urg(struct sock *sk, struct msghdr *msg, int len, int flags)  
-</span><span class='line'>{  
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>  
-</span><span class='line'>    /* No URG data to read.  
-</span><span class='line'>    用户已经读取过了*/  
-</span><span class='line'>    if (sock_flag(sk, SOCK_URGINLINE) || !tp-&gt;urg_data ||  
-</span><span class='line'>        tp-&gt;urg_data == TCP_URG_READ)  
-</span><span class='line'>        return -EINVAL; /* Yes this is right ! */  
-</span><span class='line'>  
-</span><span class='line'>    if (sk-&gt;sk_state == TCP_CLOSE && !sock_flag(sk, SOCK_DONE))  
-</span><span class='line'>        return -ENOTCONN;  
-</span><span class='line'>    /*当前的tp-&gt;urg_data为合法的数据，可以读取*/  
-</span><span class='line'>    if (tp-&gt;urg_data & TCP_URG_VALID) {  
-</span><span class='line'>        int err = 0;  
-</span><span class='line'>        char c = tp-&gt;urg_data;  
-</span><span class='line'>        /*标识urgent data已读*/  
-</span><span class='line'>        if (!(flags & MSG_PEEK))  
-</span><span class='line'>            tp-&gt;urg_data = TCP_URG_READ;  
-</span><span class='line'>  
-</span><span class='line'>        /* Read urgent data. */  
-</span><span class='line'>        msg-&gt;msg_flags |= MSG_OOB;  
-</span><span class='line'>  
-</span><span class='line'>        if (len &gt; 0) {  
-</span><span class='line'>            if (!(flags & MSG_TRUNC))  
-</span><span class='line'>                err = memcpy_toiovec(msg-&gt;msg_iov, &c, 1);  
-</span><span class='line'>            len = 1;  
-</span><span class='line'>        } else  
-</span><span class='line'>            msg-&gt;msg_flags |= MSG_TRUNC;  
-</span><span class='line'>  
-</span><span class='line'>        return err ? -EFAULT : len;  
-</span><span class='line'>    }  
-</span><span class='line'>  
-</span><span class='line'>    if (sk-&gt;sk_state == TCP_CLOSE || (sk-&gt;sk_shutdown & RCV_SHUTDOWN))  
-</span><span class='line'>        return 0;  
-</span><span class='line'>  
-</span><span class='line'>    /* Fixed the recv(..., MSG_OOB) behaviour.  BSD docs and 
-</span><span class='line'>     * the available implementations agree in this case: 
-</span><span class='line'>     * this call should never block, independent of the 
-</span><span class='line'>     * blocking state of the socket. 
-</span><span class='line'>     * Mike &lt;pall@rz.uni-karlsruhe.de&gt; 
-</span><span class='line'>     */  
-</span><span class='line'>    return -EAGAIN;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>用户接收普通数据的接口中的相关处理</h5>
-
-<p>在用户接收数据的tcp_recvmsg函数中，在查找到待拷贝的skb后，首先拷贝urgent data数据前的数据，然后退出接收过程，在用户下一次执行tcp_recvmsg的时候跳过urgent data，设置urgent data读取结束</p>
-
-<p>查找到准备拷贝的skb后的处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>found_ok_skb:  
-</span><span class='line'>/* Ok so how much can we use? */  
-</span><span class='line'>used = skb-&gt;len - offset;  
-</span><span class='line'>if (len &lt; used)  
-</span><span class='line'>    used = len;  
-</span><span class='line'>  
-</span><span class='line'>/* 当前有urg_data数据*/  
-</span><span class='line'>if (tp-&gt;urg_data) {  
-</span><span class='line'>    u32 urg_offset = tp-&gt;urg_seq - *seq;  
-</span><span class='line'>    /*urgent data在当前待拷贝的数据范围内*/  
-</span><span class='line'>    if (urg_offset &lt; used) {  
-</span><span class='line'>        if (!urg_offset) {/*待拷贝的数据就是urgent data，跨过该urgent data， 
-</span><span class='line'>        只给用户读取后面的数据*/  
-</span><span class='line'>            if (!sock_flag(sk, SOCK_URGINLINE)) {  
-</span><span class='line'>                ++*seq;  
-</span><span class='line'>                urg_hole++;  
-</span><span class='line'>                offset++;  
-</span><span class='line'>                used--;  
-</span><span class='line'>                if (!used)  
-</span><span class='line'>                    goto skip_copy;  
-</span><span class='line'>            }  
-</span><span class='line'>        }   
-</span><span class='line'>        } else/*指定只拷贝urgent data数据之前的，完成后在下一次循环 
-</span><span class='line'>        开始的位置，会退出循环，返回用户；下一次用户调用tcp_recvmsg 
-</span><span class='line'>        就进入到上面的分支了*/  
-</span><span class='line'>            used = urg_offset;  
-</span><span class='line'>    }  
-</span><span class='line'>}   </span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skip_copy:  
-</span><span class='line'>        /*用户读取的数据跨过了urgent point，设置读取结束 
-</span><span class='line'>        开启fast path*/  
-</span><span class='line'>        if (tp-&gt;urg_data && after(tp-&gt;copied_seq, tp-&gt;urg_seq)) {  
-</span><span class='line'>            tp-&gt;urg_data = 0;  
-</span><span class='line'>            tcp_fast_path_check(sk);  
-</span><span class='line'>        }  
-</span><span class='line'>        if (used + offset &lt; skb-&gt;len)  
-</span><span class='line'>            continue;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>在接收完urgent data数据前的所有数据之后， tcp_recvmsg的以下代码片段得到执行，这段代码退出当前接收过程，提示用户有urgent data数据到来，需要用MSG_OOB来接收</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (tp-&gt;urg_data && tp-&gt;urg_seq == *seq) {  
-</span><span class='line'>    if (copied)  
-</span><span class='line'>        break;  
-</span><span class='line'>    if (signal_pending(current)) {  
-</span><span class='line'>        copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;  
-</span><span class='line'>        break;  
-</span><span class='line'>    }  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h3>后记</h3>
-
-<p>TCP的urg数据，由于定义和实现上的混乱，当前已经不建议使用，但是为了兼容之前已经已经存在的实现，该机制会长期在内核中存在，如果不了解该机制及其内核行为，有可能就很难解释一些奇怪的问题：比如某段代码不小心地造成send接口事实上设置了MSG_OOB，就会造成接收端少了一个BYTE。</p>
+<p>这时就能看见终端1读到了内容。</p>
 </div>
   
   
@@ -2997,7 +1481,7 @@ if (!document.getElementById('system~centos')) document.getElementById('aexp_sys
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(115)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(120)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -3014,7 +1498,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>49</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>54</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -3134,8 +1618,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(110)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>16</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(115)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>21</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
 <li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>19</span></li>
@@ -3218,23 +1702,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2015/06/09/kernel-net-socket/">socket创建过程 sys_socket</a>
+        <a href="/blog/2015/06/12/kernel-net-tcp-close/">linux内核中tcp连接的断开处理</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/09/kernel-net-bind/">socket绑定连接 sys_bind</a>
+        <a href="/blog/2015/06/12/kernel-net-socket-io/">Socket层实现系列 — I/O事件及其处理函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/09/kernel-net-accept/">socket接收连接 sys_accept</a>
+        <a href="/blog/2015/06/12/kernel-net-socket-wakeup/">Socket层实现系列 — 睡眠驱动的同步等待</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/03/kernel-net-rps/">Receive packet steering patch详解</a>
+        <a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/03/kernel-net-mem/">内核协议栈tcp层的内存管理</a>
+        <a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a>
       </li>
     
   </ul>

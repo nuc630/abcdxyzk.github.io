@@ -62,7 +62,7 @@ if (query != null) {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq-mark/">中断，进程</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/01/14/debug-mod-timer/">mod_timer会切换cpu</a></h2>
     
     
       <p class="meta">
@@ -71,35 +71,61 @@ if (query != null) {
 
 
 
-<time class='entry-date' datetime='2015-01-03T15:45:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:45:00</span></time>
+<time class='entry-date' datetime='2015-01-14T23:59:01+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:59:01</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>blog.chinaunix.net/uid-20806345-id-3203602.html</p>
+  <div class="entry-content"><p><a href="https://lkml.org/lkml/2009/4/16/45">https://lkml.org/lkml/2009/4/16/45</a></p>
 
-<p>  中断不是进程，不受内核调度器的管辖。在系统处理进程的过程中，对于某个cpu来说，如果有内部中断或外部中断到来，则切换到中断处理程序，切换首先要将进程由用户态要切到进程的内核态，然后再将cpu切换到中断态，待处理完中断返回进程的内核态，再返回进程的用户态，如果中断时进程刚好处于内核态中不用由用户态切到内核态了。<br/>
-  中断处理时是不分优先级的，处理中断的过程中如果有任意中断到来，都会抢占当前的中断处理过程。所以对于要及时响应的中断，需要通过关中断来屏蔽其他中断。通常所说的中断优先级是指中断控制器端的优先级，当有多个中断触发时，首先选择优先级高的中断发出请求给处理器。中断优先级只是对中断控制器而言的，所有的中断对cpu来说都是一样的，没有优先级高低之分。<br/>
-  关中断是关闭所有的外部可屏蔽中断，和优先级没有关系，如果在某中断处理程序中关中断，则不会被任何可屏蔽中断抢占，但是会被任意的不可屏蔽中断抢占。关中断是中断处理程序可选的。</p>
+<blockquote><p>Ingo, Thomas, all,</p>
 
-<p>bbs.chinaunix.net/thread-2306027-1-8.html</p>
+<p>In an SMP system, tasks are scheduled on different CPUs by the
+scheduler, interrupts are managed by irqbalancer daemon, but timers
+are still stuck to the CPUs that they have been initialised.  Timers
+queued by tasks gets re-queued on the CPU where the task gets to run
+next, but timers from IRQ context like the ones in device drivers are
+still stuck on the CPU they were initialised.  This framework will
+help move all &lsquo;movable timers&rsquo; using a sysctl interface.</p></blockquote>
 
-<p>软中断做的是一些可延迟的费时间的事，当然不能在中断里执行了。<br/>
-  <code>__do_softirq</code>代码，可以看到在执行可延迟函数第一件事就是开中断。但在开始之前，禁用了下半部中断（<code>__local_bh_disable</code>）。这样就算被中断了，返回内核时也不会被抢占，还是执行这里的代码。也不会被调度。<br/>
-  那么这样的后果就是软中断上下文里的会一直执行下去，直到到达了限定次数，然后唤醒守护进程。<br/>
-  因为软中断切换了栈，不再使用进程上下文，那么如果在软中断上下文直接或简洁调用了shedule，那么只有死翘翘了！！因为schedule调度回来的时候是依赖进程内核栈的thread_info。</p>
+<p>kernel/timer.c 中 __mod_timer函数的部分patch：</p>
 
-<p>  内核抢占点之一就是中断返回的时候检查是否可以抢占，检查的内容之一就是preempt_count是否等于0，因为禁用了下半部中断，那么肯定就不会等于0的，所以不会被抢占。也就是说返回的时候不会发生调度。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>+    cpu = smp_processor_id();
+</span><span class='line'>+ if (get_sysctl_timer_migration() && idle_cpu(cpu) && !pinned) {
+</span><span class='line'>+#if defined(CONFIG_NO_HZ) && (CONFIG_SMP)
+</span><span class='line'>+     preferred_cpu = get_nohz_load_balancer();
+</span><span class='line'>+#endif
+</span><span class='line'>+     if (preferred_cpu &gt;= 0)
+</span><span class='line'>+         cpu = preferred_cpu;
+</span><span class='line'>+ }
+</span><span class='line'>+
+</span><span class='line'>+ new_base = per_cpu(tvec_bases, cpu);
+</span><span class='line'>+</span></code></pre></td></tr></table></div></figure>
 
-<p>  个人理解 中断上下文 最大的特征 禁掉了某种中断（硬中断和软中断），所以导致 不能阻塞。<br/>
-  softirq 有可能在两种方式下被调用，一是中断处理程序退出时，开放硬件中断之后，会去调用do_softirq()。
-  do_softirq()会禁掉后半部抢占，并且现在执行流使用的是被中断的进程的栈，所以无法阻塞。<br/>
-  softirq的另一种调用方式是ksoftirq内核线程，同样do_softirq()被调用，后半部中断被禁掉，同样禁止阻塞。<br/>
-  工作队列，可以被任何中断或者软中断中断，运行在进程上下文，有自己的栈，可以阻塞。</p>
 
-<p>看一下__do_softirq()的代码,新的硬中断确实可能触发更高优先级的软中断，但是这个软中断并不会在被中断的软中断之前得到执行，软中断始终是顺序执行的。从代码看来，新一批的软中断，无论优先级多高，也得等到前一批的软中断被处理完成之后才能得到处理。而优先级只能帮助软中断在对应的批次中优先得到处理。</p>
+<hr />
+
+<p>也就是说：如果当前进程是idle（函数idle_cpu(cpu)判定），那么在mod_timer时会根据cpu的struct rq runqueues;中的 struct sched_domain *sd; 来选一个不是idle的cpu，然后把timer移到他上去。如果都是idle，就还在本cpu。<br/>
+禁用该功能可以 echo 0 > /proc/sys/kernel/timer_magration，默认的启用是1。</p>
+
+<p>也就是说：系统默认状态下mod_timer有可能会mod_timer到其他cpu上。</p>
+
+<hr />
+
+<p>但是基本只有softirq时（如 <a href="/blog/2015/01/14/debug-softirq-time-count/">/blog/2015/01/14/debug-softirq-time-count/</a>），这时会的当前进程就是idle，但cpu实际并不空闲。这样的话softirq的timer在mod_timer时，会被加到其他cpu的定时器队列。如果这些timer是不允许切换cpu的（如对per_cpu变量的操作），那么就会产生bug。</p>
 </div>
   
   
@@ -112,7 +138,7 @@ if (query != null) {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq/">硬中断和软中断</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/01/14/debug-softirq-time-count/">中断时间统计</a></h2>
     
     
       <p class="meta">
@@ -121,284 +147,57 @@ if (query != null) {
 
 
 
-<time class='entry-date' datetime='2015-01-03T15:15:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:15:00</span></time>
+<time class='entry-date' datetime='2015-01-14T23:59:00+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:59:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>关闭硬中断： spin_lock_irq和spin_unlock_irq以及spin_lock_irqsave和spin_unlock_irqrestore<br/>
-关闭软中断： spin_lock_bh和spin_unlock_bh</p>
+  <div class="entry-content"><p>软中断运行在中断上下文，不会被抢占调度，只会被硬中断打断，但硬中断退出时还是继续执行没结束的软中断。</p>
 
-<hr />
+<p>因为软中断不是运行在进程上下文，不具备被调度的前提，也不具备统计运行时间。系统是将softirq的时间加到当前被他打断的进程上（还是不统计softirq时间？？？有待学习）。</p>
 
-<p>netfilter：<br/>
-有些netfilter hooks可以从系统调用的context到达， 比如socket的send_msg()是可以到达LOCAL_OUT/POST_ROUTING的， <br/>
-这样，也就是说，在这些情况下操作conntrack链表的时候，是进程上下文，而不是软中断上下文， 因此，是需要关闭bh的。</p>
+<p>如果当前系统只运行数据包的接收服务，那么系统很可能显示的是100%idle，因为被softirq打断的进程就是idle。</p>
 
-<p>PRE_ROUTING上的按道理说，它只能从软中断到达，因此只需要spin_lock()就可以了。</p>
+<p>如果softirq足够多，导致启动了ksoftirqd进程来协助处理，那么softirq的时间会被记到ksoftirqd的进程上，显示有“有点正常”了。</p>
 
-<hr />
-
-<p><a href="http://blog.csdn.net/zhangskd/article/details/21992933">http://blog.csdn.net/zhangskd/article/details/21992933</a></p>
-
-<h4>概述</h4>
-
-<p>从本质上来讲，中断是一种电信号，当设备有某种事件发生时，它就会产生中断，通过总线把电信号发送给中断控制器。
-如果中断的线是激活的，中断控制器就把电信号发送给处理器的某个特定引脚。处理器于是立即停止自己正在做的事，
-跳到中断处理程序的入口点，进行中断处理。</p>
-
-<h5>(1) 硬中断</h5>
-
-<p>由与系统相连的外设(比如网卡、硬盘)自动产生的。主要是用来通知操作系统系统外设状态的变化。比如当网卡收到数据包的时候，就会发出一个中断。我们通常所说的中断指的是硬中断(hardirq)。</p>
-
-<h5>(2) 软中断</h5>
-
-<p>为了满足实时系统的要求，中断处理应该是越快越好。linux为了实现这个特点，当中断发生的时候，硬中断处理那些短时间就可以完成的工作，而将那些处理事件比较长的工作，放到中断之后来完成，也就是软中断(softirq)来完成。</p>
-
-<h5>(3) 中断嵌套</h5>
-
-<p>Linux下硬中断是可以嵌套的，但是没有优先级的概念，也就是说任何一个新的中断都可以打断正在执行的中断，但同种中断除外。软中断不能嵌套，但相同类型的软中断可以在不同CPU上并行执行。</p>
-
-<h5>(4) 软中断指令</h5>
-
-<p>int是软中断指令。<br/>
-中断向量表是中断号和中断处理函数地址的对应表。<br/>
-int n - 触发软中断n。相应的中断处理函数的地址为：中断向量表地址 + 4 * n。</p>
-
-<h5>(5)硬中断和软中断的区别</h5>
-
-<p>软中断是执行中断指令产生的，而硬中断是由外设引发的。<br/>
-硬中断的中断号是由中断控制器提供的，软中断的中断号由指令直接指出，无需使用中断控制器。<br/>
-硬中断是可屏蔽的，软中断不可屏蔽。<br/>
-硬中断处理程序要确保它能快速地完成任务，这样程序执行时才不会等待较长时间，称为上半部。<br/>
-软中断处理硬中断未完成的工作，是一种推后执行的机制，属于下半部。</p>
-
-<h4>开关</h4>
-
-<h5>(1) 硬中断的开关</h5>
-
-<p>简单禁止和激活当前处理器上的本地中断：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>local_irq_disable();
-</span><span class='line'>local_irq_enable();</span></code></pre></td></tr></table></div></figure>
+<p>这样就会出现：当cpu个数充足时显示100%idle，然后减少到一半cpu就显示X%si。也就是说显示100%idle是不对，应该是近似的(x/2)%si</p>
+</div>
+  
+  
 
 
-<p>保存本地中断系统状态下的禁止和激活：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned long flags;
-</span><span class='line'>local_irq_save(flags);
-</span><span class='line'>local_irq_restore(flags);</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>(2) 软中断的开关</h5>
-
-<p>禁止下半部，如softirq、tasklet和workqueue等：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>local_bh_disable();
-</span><span class='line'>local_bh_enable();</span></code></pre></td></tr></table></div></figure>
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/14/kernel-sched-alg1/">linux内核分析之调度算法（一）</a></h2>
+    
+    
+      <p class="meta">
+        
 
 
-<p>需要注意的是，禁止下半部时仍然可以被硬中断抢占。</p>
-
-<h5>(3) 判断中断状态</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define in_interrupt() (irq_count()) // 是否处于中断状态(硬中断或软中断)
-</span><span class='line'>#define in_irq() (hardirq_count()) // 是否处于硬中断
-</span><span class='line'>#define in_softirq() (softirq_count()) // 是否处于软中断</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>硬中断</h4>
-
-<h5>(1) 注册中断处理函数</h5>
-
-<p>注册中断处理函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
-</span><span class='line'> * irq: 要分配的中断号 
-</span><span class='line'> * handler: 要注册的中断处理函数 
-</span><span class='line'> * flags: 标志(一般为0) 
-</span><span class='line'> * name: 设备名(dev-&gt;name) 
-</span><span class='line'> * dev: 设备(struct net_device *dev)，作为中断处理函数的参数 
-</span><span class='line'> * 成功返回0 
-</span><span class='line'> */  
-</span><span class='line'>  
-</span><span class='line'>int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,   
-</span><span class='line'>    const char *name, void *dev);  </span></code></pre></td></tr></table></div></figure>
+<time class='entry-date' datetime='2015-01-14T23:49:00+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:49:00</span></time>
+        
+      </p>
+    
+  </header>
 
 
-<p>中断处理函数本身：</p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/bullbat/article/details/7160246">http://blog.csdn.net/bullbat/article/details/7160246</a></p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>typedef irqreturn_t (*irq_handler_t) (int, void *);  
-</span><span class='line'>  
-</span><span class='line'>/** 
-</span><span class='line'> * enum irqreturn 
-</span><span class='line'> * @IRQ_NONE: interrupt was not from this device 
-</span><span class='line'> * @IRQ_HANDLED: interrupt was handled by this device 
-</span><span class='line'> * @IRQ_WAKE_THREAD: handler requests to wake the handler thread 
-</span><span class='line'> */  
-</span><span class='line'>enum irqreturn {  
-</span><span class='line'>    IRQ_NONE,  
-</span><span class='line'>    IRQ_HANDLED,  
-</span><span class='line'>    IRQ_WAKE_THREAD,  
-</span><span class='line'>};  
-</span><span class='line'>typedef enum irqreturn irqreturn_t;  
-</span><span class='line'>#define IRQ_RETVAL(x) ((x) != IRQ_NONE)  </span></code></pre></td></tr></table></div></figure>
+<p>linux调度算法在2.6.32中采用调度类实现模块式的调度方式。这样，能够很好的加入新的调度算法。</p>
 
+<p>linux调度器是以模块方式提供的，这样做的目的是允许不同类型的进程可以有针对性地选择调度算法。这种模块化结构被称为调度器类，他允许多种不同哦可动态添加的调度算法并存，调度属于自己范畴的进程。每个调度器都有一个优先级，调度代码会按照优先级遍历调度类，拥有一个可执行进程的最高优先级的调度器类胜出，去选择下面要执行的那个程序。</p>
 
-<h5>(2) 注销中断处理函数</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
-</span><span class='line'> * free_irq - free an interrupt allocated with request_irq 
-</span><span class='line'> * @irq: Interrupt line to free 
-</span><span class='line'> * @dev_id: Device identity to free 
-</span><span class='line'> * 
-</span><span class='line'> * Remove an interrupt handler. The handler is removed and if the 
-</span><span class='line'> * interrupt line is no longer in use by any driver it is disabled. 
-</span><span class='line'> * On a shared IRQ the caller must ensure the interrupt is disabled 
-</span><span class='line'> * on the card it drives before calling this function. The function does 
-</span><span class='line'> * not return until any executing interrupts for this IRQ have completed. 
-</span><span class='line'> * This function must not be called from interrupt context. 
-</span><span class='line'> */  
-</span><span class='line'>  
-</span><span class='line'>void free_irq(unsigned int irq, void *dev_id);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>软中断</h4>
-
-<h5>(1) 定义</h5>
-
-<p>软中断是一组静态定义的下半部接口，可以在所有处理器上同时执行，即使两个类型相同也可以。<br/>
-但一个软中断不会抢占另一个软中断，唯一可以抢占软中断的是硬中断。</p>
-
-<p>软中断由softirq_action结构体表示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct softirq_action {  
-</span><span class='line'>    void (*action) (struct softirq_action *); /* 软中断的处理函数 */  
-</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>目前已注册的软中断有10种，定义为一个全局数组：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct softirq_action softirq_vec[NR_SOFTIRQS];  
-</span><span class='line'>  
-</span><span class='line'>enum {  
-</span><span class='line'>    HI_SOFTIRQ = 0, /* 优先级高的tasklets */  
-</span><span class='line'>    TIMER_SOFTIRQ, /* 定时器的下半部 */  
-</span><span class='line'>    NET_TX_SOFTIRQ, /* 发送网络数据包 */  
-</span><span class='line'>    NET_RX_SOFTIRQ, /* 接收网络数据包 */  
-</span><span class='line'>    BLOCK_SOFTIRQ, /* BLOCK装置 */  
-</span><span class='line'>    BLOCK_IOPOLL_SOFTIRQ,  
-</span><span class='line'>    TASKLET_SOFTIRQ, /* 正常优先级的tasklets */  
-</span><span class='line'>    SCHED_SOFTIRQ, /* 调度程序 */  
-</span><span class='line'>    HRTIMER_SOFTIRQ, /* 高分辨率定时器 */  
-</span><span class='line'>    RCU_SOFTIRQ, /* RCU锁定 */  
-</span><span class='line'>    NR_SOFTIRQS /* 10 */  
-</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>(2) 注册软中断处理函数</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
-</span><span class='line'> * @nr: 软中断的索引号 
-</span><span class='line'> * @action: 软中断的处理函数 
-</span><span class='line'> */  
-</span><span class='line'>  
-</span><span class='line'>void open_softirq(int nr, void (*action) (struct softirq_action *))  
-</span><span class='line'>{  
-</span><span class='line'>    softirq_vec[nr].action = action;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>open_softirq(NET_TX_SOFTIRQ, net_tx_action);
-</span><span class='line'>open_softirq(NET_RX_SOFTIRQ, net_rx_action);</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>(3) 触发软中断</h5>
-
-<p>调用raise_softirq()来触发软中断。</p>
+<p>linux上主要有两大类调度算法，CFS(完全公平调度算法）和实时调度算法。宏SCHED_NOMAL主要用于CFS调度，而SCHED_FIFO和SCHED_RR主要用于实时调度。如下面的宏定义：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -423,127 +222,35 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 <span class='line-number'>21</span>
 <span class='line-number'>22</span>
 <span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void raise_softirq(unsigned int nr)  
-</span><span class='line'>{  
-</span><span class='line'>    unsigned long flags;  
-</span><span class='line'>    local_irq_save(flags);  
-</span><span class='line'>    raise_softirq_irqoff(nr);  
-</span><span class='line'>    local_irq_restore(flags);  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>/* This function must run with irqs disabled */  
-</span><span class='line'>inline void rasie_softirq_irqsoff(unsigned int nr)  
-</span><span class='line'>{  
-</span><span class='line'>    __raise_softirq_irqoff(nr);  
-</span><span class='line'>  
-</span><span class='line'>    /* If we're in an interrupt or softirq, we're done 
-</span><span class='line'>     * (this also catches softirq-disabled code). We will 
-</span><span class='line'>     * actually run the softirq once we return from the irq 
-</span><span class='line'>     * or softirq. 
-</span><span class='line'>     * Otherwise we wake up ksoftirqd to make sure we 
-</span><span class='line'>     * schedule the softirq soon. 
-</span><span class='line'>     */  
-</span><span class='line'>    if (! in_interrupt()) /* 如果不处于硬中断或软中断 */  
-</span><span class='line'>        wakeup_softirqd(void); /* 唤醒ksoftirqd/n进程 */  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * Scheduling policies
+</span><span class='line'> */
+</span><span class='line'> /*支援Real-Time Task的排程,包括有SCHED_FIFO與SCHED_RR. 
+</span><span class='line'> */
+</span><span class='line'> 
+</span><span class='line'> /*(也稱為SCHED_OTHER): 主要用以排程
+</span><span class='line'> 一般目的的Task.*/
+</span><span class='line'>#define SCHED_NORMAL      0
+</span><span class='line'>#define SCHED_FIFO        1
+</span><span class='line'>/*task預設的 Time Slice長度為100 msecs*/
+</span><span class='line'>#define SCHED_RR      2
+</span><span class='line'>/*主要用以讓Task可以延長執行的時間
+</span><span class='line'>(Time Slice),減少被中斷發生Task Context-Switch
+</span><span class='line'>的次數.藉此可以提高 Cache的利用率 
+</span><span class='line'>(每次Context-Switch都會導致Cache-Flush). 比
+</span><span class='line'>較適合用在固定週期執行的Batch Jobs任
+</span><span class='line'>務主機上,而不適合用在需要使用者互
+</span><span class='line'>動的產品 (會由於Task切換的延遲,而
+</span><span class='line'>感覺到系統效能不佳或是反應太慢).*/
+</span><span class='line'>#define SCHED_BATCH       3
+</span><span class='line'>/* SCHED_ISO: reserved but not implemented yet */
+</span><span class='line'>/*為系統中的Idle Task排程.*/
+</span><span class='line'>#define SCHED_IDLE        5</span></code></pre></td></tr></table></div></figure>
 
 
-<p>Percpu变量irq_cpustat_t中的__softirq_pending是等待处理的软中断的位图，通过设置此变量</p>
-
-<p>即可告诉内核该执行哪些软中断。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __rasie_softirq_irqoff(unsigned int nr)  
-</span><span class='line'>{  
-</span><span class='line'>    trace_softirq_raise(nr);  
-</span><span class='line'>    or_softirq_pending(1UL &lt;&lt; nr);  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>typedef struct {  
-</span><span class='line'>    unsigned int __softirq_pending;  
-</span><span class='line'>    unsigned int __nmi_count; /* arch dependent */  
-</span><span class='line'>} irq_cpustat_t;  
-</span><span class='line'>  
-</span><span class='line'>irq_cpustat_t irq_stat[];  
-</span><span class='line'>#define __IRQ_STAT(cpu, member) (irq_stat[cpu].member)  
-</span><span class='line'>#define or_softirq_pending(x) percpu_or(irq_stat.__softirq_pending, (x))  
-</span><span class='line'>#define local_softirq_pending() percpu_read(irq_stat.__softirq_pending)  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>唤醒ksoftirqd内核线程处理软中断。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void wakeup_softirqd(void)  
-</span><span class='line'>{  
-</span><span class='line'>    /* Interrupts are disabled: no need to stop preemption */  
-</span><span class='line'>    struct task_struct *tsk = __get_cpu_var(ksoftirqd);  
-</span><span class='line'>  
-</span><span class='line'>    if (tsk && tsk-&gt;state != TASK_RUNNING)  
-</span><span class='line'>        wake_up_process(tsk);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>在下列地方，待处理的软中断会被检查和执行：<br/>
-1. 从一个硬件中断代码处返回时<br/>
-2. 在ksoftirqd内核线程中<br/>
-3. 在那些显示检查和执行待处理的软中断的代码中，如网络子系统中</p>
-
-<p>而不管是用什么方法唤起，软中断都要在do_softirq()中执行。如果有待处理的软中断，do_softirq()会循环遍历每一个，调用它们的相应的处理程序。在中断处理程序中触发软中断是最常见的形式。中断处理程序执行硬件设备的相关操作，然后触发相应的软中断，最后退出。内核在执行完中断处理程序以后，马上就会调用do_softirq()，于是软中断开始执行中断处理程序完成剩余的任务。</p>
-
-<p>下面来看下do_softirq()的具体实现。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>asmlinkage void do_softirq(void)  
-</span><span class='line'>{  
-</span><span class='line'>    __u32 pending;  
-</span><span class='line'>    unsigned long flags;  
-</span><span class='line'>  
-</span><span class='line'>    /* 如果当前已处于硬中断或软中断中，直接返回 */  
-</span><span class='line'>    if (in_interrupt())   
-</span><span class='line'>        return;  
-</span><span class='line'>  
-</span><span class='line'>    local_irq_save(flags);  
-</span><span class='line'>    pending = local_softirq_pending();  
-</span><span class='line'>    if (pending) /* 如果有激活的软中断 */  
-</span><span class='line'>        __do_softirq(); /* 处理函数 */  
-</span><span class='line'>    local_irq_restore(flags);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
+<p>linux调度算法实现的高层数据结构主要有运行实体、调度类、运行队列，下面我们主要看看这几个数据结构的字段和意义。<br/>
+运行实体，rq结构体每个cpu有一个，主要存储一些基本的用于调度的信息，包括实时调度的和CFS调度的</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -606,77 +313,642 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 <span class='line-number'>59</span>
 <span class='line-number'>60</span>
 <span class='line-number'>61</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* We restart softirq processing MAX_SOFTIRQ_RESTART times, 
-</span><span class='line'> * and we fall back to softirqd after that. 
-</span><span class='line'> * This number has been established via experimentation. 
-</span><span class='line'> * The two things to balance is latency against fairness - we want 
-</span><span class='line'> * to handle softirqs as soon as possible, but they should not be 
-</span><span class='line'> * able to lock up the box. 
-</span><span class='line'> */  
-</span><span class='line'>asmlinkage void __do_softirq(void)  
-</span><span class='line'>{  
-</span><span class='line'>    struct softirq_action *h;  
-</span><span class='line'>    __u32 pending;  
-</span><span class='line'>    /* 本函数能重复触发执行的次数，防止占用过多的cpu时间 */  
-</span><span class='line'>    int max_restart = MAX_SOFTIRQ_RESTART;  
-</span><span class='line'>    int cpu;  
-</span><span class='line'>  
-</span><span class='line'>    pending = local_softirq_pending(); /* 激活的软中断位图 */  
-</span><span class='line'>    account_system_vtime(current);  
-</span><span class='line'>    /* 本地禁止当前的软中断 */  
-</span><span class='line'>    __local_bh_disable((unsigned long)__builtin_return_address(0), SOFTIRQ_OFFSET);  
-</span><span class='line'>    lockdep_softirq_enter(); /* current-&gt;softirq_context++ */  
-</span><span class='line'>    cpu = smp_processor_id(); /* 当前cpu编号 */  
-</span><span class='line'>  
-</span><span class='line'>restart:  
-</span><span class='line'>    /* Reset the pending bitmask before enabling irqs */  
-</span><span class='line'>    set_softirq_pending(0); /* 重置位图 */  
-</span><span class='line'>    local_irq_enable();  
-</span><span class='line'>    h = softirq_vec;  
-</span><span class='line'>    do {  
-</span><span class='line'>        if (pending & 1) {  
-</span><span class='line'>            unsigned int vec_nr = h - softirq_vec; /* 软中断索引 */  
-</span><span class='line'>            int prev_count = preempt_count();  
-</span><span class='line'>            kstat_incr_softirqs_this_cpu(vec_nr);  
-</span><span class='line'>  
-</span><span class='line'>            trace_softirq_entry(vec_nr);  
-</span><span class='line'>            h-&gt;action(h); /* 调用软中断的处理函数 */  
-</span><span class='line'>            trace_softirq_exit(vec_nr);  
-</span><span class='line'>  
-</span><span class='line'>            if (unlikely(prev_count != preempt_count())) {  
-</span><span class='line'>                printk(KERN_ERR "huh, entered softirq %u %s %p" "with preempt_count %08x,"  
-</span><span class='line'>                    "exited with %08x?\n", vec_nr, softirq_to_name[vec_nr], h-&gt;action, prev_count,  
-</span><span class='line'>                    preempt_count());  
-</span><span class='line'>            }  
-</span><span class='line'>            rcu_bh_qs(cpu);  
-</span><span class='line'>        }  
-</span><span class='line'>        h++;  
-</span><span class='line'>        pending &gt;&gt;= 1;  
-</span><span class='line'>    } while(pending);  
-</span><span class='line'>  
-</span><span class='line'>    local_irq_disable();  
-</span><span class='line'>    pending = local_softirq_pending();  
-</span><span class='line'>    if (pending & --max_restart) /* 重复触发 */  
-</span><span class='line'>        goto restart;  
-</span><span class='line'>  
-</span><span class='line'>    /* 如果重复触发了10次了，接下来唤醒ksoftirqd/n内核线程来处理 */  
-</span><span class='line'>    if (pending)  
-</span><span class='line'>        wakeup_softirqd();   
-</span><span class='line'>  
-</span><span class='line'>    lockdep_softirq_exit();  
-</span><span class='line'>    account_system_vtime(current);  
-</span><span class='line'>    __local_bh_enable(SOFTIRQ_OFFSET);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> /*每个处理器都会配置一个rq*/
+</span><span class='line'>struct rq {
+</span><span class='line'>    /* runqueue lock: */
+</span><span class='line'>    spinlock_t lock;
+</span><span class='line'>
+</span><span class='line'>    /*
+</span><span class='line'>     * nr_running and cpu_load should be in the same cacheline because
+</span><span class='line'>     * remote CPUs use both these fields when doing load calculation.
+</span><span class='line'>     */
+</span><span class='line'>     /*用以记录目前处理器rq中执行task的数量*/
+</span><span class='line'>    unsigned long nr_running;
+</span><span class='line'>    #define CPU_LOAD_IDX_MAX 5
+</span><span class='line'>    /*用以表示处理器的负载，在每个处理器的rq中
+</span><span class='line'>    都会有对应到该处理器的cpu_load参数配置，在每次
+</span><span class='line'>    处理器触发scheduler tick时，都会呼叫函数
+</span><span class='line'>    update_cpu_load_active,进行cpu_load的更新。在系统初始化的时候
+</span><span class='line'>    会呼叫函数sched_init把rq的cpu_load array初始化为0.
+</span><span class='line'>    了解他的更新方式最好的方式是通过函数update_cpu_load,公式如下澹?
+</span><span class='line'>    cpu_load[0]会直接等待rq中load.weight的值。
+</span><span class='line'>    cpu_load[1]=(cpu_load[1]*(2-1)+cpu_load[0])/2
+</span><span class='line'>    cpu_load[2]=(cpu_load[2]*(4-1)+cpu_load[0])/4
+</span><span class='line'>    cpu_load[3]=(cpu_load[3]*(8-1)+cpu_load[0])/8
+</span><span class='line'>    cpu_load[4]=(cpu_load[4]*(16-1)+cpu_load[0]/16
+</span><span class='line'>    呼叫函数this_cpu_load时，所返回的cpu load值是cpu_load[0]
+</span><span class='line'>    而在进行cpu blance或migration时，就会呼叫函数
+</span><span class='line'>    source_load target_load取得对该处理器cpu_load index值，
+</span><span class='line'>    来进行计算*/
+</span><span class='line'>    unsigned long cpu_load[CPU_LOAD_IDX_MAX];
+</span><span class='line'>#ifdef CONFIG_NO_HZ
+</span><span class='line'>    unsigned long last_tick_seen;
+</span><span class='line'>    unsigned char in_nohz_recently;
+</span><span class='line'>#endif
+</span><span class='line'>    /* capture load from *all* tasks on this cpu: */
+</span><span class='line'>    /*load-&gt;weight值，会是目前所执行的schedule entity的
+</span><span class='line'>    load-&gt;weight的总和，也就是说rq的load-&gt;weight越高，
+</span><span class='line'>    也表示所负责的排程单元load-&gt;weight总和越高
+</span><span class='line'>    表示处理器所负荷的执行单元也越重*/
+</span><span class='line'>    struct load_weight load;
+</span><span class='line'>    /*在每次scheduler tick中呼叫update_cpu_load时，
+</span><span class='line'>    这个值就增加一，可以用来反馈目前cpu
+</span><span class='line'>    load更新的次数*/
+</span><span class='line'>    unsigned long nr_load_updates;
+</span><span class='line'>    /*用来累加处理器进行context switch的次数，会在
+</span><span class='line'>    函数schedule呼叫时进行累加，并可以通过函数
+</span><span class='line'>    nr_context_switches统计目前所有处理器总共的context switch
+</span><span class='line'>    次数，或是可以透过查看档案/proc/stat中的ctxt位得知目前
+</span><span class='line'>    整个系统触发context switch的次数*/
+</span><span class='line'>    u64 nr_switches;
+</span><span class='line'>
+</span><span class='line'>    u64 nr_migrations_in;
+</span><span class='line'>    /*为cfs fair scheduling class 的rq*/
+</span><span class='line'>    struct cfs_rq cfs;
+</span><span class='line'>    /*为real-time scheduling class 的rq*/
+</span><span class='line'>    struct rt_rq rt;
+</span><span class='line'>
+</span><span class='line'>/*用以支援可以group cfs tasks的机制*/
+</span><span class='line'>#ifdef CONFIG_FAIR_GROUP_SCHED
+</span><span class='line'>    /* list of leaf cfs_rq on this cpu: */
+</span><span class='line'>    /*在有设置fair group scheduling 的环境下，
+</span><span class='line'>    会基于原本cfs rq中包含有若干task的group
+</span><span class='line'>    所成的排程集合，也就是说当有一个group a
+</span><span class='line'>    就会有自己的cfs rq用来排程自己所属的tasks,
+</span><span class='line'>    而属于这group a的tasks所使用到的处理器时间
+</span><span class='line'>    就会以这group a总共所分的的时间为上限。
+</span><span class='line'>    基于cgroup的fair group scheduling 架构，可以创造出
+</span><span class='line'>    有阶层性的task组织，根据不同task的功能群组化
+</span><span class='line'>    在配置给该群主对应的处理器资源，让属于
+</span><span class='line'>    该群主下的task可以透过rq机制排程。使用属于
+</span><span class='line'>    该群主下的资源。
+</span><span class='line'>    这个变数主要是管理CFS RQ list，操作上可以透过函数
+</span><span class='line'>    list_add_leaf_cfs_rq把一个group cfs rq加入到list中，或透过
+</span><span class='line'>    函数list_del_leaf_cfs_rq把一个group cfs rq移除，并可以
+</span><span class='line'>    透过for_each_leaf_cfs_rq把一个rq上得所有leaf cfs_rq走一遍
+</span><span class='line'>    */
+</span><span class='line'>    struct list_head leaf_cfs_rq_list;
+</span><span class='line'>#endif
+</span><span class='line'>/*用以支援可以group real-time tasks的机制*/
+</span><span class='line'>#ifdef CONFIG_RT_GROUP_SCHED
+</span><span class='line'>    /*类似leaf_cfs_rq_list所扮演的角色，只是这里
+</span><span class='line'>    是针对属于real-time的task,在实际操作上可以
+</span><span class='line'>    透过函数list_add_leaf_rt_rq,list_del_leaf_rt_rq或
+</span><span class='line'>    巨集for_each_leaf_rt_rq*/
+</span><span class='line'>    struct list_head leaf_rt_rq_list;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>    /*
+</span><span class='line'>     * This is part of a global counter where only the total sum
+</span><span class='line'>     * over all CPUs matters. A task can increase this counter on
+</span><span class='line'>     * one CPU and if it got migrated afterwards it may decrease
+</span><span class='line'>     * it on another CPU. Always updated under the runqueue lock:
+</span><span class='line'>     */
+</span><span class='line'>     /*一般来说，linux kernel 的task状态可以为TASK_RUNNING
+</span><span class='line'>     TASK_INTERRUPTIBLE(sleep),
+</span><span class='line'>     TASK_UNINTERRUPTIBLE(Deactivate Task,此时Task会从rq中
+</span><span class='line'>     移除)或TASK_STOPPED.
+</span><span class='line'>     透过这个变数会统计目前rq中有多少task属于
+</span><span class='line'>     TASK_UNINTERRUPTIBLE的状态。当呼叫函数
+</span><span class='line'>     active_task时，会把nr_uninterruptible值减一，并透过 该函数
+</span><span class='line'>    enqueue_task把对应的task依据所在的scheduling class
+</span><span class='line'>    放在 对应的rq中，并把目前rq中nr_running值加一*/
+</span><span class='line'>    unsigned long nr_uninterruptible;
+</span><span class='line'>    /*curr:指向目前处理器正在执行的task;
+</span><span class='line'>    idle:指向属于idle-task scheduling class 的idle task;
+</span><span class='line'>    stop:指向目前最高等级属于stop-task scheduling class
+</span><span class='line'>    的task;*/
+</span><span class='line'>    struct task_struct *curr, *idle;
+</span><span class='line'>    /*基于处理器的jiffies值，用以记录下次进行处理器
+</span><span class='line'>    balancing 的时间点*/
+</span><span class='line'>    unsigned long next_balance;
+</span><span class='line'>    /*用以存储context-switch发生时，前一个task的memory management
+</span><span class='line'>    结构并可用在函数finish_task_switch中，透过函数mmdrop释放前一个
+</span><span class='line'>    task的记忆体资源*/  
+</span><span class='line'>    struct mm_struct *prev_mm;
+</span><span class='line'>    /*用以记录目前rq的clock值，基本上该值会等于透过sched_clock_cpu
+</span><span class='line'>    (cpu_of(rq))的回传值，并会在每次呼叫scheduler_tick时透过
+</span><span class='line'>    函数update_rq_clock更新目前rq clock值。
+</span><span class='line'>    在实作部分，函数sched_clock_cpu会透过sched_clock_local或
+</span><span class='line'>    ched_clock_remote取得对应的sched_clock_data,而处理的sched_clock_data
+</span><span class='line'>    值，会透过函数sched_clock_tick在每次呼叫scheduler_tick时进行更新；
+</span><span class='line'>    */
+</span><span class='line'>    u64 clock;
+</span><span class='line'>    /*用以记录目前rq中有多少task处于等待i/o的sleep状态
+</span><span class='line'>    在实际的使用上，例如当driver接受来自task的调用，但处于等待i/o
+</span><span class='line'>    回复的阶段时，为了充分利用处理器的执行资源，这时
+</span><span class='line'>    就可以在driver中呼叫函数io_schedule，此时
+</span><span class='line'>    就会把目前rq中的nr_iowait加一，并设定目前task的io_wait为1
+</span><span class='line'>    然后触发scheduling 让其他task有机会可以得到处理器执行时间*/
+</span><span class='line'>    atomic_t nr_iowait;
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>    /*root domain是基于多核心架构下的机制，
+</span><span class='line'>    会由rq结构记住目前采用的root domain，其中包括了
+</span><span class='line'>    目前的cpu mask(包括span,online rt overload), reference count 跟cpupri
+</span><span class='line'>    当root domain有被rq参考到时，refcount 就加一，反之就减一。而cpu
+</span><span class='line'>    mask span表示rq可挂上的cpu mask,noline为rq目前已经排程的
+</span><span class='line'>    cpu mask cpu上执行real-time task.可以参考函数pull_rt_task，当一个rq中属于
+</span><span class='line'>    real-time的task已经执行完毕，就会透过函数pull_rt_task从该
+</span><span class='line'>    rq中属于rto_mask cpu mask 可以执行的处理器上，找出是否有一个处理器
+</span><span class='line'>    有大于一个以上的real-time task，若有就会转到目前这个执行完成
+</span><span class='line'>    real-time task 的处理器上
+</span><span class='line'>    而cpupri不同于Task本身有区分140個(0-139)
+</span><span class='line'>    Task Priority (0-99為RT Priority 而 100-139為Nice值 -20-19). 
+</span><span class='line'>    CPU Priority本身有102個Priority (包括,-1 為Invalid,
+</span><span class='line'>    0為Idle,1為Normal,2-101對應到Real-Time Priority 0-99).
+</span><span class='line'>    參考函式convert_prio, Task Priority如果是 140就會對應到
+</span><span class='line'>    CPU Idle,如果是大於等於100就會對應到CPU Normal,
+</span><span class='line'>    若是Task Priority介於0-99之間,就會對應到CPU Real-Time Priority 101-2之間.) 
+</span><span class='line'>    在實際的操作上,例如可以透過函式cpupri_find
+</span><span class='line'>    帶入一個要插入的Real-Time Task,此時就會依據cpupri中
+</span><span class='line'>    pri_to_cpu選擇一個目前執行Real-Time Task且該Task
+</span><span class='line'>    的優先級比目前要插入的Task更低的處理器,
+</span><span class='line'>    並透過CPU Mask(lowest_mask)返回目前可以選擇的處理器Mask.
+</span><span class='line'>    實作的部份可以參考檔案kernel/sched_cpupri.c.
+</span><span class='line'>    在初始化的過程中,會透過函式sched_init呼叫函式init_defrootdomain,
+</span><span class='line'>    對Root Domain與 CPU Priority機制進行初始化.
+</span><span class='line'>    */
+</span><span class='line'>    struct root_domain *rd;
+</span><span class='line'>    /*Schedule Domain是基於多核心架構下的機制.
+</span><span class='line'>    每個處理器都會有一個基礎的Scheduling Domain,
+</span><span class='line'>    Scheduling Domain可以有階層性的架構,透過parent
+</span><span class='line'>    可以找到上一層的Domain,或是透過child找到
+</span><span class='line'>    下一層的 Domain (NULL表示結尾.).並可透過span
+</span><span class='line'>    栏位,表示這個Domain所能涵蓋的處理器範圍.
+</span><span class='line'>    通常Base Domain會涵蓋系統中所有處理器的個數,
+</span><span class='line'>    而Child Domain所能涵蓋的處理器個數不超過它的
+</span><span class='line'>    Parent Domain. 而當在進行Scheduling Domain 中的Task Balance
+</span><span class='line'>    時,就會以該Domain所能涵蓋的處理器為最大範圍.
+</span><span class='line'>    同時,每個Schedule Domain都會包括一個或一個以上的
+</span><span class='line'>    CPU Groups (結構為struct sched_group),並透過next變數把
+</span><span class='line'>    CPU Groups串連在一起(成為一個單向的Circular linked list),
+</span><span class='line'>    每個CPU Group都會有變數cpumask來定义這個CPU Group
+</span><span class='line'>    所涵蓋的處理器範圍.並且CPU Group所包括的處理器
+</span><span class='line'>    範圍,必需涵蓋在所屬的Schedule Domain處理器範圍中.
+</span><span class='line'>    當進行Scheduling Domain的Balancing時,會以其下的CPU Groups
+</span><span class='line'>    為單位,根據cpu_power （會是該Group所涵蓋的處理器
+</span><span class='line'>    Tasks Loading的總和）來比較不同的CPU Groups的負荷,
+</span><span class='line'>    以進行Tasks的移動,達到Balancing的目的.
+</span><span class='line'>    在有支援SMP的架構下,會在函式sched_init中,呼叫open_softirq,
+</span><span class='line'>    註冊 SCHED_SOFTIRQ Software IRQ与其对应的 Callback函式 
+</span><span class='line'>    run_rebalance_domains. 並會在每次呼叫函式scheduler_tick時,
+</span><span class='line'>    透過函式trigger_load_balance确认是否目前的jiffies值已經
+</span><span class='line'>    大於RunQueue下一次要觸發Load Balance的next_balance時間值,
+</span><span class='line'>    並透過函式raise_softirq觸發SCHED_SOFTIRQ Software IRQ. 
+</span><span class='line'>    在Software IRQ觸發後,就會呼叫函式run_rebalance_domains,
+</span><span class='line'>    並在函式rebalance_domains中,進行后续處理器上的
+</span><span class='line'>    Scheduling Domain Load Balance動作.
+</span><span class='line'>    有關Scheduling Domain進一步的內容,也可以參考
+</span><span class='line'>    Linux Kernel文件 Documentation/scheduler/sched-domains.txt.
+</span><span class='line'>    */
+</span><span class='line'>    struct sched_domain *sd;
+</span><span class='line'>    /*這值會等於函式idle_cpu的返回值,如果為1表示
+</span><span class='line'>    目前CPU RunQueue中執行的為Idle Task. 反之為0,
+</span><span class='line'>    則表示處理器執行的不是Idle Task (也就是說
+</span><span class='line'>    處理器正在忙碌中.).*/
+</span><span class='line'>    unsigned char idle_at_tick;
+</span><span class='line'>    /* For active balancing */
+</span><span class='line'>    /*若這值不為0,表示會有在Schedule排程動作
+</span><span class='line'>    結束前,要呼叫的收尾函式. (实作為inline函式
+</span><span class='line'>    post_schedule in kernel/sched.c),目前只有Real-Time Scheduling 
+</span><span class='line'>    Class有支援這個機制(會呼叫函式has_pushable_tasks 
+</span><span class='line'>    in kernel/sched_rt.c).*/
+</span><span class='line'>    int post_schedule;
+</span><span class='line'>    /*當RunQueue中此值為1,表示這個RunQueue正在進行
+</span><span class='line'>    Fair Scheduling的Load Balance,此時會呼叫stop_one_cpu_nowait
+</span><span class='line'>    暫停該RunQueue所屬處理器的排程,並透過函式
+</span><span class='line'>    active_load_balance_cpu_stop,把Tasks從最忙碌的處理器,
+</span><span class='line'>    移到Idle的處理器上執行.*/
+</span><span class='line'>    int active_balance;
+</span><span class='line'>    /*用以儲存目前進入Idle且負責進行 Load Balance
+</span><span class='line'>    流程的處理器ID. 呼叫的流程為,在呼叫函式schedule時,
+</span><span class='line'>    若該處理器RunQueue的nr_running為0 (也就是目前沒有
+</span><span class='line'>    正在執行的Task),就會呼叫idle_balance,並觸發後續Load 
+</span><span class='line'>    Balance流程.*/
+</span><span class='line'>    int push_cpu;
+</span><span class='line'>    /* cpu of this runqueue: */
+</span><span class='line'>    /*用以儲存目前运作這個RunQueue的處理器ID*/
+</span><span class='line'>    int cpu;
+</span><span class='line'>    /*為1表示目前此RunQueue有在對應的處理器掛上
+</span><span class='line'>    並執行.*/
+</span><span class='line'>    int online;
+</span><span class='line'>    /*如果RunQueue中目前有Task正在執行,這個值會
+</span><span class='line'>    等於目前該RunQueue的Load Weight除以目前RunQueue
+</span><span class='line'>    中Task數目的均值. 
+</span><span class='line'>    (rq-&gt;avg_load_per_task = rq-&gt;load.weight / nr_running;).*/
+</span><span class='line'>    unsigned long avg_load_per_task;
+</span><span class='line'>
+</span><span class='line'>    struct task_struct *migration_thread;
+</span><span class='line'>    struct list_head migration_queue;
+</span><span class='line'>    /*這個值會由Real-Time Scheduling Class呼叫函式
+</span><span class='line'>    update_curr_rt,用以統計目前Real-Time Task執行時間的
+</span><span class='line'>    均值,在這函式中會以目前RunQueue的clock_task
+</span><span class='line'>    減去目前Task執行的起始時間,取得執行時間的
+</span><span class='line'>    Delta值. (delta_exec = rq-&gt;clock_task – curr-&gt;se.exec_start; ).
+</span><span class='line'>    在透過函式sched_rt_avg_update把這Delta值跟原本
+</span><span class='line'>    RunQueue中的rt_avg值取平均值. 以運作的週期來看,
+</span><span class='line'>    這個值可反應目前系統中Real-Time Task平均被
+</span><span class='line'>    分配到的執行時間值.*/
+</span><span class='line'>    u64 rt_avg;
+</span><span class='line'>    /*這個值主要在函式sched_avg_update更新,以笔者手中
+</span><span class='line'>    的Linux Kernel 2.6.38.6的實作來說,當RunQueue Clock
+</span><span class='line'>    減去age_stamp大於 0.5秒 (=sched_avg_period),就會把這值
+</span><span class='line'>    累加0.5秒 (單位都是nanoseconds). 從函式scale_rt_power
+</span><span class='line'>    的實作來說,age_stamp值離RunQueue Clock越遠,表示total
+</span><span class='line'>    值越大,available值也越大,而函式scale_rt_power返回的
+</span><span class='line'>    div_u64計算結果也越大,最終 RunQueue的cpu_power
+</span><span class='line'>    與Scheduling Domain中的Scheduling Group的cpu_power
+</span><span class='line'>    值也就越大. (可參考函式update_cpu_power的實作).*/
+</span><span class='line'>    u64 age_stamp;
+</span><span class='line'>    /*這值會在觸發Scheduling時,若判斷目前處理器
+</span><span class='line'>    RunQueue沒有正在運作的Task,就會透過函式
+</span><span class='line'>    idle_balance更新這值為為目前RunQueue的clock值.
+</span><span class='line'>    可用以表示這個處理器是何時進入到Idle的
+</span><span class='line'>    狀態*/
+</span><span class='line'>    u64 idle_stamp;
+</span><span class='line'>    /*會在有Task運作且idle_stamp不為0 (表示前一個
+</span><span class='line'>    狀態是在Idle)時以目前RunQueue的clock減去
+</span><span class='line'>    idle_stmp所計算出的Delta值為依據,更新這個值
+</span><span class='line'>    . 可反應目前處理器進入Idle狀態的時間長短*/
+</span><span class='line'>    u64 avg_idle;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>    /* calc_load related fields */
+</span><span class='line'>    /*用以記錄下一次計算CPU Load的時間,初始值
+</span><span class='line'>    為目前的jiffies加上五秒與1次的Scheduling Tick的
+</span><span class='line'>    間隔 (=jiffies + LOAD_FREQ,且LOAD_FREQ=(5*HZ+1))*/
+</span><span class='line'>    unsigned long calc_load_update;
+</span><span class='line'>    /*會等於RunQueue中nr_running與nr_uninterruptible的
+</span><span class='line'>    總和.（可參考函式calc_load_fold_active）.*/
+</span><span class='line'>    long calc_load_active;
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_SCHED_HRTICK
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>    /*在函式init_rq_hrtick初始化RunQueue High-Resolution 
+</span><span class='line'>    Tick時,此值預設為0.
+</span><span class='line'>    在函式hrtick_start中,會判斷目前觸發的RunQueue
+</span><span class='line'>    跟目前處理器所使用的RunQueue是否一致,
+</span><span class='line'>    若是,就直接呼叫函式hrtimer_restart,反之就會
+</span><span class='line'>    依據RunQueue中hrtick_csd_pending的值,如果
+</span><span class='line'>    hrtick_csd_pending為0,就會透過函式
+</span><span class='line'>    __smp_call_function_single讓RunQueue所在的另一個
+</span><span class='line'>    處理器執行rq-&gt;hrtick_csd.func 所指到的函式 
+</span><span class='line'>    __hrtick_start. 並等待該處理器執行完畢後,
+</span><span class='line'>    才重新把hrtick_csd_pending設定為1.
+</span><span class='line'>    也就是說, RunQueue的hrtick_csd_pending是用來作為
+</span><span class='line'>    SMP架構下,由處理器A觸發處理器B執行
+</span><span class='line'>    _hrtick_start函式的一個保護機制.而有關在
+</span><span class='line'>    SMP下如何由一個處理器觸發另一個處理器
+</span><span class='line'>    執行函式的機制,可以參考kernel/smp.c中
+</span><span class='line'>    相關smp_call_function_xxxxxxx的實作.s*/
+</span><span class='line'>    int hrtick_csd_pending;
+</span><span class='line'>    /*用以儲存hrtick機制中,要跨處理器執行的
+</span><span class='line'>    函式結構.*/
+</span><span class='line'>    struct call_single_data hrtick_csd;
+</span><span class='line'>#endif
+</span><span class='line'>    /*為High-Resolution Tick的结构,會透過函式
+</span><span class='line'>    hrtimer_init初始化.*/
+</span><span class='line'>    struct hrtimer hrtick_timer;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_SCHEDSTATS
+</span><span class='line'>    /* latency stats */
+</span><span class='line'>    /*為Scheduling Info.的統計結構,可以參考
+</span><span class='line'>    include/linux/sched.h中的宣告. 例如在每次觸發
+</span><span class='line'>    Schedule時,呼叫函式schedule_debug對上一個Task
+</span><span class='line'>    的lock_depth進行確認(Fork一個新的Process 時,
+</span><span class='line'>    會把此值預設為-1就是No-Lock,當呼叫
+</span><span class='line'>    Kernel Lock時, 就會把Current Task的lock_depth加一.),
+</span><span class='line'>    若lock_depth&gt;=0,就會累加Scheduling Info.的bkl_count值,
+</span><span class='line'>    用以代表Task Blocking的次數.*/
+</span><span class='line'>    struct sched_info rq_sched_info;
+</span><span class='line'>    /*可用以表示RunQueue中的Task所得到CPU執行
+</span><span class='line'>    時間的累加值.
+</span><span class='line'>    在發生Task Switch時,會透過sched_info_switch呼叫
+</span><span class='line'>    sched_info_arrive並以目前RunQueue Clock值更新
+</span><span class='line'>    Task 的sched_info.last_arrival時間,而在Task所分配時間
+</span><span class='line'>    結束後,會在函式sched_info_depart中以現在的
+</span><span class='line'>    RunQueue Clock值減去Task的sched_info.last_arrival
+</span><span class='line'>    時間值,得到的 Delta作為變數rq_cpu_time的累
+</span><span class='line'>    加值.*/
+</span><span class='line'>    unsigned long long rq_cpu_time;
+</span><span class='line'>    /* could above be rq-&gt;cfs_rq.exec_clock + rq-&gt;rt_rq.rt_runtime ? */
+</span><span class='line'>
+</span><span class='line'>    /* sys_sched_yield() stats */
+</span><span class='line'>    /*用以統計呼叫System Call sys_sched_yield的次數.*/
+</span><span class='line'>    unsigned int yld_count;
+</span><span class='line'>
+</span><span class='line'>    /* schedule() stats */
+</span><span class='line'>    unsigned int sched_switch;
+</span><span class='line'>    /*可用以統計觸發Scheduling的次數. 在每次觸發
+</span><span class='line'>    Scheduling時,會透過函式schedule呼叫schedule_debug,
+</span><span class='line'>    呼叫schedstat_inc對這變數進行累加.*/
+</span><span class='line'>    unsigned int sched_count;
+</span><span class='line'>    /*可用以統計進入到Idle Task的次數. 會在函式
+</span><span class='line'>    pick_next_task_idle中,呼叫schedstat_inc對這變數進行
+</span><span class='line'>    累加.*/
+</span><span class='line'>    unsigned int sched_goidle;
+</span><span class='line'>
+</span><span class='line'>    /* try_to_wake_up() stats */
+</span><span class='line'>    /*用以統計Wake Up Task的次數.*/
+</span><span class='line'>    unsigned int ttwu_count;
+</span><span class='line'>    /*用以統計Wake Up 同一個處理器Task的次數.*/
+</span><span class='line'>    unsigned int ttwu_local;
+</span><span class='line'>
+</span><span class='line'>    /* BKL stats */
+</span><span class='line'>    unsigned int bkl_count;
+</span><span class='line'>#endif
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>(4) ksoftirqd内核线程</h5>
-
-<p>内核不会立即处理重新触发的软中断。<br/>
-当大量软中断出现的时候，内核会唤醒一组内核线程来处理。<br/>
-这些线程的优先级最低(nice值为19)，这能避免它们跟其它重要的任务抢夺资源。<br/>
-但它们最终肯定会被执行，所以这个折中的方案能够保证在软中断很多时用户程序不会因为得不到处理时间而处于饥饿状态，同时也保证过量的软中断最终会得到处理。</p>
-
-<p>每个处理器都有一个这样的线程，名字为ksoftirqd/n，n为处理器的编号。</p>
+<p>调度类，sched_class为对模块编程的上层支持，对于每个linux新添加进来的调度算法都需要有自己的调度类实例。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -728,59 +1000,155 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 <span class='line-number'>48</span>
 <span class='line-number'>49</span>
 <span class='line-number'>50</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int run_ksoftirqd(void *__bind_cpu)  
-</span><span class='line'>{  
-</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);  
-</span><span class='line'>    current-&gt;flags |= PF_KSOFTIRQD; /* I am ksoftirqd */  
-</span><span class='line'>  
-</span><span class='line'>    while(! kthread_should_stop()) {  
-</span><span class='line'>        preempt_disable();  
-</span><span class='line'>  
-</span><span class='line'>        if (! local_softirq_pending()) { /* 如果没有要处理的软中断 */  
-</span><span class='line'>            preempt_enable_no_resched();  
-</span><span class='line'>            schedule();  
-</span><span class='line'>            preempt_disable():  
-</span><span class='line'>        }  
-</span><span class='line'>  
-</span><span class='line'>        __set_current_state(TASK_RUNNING);  
-</span><span class='line'>  
-</span><span class='line'>        while(local_softirq_pending()) {  
-</span><span class='line'>            /* Preempt disable stops cpu going offline. 
-</span><span class='line'>             * If already offline, we'll be on wrong CPU: don't process. 
-</span><span class='line'>             */  
-</span><span class='line'>             if (cpu_is_offline(long)__bind_cpu))/* 被要求释放cpu */  
-</span><span class='line'>                 goto wait_to_die;  
-</span><span class='line'>  
-</span><span class='line'>            do_softirq(); /* 软中断的统一处理函数 */  
-</span><span class='line'>  
-</span><span class='line'>            preempt_enable_no_resched();  
-</span><span class='line'>            cond_resched();  
-</span><span class='line'>            preempt_disable();  
-</span><span class='line'>            rcu_note_context_switch((long)__bind_cpu);  
-</span><span class='line'>        }  
-</span><span class='line'>  
-</span><span class='line'>        preempt_enable();  
-</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);  
-</span><span class='line'>    }  
-</span><span class='line'>  
-</span><span class='line'>    __set_current_state(TASK_RUNNING);  
-</span><span class='line'>    return 0;  
-</span><span class='line'>  
-</span><span class='line'>wait_to_die:  
-</span><span class='line'>    preempt_enable();  
-</span><span class='line'>    /* Wait for kthread_stop */  
-</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);  
-</span><span class='line'>    while(! kthread_should_stop()) {  
-</span><span class='line'>        schedule();  
-</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);  
-</span><span class='line'>    }  
-</span><span class='line'>  
-</span><span class='line'>    __set_current_state(TASK_RUNNING);  
-</span><span class='line'>    return 0;  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*CFS排程機制在設計時,考慮到排程機制的
+</span><span class='line'>彈性,定義了Scheduler Class的機制,讓排程機制
+</span><span class='line'>可以根據設計的需求,延伸不同的排程模
+</span><span class='line'>組進來,每個新加入的排程機制都必須要
+</span><span class='line'>提供Scheduler Class的實作,結構為 struct sched_class*/
+</span><span class='line'>struct sched_class {
+</span><span class='line'>    /*會指向下一個Scheduling Class,以筆者所採用
+</span><span class='line'>    的Linux Kernel 2.6.38.6而言,Scheduling Class的順序為
+</span><span class='line'>    stop_sched_class-&gt;rt_sched_class-&gt;fair_sched_class-&gt;idle_sched_class*/
+</span><span class='line'>    const struct sched_class *next;
+</span><span class='line'>    /*當Task屬於Runnable狀態時,就會呼叫這個函式
+</span><span class='line'>    把Task配置到RunQueue RBTree中,進行排程動作,
+</span><span class='line'>    並呼叫inc_nr_running將RunQueue中nr_running的值
+</span><span class='line'>    加一.(nr_running用以代表目前RunQueue有多少
+</span><span class='line'>    Runnable Task進行排程)*/
+</span><span class='line'>    void (*enqueue_task) (struct rq *rq, struct task_struct *p, int wakeup);
+</span><span class='line'>    /*當Task不需要執行時,就會呼叫這個函式
+</span><span class='line'>    把Task從RunQueue RBTree中移除,並呼叫
+</span><span class='line'>    dec_nr_running將RunQueue中nr_running的值減一.*/
+</span><span class='line'>    void (*dequeue_task) (struct rq *rq, struct task_struct *p, int sleep);
+</span><span class='line'>    /*用以暫停目前正在執行中的Task,如果
+</span><span class='line'>    sysctl_sched_compat_yield有設定,就會找出目前
+</span><span class='line'>    RBTree中最右邊的Task(也就是vrruntime最多
+</span><span class='line'>    的Task),讓目前Task的vrruntime值等於最右邊
+</span><span class='line'>    Task值的vrruntime加一(可參考:
+</span><span class='line'>    se-&gt;vruntime = rightmost-&gt;vruntime + 1),如此在下次
+</span><span class='line'>    排程觸發時就會透過函式put_prev_task把目前
+</span><span class='line'>    的Task放到RBTree的最右邊,也就等同於暫停
+</span><span class='line'>    Task,讓該Task下次被執行到的機會最低.*/
+</span><span class='line'>    void (*yield_task) (struct rq *rq);
+</span><span class='line'>    /*用以決定一個Task是否可以中斷目前正在
+</span><span class='line'>    運作的Task,取得執行權.以CFS本身的實作來說
+</span><span class='line'>    (in sched_fair.c).如果想要取代目前Task的Task本身
+</span><span class='line'>    的Scheduling Policy為 Batch或是Idle時,會直接返回,
+</span><span class='line'>    不會用來取代目前正在執行中的Task.反之,
+</span><span class='line'>    如果目前正在執行中的Task的Scheduling Policy
+</span><span class='line'>    為Idle,就會直接由所傳入的Task取代目前正
+</span><span class='line'>    在執行的Task.*/
+</span><span class='line'>    void (*check_preempt_curr) (struct rq *rq, struct task_struct *p, int flags);
+</span><span class='line'>    /*用以在排程觸發時,從RunQueue RBTree中,
+</span><span class='line'>    取出符合目前Scheduling邏輯的下一個要
+</span><span class='line'>    被執行的Task.*/
+</span><span class='line'>    struct task_struct * (*pick_next_task) (struct rq *rq);
+</span><span class='line'>    /*用以在排程觸發時,把上一個執行完畢的
+</span><span class='line'>    Task放到目前RunQueue RBTree中對應的位置.*/
+</span><span class='line'>    void (*put_prev_task) (struct rq *rq, struct task_struct *p);
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>    /*通常用在執行一個新的程序,或是WakeUp
+</span><span class='line'>    一個Task時,會根據目前SMP下每個處理器的
+</span><span class='line'>    負荷,決定Task是否要切換到另一個處理器
+</span><span class='line'>    的RunQueue去執行,執行時會返回最後目標
+</span><span class='line'>    處理器的值.*/
+</span><span class='line'>    int  (*select_task_rq)(struct task_struct *p, int sd_flag, int flags);
+</span><span class='line'>
+</span><span class='line'>    unsigned long (*load_balance) (struct rq *this_rq, int this_cpu,
+</span><span class='line'>            struct rq *busiest, unsigned long max_load_move,
+</span><span class='line'>            struct sched_domain *sd, enum cpu_idle_type idle,
+</span><span class='line'>            int *all_pinned, int *this_best_prio);
+</span><span class='line'>
+</span><span class='line'>    int (*move_one_task) (struct rq *this_rq, int this_cpu,
+</span><span class='line'>                  struct rq *busiest, struct sched_domain *sd,
+</span><span class='line'>                  enum cpu_idle_type idle);
+</span><span class='line'>    void (*pre_schedule) (struct rq *this_rq, struct task_struct *task);
+</span><span class='line'>    void (*post_schedule) (struct rq *this_rq);
+</span><span class='line'>    void (*task_wake_up) (struct rq *this_rq, struct task_struct *task);
+</span><span class='line'>
+</span><span class='line'>    void (*set_cpus_allowed)(struct task_struct *p,
+</span><span class='line'>                 const struct cpumask *newmask);
+</span><span class='line'>
+</span><span class='line'>    void (*rq_online)(struct rq *rq);
+</span><span class='line'>    void (*rq_offline)(struct rq *rq);
+</span><span class='line'>#endif
+</span><span class='line'>    /*這個函式用以改變Task目前所屬的Scheduling
+</span><span class='line'>    Class與改變Task Group.*/
+</span><span class='line'>    void (*set_curr_task) (struct rq *rq);
+</span><span class='line'>    /*這是Scheduler的 Timer Tick來源,系統中觸發的
+</span><span class='line'>    Scheduling Tick會呼叫這個函式 (看HZ設定多少,
+</span><span class='line'>    100就是每秒呼叫這函式100次,1000就是每秒
+</span><span class='line'>    呼叫這函式1000次),
+</span><span class='line'>    用以讓排程機制可以決定哪些Task應該要配
+</span><span class='line'>    執行與哪些Task應該要被移出RunQueue.*/
+</span><span class='line'>    void (*task_tick) (struct rq *rq, struct task_struct *p, int queued);
+</span><span class='line'>    void (*task_new) (struct rq *rq, struct task_struct *p);
+</span><span class='line'>
+</span><span class='line'>    void (*switched_from) (struct rq *this_rq, struct task_struct *task,
+</span><span class='line'>                   int running);
+</span><span class='line'>    void (*switched_to) (struct rq *this_rq, struct task_struct *task,
+</span><span class='line'>                 int running);
+</span><span class='line'>    void (*prio_changed) (struct rq *this_rq, struct task_struct *task,
+</span><span class='line'>                 int oldprio, int running);
+</span><span class='line'>
+</span><span class='line'>    unsigned int (*get_rr_interval) (struct task_struct *task);
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_FAIR_GROUP_SCHED
+</span><span class='line'>    void (*moved_group) (struct task_struct *p);
+</span><span class='line'>#endif
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-
+<p>调度实体，调度实体用于调度时间记账，linux中CFS和实时调度使用不同的调度实体。调度运行队列，对于不用的调度算法同样运用不用的运行队列，对于CFS调度，运用的是红黑树，而对于实时调度为组链表。在后面具体的调度算法介绍中我们会看到他们的运用。</p>
 </div>
   
   
@@ -793,7 +1161,7 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq-ksoftirqd/">关于ksoftirqd进程</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/01/14/kernel-sched-idle/">Idle进程的切换过程</a></h2>
     
     
       <p class="meta">
@@ -802,34 +1170,289 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 
 
 
-<time class='entry-date' datetime='2015-01-03T15:01:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:01:00</span></time>
+<time class='entry-date' datetime='2015-01-14T23:39:00+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:39:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>blog.chinaunix.net/uid-20737871-id-1881243.html</p>
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-27767798-id-3577069.html">http://blog.chinaunix.net/uid-27767798-id-3577069.html</a></p>
 
-<p>每个处理器都有一组辅助处理器软中断(和tasklet)的内核线程。当内核中出现大量软中断的时候，这些内核进程就会辅助处理它们。</p>
+<p>  每个cpu都有自己的运行队列，如果当前cpu上运行的任务都已经dequeue出运行队列，而且idle_balance也没有移动到当前运行队列的任务，那么schedule函数中，按照rt ，cfs，idle这三种调度方式顺序，寻找各自的运行任务，那么如果rt和cfs都未找到运行任务，那么最后会调用idle schedule的idle进程，作为schedule函数调度的下一个任务。</p>
 
-<h4>引入ksoftirq内核线程的原因：</h4>
+<p>kernel/sched.c 中的schedule()函数中的片段</p>
 
-<p>对于软中断，内核会选择在几个特殊时机进行处理。而在中断处理程序返回时处理是最常见的。软中断被触发的频率有时可能很高，更不利的是，处理函数有时还会 字形重复触发，那么就会导致用户空间进程无法获得足够的处理时间，因而处于饥饿状态。单纯的对重新触发的软中断采取不立即处理的策略，也无法让人接受。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (prev-&gt;state && !(preempt_count() & PREEMPT_ACTIVE)) {   
+</span><span class='line'>    //state大于0代表prev也就是当前运行的任务不是running状态，并且没有标记 PREEMPT_ACTIVE，就表示当前的运行的任务没有必要停留在运行队列中了
+</span><span class='line'>    if (unlikely(signal_pending_state(prev-&gt;state, prev)))  //如果当前进程标记了状态是TASK_INTERRUPTIBLE，并且还有信号未处理，那么没有必要从运行队列中移除这个进程
+</span><span class='line'>        prev-&gt;state = TASK_RUNNING;
+</span><span class='line'>    else
+</span><span class='line'>        deactivate_task(rq, prev, DEQUEUE_SLEEP);        //从运行队列中移除这个进程
+</span><span class='line'>    switch_count = &prev-&gt;nvcsw;
+</span><span class='line'>}
+</span><span class='line'>        
+</span><span class='line'>pre_schedule(rq, prev);
+</span><span class='line'>
+</span><span class='line'>if (unlikely(!rq-&gt;nr_running)) //如果当前运行队列没有进程可以运行了，就balance其他运行队列的任务到当前运行队列，这里balance的具体过程暂时不说
+</span><span class='line'>    idle_balance(cpu, rq);
+</span><span class='line'>
+</span><span class='line'>put_prev_task(rq, prev);
+</span><span class='line'>next = pick_next_task(rq);     //按照rt，cfs，idle优先级的顺序挑选进程，如果在rt和cfs中都没有找到能够运行的任务，那么当前cpu会切换到idle进程。</span></code></pre></td></tr></table></div></figure>
 
-<h4>最初的解决方案：</h4>
 
-<p>1）只要还有被触发并等待处理的软中断，本次执行就要负责处理，重新触发的软中断也在本次执行返回前被处理。这样做可以保证对内核的软中断采取即时处理的 方式，关键在于，对重新触发的软中断也会立即处理。当负载很高的时候，此时若有大量被触发的软中断，而它们本身又会重复触发。系统可能会一直处理软中断根 本不能完成其他任务。</p>
+<p>  这里 PREEMPT_ACTIVE是个标志位，由于进程由于系统调用或者中断异常返回到用户态之前，都要判断是否可以被抢占，会首先判断preempt_count,等于0的时候表示没有禁止抢占，然后再去判断是否标记了need_resched,如果标记了，在去调用schedule函数，如果在某些时候禁止了抢占，禁止了一次就要preempt_count加1。可以肯定的一点是进程的state和是否在运行队列的因果关系并不是十分同步的，修改了进程的状态后，可能还需要做一些其他的工作才去调用schedule函数。引用一下其他人的例子。</p>
 
-<p>2）不处理重新触发的软中断。在从中断返回的时候，内核和平常一样，也会检查所有挂起的软中断并处理他们。但是，任何自行重新触发的软中断不会马上处理， 它们被放到下一个软中断执行时机去处理。而这个时机通常也就是下一次中断返回的时候。可是，在比较空闲的系统中，立即处理软中断才是比较好的做法。尽管它 能保证用户空间不处于饥饿状态，但它却让软中断忍受饥饿的痛苦，而根本没有好好利用闲置的系统资源。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (;;) {
+</span><span class='line'>   prepare_to_wait(&wq, &__wait,TASK_UNINTERRUPTIBLE);
+</span><span class='line'>   if (condition)
+</span><span class='line'>     break;
+</span><span class='line'>   schedule();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
-<h4>改进：</h4>
 
-<p>最终在内核中实现的方案是不会立即处理处理重新触发的软中断。而作为改进，当大量软中断出现的时候，内核会唤醒一组内核线程来处理这些负载。这些线程在最 低的优先级上运行（nice值是19），这能避免它们跟其他重要的任务抢夺资源。但它们最终肯定会被执行，所以这个折中方案能够保证在软中断负担很中的时 候用户程序不会因为得不到处理时间处于饥饿状态。相应的，也能保证”过量“的软中断终究会得到处理。</p>
+<p>  可以看出在修改了进程的state之后，并不会立刻调用schedule函数，即使立刻调用了schedule函数，也不能保证在schedule函数之前的禁止抢占开启之前有其他的抢占动作。毕竟修改进程的state和从运行队列中移除任务不是一行代码（机器码）就能搞定的事情。所以如果在修改了进程的状态之后和schedule函数禁止抢占之前有抢占动作（可能是中断异常返回），如果这个时候进程被其他进程抢占，这个时候把当前进程移除运行队列，那么这个进程将永远没有机会运行后面的代码。所以这个时候在抢占的过程之前将preempt_count标记PREEMPT_ACTIVE，这样抢占中调用schedule函数将不会从当前运行队列中移除当前进程，这样才有前面分析schedule函数代码，有判断进程state同时判断preempt_count未标记PREEMPT_ACTIVE的情况。</p>
 
-<p>每个处理器都有一个这样的线程。所有线程的名字都叫做ksoftirq/n，区别在于n，它对应的是处理器的编号。在一个双CPU的机器上就有两个这样的 线程，分别叫做ksoftirqd/0和ksoftirqd/1。为了保证只要有空闲的处理器，它们就会处理软中断，所以给每个处理器都分配一个这样的线 程。一旦该线程被初始化，它就会执行类似下面这样的死循环：</p>
+<p>  在当前进程被移除出运行队列之前还需要判断是否有挂起的信号需要处理，如果当前进程的状态是TASK_INTERRUPTIBLE或者TASK_WAKEKILL的时候，如果还有信号未处理，那么当前进程就不需要被移除运行队列，并且将state置为running。</p>
 
-<p>在kernel/softirq.c中</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int signal_pending_state(long state, struct task_struct *p)
+</span><span class='line'>{
+</span><span class='line'>    if (!(state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL))) //首先判断状态不是这两个可以处理信号的状态就直接返回0，后面的逻辑不考虑了
+</span><span class='line'>        return 0;
+</span><span class='line'>    if (!signal_pending(p))             //如果没有信号挂起就不继续了
+</span><span class='line'>        return 0;
+</span><span class='line'>
+</span><span class='line'>    return (state & TASK_INTERRUPTIBLE) || __fatal_signal_pending(p); //如果有信号
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<pre><code>说下 put_prev_task的逻辑，按照道理说应该是rt，cfs，idle的顺序寻找待运行态的任务。
+</code></pre>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pick_next_task(struct rq *rq)
+</span><span class='line'>{
+</span><span class='line'>    const struct sched_class *class;
+</span><span class='line'>    struct task_struct *p;
+</span><span class='line'>
+</span><span class='line'>    /*
+</span><span class='line'>     * Optimization: we know that if all tasks are in
+</span><span class='line'>     * the fair class we can call that function directly:
+</span><span class='line'>     */
+</span><span class='line'>    //这里注释的意思都能看懂，如果rq中的cfs队列的运行个数和rq中的运行个数相同，直接调用cfs中 的pick函数，因为默认的调度策略是cfs。
+</span><span class='line'>    if (likely(rq-&gt;nr_running == rq-&gt;cfs.nr_running)) {
+</span><span class='line'>        p = fair_sched_class.pick_next_task(rq);
+</span><span class='line'>        if (likely(p))
+</span><span class='line'>        return p;
+</span><span class='line'>    }
+</span><span class='line'>        
+</span><span class='line'>    //这里 sched_class_highest就是rt_sched_class，所以前面没有选择出任务，那么从rt开始挑选任务，直到idle
+</span><span class='line'>    class = sched_class_highest;
+</span><span class='line'>         for ( ; ; ) {
+</span><span class='line'>        p = class-&gt;pick_next_task(rq);
+</span><span class='line'>        if (p)
+</span><span class='line'>            return p;
+</span><span class='line'>        /*
+</span><span class='line'>         * Will never be NULL as the idle class always
+</span><span class='line'>         * returns a non-NULL p:
+</span><span class='line'>         */
+</span><span class='line'>        class = class-&gt;next;
+</span><span class='line'>    }
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  从每个调度类的代码的最后可以看出这个next关系</p>
+
+<p>sched_rt.c中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct sched_class rt_sched_class = {
+</span><span class='line'>.next = &fair_sched_class,</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sched_fair.c中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct sched_class fair_sched_class = {
+</span><span class='line'>.next = &idle_sched_class,</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  那么可以试想如果rt和cfs都没有可以运行的任务，那么最后就是调用idle的pick_next_task函数</p>
+
+<p>sched_idletask.c:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct task_struct *pick_next_task_idle(struct rq *rq)
+</span><span class='line'>{
+</span><span class='line'>    schedstat_inc(rq, sched_goidle);
+</span><span class='line'>    calc_load_account_idle(rq);
+</span><span class='line'>    return rq-&gt;idle;    //可以看到就是返回rq中idle进程。
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这idle进程在启动start_kernel函数的时候调用init_idle函数的时候，把当前进程（0号进程）置为每个rq的idle上。</p>
+
+<p>kernel/sched.c:5415</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>rq-&gt;curr = rq-&gt;idle = idle;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里idle就是调用start_kernel函数的进程，就是0号进程。</p>
+
+<p>  0号进程在fork完init进程等之后，进入cpu_idle函数，大概的逻辑是for循环调用hlt指令，每次hlt返回后，调用schedule函数，具体的流程现在还没太看懂，可以看到的是在具体的逻辑在default_idle函数中，调用了safe_halt函数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void native_safe_halt(void)
+</span><span class='line'>{
+</span><span class='line'>        asm volatile("sti; hlt": : :"memory");
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  关于hlt指令的作用是：引用wiki百科</p>
+
+<blockquote><p>  In the x86 computer architecture, HLT (halt) is an assembly language instruction which halts the CPU until the next external interrupt is fired.[1] Interrupts are signals sent by hardware devices to the CPU alerting it that an event occurred to which it should react. For example, hardware timers send interrupts to the CPU at regular intervals.</p>
+
+<p>  The HLT instruction is executed by the operating system when there is no immediate work to be done, and the system enters its idle state. In Windows NT, for example, this instruction is run in the &ldquo;System Idle Process&rdquo;.</p></blockquote>
+
+<p>  可以看到注释的意思是，hlt指令使得cpu挂起，直到有中断产生这个时候cpu重新开始运行。所以时钟中断会唤醒正在hlt中的cpu，让它调用schedule函数，检测是否有新的任务在rq中，如果有的话切换到新的任务，否则继续执行hlt，cpu继续挂起。</p>
+
+<p>参考文章<br/>
+1.<a href="http://blog.csdn.net/dog250/article/details/5303547">http://blog.csdn.net/dog250/article/details/5303547</a></p>
+
+<p>2.<a href="http://en.wikipedia.org/wiki/HLT">http://en.wikipedia.org/wiki/HLT</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/14/kernel-nmi-irq/">NMI 看门狗</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-14T23:34:00+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:34:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/arethe/article/details/6153143">http://blog.csdn.net/arethe/article/details/6153143</a></p>
+
+<h4>[X86和X86-64体系结构均支持NMI看门狗]</h4>
+
+<p>  你的系统是不是会经常被锁住（Lock up）？直至解锁，系统不再响应键盘？你希望帮助我们解决类似的问题吗？如果你对所有的问题都回答“yes”，那么此文档正是为你而写。</p>
+
+<p>  在很多X86/X86-64结构的硬件上，我们都可以使用一种被称为“看门狗NMI中断”的机制。（NMI：Non Maskable Interrupt. 这种中断即使在系统被锁住时，也能被响应）。这种机制可以被用来调试内核锁住现象。通过周期性地执行NMI中断，内核能够监测到是否有CPU被锁住。当有处理器被锁住时，打印调试信息。</p>
+
+<p>  为了使用NMI看门狗，首先需要在内核中支持APIC。对于SMP内核，APIC的相关支持已自动地被编译进内核。对于UP内核，需要在内核配置中使能CONFIG_X86_UP_APIC (Processor type and features -> Local APIC support on uniprocessors) 或 CONFIG_X86_UP_IOAPIC (Processor type and features -> IO-APIC support on uniprocessors)。在没有IO-APIC的单处理器系统中，配置CONFIG_X86_UP_APIC。在有IO-APIC的单处理器系统中，则需配置CONFIG_X86_UP_IOAPIC。[注意：某些与内核调试相关选项可能会禁用NMI看门狗。如：Kernel Stack Meter或Kernel Tracer]。</p>
+
+<p>  对于X86-64系统，APIC已被编进内核。</p>
+
+<p>  使用本地APIC（nmi_watchdog=2）时，需要占用第一个性能寄存器，因而此寄存器不能再被另作它用（如高精度的性能分析）。Oprofile与perfctr的驱动已自动地禁用了本地APIC的NMI看门狗。</p>
+
+<p>  可以通过启动参数“nmi_watchdog=N”使能NMI看门狗。即在lilo.conf的相关项中添加如下语句：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>  append=”nmi_watchdog=1”</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  对于具有IO-APIC的SMP与UP机器，设置nmi_watchdog=1。对于没有IO-APIC的UP机器，设置nmi_watchdog=2，但仅在某些处理器上可以起作用。如果有疑问，在用nmi_watchdog=1启动后，再查看/proc/interrupts文件中的NMI项，如果该项为0，那么便用nmi_watchdog=2重新启动，并再次检查NMI项。如果还是0，问题就比较严重了，你的处理器很可能不支持NMI。</p>
+
+<p>  “锁住（Lockup）”是指如下的情况：如果系统中的任何一个CPU不能处理周期性的本地时钟中断，并持续5秒钟以上，那么NMI的处理函数将产生一个oops并杀死当前进程。这是一种“可控崩溃”（Controlled Crash，所谓可控，是指发生崩溃时，能够输出内核信息），可以用此机制来调试“锁住”现象。那么，无论什么时候发生“锁住”，5秒钟之后都会自动地输出oops。如果内核没有输出信息，说明此时发生的崩溃过于严重（如：hardware-wise），以至于NMI中断都无法被响应，或者此次崩溃使得内核无法打印信息。</p>
+
+<p>  在使用本地APIC时要注意，NMI中断被触发的频率依赖于系统的当前负载。由于缺乏更好的时钟源，本地APIC中的NMI看门狗使用的是“有效周期（Cycle unhalted，这个词的翻译似乎不太确切，如果某位朋友有更佳的建议，请告知在下。）”事件。也许你已经猜到了，当CPU处于halted（空等）状态时，该时钟是不计数的。处理器处于空闲状态的时候，常出现这样的情况。如果你的系统在被锁住时，执行的不是hlt指令，看门狗中断很快就会被触发，因为每个时钟周期都会发生“有效周期”事件。如果不幸，处理器在被锁住时，执行的恰是“hlt”指令，那么“有效周期”事件永远都不会发生，看门狗自然也不会被触发。这是本地APIC看门狗的缺陷，在倒霉的时候，永远不会进行时钟计数。而I/O APIC中的看门狗由于采用外部时钟进行驱动，便不存在这个缺陷。但是，它的NMI频率非常高，会显著地影响系统的性能。</p>
+
+<p>  X86的nmi_watchdog在默认情况下是禁用的，因此你需要在系统启动的时候使能它。</p>
+
+<p>  在系统运行期间，可以禁用NMI看门狗，只要向文件“/proc/sys/kernel/nmi_watchdog”中写“0”即可。向该文件写“1”，将重新使能看门狗。即使如此，你仍然需要在启动时使用参数“nmi_watchdog=”。</p>
+
+<p>  注意：在2.4.2-ac18之前的内核中，X86 SMP平台会无条件地使能NMI-oopser。</p>
+
+<hr />
+
+<p>www.2cto.com/kf/201311/260704.html</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -871,158 +1494,147 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 <span class='line-number'>38</span>
 <span class='line-number'>39</span>
 <span class='line-number'>40</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int ksoftirqd(void * __bind_cpu)
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//  使能hard lockup探测
+</span><span class='line'>//  调用路径：watchdog_enable-&gt;watchdog_nmi_enable
+</span><span class='line'>//  函数任务：
+</span><span class='line'>//      1.初始化hard lockup检测事件
+</span><span class='line'>//          2.hard lockup阈值为10s
+</span><span class='line'>//      2.向performance monitoring子系统注册hard lockup检测事件
+</span><span class='line'>//      3.使能hard lockup检测事件
+</span><span class='line'>//  注：
+</span><span class='line'>//      performance monitoring，x86中的硬件设备，当cpu clock经过了指定个周期后发出一个NMI中断。
+</span><span class='line'>1.1 static int watchdog_nmi_enable(unsigned int cpu)
 </span><span class='line'>{
-</span><span class='line'>    set_user_nice(current, 19);
-</span><span class='line'>    current-&gt;flags |= PF_NOFREEZE;
-</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>    while (!kthread_should_stop()) {
-</span><span class='line'>        preempt_disable();
-</span><span class='line'>        if (!local_softirq_pending()) {
-</span><span class='line'>            preempt_enable_no_resched();
-</span><span class='line'>            schedule();
-</span><span class='line'>            preempt_disable();
-</span><span class='line'>        }
-</span><span class='line'>        __set_current_state(TASK_RUNNING);
-</span><span class='line'>        while (local_softirq_pending()) {
-</span><span class='line'>            /* Preempt disable stops cpu going offline.
-</span><span class='line'>                If already offline, we'll be on wrong CPU:
-</span><span class='line'>                don't process */
-</span><span class='line'>            if (cpu_is_offline((long)__bind_cpu))
-</span><span class='line'>                goto wait_to_die;
-</span><span class='line'>            do_softirq();
-</span><span class='line'>            preempt_enable_no_resched();
-</span><span class='line'>            cond_resched();
-</span><span class='line'>            preempt_disable();
-</span><span class='line'>        }
-</span><span class='line'>        preempt_enable();
-</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>    }
-</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    //hard lockup事件
+</span><span class='line'>    struct perf_event_attr *wd_attr;
+</span><span class='line'>    struct perf_event *event = per_cpu(watchdog_ev, cpu);
+</span><span class='line'>    ....
+</span><span class='line'>    wd_attr = &wd_hw_attr;
+</span><span class='line'>    //hard lockup检测周期，10s
+</span><span class='line'>    wd_attr-&gt;sample_period = hw_nmi_get_sample_period(watchdog_thresh);
+</span><span class='line'>    //向performance monitoring注册hard lockup检测事件
+</span><span class='line'>    event = perf_event_create_kernel_counter(wd_attr, cpu, NULL, watchdog_overflow_callback, NULL);
+</span><span class='line'>    ....
+</span><span class='line'>    //使能hard lockup的检测
+</span><span class='line'>    per_cpu(watchdog_ev, cpu) = event;
+</span><span class='line'>    perf_event_enable(per_cpu(watchdog_ev, cpu));
 </span><span class='line'>    return 0;
-</span><span class='line'>wait_to_die:
-</span><span class='line'>    preempt_enable();
-</span><span class='line'>    /* Wait for kthread_stop */
-</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>    while (!kthread_should_stop()) {
-</span><span class='line'>        schedule();
-</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>//  换算hard lockup检测周期到cpu频率
+</span><span class='line'>1.2 u64 hw_nmi_get_sample_period(int watchdog_thresh)
+</span><span class='line'>{
+</span><span class='line'>    return (u64)(cpu_khz) * 1000 * watchdog_thresh;
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>//  hard lockup检测事件发生时的nmi回调函数
+</span><span class='line'>//  函数任务：
+</span><span class='line'>//      1.判断是否发生了hard lockup
+</span><span class='line'>//          1.1 dump hard lockup信息
+</span><span class='line'>1.3 static void watchdog_overflow_callback(struct perf_event *event,
+</span><span class='line'>     struct perf_sample_data *data,
+</span><span class='line'>     struct pt_regs *regs)
+</span><span class='line'>{
+</span><span class='line'>    //判断是否发生hard lockup
+</span><span class='line'>    if (is_hardlockup()) {
+</span><span class='line'>        int this_cpu = smp_processor_id();
+</span><span class='line'> 
+</span><span class='line'>        //打印hard lockup信息
+</span><span class='line'>        if (hardlockup_panic)
+</span><span class='line'>            panic("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+</span><span class='line'>        else
+</span><span class='line'>            WARN(1, "Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+</span><span class='line'> 
+</span><span class='line'>        return;
 </span><span class='line'>    }
-</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return;
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>//  判断是否发生hard lockup
+</span><span class='line'>//  注：
+</span><span class='line'>//      如果时钟中断在指定阈值范围内为运行，核心认为可屏蔽中断被屏蔽时间过长
+</span><span class='line'>1.4 static int is_hardlockup(void)
+</span><span class='line'>{
+</span><span class='line'>    //获取watchdog timer的运行次数
+</span><span class='line'>    unsigned long hrint = __this_cpu_read(hrtimer_interrupts);
+</span><span class='line'>    //在一个hard lockup检测时间阈值内，如果watchdog timer未运行，说明cpu中断被屏蔽时间超过阈值
+</span><span class='line'>    if (__this_cpu_read(hrtimer_interrupts_saved) == hrint)
+</span><span class='line'>        return 1;
+</span><span class='line'>    //记录watchdog timer运行的次数
+</span><span class='line'>    __this_cpu_write(hrtimer_interrupts_saved, hrint);
 </span><span class='line'>    return 0;
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>//  关闭hard lockup检测机制
+</span><span class='line'>//  函数任务：
+</span><span class='line'>//      1.向performance monitoring子系统注销hard lockup检测控制块
+</span><span class='line'>//      2.清空per-cpu hard lockup检测控制块
+</span><span class='line'>//      3.释放hard lock检测控制块
+</span><span class='line'>2.1 static void watchdog_nmi_disable(unsigned int cpu)
+</span><span class='line'>{
+</span><span class='line'>    struct perf_event *event = per_cpu(watchdog_ev, cpu);
+</span><span class='line'>    if (event) {
+</span><span class='line'>        //向performance monitoring子系统注销hard lockup检测控制块
+</span><span class='line'>        perf_event_disable(event);
+</span><span class='line'>        //清空per-cpu hard lockup检测控制块
+</span><span class='line'>        per_cpu(watchdog_ev, cpu) = NULL;
+</span><span class='line'>        //释放hard lock检测控制块
+</span><span class='line'>        perf_event_release_kernel(event);
+</span><span class='line'>    }
+</span><span class='line'>    return;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>只要有待处理的软中断(由softirq_pending()函数负责发现)，ksoftirq就会调用do_softirq去处理它们。通过重复执行这 样的操作，重新触发的软中断也会被执行。如果有必要，每次迭代后都会调用schedule()以便让更重要的进程得到处理机会。当所有需要执行的操作都完 成以后，该内核线程将自己设置为TASK_INTERRUPTIBLE状态，唤起调度程序选择其他可执行进程投入运行。</p>
 
-<p>只要do_softirq()函数发现已经执行过的内核线程重新触发了它自己，软中断内核线程就会被唤醒.</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/03/android-I9507V-kernel/">编译I9507V内核</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-03T14:52:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>14:52:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>源码地址 <a href="http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507">http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507</a></p>
-
-<p>好像三星android4.3版本后的bootloader会检测是否三星自编译内核，不是的会开机提示一下，不影响正常使用。</p>
-
-<p>按照README_Kernel.txt的做。</p>
-
-<p>内核中说明是用4.7编译器，但是4.7编译出来的装上去会挂，不知道为什么。<br/>
-但是换成4.6编译器就没问题。</p>
-
-<p>最后作成boot.img</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mkbootimg --kernel zImage --ramdisk boot.img-ramdisk.cpio.gz --base 80200000 --ramdisk_offset 1FF8000 --pagesize 2048 --cmdline "console=null androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x3F ehci-hcd.park=3 maxcpus=4" -o boot.img</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/03/android-img.ext4/">img.ext4格式</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-03T14:36:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>14:36:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>工具 <a href="https://github.com/abcdxyzk/ext4_utils">https://github.com/abcdxyzk/ext4_utils</a></p>
-
-<h4>一、转换源文件为ext4格式</h4>
-
-<p>然后，我们可以使用./simg2img src des命令来转换system.img.ext4格式文件了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>./simg2img system.img.ext4 system.img</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>二、挂载镜像到指定目录</h4>
-
-<p>然后挂载此img到一个目录上</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mount -o loop system.img sysmain</span></code></pre></td></tr></table></div></figure>
-
-
-<p>成功挂载。然后你就可以进入目录了查看里面的文件了！！！！！</p>
-
-<h4>三、修改镜像内的文件</h4>
-
-<p>这时候可以进入挂载的目录mysys里面查看各个文件，甚至是修改了。不过这时候要注意一点，就是保持文件的原始权限。</p>
-
-<h4>四、打包文件</h4>
-
-<p>当你所有文件搞定后，下来需要一个命令来打包了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>./mkuserimg.sh -s sysmain systest.img.ext4 ext4 tmp 512M</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里需要注意，temp是我在当前目录新建立的一个目录，后面的512M是这个镜像打包后占用空间大小。如果你不知道你的镜像包应该多大，你查看你景象挂载到目录后，这个景象分区的大小。</p>
-
-<p>恩，当你完成以上步骤，新的systest.img.ext4成功生成了，好了，你可以在fastboot模式下刷入了！！！</p>
 </div>
   
   
@@ -1123,7 +1735,7 @@ if (!document.getElementById('system~centos')) document.getElementById('aexp_sys
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(115)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(120)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -1140,7 +1752,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>49</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>54</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1260,8 +1872,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(110)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>16</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(115)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>21</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
 <li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>19</span></li>
@@ -1344,23 +1956,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2015/06/09/kernel-net-socket/">socket创建过程 sys_socket</a>
+        <a href="/blog/2015/06/12/kernel-net-tcp-close/">linux内核中tcp连接的断开处理</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/09/kernel-net-bind/">socket绑定连接 sys_bind</a>
+        <a href="/blog/2015/06/12/kernel-net-socket-io/">Socket层实现系列 — I/O事件及其处理函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/09/kernel-net-accept/">socket接收连接 sys_accept</a>
+        <a href="/blog/2015/06/12/kernel-net-socket-wakeup/">Socket层实现系列 — 睡眠驱动的同步等待</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/03/kernel-net-rps/">Receive packet steering patch详解</a>
+        <a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/06/03/kernel-net-mem/">内核协议栈tcp层的内存管理</a>
+        <a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a>
       </li>
     
   </ul>
