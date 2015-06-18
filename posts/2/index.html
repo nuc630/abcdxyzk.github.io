@@ -21,7 +21,7 @@
   <header role="banner"><hgroup>
   <h1><a href="/">kk Blog —— 通用基础</a></h1>
   
-    <h2>学习中......</h2>
+    <h2>cp -rf * .</h2>
   
 </hgroup>
 
@@ -56,6 +56,1475 @@ if (query != null) {
     <div id="content">
       <div class="blog-index">
   
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-12T17:13:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>17:13:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/45932775">http://blog.csdn.net/zhangskd/article/details/45932775</a></p>
+
+<p>主要内容：Socket的异步通知机制。</p>
+
+<p>内核版本：3.15.2</p>
+
+<h4>概述</h4>
+
+<p>socket上定义了几个IO事件：状态改变事件、有数据可读事件、有发送缓存可写事件、有IO错误事件。对于这些事件，socket中分别定义了相应的事件处理函数，也称回调函数。</p>
+
+<p>Socket I/O事件的处理过程中，要使用到sock上的两个队列：等待队列和异步通知队列，这两个队列中都保存着等待该Socket I/O事件的进程。</p>
+
+<p>Q：为什么要使用两个队列，等待队列和异步通知队列有什么区别呢？<br/>
+A：等待队列上的进程会睡眠，直到Socket I/O事件的发生，然后在事件处理函数中被唤醒。异步通知队列上的进程则不需要睡眠，Socket I/O事件发时，事件处理函数会给它们发送到信号，这些进程事先注册的信号处理函数就能够被执行。</p>
+
+<h4>异步通知队列</h4>
+
+<p>Socket层使用异步通知队列来实现异步等待，此时等待Socket I/O事件的进程不用睡眠。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock {
+</span><span class='line'>    ...
+</span><span class='line'>    struct socket_wq __rcu *sk_wq; /* socket的等待队列和异步通知队列 */
+</span><span class='line'>    ...
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>struct socket_wq {
+</span><span class='line'>    /* Note: wait MUST be first field of socket_wq */
+</span><span class='line'>    wait_queue_head_t wait; /* 等待队列头 */
+</span><span class='line'>    struct fasync_struct *fasync_list; /* 异步通知队列 */
+</span><span class='line'>    struct rcu_head *rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct fasync_struct {
+</span><span class='line'>    spinlock_t fa_lock;
+</span><span class='line'>    int magic;
+</span><span class='line'>    int fa_fd; /* 文件描述符 */
+</span><span class='line'>    struct fasync_struct *fa_next; /* 用于链入单向链表 */
+</span><span class='line'>    struct file *fa_file; /* fa_file-&gt;f_owner记录接收信号的进程 */
+</span><span class='line'>    struct rcu_head fa_rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过之前的blog《linux的异步通知机制》，我们知道为了能处理协议栈发出的SIGIO信号，</p>
+
+<p>用户程序需要做的事情有：<br/>
+1. 通过signal()指定SIGIO的处理函数。<br/>
+2. 设置sockfd的拥有者为本进程，如此一来本进程才能收到协议栈发出的SIGIO信号。<br/>
+3. 设置sockfd支持异步通知，即设置O_ASYNC标志。</p>
+
+<p>对应的用户程序函数调用大概如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>signal(SIGIO, my_handler); /* set new SIGIO handler */
+</span><span class='line'>fcntl(sockfd, F_SETOWN, getpid()); /* set sockfd's owner process */
+</span><span class='line'>oflags = fcntl(sockfd, F_GETFL); /* get old sockfd flags */
+</span><span class='line'>fcntl(sockfd, F_SETFL, oflags | O_ASYNC); /* set new sockfd flags */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下文关注的是内核层面的一些工作：<br/>
+1. 如何把进程加入Socket的异步通知队列，或者把进程从Socket的异步通知队列中删除。<br/>
+2. 协议栈何时发送信号给Socket异步通知队列上的进程。</p>
+
+<h4>插入和删除</h4>
+
+<p>首先来看下fcntl()的系统调用。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+</span><span class='line'>{
+</span><span class='line'>    struct fd f = fdget_raw(fd);
+</span><span class='line'>    long err = -EBADF; /* Bad file number */
+</span><span class='line'>
+</span><span class='line'>    if (! f.file)
+</span><span class='line'>        goto out;
+</span><span class='line'>
+</span><span class='line'>    /* File is opened with O_PATH, almost nothing can be done with it */
+</span><span class='line'>    if (unlikely(f.file-&gt;f_mode & FMODE_PATH)) {
+</span><span class='line'>        if (! check_fcntl_cmd(cmd))
+</span><span class='line'>            goto out1;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    err = security_file_fcntl(f.file, cmd, arg);
+</span><span class='line'>    if (! err)
+</span><span class='line'>        err = do_fcntl(fd, cmd, arg, f.file); /* 实际的处理函数 */
+</span><span class='line'>
+</span><span class='line'>out1:
+</span><span class='line'>    fdput(f);
+</span><span class='line'>out:
+</span><span class='line'>    return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static long do_fcntl(int fd, unsigned int cmd, unsigned long arg, struct fil *filp)
+</span><span class='line'>{
+</span><span class='line'>    long err = -EINVAL;
+</span><span class='line'>
+</span><span class='line'>    switch(cmd) {
+</span><span class='line'>    ...
+</span><span class='line'>    case F_SETFL: /* 在这里设置O_ASYNC标志 */
+</span><span class='line'>        err = setfl(fd, filp, arg);
+</span><span class='line'>        break;
+</span><span class='line'>    ...
+</span><span class='line'>    case F_SETOWN: /* 在这里设置所有者进程 */
+</span><span class='line'>        err = f_setown(filp, arg, 1);
+</span><span class='line'>        break;
+</span><span class='line'>    ....
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int setfl(int fd, struct file *filp, unsigned long arg)
+</span><span class='line'>{
+</span><span class='line'>    ...
+</span><span class='line'>    /* -&gt;fasync() is responsible for setting the FASYNC bit. */
+</span><span class='line'>    if (((arg ^ filp-&gt;f_flags) & FASYNC) && filp-&gt;f_op-&gt;fasync) {
+</span><span class='line'>        error = filp-&gt;f_op-&gt;fasync(fd, filp, (arg & FASYNC) != 0);
+</span><span class='line'>
+</span><span class='line'>        if (error &lt; 0)
+</span><span class='line'>            goto out;
+</span><span class='line'>        if (error &gt; 0)
+</span><span class='line'>            error = 0;
+</span><span class='line'>    }
+</span><span class='line'>    ...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Socket文件的操作函数集为socket_file_ops。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations socket_file_ops = {
+</span><span class='line'>    ...
+</span><span class='line'>    .fasync = sock_fasync,
+</span><span class='line'>    ...
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Update the socket async list. */
+</span><span class='line'>static int sock_fasync(int fd, struct file *filp, int on)
+</span><span class='line'>{
+</span><span class='line'>    struct socket *sock = filp-&gt;private_data;
+</span><span class='line'>    struct sock *sk = sock-&gt;sk;
+</span><span class='line'>    struct socket_wq *wq; /* Socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>    if (sk == NULL)
+</span><span class='line'>        return -EINVAL;
+</span><span class='line'>
+</span><span class='line'>    lock_sock(sk);
+</span><span class='line'>    wq = rcu_dereference_protected(sock-&gt;wq, sock_owned_by_user(sk));
+</span><span class='line'>
+</span><span class='line'>    fasync_helper(fd, filp, on, &wq-&gt;fasync_list); /* 使用此函数来插入或删除 */
+</span><span class='line'>
+</span><span class='line'>    /* 设置或取消SOCK_FASYNC标志 */
+</span><span class='line'>    if (! wq-&gt;fasync_list)
+</span><span class='line'>        sock_reset_flag(sk, SOCK_FASYNC);
+</span><span class='line'>    else
+</span><span class='line'>        sock_set_flag(sk, SOCK_FASYNC);
+</span><span class='line'>
+</span><span class='line'>    release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和设备驱动一样，最终调用fasync_helper()来把进程插入异步通知队列，或者把进程从异步通知队列中删除。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * fasync_helper() is used by almost all character device drivers to set up the fasync
+</span><span class='line'> * queue, and for regular files by the file lease code. It returns negative on error, 0 if
+</span><span class='line'> * it did no changes and positive if it added / deleted the entry.
+</span><span class='line'> */
+</span><span class='line'>
+</span><span class='line'>int fasync_helper(int fd, struct file *filp, int on, struct fasync_struct **fapp)
+</span><span class='line'>{
+</span><span class='line'>    if (! on)
+</span><span class='line'>        return fasync_remove_entry(filp, fapp); /* 插入 */
+</span><span class='line'>
+</span><span class='line'>    return fasync_add_entry(fd, filp, fapp); /* 删除 */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>发送信号</h4>
+
+<p>当Socket I/O事件触发时，协议栈会调用sk_wake_async()来进行异步通知。</p>
+
+<p>函数的处理方式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum {
+</span><span class='line'>    SOCK_WAKE_IO, /* 直接发送SIGIO信号 */
+</span><span class='line'>    SOCK_WAKE_WAITD, /* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>    SOCK_WAKE_SPACE, /* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>    SOCK_WAKE_URG, /* 直接发送SIGURG信号 */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通告的IO类型，常用的有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define __SI_POLL 0
+</span><span class='line'>#define POLL_IN (__SI_POLL | 1) /* data input available, 有接收数据可读 */
+</span><span class='line'>#define POLL_OUT (__SI_POLL | 2) /* output buffers available, 有输出缓存可写 */
+</span><span class='line'>#define POLL_MSG (__SI_POLL | 3) /* input message available, 有输入消息可读 */
+</span><span class='line'>#define POLL_ERR (__SI_POLL | 4) /* i/0 error, I/O错误 */
+</span><span class='line'>#define POLL_PRI (__SI_POLL | 5) /* high priority input available, 有紧急数据可读 */
+</span><span class='line'>#define POLL_HUP (__SI_POLL | 6) /* device disconnected, 设备关闭或文件关闭，无法继续读写 */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>how为函数的处理方式，band为通告的IO类型。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_wake_async(struct sock *sk, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>    if (sock_flag(sk, SOCK_FASYNC)) /* sock需要支持异步通知 */
+</span><span class='line'>        sock_wake_async(sk-&gt;sk_socket, how, band);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int sock_wake_async(struct socket *sock, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>    struct socket_wq *wq;
+</span><span class='line'>
+</span><span class='line'>    if (! sock)
+</span><span class='line'>        return -1;
+</span><span class='line'>
+</span><span class='line'>    rcu_read_lock();
+</span><span class='line'>    wq = rcu_dereference(sock-&gt;wq); /* socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>    if (! wq || !wq-&gt;fasync_list) { /* 如果有队列没有实例 */
+</span><span class='line'>        rcu_read_unlock();
+</span><span class='line'>        return -1;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    switch(how) {
+</span><span class='line'>    /* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>    case SOCK_WAKE_WAITD:
+</span><span class='line'>        if (test_bit(SOCK_ASYNC_WAITDATA, &sock-&gt;flags))
+</span><span class='line'>            break;
+</span><span class='line'>        goto call_kill;
+</span><span class='line'>
+</span><span class='line'>    /* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>    case SOCK_WAKE_SPACE:
+</span><span class='line'>        if (! test_and_clear_bit(SOCK_ASYNC_NOSPACE, &sock-&gt;flags))
+</span><span class='line'>            break;
+</span><span class='line'>    /* fall_through */
+</span><span class='line'>
+</span><span class='line'>    case SOCK_WAKE_IO: /* 直接发送SIGIO信号 */
+</span><span class='line'>call_kill:
+</span><span class='line'>            /* 发送SIGIO信号给异步通知队列上的进程，告知IO消息 */
+</span><span class='line'>            kill_fasync(&wq-&gt;fasync_list, SIGIO, band);
+</span><span class='line'>            break;
+</span><span class='line'>
+</span><span class='line'>    case SOCK_WAKE_URG:
+</span><span class='line'>            /* 发送SIGURG信号给异步通知队列上的进程 */
+</span><span class='line'>            kill_fasync(&wq-&gt;fasync_list, SIGURG, band);
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    rcu_read_unlock();
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和设备驱动一样，最终调用kill_fasync()来发送信号给用户进程。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kill_fasync(struct fasync_struct **fp, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>    /* First a quick test without locking: usually the list is empty. */
+</span><span class='line'>    if (*f) {
+</span><span class='line'>        rcu_read_lock();
+</span><span class='line'>        kill_fasync_rcu(rcu_dereference(*fp), sig, band);
+</span><span class='line'>        rcu_read_unlock();
+</span><span class='line'>    }
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void kill_fasync_rcu(struct fasync_struct *fa, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>    while (fa) {
+</span><span class='line'>        struct fown_struct *fown;
+</span><span class='line'>        unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>        if (fa-&gt;magic != FASYNC_MAGIC) {
+</span><span class='line'>            printk(KERN_ERR "kill_fasync: bad magic number in fasync_struct!\n");
+</span><span class='line'>            return;
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        spin_lock_irqsave(&fa-&gt;fa_lock, flags);
+</span><span class='line'>        if (fa-&gt;fa_file) {
+</span><span class='line'>            fown = &fa-&gt;file-&gt;f_owner; /* 持有文件的进程 */
+</span><span class='line'>
+</span><span class='line'>            /* Don't send SIGURG to processes which have not set a queued signum:
+</span><span class='line'>             * SIGURG has its own default signalling mechanism. */
+</span><span class='line'>
+</span><span class='line'>            if (! (sig == SIGURG && fown-&gt;signum == 0))
+</span><span class='line'>                send_sigio(fown, fa-&gt;fa_fd, band); /* 发送信号给持有文件的进程 */
+</span><span class='line'>        }
+</span><span class='line'>        spin_unlock_irqrestore(&fa-&gt;fa_lock, flags);
+</span><span class='line'>
+</span><span class='line'>        fa = rcu_dereference(fa-&gt;fa_next); /* 指向下一个异步通知结构体 */
+</span><span class='line'>    }
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-12T16:55:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>16:55:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/wolongzhumeng/article/details/8900414">http://blog.csdn.net/wolongzhumeng/article/details/8900414</a></p>
+
+<p>1、每一个打开的文件、socket等等都用一个file数据结构代表，这样文件和socket就通过inode->u(union)中的各个成员来区别：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inode {
+</span><span class='line'>    .....................
+</span><span class='line'>    union {
+</span><span class='line'>        struct ext2_inode_info ext2_i;
+</span><span class='line'>        struct ext3_inode_info ext3_i;
+</span><span class='line'>        struct socket socket_i;
+</span><span class='line'>        .....................
+</span><span class='line'>    } u;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>2、每个socket数据结构都有一个sock数据结构成员，sock是对socket的扩充，两者一一对应，socket->sk指向对应的sock，sock->socket 指向对应的socket；</p>
+
+<p>3、socket和sock是同一事物的两个侧面，为什么不把两个数据结构合并成一个呢？这是因为socket是inode结构中的一部分，即把inode结
+构内部的一个union用作socket结构。由于插口操作的特殊性，这个数据结构中需要有大量的结构成分，如果把这些成分全部放到socket
+结构中，则inode结构中的这个union就会变得很大，从而inode结构也会变得很大，而对于其他文件系统这个union是不需要这么大的，
+所以会造成巨大浪费，系统中使用inode结构的数量要远远超过使用socket的数量，故解决的办法就是把插口分成两部分，把与文件系
+统关系密切的放在socket结构中，把与通信关系密切的放在另一个单独结构sock中；</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct socket
+</span><span class='line'>{
+</span><span class='line'>    socket_state state;      // 该state用来表明该socket的当前状态
+</span><span class='line'>    typedef enum {
+</span><span class='line'>        SS_FREE = 0,         /* not allocated */
+</span><span class='line'>        SS_UNCONNECTED,      /* unconnected to any socket */
+</span><span class='line'>        SS_CONNECTING,       /* in process of connecting */
+</span><span class='line'>        SS_CONNECTED,        /* connected to socket */
+</span><span class='line'>        SS_DISCONNECTING     /* in process of disconnecting */
+</span><span class='line'>    } socket_state;
+</span><span class='line'>    unsigned long flags;     //该成员可能的值如下，该标志用来设置socket是否正在忙碌
+</span><span class='line'>    #define SOCK_ASYNC_NOSPACE 0
+</span><span class='line'>    #define SOCK_ASYNC_WAITDATA 1
+</span><span class='line'>    #define SOCK_NOSPACE 2
+</span><span class='line'>    struct proto_ops *ops;   //依据协议邦定到该socket上的特定的协议族的操作函数指针，例如IPv4 TCP就是inet_stream_ops
+</span><span class='line'>    struct inode *inode;     //表明该socket所属的inode
+</span><span class='line'>    struct fasync_struct *fasync_list; //异步唤醒队列
+</span><span class='line'>    struct file *file;       //file回指指针
+</span><span class='line'>    struct sock *sk;         //sock指针
+</span><span class='line'>    wait_queue_head_t wait;  //sock的等待队列，在TCP需要等待时就sleep在这个队列上
+</span><span class='line'>    short type;              //表示该socket在特定协议族下的类型例如SOCK_STREAM,
+</span><span class='line'>    unsigned char passcred;  //在TCP分析中无须考虑
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct sock {
+</span><span class='line'>    /* socket用来对进入的包进行匹配的5大因素 */
+</span><span class='line'>    __u32 daddr;        // dip，Foreign IPv4 addr
+</span><span class='line'>    __u32 rcv_saddr;    // 记录套接字所绑定的地址 Bound local IPv4 addr
+</span><span class='line'>    __u16 dport;        // dport
+</span><span class='line'>    unsigned short num; /* 套接字所在的端口号, 端口号小于1024的为特权端口, 只有特权用户才能绑定,当用户指定的端
+</span><span class='line'>                         * 口号为零时, 系统将提供一个未分配的用户端口，如果对于raw socket的话，该num又可以用来
+</span><span class='line'>                         * 保存socket(int family, int type, int protocol)中的protocol，而不是端口号了；在bind时候，会首先
+</span><span class='line'>                         * 将邦定的源端口号赋予该成员，最终sport成员从该成员出获取源端口号__tcp_v4_hash主要就
+</span><span class='line'>                         * 是利用了该成员来hash从而排出hash链
+</span><span class='line'>                         */
+</span><span class='line'>    int bound_dev_if;   // Bound device index if != 0
+</span><span class='line'>
+</span><span class='line'>    /* 主hash链，系统已分配的端口用tcp_hashinfo.__tcp_bhash来索引, 索引槽结构为tcp_bind_hashbucket, 端口绑定结构用tcp_bind_bucket描述,
+</span><span class='line'>    它包含指向绑定到该端口套接字的指针(owners), 套接字的sk-&gt;prev指针指向该绑定结构 */
+</span><span class='line'>    struct sock *next;
+</span><span class='line'>    struct sock **pprev;
+</span><span class='line'>    /* sk-&gt;bind_next和sk-&gt;bind_pprev用来描述绑定到同一端口的套接字，例如http服务器 */
+</span><span class='line'>    struct sock *bind_next;
+</span><span class='line'>    struct sock **bind_pprev;
+</span><span class='line'>    struct sock *prev;
+</span><span class='line'>
+</span><span class='line'>    volatile unsigned char state, zapped; // Connection state，zapped在TCP分析中无须考虑
+</span><span class='line'>    __u16 sport;                   // 源端口，见num
+</span><span class='line'>
+</span><span class='line'>    unsigned short family;         // 协议族，例如PF_INET
+</span><span class='line'>    unsigned char reuse;           // 地址是否可重用，只有RAW才使用
+</span><span class='line'>    unsigned char shutdown;        // 判断该socket连接在某方向或者双向方向上都已经关闭
+</span><span class='line'>    #define SHUTDOWN_MASK 3
+</span><span class='line'>    #define RCV_SHUTDOWN 1
+</span><span class='line'>    #define SEND_SHUTDOWN 2
+</span><span class='line'>    atomic_t refcnt;               // 引用计数
+</span><span class='line'>    socket_lock_t lock;            // 锁标志， 每个socket都有一个自旋锁，该锁在用户上下文和软中断处理时提供了同步机制
+</span><span class='line'>    typedef struct {
+</span><span class='line'>        spinlock_t slock;
+</span><span class='line'>        unsigned int users;
+</span><span class='line'>        wait_queue_head_t wq;
+</span><span class='line'>    } socket_lock_t;
+</span><span class='line'>    wait_queue_head_t *sleep;      // Sock所属线程的自身休眠等待队列
+</span><span class='line'>    struct dst_entry *dst_cache;   // 目的地的路由缓存
+</span><span class='line'>    rwlock_t dst_lock;             // 为该socket赋dst_entry值时的锁
+</span><span class='line'>
+</span><span class='line'>    /* sock的收发都是要占用内存的，即发送缓冲区和接收缓冲区。 系统对这些内存的使用是有限制的。 通常，每个sock都会从配额里
+</span><span class='line'>        预先分配一些，这就是forward_alloc， 具体分配时：
+</span><span class='line'>        1）比如收到一个skb，则要计算到rmem_alloc中，并从forward_alloc中扣除。 接收处理完成后（如用户态读取），则释放skb，并利
+</span><span class='line'>            用tcp_rfree()把该skb的内存反还给forward_alloc。
+</span><span class='line'>        2）发送一个skb，也要暂时放到发送缓冲区，这也要计算到wmem_queued中，并从forward_alloc中扣除。真正发送完成后，也释放
+</span><span class='line'>            skb，并反还forward_alloc。 当从forward_alloc中扣除的时候，有可能forward_alloc不够，此时就要调用tcp_mem_schedule()来增
+</span><span class='line'>            加forward_alloc，当然，不是随便想加就可以加的，系统对整个TCP的内存使用有总的限制，即sysctl_tcp_mem[3]。也对每个sock
+</span><span class='line'>            的内存使用分别有限制，即sysctl_tcp_rmem[3]和sysctl_tcp_wmem[3]。只有满足这些限制（有一定的灵活性），forward_alloc才
+</span><span class='line'>            能增加。 当发现内存紧张的时候，还会调用tcp_mem_reclaim()来回收forward_alloc预先分配的配额。
+</span><span class='line'>    */
+</span><span class='line'>    int rcvbuf;                    // 接受缓冲区的大小（按字节）
+</span><span class='line'>    int sndbuf;                    // 发送缓冲区的大小（按字节）
+</span><span class='line'>    atomic_t rmem_alloc;           // 接受队列中存放的数据的字节数
+</span><span class='line'>    atomic_t wmem_alloc;           // 发送队列中存放的数据的字节数
+</span><span class='line'>    int wmem_queued;               // 所有已经发送的数据的总字节数
+</span><span class='line'>    int forward_alloc;             // 预分配剩余字节数
+</span><span class='line'>
+</span><span class='line'>    struct sk_buff_head receive_queue; // 接受队列
+</span><span class='line'>    struct sk_buff_head write_queue;   // 发送队列
+</span><span class='line'>    atomic_t omem_alloc;               // 在TCP分析中无须考虑 * "o" is "option" or "other" */
+</span><span class='line'>
+</span><span class='line'>    __u32 saddr; /* 指真正的发送地址，这里需要注意的是，rcv_saddr是记录套接字所绑定的地址，其可能是广播或者
+</span><span class='line'>                    多播，对于我们要发送的包来说，只能使用接口的IP地址，而不能使用广播或者多播地址 */
+</span><span class='line'>    unsigned int allocation;       // 分配该sock之skb时选择的模式，GFP_ATOMIC还是GFP_KERNEL等等
+</span><span class='line'>
+</span><span class='line'>    volatile char dead,            // tcp_close.tcp_listen_stop.inet_sock_release调用sock_orphan将该值置1，表示该socket已经和进程分开，变成孤儿
+</span><span class='line'>                done,              // 用于判断该socket是否已经收到 fin，如果收到则将该成员置1
+</span><span class='line'>                urginline,         // 如果该值被设置为1，表示将紧急数据放于普通数据流中一起处理，而不在另外处理
+</span><span class='line'>                keepopen,          // 是否启动保活定时器
+</span><span class='line'>                linger,            // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>                destroy,           // 在TCP分析中无须考虑
+</span><span class='line'>                no_check,          // 是否对发出的skb做校验和，仅对UDP有效
+</span><span class='line'>                broadcast,         // 是否允许广播，仅对UPD有效
+</span><span class='line'>                bsdism;            // 在TCP分析中无须考虑
+</span><span class='line'>    unsigned char debug;           // 在TCP分析中无须考虑
+</span><span class='line'>    unsigned char rcvtstamp;       // 是否将收到skb的时间戳发送给app
+</span><span class='line'>    unsigned char use_write_queue; // 在init中该值被初始化为1，该值一直没有变化
+</span><span class='line'>    unsigned char userlocks;       // 包括如下几种值的组合，从而改变收包等操作的执行顺序
+</span><span class='line'>    #define SOCK_SNDBUF_LOCK 1
+</span><span class='line'>    #define SOCK_RCVBUF_LOCK 2
+</span><span class='line'>    #define SOCK_BINDADDR_LOCK 4
+</span><span class='line'>    #define SOCK_BINDPORT_LOCK 8
+</span><span class='line'>    int route_caps;                // 指示本sock用到的路由的信息
+</span><span class='line'>    int proc;                      // 保存用户线程的pid
+</span><span class='line'>    unsigned long lingertime;      // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>    int hashent;                   // 存放4元的hash值
+</span><span class='line'>    struct sock *pair;             // 在TCP分析中无须考虑
+</span><span class='line'>
+</span><span class='line'>    /* 一个进程也许会锁住socket导致该socket不能被改变。特别是这点意味着其甚至不能被驱动中断所改变，例如，
+</span><span class='line'>        到达的报会被堵塞，导致我们无法获取新的数据或者任何的状态改变。所以在这里，当socket被锁住的时候，中
+</span><span class='line'>        断处理可以将包往下面的backlog中添加*/
+</span><span class='line'>    struct {
+</span><span class='line'>        struct sk_buff *head;
+</span><span class='line'>        struct sk_buff *tail;
+</span><span class='line'>    } backlog;
+</span><span class='line'>
+</span><span class='line'>    rwlock_t callback_lock;          // sock相关函数内部操作的保护锁
+</span><span class='line'>    struct sk_buff_head error_queue; // 错误报文的队列，很少使用
+</span><span class='line'>    struct proto *prot;              // 例如指向tcp_prot
+</span><span class='line'>
+</span><span class='line'>    union {       // 私有TCP相关数据保存
+</span><span class='line'>        struct tcp_opt af_tcp;
+</span><span class='line'>        .............
+</span><span class='line'>    } tp_pinfo;
+</span><span class='line'>
+</span><span class='line'>    int err,      // 保存各种错误，例如ECONNRESET Connection reset by peer，从而会影响到后续流程的处理
+</span><span class='line'>        err_soft; // 保存各种软错误，例如EPROTO Protocol error，从而会影响到后续流程的处理
+</span><span class='line'>    unsigned short ack_backlog;       // 当前已经accept的数目
+</span><span class='line'>    unsigned short max_ack_backlog;   // 当前listen sock能保留多少个待处理TCP连接.
+</span><span class='line'>    __u32 priority;                   /* Packet queueing priority，Used to set the TOS field. Packets with a higher priority may be processed first, depending on the device’s queueing discipline. See SO_PRIORITY */
+</span><span class='line'>    unsigned short type;              // 例如SOCK_STREAM，SOCK_DGRAM或者SOCK_RAW等
+</span><span class='line'>    unsigned char localroute;         // Route locally only if set – set by SO_DONTROUTE option.
+</span><span class='line'>    unsigned char protocol;           // socket(int family, int type, int protocol)中的protocol
+</span><span class='line'>    struct ucred peercred;            // 在TCP分析中无须考虑
+</span><span class='line'>    int rcvlowat;                     /* 声明在开始发送 数据 (SO_SNDLOWAT) 或正在接收数据的用户 (SO_RCVLOWAT) 传递数据之
+</span><span class='line'>    前缓冲区内的最小字节数. 在 Linux 中这两个值是不可改变的, 固定为 1 字节. */
+</span><span class='line'>    long rcvtimeo;                    // 接收时的超时设定, 并在超时时报错
+</span><span class='line'>    long sndtimeo;                    // 发送时的超时设定, 并在超时时报错
+</span><span class='line'>
+</span><span class='line'>    union {       // 私有inet相关数据保存
+</span><span class='line'>        struct inet_opt af_inet;
+</span><span class='line'>        .................
+</span><span class='line'>    } protinfo;
+</span><span class='line'>
+</span><span class='line'>    /* the timer is used for SO_KEEPALIVE (i.e. sending occasional keepalive probes to a remote site – by default, set to 2 hours in
+</span><span class='line'>    stamp is simply the time that the last packet was received. */
+</span><span class='line'>    struct timer_list timer;
+</span><span class='line'>    struct timeval stamp;
+</span><span class='line'>    struct socket *socket; // 对应的socket
+</span><span class='line'>    void *user_data;       // 私有数据，在TCP分析中无须考虑
+</span><span class='line'>
+</span><span class='line'>    /* The state_change operation is called whenever the status of the socket is changed. Similarly, data_ready is called
+</span><span class='line'>        when data have been received, write_space when free memory available for writing has increased and error_report
+</span><span class='line'>        when an error occurs, backlog_rcv when socket locked, putting skb to backlog, destruct for release this sock*/
+</span><span class='line'>    void (*state_change)(struct sock *sk);
+</span><span class='line'>    void (*data_ready)(struct sock *sk,int bytes);
+</span><span class='line'>    void (*write_space)(struct sock *sk);
+</span><span class='line'>    void (*error_report)(struct sock *sk);
+</span><span class='line'>    int (*backlog_rcv) (struct sock *sk, struct sk_buff *skb);
+</span><span class='line'>    void (*destruct)(struct sock *sk);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>struct inet_opt
+</span><span class='line'>{
+</span><span class='line'>    int ttl;                    // IP的TTL设置
+</span><span class='line'>    int tos;                    // IP的TOS设置
+</span><span class='line'>    unsigned cmsg_flags;        // 该标志用来决定是否向应用层打印相关信息，包括如下可能的值
+</span><span class='line'>    #define IP_CMSG_PKTINFO 1
+</span><span class='line'>    #define IP_CMSG_TTL 2
+</span><span class='line'>    #define IP_CMSG_TOS 4
+</span><span class='line'>    #define IP_CMSG_RECVOPTS 8
+</span><span class='line'>    #define IP_CMSG_RETOPTS 16
+</span><span class='line'>    struct ip_options *opt;     // IP选项，包括安全和处理限制、记录路径、时间戳、宽松的源站选路、严格的源站选路
+</span><span class='line'>    unsigned char hdrincl;      // 用于RAW
+</span><span class='line'>    __u8 mc_ttl;                // 多播TTL
+</span><span class='line'>    __u8 mc_loop;               // 多播回环
+</span><span class='line'>    unsigned recverr : 1,       // 是否允许传递扩展的可靠的错误信息.
+</span><span class='line'>    freebind : 1;               // 是否允许socket被绑定
+</span><span class='line'>    __u16 id;                   // 用于禁止分片的IP包的ID计数
+</span><span class='line'>    __u8 pmtudisc;              // 路径MTU发现
+</span><span class='line'>    int mc_index;               // 多播设备索引
+</span><span class='line'>    __u32 mc_addr;              // 自己的多播地址
+</span><span class='line'>    struct ip_mc_socklist *mc_list; // 多播组
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct tcp_opt {
+</span><span class='line'>    int tcp_header_len;         // tcp首部长度（包括选项）
+</span><span class='line'>    __u32 pred_flags; /* 首部预测标志，在syn_rcv、syn_sent、更新窗口或其他恰当的时候，设置pred_flags（主要
+</span><span class='line'>                        是创建出不符合快速路径的条件，一般值为0x??10 &lt;&lt; 16 + snd_wnd）?所对应的值不确定，
+</span><span class='line'>                        在连接完毕之后，根据pred_flags以及其他因素来确定是否走快速路径。*/
+</span><span class='line'>
+</span><span class='line'>    __u32 rcv_nxt;              // 期望接受到的下一个tcp包的seq
+</span><span class='line'>    __u32 snd_nxt;              // 要发送的下一个tcp包的seq
+</span><span class='line'>    __u32 snd_una;              // 表示最近一个尚未确认的但是已经发送过的报文的seq
+</span><span class='line'>    __u32 snd_sml;              // 最近发送的小包的最后一个字节数，主要用于Nagle算法
+</span><span class='line'>    __u32 rcv_tstamp;           // 最近收到的ACK的时间，用于保活
+</span><span class='line'>    __u32 lsndtime;             // 最近发送的数据包的时间，用于窗口restart
+</span><span class='line'>
+</span><span class='line'>    /* 经受时延的确认的控制 */
+</span><span class='line'>    struct {
+</span><span class='line'>        __u8 pending;           /* 正处于ACK延时状态，包括如下几种状态 ACK is pending */
+</span><span class='line'>        enum tcp_ack_state_t
+</span><span class='line'>        {
+</span><span class='line'>            TCP_ACK_SCHED = 1,
+</span><span class='line'>            TCP_ACK_TIMER = 2,
+</span><span class='line'>            TCP_ACK_PUSHED= 4
+</span><span class='line'>        };
+</span><span class='line'>        __u8 quick;            /* 快速恢复算法时，用于决定是否需要重传的收到的重复ACK的最大数目 Scheduled number of quick acks */
+</span><span class='line'>        __u8 pingpong;         /* 当前该TCP会话处于交互状态（非延时ACK状态）The session is interactive */
+</span><span class='line'>        __u8 blocked;          /* 当前socket被锁住了，这时候延时的ACK不再等待，而是立即发送 Delayed ACK was blocked by socket lock*/]
+</span><span class='line'>        /*Adaptive Time-Out (ATO) is the time that must elapse before an acknowledgment is considered lost. RFC 2637*/
+</span><span class='line'>        __u32 ato;             /* 软件时钟的预测嘀嗒数目 Predicted tick of soft clock */
+</span><span class='line'>        unsigned long timeout; /* 当前延时确认的定时器时间 Currently scheduled timeout */
+</span><span class='line'>        __u32 lrcvtime;        /* 最后收到的数据报的时间戳 timestamp of last received data packet*/
+</span><span class='line'>        __u16 last_seg_size;   /* 最后收到的数据报的大小 Size of last incoming segment */
+</span><span class='line'>
+</span><span class='line'>        /*
+</span><span class='line'>        1. tp-&gt;advmss：The MSS advertised by the host. This is initialised in the function tcp_advertise_mss, from the routing table's destination cache(dst-&gt;advmss).
+</span><span class='line'>Given that the cached entry is calculated from the MTU (maximum transfer unit) of the next hop, this will have a value of 1460 over Ethernet.
+</span><span class='line'>
+</span><span class='line'>        2. tp-&gt;ack.rcv_mss：A lower-bound estimate of the peer's MSS. This is initiated in tcp_initialize_rcv mss, and updated whenever a segment is received by
+</span><span class='line'>tcp measure rcv mss.
+</span><span class='line'>
+</span><span class='line'>        3. tp-&gt;mss_cache：The current effective sending MSS, which is calculated in the function tcp_sync_mss. When the socket is created, it is initialised to 536 by
+</span><span class='line'>tcp_v4_init_sock. Note that these are the only functions that alter the value of tp-&gt;mss cache.
+</span><span class='line'>
+</span><span class='line'>        4. tp-&gt;mss clamp：An upper-bound value of the MSS of the connection. This is negotiated at connect(), such that it is the minimum of the MSS values advertised
+</span><span class='line'>by the two hosts.We will never see a segment larger than this.
+</span><span class='line'>*/
+</span><span class='line'>        __u16 rcv_mss;    /* 属于点到点的mss，用于延时确认 MSS used for delayed ACK decisions */
+</span><span class='line'>    } ack;
+</span><span class='line'>
+</span><span class='line'>    __u16 mss_cache;      // 当前提供的有效mss， /* Cached effective mss, not including SACKS */
+</span><span class='line'>    __u16 mss_clamp;      // 最大mss，连接建立时协商的mss或者用户通过ioctl指定的mss的两者之中最大值
+</span><span class='line'>    /* Maximal mss, negotiated at connection setup */
+</span><span class='line'>    __u16 advmss;         /* MTU包括路径MTU，这里的advmss是本机告知周围网关的我自身的mss */
+</span><span class='line'>
+</span><span class='line'>    /* 用于直接拷贝给应用层的数据，当用户正在读取该套接字时, TCP包将被排入套接字的预备队列(tcp_prequeue ())，将其
+</span><span class='line'>    传递到该用户线程上下文中进行处理. */
+</span><span class='line'>    struct {
+</span><span class='line'>        struct sk_buff_head prequeue; // 当前预备队列
+</span><span class='line'>        struct task_struct *task;     // 当前线程
+</span><span class='line'>        struct iovec *iov;            // 用户空间接受数据的地址
+</span><span class='line'>        int memory;                   // 当前预备队列中的包总字节数目
+</span><span class='line'>        int len;                      // 用户进程从预备队列中读取的数据字节数
+</span><span class='line'>    } ucopy;
+</span><span class='line'>
+</span><span class='line'>    __u32 snd_wl1;        // 收到对方返回的skb，记下该包的seq号，用于判断窗口是否需要更新 /* Sequence for window update */
+</span><span class='line'>    __u32 snd_wnd;        // 记录对方提供的窗口大小 /* The window we expect to receive */
+</span><span class='line'>    __u32 max_window;     // 对方曾经提供的最大窗口 /* Maximal window ever seen from peer */
+</span><span class='line'>    __u32 pmtu_cookie;    // 将发送mss和当前的pmtu/exthdr设置同步 /* Last pmtu seen by socket */
+</span><span class='line'>    __u16 ext_header_len; // 网络层协议选项长度 /* Network protocol overhead (IP/IPv6 options) */
+</span><span class='line'>    __u8 ca_state;        // 快速重传状态机 /* State of fast-retransmit machine */
+</span><span class='line'>    enum tcp_ca_state
+</span><span class='line'>    {
+</span><span class='line'>        TCP_CA_Open = 0,
+</span><span class='line'>        TCP_CA_Disorder = 1,
+</span><span class='line'>        TCP_CA_CWR = 2,
+</span><span class='line'>        TCP_CA_Recovery = 3,
+</span><span class='line'>        TCP_CA_Loss = 4
+</span><span class='line'>    };
+</span><span class='line'>    /* RFC 1122指出，TCP实现必须包括Karn和Jacobson实现计算重传超时（retransmission timeout：RTO）的算法 */
+</span><span class='line'>    __u8 retransmits; // 某个还没有被确认的发送TCP包重传的次数 /* Number of unrecovered RTO timeouts. */
+</span><span class='line'>
+</span><span class='line'>    /* 当收到下面数量的重复ack时，快速重传开始，而无需等待重传定时器超时 */
+</span><span class='line'>    __u8 reordering; /* Packet reordering metric. */
+</span><span class='line'>
+</span><span class='line'>    /* 当我们发出一个tcp包之后，并不立刻释放掉该包，而是等待其对应的ack到来，如果这时候ack来了，那么我们将从
+</span><span class='line'>    write_queue队列中释放掉该包，同时将该事件的标志记录在tp-&gt;queue_shrunk中，如果原来进程由于write_queue中没
+</span><span class='line'>    有足够的空间继续发送数据而休眠的话，那么此时将会唤醒其对应的sock，从而进程可以继续发送数据 */
+</span><span class='line'>    __u8 queue_shrunk; /* Write queue has been shrunk recently.*/
+</span><span class='line'>    __u8 defer_accept; // 请参考附录1 /* User waits for some data after accept() */
+</span><span class='line'>
+</span><span class='line'>    /* 往返时间测量 RTT，有关RTT的侧量这里不再详细讨论measurement ：Round-Trip Time (RTT) is the estimated round-trip time for an Acknowledgment to be received for a
+</span><span class='line'>given transmitted packet. When the network link is a local network, this delay will be minimal (if not zero). When the network link is
+</span><span class='line'>the Internet, this delay could be substantial and vary widely. RTT is adaptive. */
+</span><span class='line'>    __u8 backoff;         /* backoff */
+</span><span class='line'>    __u32 srtt;           /* smothed round trip time &lt;&lt; 3 */
+</span><span class='line'>    __u32 mdev;           /* medium deviation */
+</span><span class='line'>    __u32 mdev_max;       /* maximal mdev for the last rtt period */
+</span><span class='line'>    __u32 rttvar;         /* smoothed mdev_max */
+</span><span class='line'>    __u32 rtt_seq;        /* sequence number to update rttvar */
+</span><span class='line'>    __u32 rto;            /* 重传超时时间 retransmit timeout */
+</span><span class='line'>
+</span><span class='line'>    __u32 packets_out;    /* 已经发出去的数目 Packets which are "in flight" */
+</span><span class='line'>    __u32 left_out;       /* 发出去已经被确认的数目 Packets which leaved network */
+</span><span class='line'>    __u32 retrans_out;    /* 重传的发出去的包数目 Retransmitted packets out */
+</span><span class='line'>
+</span><span class='line'>    // 慢启动和拥塞控制 Slow start and congestion control (see also Nagle, and Karn & Partridge)
+</span><span class='line'>    __u32 snd_ssthresh;   // 拥塞控制时的慢启动门限 /* Slow start size threshold */
+</span><span class='line'>    __u32 snd_cwnd;       // 当前采用的拥塞窗口 /* Sending congestion window */
+</span><span class='line'>    __u16 snd_cwnd_cnt;   // 线形增加的拥塞窗口计数器 /* Linear increase counter */
+</span><span class='line'>    __u16 snd_cwnd_clamp; // 拥塞窗口的最大值（一般为对方通告的窗口大小） /* Do not allow snd_cwnd to grow above this */
+</span><span class='line'>    __u32 snd_cwnd_used;  // 慢启动，每发出去一个包，snd_cwnd_used++
+</span><span class='line'>    __u32 snd_cwnd_stamp; // 该参数可以保证在重传模式下不会改变拥塞窗口的大小 */
+</span><span class='line'>
+</span><span class='line'>    /* 重传定时器和延时确认定时器 Two commonly used timers in both sender and receiver paths. */
+</span><span class='line'>    unsigned long timeout;// 用于重传
+</span><span class='line'>    struct timer_list retransmit_timer;     /* Resend (no ack) */
+</span><span class='line'>    struct timer_list delack_timer;         /* Ack delay */
+</span><span class='line'>    struct sk_buff_head out_of_order_queue; // 乱序的TCP报都存放在该队列中 /* Out of order segments go here */
+</span><span class='line'>
+</span><span class='line'>    struct tcp_func *af_specific;           // ipv4/ipv6 相关特定处理函数 /* Operations which are AF_INET{4,6} specific */
+</span><span class='line'>    struct tcp_func ipv4_specific = {
+</span><span class='line'>        ip_queue_xmit,
+</span><span class='line'>        tcp_v4_send_check,
+</span><span class='line'>        tcp_v4_rebuild_header,
+</span><span class='line'>        tcp_v4_conn_request,
+</span><span class='line'>        tcp_v4_syn_recv_sock,
+</span><span class='line'>        tcp_v4_remember_stamp,
+</span><span class='line'>        sizeof(struct iphdr),
+</span><span class='line'>
+</span><span class='line'>        ip_setsockopt,
+</span><span class='line'>        ip_getsockopt,
+</span><span class='line'>        v4_addr2sockaddr,
+</span><span class='line'>        sizeof(struct sockaddr_in)
+</span><span class='line'>    };
+</span><span class='line'>    struct sk_buff *send_head;  // 最先要发送的TCP报文 /* Front of stuff to transmit */
+</span><span class='line'>    struct page *sndmsg_page;   // sendmsg所使用的缓冲内存页面 /* Cached page for sendmsg */
+</span><span class='line'>    u32 sndmsg_off;             // sendmsg所使用的缓冲偏移 /* Cached offset for sendmsg */
+</span><span class='line'>
+</span><span class='line'>    __u32 rcv_wnd;              // 当前接受窗口 /* Current receiver window */
+</span><span class='line'>    __u32 rcv_wup;              // 对方窗口最后一次更新时的rcv_nxt /* rcv_nxt on last window update sent */
+</span><span class='line'>    __u32 write_seq;            // tcp发送总数据字节量+1 /* Tail(+1) of data held in tcp send buffer */
+</span><span class='line'>    __u32 pushed_seq;           // 上次发送带PSH标志的TCP包的seq /* Last pushed seq, required to talk to windows */
+</span><span class='line'>    __u32 copied_seq;           // 尚未读取的数据第一个字节位置 /* Head of yet unread data */
+</span><span class='line'>
+</span><span class='line'>    // Options received (usually on last packet, some only on SYN packets).
+</span><span class='line'>    char tstamp_ok,        /* syn包上的时间戳 TIMESTAMP seen on SYN packet */
+</span><span class='line'>    wscale_ok,             /* SACK选项处理Kind=5不再详细叙说 Wscale seen on SYN packet */
+</span><span class='line'>    sack_ok;               /* SACK选项处理Kind=5不再详细叙说 SACK seen on SYN packet */
+</span><span class='line'>    char saw_tstamp;       /* 最后一个TCP包的时间戳 Saw TIMESTAMP on last packet */
+</span><span class='line'>    __u8 snd_wscale;       /* 接受窗口扩大因子 Window scaling received from sender */
+</span><span class='line'>    __u8 rcv_wscale;       /* 发送窗口扩大因子 Window scaling to send to receiver */
+</span><span class='line'>    __u8 nonagle;          /* 是否允许Nagle算法 Disable Nagle algorithm? */
+</span><span class='line'>    __u8 keepalive_probes; /* 保活探测的数量 num of allowed keep alive probes */
+</span><span class='line'>
+</span><span class='line'>    /* PAWS：防止回绕的序号，不再详细叙说 PAWS/RTTM data */
+</span><span class='line'>    __u32 rcv_tsval;       /* Time stamp value */
+</span><span class='line'>    __u32 rcv_tsecr;       /* Time stamp echo reply */
+</span><span class='line'>    __u32 ts_recent;       /* Time stamp to echo next */
+</span><span class='line'>    long ts_recent_stamp;  /* Time we stored ts_recent (for aging) */
+</span><span class='line'>
+</span><span class='line'>    /* SACK选项处理Kind=5不再详细叙说 SACKs data1 */
+</span><span class='line'>    __u16 user_mss;        /* 用户通过ioctl指定的mssmss requested by user in ioctl */
+</span><span class='line'>    __u8 dsack;            /* D-SACK is scheduled */
+</span><span class='line'>    __u8 eff_sacks;        /* Size of SACK array to send with next packet */
+</span><span class='line'>    struct tcp_sack_block duplicate_sack[1]; /* D-SACK block */
+</span><span class='line'>    struct tcp_sack_block selective_acks[4]; /* The SACKS themselves*/
+</span><span class='line'>
+</span><span class='line'>    /* 通告窗口(advertised window，tp-&gt;tcv_wnd)，window_clamp是最大的通告窗口，说白了就是
+</span><span class='line'>    应用程序的缓冲区真实大小。rcv_ssthresh是更为严格的window_clamp，主要用于慢启动期间
+</span><span class='line'>    预测连接的行为 */
+</span><span class='line'>    __u32 window_clamp;   /* Maximal window to advertise */
+</span><span class='line'>    __u32 rcv_ssthresh;   /* Current window clamp */
+</span><span class='line'>
+</span><span class='line'>    __u8 probes_out;      /* 用于零窗口探测 unanswered 0 window probes */
+</span><span class='line'>    __u8 num_sacks;       /* Number of SACK blocks */
+</span><span class='line'>
+</span><span class='line'>    __u8 syn_retries;     /* syn重试次数 num of allowed syn retries */
+</span><span class='line'>    __u8 ecn_flags;       /* 显式拥塞通知状态位，不再详叙 ECN status bits. */
+</span><span class='line'>    __u16 prior_ssthresh; /* 在经过重传后恢复时的ssthresh保存值 ssthresh saved at recovery start */
+</span><span class='line'>
+</span><span class='line'>    /* SACK选项处理Kind=5不再详细叙说 SACKs data2 */
+</span><span class='line'>    __u32 lost_out;       /* Lost packets */
+</span><span class='line'>    __u32 sacked_out;     /* SACK'd packets */
+</span><span class='line'>    __u32 fackets_out;    /* FACK'd packets */
+</span><span class='line'>    __u32 high_seq;       /* snd_nxt at onset of congestion */
+</span><span class='line'>
+</span><span class='line'>    __u32 retrans_stamp;  // 上次重传的时间，其也会记住第一个syn的时间戳
+</span><span class='line'>    __u32 undo_marker;    /* 开始跟踪重传的标示符 tracking retrans started here. */
+</span><span class='line'>    int undo_retrans;     /* 用于Undo冗余的重传 number of undoable retransmissions. */
+</span><span class='line'>    __u32 urg_seq;        /* 紧急指针的seq Seq of received urgent pointer */
+</span><span class='line'>    __u16 urg_data;       /* 紧急指针的相关控制标志保存 Saved octet of OOB data and control flags */
+</span><span class='line'>    __u8 pending;         /* 确定定时器的事件 Scheduled timer event，包括如下四种情况 */
+</span><span class='line'>    #define TCP_TIME_RETRANS 1  /* Retransmit timer */
+</span><span class='line'>    #define TCP_TIME_DACK 2     /* Delayed ack timer */
+</span><span class='line'>    #define TCP_TIME_PROBE0 3   /* Zero window probe timer */
+</span><span class='line'>    #define TCP_TIME_KEEPOPEN 4 /* Keepalive timer */
+</span><span class='line'>
+</span><span class='line'>    __u8 urg_mode;        /* 是否处于紧急模式 In urgent mode */
+</span><span class='line'>    __u32 snd_up;         /* 紧急指针位置 Urgent pointer */
+</span><span class='line'>
+</span><span class='line'>    /* The syn_wait_lock is necessary only to avoid tcp_get_info having to grab the main lock sock while browsing the listening hash
+</span><span class='line'>     * (otherwise it's deadlock prone). This lock is acquired in read mode only from tcp_get_info() and it's acquired in write mode _only_ from
+</span><span class='line'>     * code that is actively changing the syn_wait_queue. All readers that are holding the master sock lock don't need to grab this lock in read
+</span><span class='line'>     * mode too as the syn_wait_queue writes are always protected from the main sock lock.
+</span><span class='line'>     */
+</span><span class='line'>    rwlock_t syn_wait_lock;
+</span><span class='line'>    struct tcp_listen_opt *listen_opt;
+</span><span class='line'>
+</span><span class='line'>    /* 服务器段listening socket的已经建立的子socket FIFO队列 FIFO of established children */
+</span><span class='line'>    struct open_request *accept_queue;
+</span><span class='line'>    struct open_request *accept_queue_tail;
+</span><span class='line'>
+</span><span class='line'>    int write_pending;             /* 是否有对socket的写请求 A write to socket waits to start. */
+</span><span class='line'>    unsigned int keepalive_time;   /* 保活定时器启动的时间阀值 time before keep alive takes place */
+</span><span class='line'>    unsigned int keepalive_intvl;  /* 保活探测时间间隔 time interval between keep alive probes */
+</span><span class='line'>    int linger2;                   // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>    int frto_counter;              /* 开始重传后的新的ack数目 Number of new acks after RTO */
+</span><span class='line'>    __u32 frto_highmark;           /* 重传发生时的要发送的下一个tcp包的seq snd_nxt when RTO occurred */
+</span><span class='line'>
+</span><span class='line'>    unsigned long last_synq_overflow; // 用于syn_cookie处理
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>/*
+附录1：
+The first option we&rsquo;ll consider is TCP_DEFER_ACCEPT. (This is what it&rsquo;s called in Linux; other OSs offer the same option but use different names.)
+To understand the idea of the TCP_DEFER_ACCEPT option, it is necessary to picture a typical process of the HTTP client-server interaction. Consider
+how the TCP establishes a connection with the goal of transferring data. On a network, information travels in discrete units called IP packets (or IP
+datagrams). A packet always has a header that carries service information, used for internal protocol handling, and it may also carry payload data. A
+typical example of service information is a set of so-called flags, which mark the packets as having special meaning to a TCP/IP stack, such as
+acknowledgement of successful packet receiving. Often, it&rsquo;s possible to carry payload in the “marked” packet, but sometimes, internal logic forces a
+TCP/IP stack to send out packets with just a header. These packets often introduce unwanted delays and increased overhead and result in overall
+performance degradation.</p>
+
+<p>The server has now created a socket and is waiting for a connection. The connection procedure in TCP/IP is a so-called “three-way handshake.” First,
+a client sends a TCP packet with a SYN flag set and no payload (a SYN packet). The server replies by sending a packet with SYN/ACK flags set (a
+SYN/ACK packet) to acknowledge receipt of the initial packet. The client then sends an ACK packet to acknowledge receipt of the second packet and to
+finalize the connection procedure. After receiving the SYN/ACK, the packet server wakes up a receiver process while waiting for data. When the three-way
+handshake is completed, the client starts to send “useful” data to be transferred to the server. Usually, an HTTP request is quite small and fits into a single
+packet. But in this case, at least four packets will be sent in both directions, adding considerable delay times. Note also that the receiver has already been
+waiting for the information—since before the data was ever sent.</p>
+
+<p>To alleviate these problems, Linux (along with some other OSs) includes a TCP_DEFER_ACCEPT option in its TCP implementation. Set on a server-side
+listening socket, it instructs the kernel not to wait for the final ACK packet and not to initiate the process until the first packet of real data has arrived. After
+sending the SYN/ACK, the server will then wait for a data packet from a client. Now, only three packets will be sent over the network, and the connection
+establishment delay will be significantly reduced, which is typical for HTTP.</p>
+
+<p>This feature, called an “accept filter” , is used in different ways, although in all cases, the effect is the same as TCP_DEFER_ACCEPT—the server
+will not wait for the final ACK packet, waiting only for a packet carrying a payload. More information about this option and its significance for a high-performance
+Web server is available in the Apache documentation.
+*/</p>
+</div>
+  
+  
+
+
+    </article>
   
   
     <article>
@@ -2510,2269 +3979,6 @@ if (query != null) {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/03/kernel-net-rps/">Receive packet steering patch详解</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-03T15:39:00+08:00'><span class='date'>2015-06-03</span> <span class='time'>15:39:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://simohayha.iteye.com/blog/720850">http://simohayha.iteye.com/blog/720850</a></p>
-
-<p>Receive packet steering简称rps，是google贡献给linux kernel的一个patch，主要的功能是解决多核情况下，网络协议栈的软中断的负载均衡。这里的负载均衡也就是指能够将软中断均衡的放在不同的cpu核心上运行。</p>
-
-<p>简介在这里：<br/>
-<a href="http://lwn.net/Articles/362339/">http://lwn.net/Articles/362339/</a></p>
-
-<p>linux现在网卡的驱动支持两种模式，一种是NAPI，一种是非NAPI模式，这两种模式的区别，我前面的blog都有介绍，这里就再次简要的介绍下。</p>
-
-<p>在NAPI中，中断收到数据包后调用__napi_schedule调度软中断，然后软中断处理函数中会调用注册的poll回掉函数中调用netif_receive_skb将数据包发送到3层，没有进行任何的软中断负载均衡。</p>
-
-<p>在非NAPI中，中断收到数据包后调用netif_rx，这个函数会将数据包保存到input_pkt_queue，然后调度软中断，这里为了兼容NAPI的驱动，他的poll方法默认是process_backlog，最终这个函数会从input_pkt_queue中取得数据包然后发送到3层。</p>
-
-<p>通过比较我们可以看到，不管是NAPI还是非NAPI的话都无法做到软中断的负载均衡，因为软中断此时都是运行在在硬件中断相应的cpu上。也就是说如果始终是cpu0相应网卡的硬件中断，那么始终都是cpu0在处理软中断，而此时cpu1就被浪费了，因为无法并行的执行多个软中断。</p>
-
-<p>google的这个patch的基本原理是这样的,根据数据包的源地址，目的地址以及目的和源端口(这里它是将两个端口组合成一个4字节的无符数进行计算的，后面会看到)计算出一个hash值，然后根据这个hash值来选择软中断运行的cpu，从上层来看，也就是说将每个连接和cpu绑定，并通过这个hash值，来均衡软中断在多个cpu上。</p>
-
-<p>这个介绍比较简单，我们来看代码是如何实现的。</p>
-
-<p>它这里主要是hook了两个内核的函数，一个是netif_rx主要是针对非NAPI的驱动，一个是netif_receive_skb这个主要是针对NAPI的驱动，这两个函数我前面blog都有介绍过，想了解可以看我前面的blog，现在这里我只介绍打过patch的实现。</p>
-
-<p>在看netif_rx和netif_receive_skb之前，我们先来看这个patch中两个重要的函数get_rps_cpu和enqueue_to_backlog，我们一个个看。</p>
-
-<p>先来看相关的两个数据结构，首先是netdev_rx_queue，它表示对应的接收队列，因为有的网卡可能硬件上就支持多队列的模式，此时对应就会有多个rx队列，这个结构是挂载在net_device中的，也就是每个网络设备最终都会有一个或者多个rx队列。这个结构在sys文件系统中的表示类似这样的/sys/class/net/<device>/queues/rx-<n> 几个队列就是rx-n.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct netdev_rx_queue {
-</span><span class='line'>    // 保存了当前队列的rps map
-</span><span class='line'>    struct rps_map *rps_map;
-</span><span class='line'>    // 对应的kobject
-</span><span class='line'>    struct kobject kobj;
-</span><span class='line'>    // 指向第一个rx队列
-</span><span class='line'>    struct netdev_rx_queue *first;
-</span><span class='line'>    // 引用计数
-</span><span class='line'>    atomic_t count;
-</span><span class='line'>} ____cacheline_aligned_in_smp;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后就是rps_map，其实这个也就是保存了能够执行数据包的cpu。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct rps_map {
-</span><span class='line'>    // cpu的个数，也就是cpus数组的个数
-</span><span class='line'>    unsigned int len;
-</span><span class='line'>    // RCU锁
-</span><span class='line'>    struct rcu_head rcu;
-</span><span class='line'>    // 保存了cpu的id.
-</span><span class='line'>    u16 cpus[0];
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>看完上面的结构，我们来看函数的实现。
-get_rps_cpu主要是通过传递进来的skb然后来选择这个skb所应该被处理的cpu。它的逻辑很简单，就是通过skb计算hash，然后通过hash从对应的队列的rps_mapping中取得对应的cpu id。</p>
-
-<p>这里有个要注意的就是这个hash值是可以交给硬件网卡去计算的，作者自己说是最好交由硬件去计算这个hash值，因为如果是软件计算的话会导致CPU 缓存不命中，带来一定的性能开销。</p>
-
-<p>还有就是rps_mapping这个值是可以通过sys 文件系统设置的，位置在这里：
-/sys/class/net/<device>/queues/rx-<n>/rps_cpus 。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    struct ipv6hdr *ip6;
-</span><span class='line'>    struct iphdr *ip;
-</span><span class='line'>    struct netdev_rx_queue *rxqueue;
-</span><span class='line'>    struct rps_map *map;
-</span><span class='line'>    int cpu = -1;
-</span><span class='line'>    u8 ip_proto;
-</span><span class='line'>    u32 addr1, addr2, ports, ihl;
-</span><span class='line'>    // rcu锁
-</span><span class='line'>    rcu_read_lock();
-</span><span class='line'>    // 取得设备对应的rx 队列
-</span><span class='line'>    if (skb_rx_queue_recorded(skb)) {
-</span><span class='line'>    ..........................................
-</span><span class='line'>        rxqueue = dev-&gt;_rx + index;
-</span><span class='line'>    } else
-</span><span class='line'>        rxqueue = dev-&gt;_rx;
-</span><span class='line'>
-</span><span class='line'>    if (!rxqueue-&gt;rps_map)
-</span><span class='line'>        goto done;
-</span><span class='line'>    // 如果硬件已经计算，则跳过计算过程
-</span><span class='line'>    if (skb-&gt;rxhash)
-</span><span class='line'>        goto got_hash; /* Skip hash computation on packet header */
-</span><span class='line'>
-</span><span class='line'>    switch (skb-&gt;protocol) {
-</span><span class='line'>    case __constant_htons(ETH_P_IP):
-</span><span class='line'>        if (!pskb_may_pull(skb, sizeof(*ip)))
-</span><span class='line'>            goto done;
-</span><span class='line'>        // 得到计算hash的几个值
-</span><span class='line'>        ip = (struct iphdr *) skb-&gt;data;
-</span><span class='line'>        ip_proto = ip-&gt;protocol;
-</span><span class='line'>        // 两个地址
-</span><span class='line'>        addr1 = ip-&gt;saddr;
-</span><span class='line'>        addr2 = ip-&gt;daddr;
-</span><span class='line'>        // 得到ip头
-</span><span class='line'>        ihl = ip-&gt;ihl;
-</span><span class='line'>        break;
-</span><span class='line'>    case __constant_htons(ETH_P_IPV6):
-</span><span class='line'>        ..........................................
-</span><span class='line'>        break;
-</span><span class='line'>    default:
-</span><span class='line'>        goto done;
-</span><span class='line'>    }
-</span><span class='line'>    ports = 0;
-</span><span class='line'>    switch (ip_proto) {
-</span><span class='line'>    case IPPROTO_TCP:
-</span><span class='line'>    case IPPROTO_UDP:
-</span><span class='line'>    case IPPROTO_DCCP:
-</span><span class='line'>    case IPPROTO_ESP:
-</span><span class='line'>    case IPPROTO_AH:
-</span><span class='line'>    case IPPROTO_SCTP:
-</span><span class='line'>    case IPPROTO_UDPLITE:
-</span><span class='line'>        if (pskb_may_pull(skb, (ihl * 4) + 4))
-</span><span class='line'>        // 我们知道tcp头的前4个字节就是源和目的端口，因此这里跳过ip头得到tcp头的前4个字节
-</span><span class='line'>            ports = *((u32 *) (skb-&gt;data + (ihl * 4)));
-</span><span class='line'>        break;
-</span><span class='line'>
-</span><span class='line'>    default:
-</span><span class='line'>        break;
-</span><span class='line'>    }
-</span><span class='line'>    // 计算hash
-</span><span class='line'>    skb-&gt;rxhash = jhash_3words(addr1, addr2, ports, hashrnd);
-</span><span class='line'>    if (!skb-&gt;rxhash)
-</span><span class='line'>        skb-&gt;rxhash = 1;
-</span><span class='line'>
-</span><span class='line'>got_hash:
-</span><span class='line'>    // 通过rcu得到对应rps map
-</span><span class='line'>    map = rcu_dereference(rxqueue-&gt;rps_map);
-</span><span class='line'>    if (map) {
-</span><span class='line'>        // 取得对应的cpu
-</span><span class='line'>        u16 tcpu = map-&gt;cpus[((u64) skb-&gt;rxhash * map-&gt;len) &gt;&gt; 32];
-</span><span class='line'>        // 如果cpu是online的，则返回计算出的这个cpu，否则跳出循环。
-</span><span class='line'>        if (cpu_online(tcpu)) {
-</span><span class='line'>            cpu = tcpu;
-</span><span class='line'>            goto done;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>done:
-</span><span class='line'>    rcu_read_unlock();
-</span><span class='line'>    // 如果上面失败，则返回-1.
-</span><span class='line'>    return cpu;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后是enqueue_to_backlog这个方法，首先我们知道在每个cpu都有一个softnet结构，而他有一个input_pkt_queue的队列，以前这个主要是用于非NAPi的驱动的，而这个patch则将这个队列也用与NAPI的处理中了。也就是每个cpu现在都会有一个input_pkt_queue队列，用于保存需要处理的数据包队列。这个队列作用现在是，如果发现不属于当前cpu处理的数据包，则我们可以直接将数据包挂载到他所属的cpu的input_pkt_queue中。</p>
-
-<p>enqueue_to_backlog接受一个skb和cpu为参数，通过cpu来判断skb如何处理。要么加入所属的input_pkt_queue中，要么schecule 软中断。</p>
-
-<p>还有个要注意就是我们知道NAPI为了兼容非NAPI模式，有个backlog的napi_struct结构，也就是非NAPI驱动会schedule backlog这个napi结构，而在enqueue_to_backlog中则是利用了这个结构，也就是它会schedule backlog，因为它会将数据放到input_pkt_queue中，而backlog的pool方法process_backlog就是从input_pkt_queue中取得数据然后交给上层处理。</p>
-
-<p>这里还有一个会用到结构就是 rps_remote_softirq_cpus，它主要是保存了当前cpu上需要去另外的cpu schedule 软中断的cpu 掩码。因为我们可能将要处理的数据包放到了另外的cpu的input queue上，因此我们需要schedule 另外的cpu上的napi(也就是软中断),所以我们需要保存对应的cpu掩码，以便于后面遍历，然后schedule。</p>
-
-<p>而这里为什么mask有两个元素，注释写的很清楚：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * This structure holds the per-CPU mask of CPUs for which IPIs are scheduled
-</span><span class='line'> * to be sent to kick remote softirq processing.  There are two masks since
-</span><span class='line'> * the sending of IPIs must be done with interrupts enabled.  The select field
-</span><span class='line'> * indicates the current mask that enqueue_backlog uses to schedule IPIs.
-</span><span class='line'> * select is flipped before net_rps_action is called while still under lock,
-</span><span class='line'> * net_rps_action then uses the non-selected mask to send the IPIs and clears
-</span><span class='line'> * it without conflicting with enqueue_backlog operation.
-</span><span class='line'> */
-</span><span class='line'>struct rps_remote_softirq_cpus {
-</span><span class='line'>    // 对应的cpu掩码
-</span><span class='line'>    cpumask_t mask[2];
-</span><span class='line'>    // 表示应该使用的数组索引
-</span><span class='line'>    int select;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int enqueue_to_backlog(struct sk_buff *skb, int cpu)
-</span><span class='line'>{
-</span><span class='line'>    struct softnet_data *queue;
-</span><span class='line'>    unsigned long flags;
-</span><span class='line'>    // 取出传递进来的cpu的softnet-data结构
-</span><span class='line'>    queue = &per_cpu(softnet_data, cpu);
-</span><span class='line'>
-</span><span class='line'>    local_irq_save(flags);
-</span><span class='line'>    __get_cpu_var(netdev_rx_stat).total++;
-</span><span class='line'>    // 自旋锁
-</span><span class='line'>    spin_lock(&queue-&gt;input_pkt_queue.lock);
-</span><span class='line'>    // 如果保存的队列还没到上限
-</span><span class='line'>    if (queue-&gt;input_pkt_queue.qlen &lt;= netdev_max_backlog) {
-</span><span class='line'>    // 如果当前队列的输入队列长度不为空
-</span><span class='line'>        if (queue-&gt;input_pkt_queue.qlen) {
-</span><span class='line'>enqueue:
-</span><span class='line'>            // 将数据包加入到input_pkt_queue中,这里会有一个小问题，我们后面再说。
-</span><span class='line'>            __skb_queue_tail(&queue-&gt;input_pkt_queue, skb);
-</span><span class='line'>            spin_unlock_irqrestore(&queue-&gt;input_pkt_queue.lock,
-</span><span class='line'>                flags);
-</span><span class='line'>            return NET_RX_SUCCESS;
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        /* Schedule NAPI for backlog device */
-</span><span class='line'>        // 如果可以调度软中断
-</span><span class='line'>        if (napi_schedule_prep(&queue-&gt;backlog)) {
-</span><span class='line'>            // 首先判断数据包该不该当前的cpu处理
-</span><span class='line'>            if (cpu != smp_processor_id()) {
-</span><span class='line'>                // 如果不该，
-</span><span class='line'>                struct rps_remote_softirq_cpus *rcpus =
-</span><span class='line'>                    &__get_cpu_var(rps_remote_softirq_cpus);
-</span><span class='line'>
-</span><span class='line'>                cpu_set(cpu, rcpus-&gt;mask[rcpus-&gt;select]);
-</span><span class='line'>                __raise_softirq_irqoff(NET_RX_SOFTIRQ);
-</span><span class='line'>            } else
-</span><span class='line'>                // 如果就是应该当前cpu处理，则直接schedule 软中断，这里可以看到传递进去的是backlog
-</span><span class='line'>                __napi_schedule(&queue-&gt;backlog);
-</span><span class='line'>        }
-</span><span class='line'>        goto enqueue;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    spin_unlock(&queue-&gt;input_pkt_queue.lock);
-</span><span class='line'>
-</span><span class='line'>    __get_cpu_var(netdev_rx_stat).dropped++;
-</span><span class='line'>    local_irq_restore(flags);
-</span><span class='line'>
-</span><span class='line'>    kfree_skb(skb);
-</span><span class='line'>    return NET_RX_DROP;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里会有一个小问题，那就是假设此时一个属于cpu0的包进入处理，此时我们运行在cpu1,此时将数据包加入到input队列，然后cpu0上面刚好又来了一个cpu0需要处理的数据包，此时由于qlen不为0则又将数据包加入到input队列中，我们会发现cpu0上的napi没机会进行调度了。</p>
-
-<p>google的patch对这个是这样处理的，在软中断处理函数中当数据包处理完毕，会调用net_rps_action来调度前面保存到其他cpu上的input队列。</p>
-
-<p>下面就是代码片断（net_rx_action）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 得到对应的rcpus.
-</span><span class='line'>rcpus = &__get_cpu_var(rps_remote_softirq_cpus);
-</span><span class='line'>    select = rcpus-&gt;select;
-</span><span class='line'>    // 翻转select，防止和enqueue_backlog冲突
-</span><span class='line'>    rcpus-&gt;select ^= 1;
-</span><span class='line'>
-</span><span class='line'>    // 打开中断，此时下面的调度才会起作用.
-</span><span class='line'>    local_irq_enable();
-</span><span class='line'>    // 这个函数里面调度对应的远程cpu的napi.
-</span><span class='line'>    net_rps_action(&rcpus-&gt;mask[select]);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后就是net_rps_action，这个函数很简单，就是遍历所需要处理的cpu，然后调度napi</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void net_rps_action(cpumask_t *mask)
-</span><span class='line'>{
-</span><span class='line'>    int cpu;
-</span><span class='line'>
-</span><span class='line'>    /* Send pending IPI's to kick RPS processing on remote cpus. */
-</span><span class='line'>    // 遍历
-</span><span class='line'>    for_each_cpu_mask_nr(cpu, *mask) {
-</span><span class='line'>        struct softnet_data *queue = &per_cpu(softnet_data, cpu);
-</span><span class='line'>        if (cpu_online(cpu))
-</span><span class='line'>            // 到对应的cpu调用csd方法。
-</span><span class='line'>            __smp_call_function_single(cpu, &queue-&gt;csd, 0);
-</span><span class='line'>    }
-</span><span class='line'>    // 清理mask
-</span><span class='line'>    cpus_clear(*mask);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面我们看到会调用csd方法，而上面的csd回掉就是被初始化为trigger_softirq函数。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void trigger_softirq(void *data)
-</span><span class='line'>{
-</span><span class='line'>    struct softnet_data *queue = data;
-</span><span class='line'>    // 调度napi可以看到依旧是backlog 这个napi结构体。
-</span><span class='line'>    __napi_schedule(&queue-&gt;backlog);
-</span><span class='line'>    __get_cpu_var(netdev_rx_stat).received_rps++;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的函数都分析完毕了，剩下的就很简单了。</p>
-
-<p>首先来看netif_rx如何被修改的，它被修改的很简单，首先是得到当前skb所应该被处理的cpu id，然后再通过比较这个cpu和当前正在处理的cpu id进行比较来做不同的处理。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int netif_rx(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    int cpu;
-</span><span class='line'>
-</span><span class='line'>    /* if netpoll wants it, pretend we never saw it */
-</span><span class='line'>    if (netpoll_rx(skb))
-</span><span class='line'>        return NET_RX_DROP;
-</span><span class='line'>
-</span><span class='line'>    if (!skb-&gt;tstamp.tv64)
-</span><span class='line'>        net_timestamp(skb);
-</span><span class='line'>    // 得到cpu id。
-</span><span class='line'>    cpu = get_rps_cpu(skb-&gt;dev, skb);
-</span><span class='line'>    if (cpu &lt; 0)
-</span><span class='line'>        cpu = smp_processor_id();
-</span><span class='line'>    // 通过cpu进行队列不同的处理
-</span><span class='line'>    return enqueue_to_backlog(skb, cpu);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后是netif_receive_skb,这里patch将内核本身的这个函数改写为__netif_receive_skb。然后当返回值小于0,则说明不需要对队列进行处理，此时直接发送到3层。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int netif_receive_skb(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    int cpu;
-</span><span class='line'>
-</span><span class='line'>    cpu = get_rps_cpu(skb-&gt;dev, skb);
-</span><span class='line'>
-</span><span class='line'>    if (cpu &lt; 0)
-</span><span class='line'>        return __netif_receive_skb(skb);
-</span><span class='line'>    else
-</span><span class='line'>        return enqueue_to_backlog(skb, cpu);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后来总结一下，可以看到input_pkt_queue是一个FIFO的队列，而且如果当qlen有值的时候，也就是在另外的cpu有数据包放到input_pkt_queue中，则当前cpu不会调度napi，而是将数据包放到input_pkt_queue中，然后等待trigger_softirq来调度napi。</p>
-
-<p>因此这个patch完美的解决了软中断在多核下的均衡问题，并且没有由于是同一个连接会map到相同的cpu，并且input_pkt_queue的使用，因此乱序的问题也不会出现。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/03/kernel-net-mem/">内核协议栈tcp层的内存管理</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-03T14:25:00+08:00'><span class='date'>2015-06-03</span> <span class='time'>14:25:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://simohayha.iteye.com/blog/532450">http://simohayha.iteye.com/blog/532450</a></p>
-
-<p><a href="http://www.ibm.com/developerworks/cn/linux/l-hisock.html#table1">http://www.ibm.com/developerworks/cn/linux/l-hisock.html#table1</a></p>
-
-<p><a href="http://blog.csdn.net/russell_tao/article/details/18711023">http://blog.csdn.net/russell_tao/article/details/18711023</a></p>
-
-<p>我们先来看tcp内存管理相关的几个内核参数,这些都能通过proc文件系统来修改:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 内核写buf的最大值.
-</span><span class='line'>extern __u32 sysctl_wmem_max;
-</span><span class='line'>// 协议栈读buf的最大值
-</span><span class='line'>extern __u32 sysctl_rmem_max;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这两个值在/proc/sys/net/core 下。这里要注意，这两个值的单位是字节。</p>
-
-<p>它们的初始化在sk_init里面,这里可以看到这两个值的大小是依赖于num_physpages的，而这个值应该是物理页数。也就是说这两个值依赖于物理内存：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __init sk_init(void)
-</span><span class='line'>{
-</span><span class='line'>    if (num_physpages &lt;= 4096) {
-</span><span class='line'>        sysctl_wmem_max = 32767;
-</span><span class='line'>        sysctl_rmem_max = 32767;
-</span><span class='line'>        sysctl_wmem_default = 32767;
-</span><span class='line'>        sysctl_rmem_default = 32767;
-</span><span class='line'>    } else if (num_physpages &gt;= 131072) {
-</span><span class='line'>        sysctl_wmem_max = 131071;
-</span><span class='line'>        sysctl_rmem_max = 131071;
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而我通过搜索源码，只有设置套接口选项的时候，才会用到这两个值，也就是setsockopt，optname为SO_SNDBUF或者SO_RCVBUF时，来限制设置的值:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>case SO_SNDBUF:
-</span><span class='line'>        if (val &gt; sysctl_wmem_max)
-</span><span class='line'>            val = sysctl_wmem_max;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来就是整个tcp协议栈的socket的buf限制(也就是所有的socket).
-这里要注意，这个东西的单位都是以页为单位的，我们下面就会看到。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>其中sysctl_tcp_mem[0]表示整个tcp sock的buf限制.
-</span><span class='line'>sysctl_tcp_mem[1]也就是tcp sock内存使用的警戒线.
-</span><span class='line'>sysctl_tcp_mem[2]也就是tcp sock内存使用的hard limit,当超过这个限制,我们就要禁止再分配buf.
-</span><span class='line'>extern int sysctl_tcp_mem[3];</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来就是针对每个sock的读写buf限制。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 其中依次为最小buf,中等buf,以及最大buf.
-</span><span class='line'>extern int sysctl_tcp_wmem[3];
-</span><span class='line'>extern int sysctl_tcp_rmem[3];</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_init</h4>
-
-<p>这几个值的初始化在tcp_init里面，这里就能清晰的看到sysctl_tcp_mem的单位是页。而sysctl_tcp_wmem和sysctl_tcp_rmem的单位是字节。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __init tcp_init(void)
-</span><span class='line'>{
-</span><span class='line'>    .................................
-</span><span class='line'>    // nr_pages就是页。
-</span><span class='line'>    nr_pages = totalram_pages - totalhigh_pages;
-</span><span class='line'>    limit = min(nr_pages, 1UL&lt;&lt;(28-PAGE_SHIFT)) &gt;&gt; (20-PAGE_SHIFT);
-</span><span class='line'>    limit = (limit * (nr_pages &gt;&gt; (20-PAGE_SHIFT))) &gt;&gt; (PAGE_SHIFT-11);
-</span><span class='line'>    limit = max(limit, 128UL);
-</span><span class='line'>    sysctl_tcp_mem[0] = limit / 4 * 3;
-</span><span class='line'>    sysctl_tcp_mem[1] = limit;
-</span><span class='line'>    sysctl_tcp_mem[2] = sysctl_tcp_mem[0] * 2;
-</span><span class='line'>
-</span><span class='line'>    /* Set per-socket limits to no more than 1/128 the pressure threshold */
-</span><span class='line'>    // 转换为字节。
-</span><span class='line'>    limit = ((unsigned long)sysctl_tcp_mem[1]) &lt;&lt; (PAGE_SHIFT - 7);
-</span><span class='line'>    max_share = min(4UL*1024*1024, limit);
-</span><span class='line'>
-</span><span class='line'>    sysctl_tcp_wmem[0] = SK_MEM_QUANTUM;
-</span><span class='line'>    sysctl_tcp_wmem[1] = 16*1024;
-</span><span class='line'>    sysctl_tcp_wmem[2] = max(64*1024, max_share);
-</span><span class='line'>
-</span><span class='line'>    sysctl_tcp_rmem[0] = SK_MEM_QUANTUM;
-</span><span class='line'>    sysctl_tcp_rmem[1] = 87380;
-</span><span class='line'>    sysctl_tcp_rmem[2] = max(87380, max_share);
-</span><span class='line'>    ................................
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后就是读写buf的最小值</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define SOCK_MIN_SNDBUF 2048
-</span><span class='line'>#define SOCK_MIN_RCVBUF 256</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后就是当前tcp协议栈已经分配了的buf的总大小。这里要注意，这个值也是以页为单位的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>atomic_t tcp_memory_allocated</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而上面的这些值如何与协议栈关联起来呢，我们来看tcp_prot结构，可以看到这些值的地址都被放到对应的tcp_prot的域。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct proto tcp_prot = {
-</span><span class='line'>    .name = "TCP",
-</span><span class='line'>    .owner = THIS_MODULE,
-</span><span class='line'>    ...................................................
-</span><span class='line'>    .enter_memory_pressure = tcp_enter_memory_pressure,
-</span><span class='line'>    .sockets_allocated = &tcp_sockets_allocated,
-</span><span class='line'>    .orphan_count = &tcp_orphan_count,
-</span><span class='line'>    .memory_allocated = &tcp_memory_allocated,
-</span><span class='line'>    .memory_pressure = &tcp_memory_pressure,
-</span><span class='line'>    .sysctl_mem = sysctl_tcp_mem,
-</span><span class='line'>    .sysctl_wmem = sysctl_tcp_wmem,
-</span><span class='line'>    .sysctl_rmem = sysctl_tcp_rmem,
-</span><span class='line'>    ........................................................
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而对应的sock域中的几个值，这几个域非常重要，我们来看他们表示的含义</p>
-
-<p>sk_rcvbuf和sk_sndbuf,这两个值分别代表每个sock的读写buf的最大限制</p>
-
-<p>sk_rmem_alloc和sk_wmem_alloc这两个值分别代表已经提交的数据包的字节数。</p>
-
-<p>读buf意味着进入tcp层的数据大小，而当数据提交给用户空间之后，这个值会相应的减去提交的大小（也就类似写buf的sk_wmem_queued)。</p>
-
-<p>写buf意味着提交给ip层。可以看到这个值的增加是在tcp_transmit_skb中进行的。</p>
-
-<p>而sk_wmem_queued也就代表skb的写队列write_queue的大小。</p>
-
-<p>还有一个sk_forward_alloc，这个值表示一个预分配置，也就是整个tcp协议栈的内存cache，第一次为一个缓冲区分配buf的时候，我们不会直接分配精确的大小，而是按页来分配，而分配的大小就是这个值，下面我们会看到这个。并且这个值初始是0.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock {
-</span><span class='line'>    int sk_rcvbuf;
-</span><span class='line'>    atomic_t sk_rmem_alloc;
-</span><span class='line'>    atomic_t sk_wmem_alloc;
-</span><span class='line'>    int sk_forward_alloc;
-</span><span class='line'>    ..........................
-</span><span class='line'>    int sk_sndbuf;
-</span><span class='line'>    // 这个表示写buf已经分配的字节长度
-</span><span class='line'>    int sk_wmem_queued;
-</span><span class='line'>    ...........................
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>sk_sndbuf和sk_rcvbuf,这两个的初始化在这里：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_v4_init_sock(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    ..................................
-</span><span class='line'>    sk-&gt;sk_sndbuf = sysctl_tcp_wmem[1];
-</span><span class='line'>    sk-&gt;sk_rcvbuf = sysctl_tcp_rmem[1];
-</span><span class='line'>    ..........................
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而当进入establish状态之后,sock会自己调整sndbuf和rcvbuf.他是通过tcp_init_buffer_space来进行调整的.这个函数会调用tcp_fixup_rcvbuf和tcp_fixup_sndbuf来调整读写buf的大小.</p>
-
-<p>这里有用到sk_userlock这个标记，这个标记主要就是用来标记SO_SNDBUF 和SO_RCVBUF套接口选项是否被设置。而是否设置对应的值为：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define SOCK_SNDBUF_LOCK 1
-</span><span class='line'>#define SOCK_RCVBUF_LOCK  2</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们可以看下面的设置SO_SNDBUF 和SO_RCVBUF的代码片断：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 首先设置sk_userlocks.
-</span><span class='line'>sk-&gt;sk_userlocks |= SOCK_SNDBUF_LOCK;
-</span><span class='line'>if ((val * 2) &lt; SOCK_MIN_SNDBUF)
-</span><span class='line'>    sk-&gt;sk_sndbuf = SOCK_MIN_SNDBUF;
-</span><span class='line'>else
-</span><span class='line'>    sk-&gt;sk_sndbuf = val * 2;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因此内核里面的处理是这样的，如果用户已经通过套接字选项设置了读或者写buf的大小，那么这里将不会调整读写buf的大小，否则就进入tcp_fixup_XXX来调整大小。</p>
-
-<p>还有一个要注意的就是MAX_TCP_HEADER，这个值表示了TCP + IP + link layer headers 以及option的长度。</p>
-
-<p>我们来看代码。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_init_buffer_space(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    int maxwin;
-</span><span class='line'>
-</span><span class='line'>    // 判断sk_userlocks，来决定是否需要fix缓冲区大小。
-</span><span class='line'>    if (!(sk-&gt;sk_userlocks & SOCK_RCVBUF_LOCK))
-</span><span class='line'>        tcp_fixup_rcvbuf(sk);
-</span><span class='line'>    if (!(sk-&gt;sk_userlocks & SOCK_SNDBUF_LOCK))
-</span><span class='line'>        tcp_fixup_sndbuf(sk);
-</span><span class='line'>......................................
-</span><span class='line'>
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来来看这两个函数如何来调整读写buf的大小，不过这里还有些疑问，就是为什么是要和3<em>sndmem以及4</em>rcvmem：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_fixup_sndbuf(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    // 首先通过mss，tcp头，以及sk_buff的大小，得到一个最小范围的sndmem。
-</span><span class='line'>    int sndmem = tcp_sk(sk)-&gt;rx_opt.mss_clamp + MAX_TCP_HEADER + 16 +sizeof(struct sk_buff);
-</span><span class='line'>
-</span><span class='line'>    // 然后取sysctl_tcp_wmem[2]和3倍的sndmem之间的最小值。
-</span><span class='line'>    if (sk-&gt;sk_sndbuf &lt; 3 * sndmem)
-</span><span class='line'>        sk-&gt;sk_sndbuf = min(3 * sndmem, sysctl_tcp_wmem[2]);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void tcp_fixup_rcvbuf(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    // 这里和上面类似，也是先得到最小的一个rcvmem段。
-</span><span class='line'>    int rcvmem = tp-&gt;advmss + MAX_TCP_HEADER + 16 + sizeof(struct sk_buff);
-</span><span class='line'>
-</span><span class='line'>    /* Try to select rcvbuf so that 4 mss-sized segments
-</span><span class='line'>     * will fit to window and corresponding skbs will fit to our rcvbuf.
-</span><span class='line'>     * (was 3; 4 is minimum to allow fast retransmit to work.)
-</span><span class='line'>     */
-</span><span class='line'>    // 这里则是通过sysctl_tcp_adv_win_scale来调整rcvmem的值。
-</span><span class='line'>    while (tcp_win_from_space(rcvmem) &lt; tp-&gt;advmss)
-</span><span class='line'>        rcvmem += 128;
-</span><span class='line'>    if (sk-&gt;sk_rcvbuf &lt; 4 * rcvmem)
-</span><span class='line'>        sk-&gt;sk_rcvbuf = min(4 * rcvmem, sysctl_tcp_rmem[2]);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ok，看完初始化，我们来看协议栈具体如何管理内存的，先来看发送端，发送端的主要实现是在tcp_sendmsg里面，这个函数我们前面已经详细的分析过了，我们这次只分析里面几个与内存相关的东西。</p>
-
-<p>来看代码片断：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
-</span><span class='line'>        size_t size)
-</span><span class='line'>{
-</span><span class='line'>    ..................................
-</span><span class='line'>
-</span><span class='line'>    if (copy &lt;= 0) {
-</span><span class='line'>new_segment:
-</span><span class='line'>        if (!sk_stream_memory_free(sk))
-</span><span class='line'>            goto wait_for_sndbuf;
-</span><span class='line'>
-</span><span class='line'>        skb = sk_stream_alloc_skb(sk, select_size(sk),
-</span><span class='line'>        sk-&gt;sk_allocation);
-</span><span class='line'>        if (sk-&gt;sk_route_caps & NETIF_F_ALL_CSUM)
-</span><span class='line'>            skb-&gt;ip_summed = CHECKSUM_PARTIAL;
-</span><span class='line'>
-</span><span class='line'>        skb_entail(sk, skb);
-</span><span class='line'>        copy = size_goal;
-</span><span class='line'>        max = size_goal;
-</span><span class='line'>    ..................
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到这里第一个sk_stream_memory_free用来判断是否还有空间来供我们分配，如果没有则跳到wait_for_sndbuf来等待buf的释放。</p>
-
-<p>然后如果有空间供我们分配，则调用sk_stream_alloc_skb来分配一个skb，然后这个大小的选择是通过select_size。</p>
-
-<p>最后调用skb_entail来更新相关的域。</p>
-
-<p>现在我们就来详细看上面的四个函数,先来看第一个：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int sk_stream_memory_free(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    return sk-&gt;sk_wmem_queued &lt; sk-&gt;sk_sndbuf;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>sk_stream_memory_free实现很简单，就是判断当前已经分配的写缓冲区的大小(sk_wmem_queued)是否小于当前写缓冲区(sk_sndbuf)的最大限制。</p>
-
-<p>然后是skb_entail，这个函数主要是当我们分配完buf后，进行一些相关域的更新，以及添加skb到writequeue。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void skb_entail(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
-</span><span class='line'>    ............................
-</span><span class='line'>    skb_header_release(skb);
-</span><span class='line'>    tcp_add_write_queue_tail(sk, skb);
-</span><span class='line'>    // 增加sk_wmem_queued.
-</span><span class='line'>    sk-&gt;sk_wmem_queued += skb-&gt;truesize;
-</span><span class='line'>    // 这里调整sk_forward_alloc的大小，也就是预分配buf的大小(减小).
-</span><span class='line'>    sk_mem_charge(sk, skb-&gt;truesize);
-</span><span class='line'>    if (tp-&gt;nonagle & TCP_NAGLE_PUSH)
-</span><span class='line'>        tp-&gt;nonagle &= ~TCP_NAGLE_PUSH;
-</span><span class='line'>}
-</span><span class='line'>// 这个函数很简单，就是将sk_forward_alloc - size.
-</span><span class='line'>static inline void sk_mem_charge(struct sock *sk, int size)
-</span><span class='line'>{
-</span><span class='line'>    if (!sk_has_account(sk))
-</span><span class='line'>        return;
-</span><span class='line'>    sk-&gt;sk_forward_alloc -= size;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后是select_size，在看这个之前我们先来坎SKB_MAX_HEAD的实现.
-SKB_MAX_HEAD主要是得到要分配的tcp数据段（不包括头)在一页中最大为多少。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define SKB_WITH_OVERHEAD(X) \
-</span><span class='line'>    ((X) - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
-</span><span class='line'>#define SKB_MAX_ORDER(X, ORDER) \
-</span><span class='line'>    SKB_WITH_OVERHEAD((PAGE_SIZE &lt;&lt; (ORDER)) - (X))
-</span><span class='line'>#define SKB_MAX_HEAD(X)    (SKB_MAX_ORDER((X), 0))</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们带入代码来看，我们下面的代码是SKB_MAX_HEAD(MAX_TCP_HEADER)，展开这个宏可以看到就是PAGE_SIZE-MAX_TCP_HEADER-SKB_DATA_ALIGN(sizeof(struct skb_shared_info).其实也就是一页还能容纳多少tcp的数据。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int select_size(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    // 首先取得存储的mss。
-</span><span class='line'>    int tmp = tp-&gt;mss_cache;
-</span><span class='line'>
-</span><span class='line'>    // 然后判断是否使用scatter–gather(前面blog有介绍)
-</span><span class='line'>    if (sk-&gt;sk_route_caps & NETIF_F_SG) {
-</span><span class='line'>        if (sk_can_gso(sk))
-</span><span class='line'>            tmp = 0;
-</span><span class='line'>        else {
-</span><span class='line'>            // 然后开始计算buf的长度。
-</span><span class='line'>            int pgbreak = SKB_MAX_HEAD(MAX_TCP_HEADER);
-</span><span class='line'>
-</span><span class='line'>            // 如果mss大于pgbreak,那么说明我们一页放不下当前需要的tcp数据，因此我们将会在skb的页区域分配，而skb的页区域是有限制的，因此tmp必须小于这个值。
-</span><span class='line'>            if (tmp &gt;= pgbreak &&
-</span><span class='line'>                    tmp &lt;= pgbreak + (MAX_SKB_FRAGS - 1) * PAGE_SIZE)
-</span><span class='line'>                tmp = pgbreak;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    return tmp;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>sk_stream_alloc_skb</h4>
-
-<p>接下来来看sk_stream_alloc_skb的实现。</p>
-
-<p>1 它会调用alloc_skb_fclone来分配内存，这个函数就不详细分析了，我们只需要知道它会从slab里分配一块内存，而大小为size+max_header(上面的分析我们知道slect_size只计算数据段).</p>
-
-<p>2 如果分配成功，则调用sk_wmem_schedule来判断我们所分配的skb的大小是否精确，是的话，就调整指针，然后返回。</p>
-
-<p>3 否则调用tcp_enter_memory_pressure设置标志进入TCP memory pressure zone。然后再调用sk_stream_moderate_sndbuf调整sndbuf(缩小sndbuf)。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct sk_buff *sk_stream_alloc_skb(struct sock *sk, int size, gfp_t gfp)
-</span><span class='line'>{
-</span><span class='line'>    struct sk_buff *skb;
-</span><span class='line'>
-</span><span class='line'>    // 4字节对其
-</span><span class='line'>    size = ALIGN(size, 4);
-</span><span class='line'>    // 分配skb。
-</span><span class='line'>    skb = alloc_skb_fclone(size + sk-&gt;sk_prot-&gt;max_header, gfp);
-</span><span class='line'>    if (skb) {
-</span><span class='line'>        // 得到精确的大小。
-</span><span class='line'>        if (sk_wmem_schedule(sk, skb-&gt;truesize)) {
-</span><span class='line'>            // 返回skb。
-</span><span class='line'>            skb_reserve(skb, skb_tailroom(skb) - size);
-</span><span class='line'>                return skb;
-</span><span class='line'>        }
-</span><span class='line'>        __kfree_skb(skb);
-</span><span class='line'>    } else {
-</span><span class='line'>        // 否则设置全局标记进入pressure zone
-</span><span class='line'>        sk-&gt;sk_prot-&gt;enter_memory_pressure(sk);
-</span><span class='line'>        sk_stream_moderate_sndbuf(sk);
-</span><span class='line'>    }
-</span><span class='line'>    return NULL;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ok,现在就来看上面的几个函数的实现。先来看几个简单的。</p>
-
-<p>首先是tcp_enter_memory_pressure,这个函数很简单，就是判断全局标记tcp_memory_pressure,然后设置这个标记。这个标记主要是用来通知其他模块调整的，比如窗口大小等等，详细的话自己搜索这个值，就知道了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_enter_memory_pressure(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    if (!tcp_memory_pressure) {
-</span><span class='line'>        NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPMEMORYPRESSURES);
-</span><span class='line'>        // 设置压力标志。
-</span><span class='line'>        tcp_memory_pressure = 1;
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后是sk_stream_moderate_sndbuf，这个函数也是要使用sk_userlocks,来判断是否已经被用户设置了。可以看到如果我们自己设置过了snd_buf的话，内核就不会帮我们调整它的大小了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_stream_moderate_sndbuf(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    if (!(sk-&gt;sk_userlocks & SOCK_SNDBUF_LOCK)) {
-</span><span class='line'>        // 它的大小调整为大于最小值，小于sk-&gt;sk_wmem_queued &gt;&gt; 1。
-</span><span class='line'>        sk-&gt;sk_sndbuf = min(sk-&gt;sk_sndbuf, sk-&gt;sk_wmem_queued &gt;&gt; 1);
-</span><span class='line'>        sk-&gt;sk_sndbuf = max(sk-&gt;sk_sndbuf, SOCK_MIN_SNDBUF);
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>sk_wmem_schedule</h4>
-
-<p>最后来看最核心的一个函数sk_wmem_schedule，这个函数只是对<code>__sk_mem_schedule</code>的简单封装。这里要知道传递进来的size是skb->truesize，也就是所分配的skb的真实大小。并且第一次进入这个函数，也就是分配第一个缓冲区包时，sk_forward_alloc是为0的，也就是说，第一次必然会执行<code>__sk_mem_schedule</code>函数。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int sk_wmem_schedule(struct sock *sk, int size)
-</span><span class='line'>{
-</span><span class='line'>    if (!sk_has_account(sk))
-</span><span class='line'>        return 1;
-</span><span class='line'>    // 先比较size(也就是skb-&gt;truesize)和预分配的内存大小。如果小于等于预分配的大小，则直接返回，否则调用__sk_mem_schedule进行调整。
-</span><span class='line'>    return size &lt;= sk-&gt;sk_forward_alloc ||
-</span><span class='line'>        __sk_mem_schedule(sk, size, SK_MEM_SEND);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>来看<code>__sk_mem_schedule</code>，这个函数的功能注释写的很清楚：</p>
-
-<p>increase sk_forward_alloc and memory_allocated</p>
-
-<p>然后来看源码。这里在看之前，我们要知道，协议栈通过读写buf的使用量，划分了3个区域，或者说标志。不同标志进行不同处理。这里的区域的划分是通过sysctl_tcp_mem，也就是prot->sysctl_mem这个数组进行的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 页的大小
-</span><span class='line'>#define SK_MEM_QUANTUM ((int)PAGE_SIZE)
-</span><span class='line'>
-</span><span class='line'>int __sk_mem_schedule(struct sock *sk, int size, int kind)
-</span><span class='line'>{
-</span><span class='line'>    struct proto *prot = sk-&gt;sk_prot;
-</span><span class='line'>    // 首先得到size占用几个内存页。
-</span><span class='line'>    int amt = sk_mem_pages(size);
-</span><span class='line'>    int allocated;
-</span><span class='line'>    // 更新sk_forward_alloc，可以看到这个值是页的大小的倍数。
-</span><span class='line'>    sk-&gt;sk_forward_alloc += amt * SK_MEM_QUANTUM;
-</span><span class='line'>
-</span><span class='line'>    // amt+memory_allocated也就是当前的总得内存使用量加上将要分配的内存的话，现在的tcp协议栈的总得内存使用量。（可以看到是以页为单位的。
-</span><span class='line'>    allocated = atomic_add_return(amt, prot-&gt;memory_allocated);
-</span><span class='line'>
-</span><span class='line'>    // 然后开始判断，将会落入哪一个区域。通过上面的分析我们知道sysctl_mem也就是sysctl_tcp_mem.
-</span><span class='line'>
-</span><span class='line'>    // 先判断是否小于等于内存最小使用限额。
-</span><span class='line'>    if (allocated &lt;= prot-&gt;sysctl_mem[0]) {
-</span><span class='line'>        // 这里取消memory_pressure，然后返回。
-</span><span class='line'>        if (prot-&gt;memory_pressure && *prot-&gt;memory_pressure)
-</span><span class='line'>            *prot-&gt;memory_pressure = 0;
-</span><span class='line'>        return 1;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    // 然后判断Under pressure。
-</span><span class='line'>    if (allocated &gt; prot-&gt;sysctl_mem[1])
-</span><span class='line'>        // 大于sysctl_mem[1]说明，已经进入pressure，一次你需要调用tcp_enter_memory_pressure来设置标志。
-</span><span class='line'>        if (prot-&gt;enter_memory_pressure)
-</span><span class='line'>            prot-&gt;enter_memory_pressure(sk);
-</span><span class='line'>
-</span><span class='line'>    // 如果超过的hard limit。则进入另外的处理。
-</span><span class='line'>    if (allocated &gt; prot-&gt;sysctl_mem[2])
-</span><span class='line'>        goto suppress_allocation;
-</span><span class='line'>
-</span><span class='line'>    // 判断类型，这里只有两种类型，读和写。总的内存大小判断完，这里开始判断单独的sock的读写内存。
-</span><span class='line'>    if (kind == SK_MEM_RECV) {
-</span><span class='line'>        if (atomic_read(&sk-&gt;sk_rmem_alloc) &lt; prot-&gt;sysctl_rmem[0])
-</span><span class='line'>            return 1;
-</span><span class='line'>    } else { /* SK_MEM_SEND */
-</span><span class='line'>        // 这里当为tcp的时候，写队列的大小只有当对端数据确认后才会更新，因此我们要用sk_wmem_queued来判断。
-</span><span class='line'>        if (sk-&gt;sk_type == SOCK_STREAM) {
-</span><span class='line'>            if (sk-&gt;sk_wmem_queued &lt; prot-&gt;sysctl_wmem[0])
-</span><span class='line'>                return 1;
-</span><span class='line'>        } else if (atomic_read(&sk-&gt;sk_wmem_alloc) &lt;
-</span><span class='line'>               prot-&gt;sysctl_wmem[0])
-</span><span class='line'>                return 1;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    // 程序到达这里说明总的内存大小在sysctl_mem[0]和sysctl_mem[2]之间，因此我们再次判断memory_pressure
-</span><span class='line'>    if (prot-&gt;memory_pressure) {
-</span><span class='line'>        int alloc;
-</span><span class='line'>
-</span><span class='line'>        // 如果没有在memory_pressure区域，则我们直接返回1。
-</span><span class='line'>        if (!*prot-&gt;memory_pressure)
-</span><span class='line'>            return 1;
-</span><span class='line'>        // 这个其实也就是计算整个系统分配的socket的多少。
-</span><span class='line'>        alloc = percpu_counter_read_positive(prot-&gt;sockets_allocated);
-</span><span class='line'>        // 这里假设其余的每个sock所占用的buf都和当前的sock一样大的时候，如果他们的总和小于sysctl_mem[2],也就是hard limit。那么我们也认为这次内存请求是成功的。
-</span><span class='line'>        if (prot-&gt;sysctl_mem[2] &gt; alloc *
-</span><span class='line'>            sk_mem_pages(sk-&gt;sk_wmem_queued +
-</span><span class='line'>             atomic_read(&sk-&gt;sk_rmem_alloc) +
-</span><span class='line'>                 sk-&gt;sk_forward_alloc))
-</span><span class='line'>            return 1;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>suppress_allocation:
-</span><span class='line'>
-</span><span class='line'>    // 到达这里说明，我们超过了hard limit或者说处于presure 区域。
-</span><span class='line'>    if (kind == SK_MEM_SEND && sk-&gt;sk_type == SOCK_STREAM) {
-</span><span class='line'>        // 调整sk_sndbuf(减小).这个函数前面已经分析过了。
-</span><span class='line'>        sk_stream_moderate_sndbuf(sk);
-</span><span class='line'>        // 然后比较和sk_sndbuf的大小，如果大于的话，就说明下次我们再次要分配buf的时候会在tcp_memory_free阻塞住，因此这次我们返回1.
-</span><span class='line'>        if (sk-&gt;sk_wmem_queued + size &gt;= sk-&gt;sk_sndbuf)
-</span><span class='line'>            return 1;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    /* Alas. Undo changes. */
-</span><span class='line'>    // 到达这里说明，请求内存是不被接受的，因此undo所有的操作。然后返回0.
-</span><span class='line'>    sk-&gt;sk_forward_alloc -= amt * SK_MEM_QUANTUM;
-</span><span class='line'>    atomic_sub(amt, prot-&gt;memory_allocated);
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来来看个很重要的函数skb_set_owner_w。</p>
-
-<p>顾名思义，这个函数也就是将一个skb和scok关联起来。只不过关联的时候更新sock相应的域。我们来看源码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    skb_orphan(skb);
-</span><span class='line'>    // 与传递进来的sock关联起来
-</span><span class='line'>    skb-&gt;sk = sk;
-</span><span class='line'>    // 设置skb的析构函数
-</span><span class='line'>    skb-&gt;destructor = sock_wfree;
-</span><span class='line'>    // 更新sk_wmem_alloc域，就是sk_wmem_alloc+truesize.
-</span><span class='line'>    atomic_add(skb-&gt;truesize, &sk-&gt;sk_wmem_alloc);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ok，接下来来看个scok_wfree函数，这个函数做得基本和上面函数相反。这个函数都是被kfree_skb自动调用的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void sock_wfree(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    struct sock *sk = skb-&gt;sk;
-</span><span class='line'>    int res;
-</span><span class='line'>
-</span><span class='line'>    // 更新sk_wmem_alloc,减去skb的大小。
-</span><span class='line'>    res = atomic_sub_return(skb-&gt;truesize, &sk-&gt;sk_wmem_alloc);
-</span><span class='line'>    if (!sock_flag(sk, SOCK_USE_WRITE_QUEUE))
-</span><span class='line'>    // 唤醒等待队列，也就是唤醒等待内存分配。
-</span><span class='line'>        sk-&gt;sk_write_space(sk);
-</span><span class='line'>    if (res == 0)
-</span><span class='line'>        __sk_free(sk);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而skb_set_owner_w是什么时候被调用呢，我们通过搜索代码可以看到，它是在tcp_transmit_skb中被调用的。而tcp_transmit_skb我们知道是传递数据包到ip层的函数。</p>
-
-<p>而kfree_skb被调用也就是在对端已经确认完我们发送的包后才会被调用来释放skb。</p>
-
-<h4>tcp_rcv_established</h4>
-
-<p>接下来来看接收数据的内存管理。我们主要来看tcp_rcv_established这个函数，我前面的blog已经断断续续的分析过了，因此这里我们只看一些重要的代码片断。</p>
-
-<p>这里我们要知道，代码能到达下面的位置，则说明，数据并没有直接拷贝到用户空间。否则的话，是不会进入下面的片断的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!eaten) {
-</span><span class='line'>    ..........................................
-</span><span class='line'>
-</span><span class='line'>    // 如果skb的大小大于预分配的值,如果大于则要另外处理。
-</span><span class='line'>    if ((int)skb-&gt;truesize &gt; sk-&gt;sk_forward_alloc)
-</span><span class='line'>            goto step5;
-</span><span class='line'>    __skb_pull(skb, tcp_header_len);
-</span><span class='line'>    __skb_queue_tail(&sk-&gt;sk_receive_queue, skb);
-</span><span class='line'>    // 这里关联skb和对应的sk，并且更新相关的域，我们下面会分析这个函数。
-</span><span class='line'>    skb_set_owner_r(skb, sk);
-</span><span class='line'>    tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>}
-</span><span class='line'>...............................................
-</span><span class='line'>
-</span><span class='line'>step5:
-</span><span class='line'>    if (th-&gt;ack && tcp_ack(sk, skb, FLAG_SLOWPATH) &lt; 0)
-</span><span class='line'>        goto discard;
-</span><span class='line'>
-</span><span class='line'>    tcp_rcv_rtt_measure_ts(sk, skb);
-</span><span class='line'>
-</span><span class='line'>    /* Process urgent data. */
-</span><span class='line'>    tcp_urg(sk, skb, th);
-</span><span class='line'>
-</span><span class='line'>    /* step 7: process the segment text */
-</span><span class='line'>    // 最核心的函数就是这个。我们接下来会详细分析这个函数。
-</span><span class='line'>    tcp_data_queue(sk, skb);
-</span><span class='line'>
-</span><span class='line'>    tcp_data_snd_check(sk);
-</span><span class='line'>    tcp_ack_snd_check(sk);
-</span><span class='line'>    return 0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>先来看skb_set_owner_r函数，这个函数关联skb和sk其实它和skb_set_owner_w类似：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    skb_orphan(skb);
-</span><span class='line'>    // 关联sk
-</span><span class='line'>    skb-&gt;sk = sk;
-</span><span class='line'>    // 设置析构函数
-</span><span class='line'>    skb-&gt;destructor = sock_rfree;
-</span><span class='line'>    // 更新rmem_alloc
-</span><span class='line'>    atomic_add(skb-&gt;truesize, &sk-&gt;sk_rmem_alloc);
-</span><span class='line'>    // 改变forward_alloc.
-</span><span class='line'>    sk_mem_charge(sk, skb-&gt;truesize);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_data_queue</h4>
-
-<p>然后是tcp_data_queue，这个函数主要用来排队接收数据，并update相关的读buf。由于这个函数比较复杂，我们只关心我们感兴趣的部分：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    struct tcphdr *th = tcp_hdr(skb);
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    int eaten = -1;
-</span><span class='line'>    .......................................
-</span><span class='line'>    // 首先判断skb的开始序列号和我们想要接收的序列号。如果相等开始处理这个数据包(也就是拷贝到用户空间).
-</span><span class='line'>    if (TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt) {
-</span><span class='line'>        if (tcp_receive_window(tp) == 0)
-</span><span class='line'>            goto out_of_window;
-</span><span class='line'>
-</span><span class='line'>        // tp的ucopy我前面的blog已经详细分析过了。这里就不解释了。
-</span><span class='line'>        if (tp-&gt;ucopy.task == current &&
-</span><span class='line'>            tp-&gt;copied_seq == tp-&gt;rcv_nxt && tp-&gt;ucopy.len &&sock_owned_by_user(sk) && !tp-&gt;urg_data)
-</span><span class='line'>        {
-</span><span class='line'>            // 计算将要拷贝给用户空间的大小。
-</span><span class='line'>            int chunk = min_t(unsigned int, skb-&gt;len,tp-&gt;ucopy.len);
-</span><span class='line'>
-</span><span class='line'>            // 设置状态，说明我们处于进程上下文。
-</span><span class='line'>            __set_current_state(TASK_RUNNING);
-</span><span class='line'>
-</span><span class='line'>            local_bh_enable();
-</span><span class='line'>            // 拷贝skb
-</span><span class='line'>            if (!skb_copy_datagram_iovec(skb, 0, tp-&gt;ucopy.iov, chunk)) {
-</span><span class='line'>                tp-&gt;ucopy.len -= chunk;
-</span><span class='line'>                tp-&gt;copied_seq += chunk;
-</span><span class='line'>                // 更新eaten，它的默认值为-1.
-</span><span class='line'>                eaten = (chunk == skb-&gt;len && !th-&gt;fin);
-</span><span class='line'>                tcp_rcv_space_adjust(sk);
-</span><span class='line'>            }
-</span><span class='line'>            local_bh_disable();
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        // 如果小于0则说明没有拷贝成功，或者说就没有进行拷贝。此时需要更新sock的相关域。
-</span><span class='line'>        if (eaten &lt;= 0) {
-</span><span class='line'>queue_and_out:
-</span><span class='line'>            // 最关键的tcp_try_rmem_schedule函数。接下来会详细分析。
-</span><span class='line'>            if (eaten &lt; 0 &&
-</span><span class='line'>                     tcp_try_rmem_schedule(sk, skb-&gt;truesize))
-</span><span class='line'>                goto drop;
-</span><span class='line'>
-</span><span class='line'>            // 关联skb和sk。到达这里说明tcp_try_rmem_schedule成功，也就是返回0.
-</span><span class='line'>            skb_set_owner_r(skb, sk);
-</span><span class='line'>            // 加skb到receive_queue.
-</span><span class='line'>            __skb_queue_tail(&sk-&gt;sk_receive_queue, skb);
-</span><span class='line'>        }
-</span><span class='line'>        // 更新期待序列号。
-</span><span class='line'>        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>        ..............................................
-</span><span class='line'>
-</span><span class='line'>        .....................................
-</span><span class='line'>
-</span><span class='line'>        tcp_fast_path_check(sk);
-</span><span class='line'>
-</span><span class='line'>        if (eaten &gt; 0)
-</span><span class='line'>            __kfree_skb(skb);
-</span><span class='line'>        else if (!sock_flag(sk, SOCK_DEAD))
-</span><span class='line'>            sk-&gt;sk_data_ready(sk, 0);
-</span><span class='line'>        return;
-</span><span class='line'>    }
-</span><span class='line'>    // 下面就是处理乱序包。以后会详细分析。
-</span><span class='line'>    ......................................
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_try_rmem_schedule</h4>
-
-<p>接下来我们就来看tcp_try_rmem_schedule这个函数,这个函数如果返回0则说明sk_rmem_schedule返回1,而sk_rmem_schedule和sk_wmem_schedule是一样的。也就是看当前的skb加入后有没有超过读buf的限制。并更新相关的域。：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_try_rmem_schedule(struct sock *sk, unsigned int size)
-</span><span class='line'>{
-</span><span class='line'>    // 首先判断rmem_alloc(当前的读buf字节数)是否大于最大buf字节数，如果大于则调用tcp_prune_queue调整分配的buf。否则调用sk_rmem_schedule来调整相关域（sk_forward_alloc）。
-</span><span class='line'>    if (atomic_read(&sk-&gt;sk_rmem_alloc) &gt; sk-&gt;sk_rcvbuf ||!sk_rmem_schedule(sk, size)) {
-</span><span class='line'>
-</span><span class='line'>        // 调整分配的buf。
-</span><span class='line'>        if (tcp_prune_queue(sk) &lt; 0)
-</span><span class='line'>            return -1;
-</span><span class='line'>        // 更新sk的相关域。
-</span><span class='line'>        if (!sk_rmem_schedule(sk, size)) {
-</span><span class='line'>            if (!tcp_prune_ofo_queue(sk))
-</span><span class='line'>                return -1;
-</span><span class='line'>
-</span><span class='line'>            if (!sk_rmem_schedule(sk, size))
-</span><span class='line'>                return -1;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>来看sk_rmem_schedule，这个函数很简单，就是封装了<code>__sk_mem_schedule</code>。而这个函数我们上面已经分析过了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int sk_rmem_schedule(struct sock *sk, int size)
-</span><span class='line'>{
-</span><span class='line'>    if (!sk_has_account(sk))
-</span><span class='line'>        return 1;
-</span><span class='line'>    return size &lt;= sk-&gt;sk_forward_alloc ||
-</span><span class='line'>        __sk_mem_schedule(sk, size, SK_MEM_RECV);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_prune_queue</h4>
-
-<p>最后是tcp_prune_queue，这个函数主要是用来丢掉一些skb，因为到这个函数就说明我们的内存使用已经到极限了，因此我们要合并一些buf。这个合并也就是将序列号连续的段进行合并。</p>
-
-<p>这里我们要知道tcp的包是有序的，因此内核中tcp专门有一个队列来保存那些Out of order segments。因此我们这里会先处理这个队列里面的skb。</p>
-
-<p>然后调用tcp_collapse来处理接收队列里面的skb。和上面的类似。</p>
-
-<p>这里要注意，合并的话都是按页来合并，也就是先分配一页大小的内存，然后将老的skb复制进去，最后free掉老的buf。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_prune_queue(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    ..................................
-</span><span class='line'>    // 如果rmem_alloc过于大，则重新计算窗口的大小。一半都会缩小窗口。
-</span><span class='line'>    if (atomic_read(&sk-&gt;sk_rmem_alloc) &gt;= sk-&gt;sk_rcvbuf)
-</span><span class='line'>        tcp_clamp_window(sk);
-</span><span class='line'>    // 如果处于pressure区域，则调整窗口大小。这里也是缩小窗口。
-</span><span class='line'>    else if (tcp_memory_pressure)
-</span><span class='line'>        tp-&gt;rcv_ssthresh = min(tp-&gt;rcv_ssthresh, 4U * tp-&gt;advmss);
-</span><span class='line'>
-</span><span class='line'>    // 处理ofo队列。
-</span><span class='line'>    tcp_collapse_ofo_queue(sk);
-</span><span class='line'>    // 如果接收队列为非空，则调用tcp_collapse来处理sk_receive_queue
-</span><span class='line'>    if (!skb_queue_empty(&sk-&gt;sk_receive_queue))
-</span><span class='line'>        tcp_collapse(sk, &sk-&gt;sk_receive_queue,
-</span><span class='line'>                 skb_peek(&sk-&gt;sk_receive_queue),
-</span><span class='line'>                 NULL,
-</span><span class='line'>                 tp-&gt;copied_seq, tp-&gt;rcv_nxt);
-</span><span class='line'>    // 更新全局的已分配内存的大小，也就是memory_allocated，接下来会详细介绍这个函数。
-</span><span class='line'>    sk_mem_reclaim(sk);
-</span><span class='line'>
-</span><span class='line'>    // 如果调整后小于sk_rcvbuf,则返回0.
-</span><span class='line'>    if (atomic_read(&sk-&gt;sk_rmem_alloc) &lt;= sk-&gt;sk_rcvbuf)
-</span><span class='line'>        return 0;
-</span><span class='line'>
-</span><span class='line'>    ......................................
-</span><span class='line'>    return -1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_collapse_ofo_queue 尝试减小ofo queue占内存的大小</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Collapse ofo queue. Algorithm: select contiguous sequence of skbs
-</span><span class='line'> * and tcp_collapse() them until all the queue is collapsed.
-</span><span class='line'> */
-</span><span class='line'>static void tcp_collapse_ofo_queue(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>    struct sk_buff *skb = skb_peek(&tp-&gt;out_of_order_queue);
-</span><span class='line'>    struct sk_buff *head;
-</span><span class='line'>    u32 start, end;
-</span><span class='line'>
-</span><span class='line'>    if (skb == NULL)
-</span><span class='line'>        return;
-</span><span class='line'>
-</span><span class='line'>    start = TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>    end = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>    head = skb;
-</span><span class='line'>
-</span><span class='line'>    for (;;) {
-</span><span class='line'>        struct sk_buff *next = NULL;
-</span><span class='line'>
-</span><span class='line'>        if (!skb_queue_is_last(&tp-&gt;out_of_order_queue, skb))
-</span><span class='line'>            next = skb_queue_next(&tp-&gt;out_of_order_queue, skb);
-</span><span class='line'>        skb = next;
-</span><span class='line'>
-</span><span class='line'>        /* Segment is terminated when we see gap or when
-</span><span class='line'>         * we are at the end of all the queue. */
-</span><span class='line'>        if (!skb ||
-</span><span class='line'>            after(TCP_SKB_CB(skb)-&gt;seq, end) ||
-</span><span class='line'>            before(TCP_SKB_CB(skb)-&gt;end_seq, start)) {  // 找到ofo queue中连续的一段skb，即 prev-&gt;end_seq &gt;= next-&gt;seq
-</span><span class='line'>            tcp_collapse(sk, &tp-&gt;out_of_order_queue,
-</span><span class='line'>                     head, skb, start, end);            // 尝试减小这一段连续skb占用的内存
-</span><span class='line'>            head = skb;
-</span><span class='line'>            if (!skb)
-</span><span class='line'>                break;
-</span><span class='line'>            /* Start new segment */
-</span><span class='line'>            start = TCP_SKB_CB(skb)-&gt;seq;               // 下个skb就是新的一段的开始
-</span><span class='line'>            end = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>        } else {
-</span><span class='line'>            if (before(TCP_SKB_CB(skb)-&gt;seq, start))    // 这种情况只可能是tcp_collapse中大包拆成小包，拆到一半内存不够，没拆完导致。
-</span><span class='line'>                start = TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>            if (after(TCP_SKB_CB(skb)-&gt;end_seq, end))
-</span><span class='line'>                end = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_collapse，gro上来的包有可能是大于4k的包，所以这个函数有时是在拆包，利弊难定</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 删除一个skb，返回下个skb
-</span><span class='line'>static struct sk_buff *tcp_collapse_one(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>                    struct sk_buff_head *list)
-</span><span class='line'>{
-</span><span class='line'>    struct sk_buff *next = NULL;
-</span><span class='line'>
-</span><span class='line'>    if (!skb_queue_is_last(list, skb))
-</span><span class='line'>        next = skb_queue_next(list, skb);
-</span><span class='line'>
-</span><span class='line'>    __skb_unlink(skb, list);
-</span><span class='line'>    __kfree_skb(skb);
-</span><span class='line'>    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPRCVCOLLAPSED);
-</span><span class='line'>
-</span><span class='line'>    return next;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/* Collapse contiguous sequence of skbs head..tail with
-</span><span class='line'> * sequence numbers start..end.
-</span><span class='line'> *
-</span><span class='line'> * If tail is NULL, this means until the end of the list.
-</span><span class='line'> *
-</span><span class='line'> * Segments with FIN/SYN are not collapsed (only because this
-</span><span class='line'> * simplifies code)
-</span><span class='line'> */
-</span><span class='line'>static void
-</span><span class='line'>tcp_collapse(struct sock *sk, struct sk_buff_head *list,
-</span><span class='line'>         struct sk_buff *head, struct sk_buff *tail,
-</span><span class='line'>         u32 start, u32 end)
-</span><span class='line'>{
-</span><span class='line'>    struct sk_buff *skb, *n;
-</span><span class='line'>    bool end_of_skbs;
-</span><span class='line'>
-</span><span class='line'>    /* First, check that queue is collapsible and find
-</span><span class='line'>     * the point where collapsing can be useful. */
-</span><span class='line'>    skb = head;
-</span><span class='line'>restart:
-</span><span class='line'>    end_of_skbs = true;
-</span><span class='line'>    skb_queue_walk_from_safe(list, skb, n) {
-</span><span class='line'>        if (skb == tail)
-</span><span class='line'>            break;
-</span><span class='line'>        /* No new bits? It is possible on ofo queue. */
-</span><span class='line'>        if (!before(start, TCP_SKB_CB(skb)-&gt;end_seq)) { // 这种情况现在是不会出现的，以前代码有可能出现？？
-</span><span class='line'>            skb = tcp_collapse_one(sk, skb, list);
-</span><span class='line'>            if (!skb)
-</span><span class='line'>                break;
-</span><span class='line'>            goto restart;
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        /* The first skb to collapse is:
-</span><span class='line'>         * - not SYN/FIN and
-</span><span class='line'>         * - bloated or contains data before "start" or
-</span><span class='line'>         *   overlaps to the next one.
-</span><span class='line'>         */
-</span><span class='line'>        if (!tcp_hdr(skb)-&gt;syn && !tcp_hdr(skb)-&gt;fin &&         // SYN，FIN 不合并，简化操作
-</span><span class='line'>            (tcp_win_from_space(skb-&gt;truesize) &gt; skb-&gt;len ||    // 合并后可能减小空间的情况才合并
-</span><span class='line'>             before(TCP_SKB_CB(skb)-&gt;seq, start))) {            // seq到start的数据已经被读走了，有减小空间的可能
-</span><span class='line'>            end_of_skbs = false;
-</span><span class='line'>            break;
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        if (!skb_queue_is_last(list, skb)) {
-</span><span class='line'>            struct sk_buff *next = skb_queue_next(list, skb);
-</span><span class='line'>            if (next != tail &&
-</span><span class='line'>                TCP_SKB_CB(skb)-&gt;end_seq != TCP_SKB_CB(next)-&gt;seq) { // 两个skb之间有交集，有减小空间可能
-</span><span class='line'>                end_of_skbs = false;
-</span><span class='line'>                break;
-</span><span class='line'>            }
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        /* Decided to skip this, advance start seq. */
-</span><span class='line'>        start = TCP_SKB_CB(skb)-&gt;end_seq;     // 否则向后继续找可能减小空间的第一个skb
-</span><span class='line'>    }
-</span><span class='line'>    if (end_of_skbs || tcp_hdr(skb)-&gt;syn || tcp_hdr(skb)-&gt;fin)
-</span><span class='line'>        return;
-</span><span class='line'>
-</span><span class='line'>    while (before(start, end)) {  // 落在在start到end的包就是这次要合并的
-</span><span class='line'>        struct sk_buff *nskb;
-</span><span class='line'>        unsigned int header = skb_headroom(skb); // skb中协议头的大小
-</span><span class='line'>        int copy = SKB_MAX_ORDER(header, 0);     // 一个页（4k）中出去协议头空间的大小，也就是能容下的数据大小
-</span><span class='line'>
-</span><span class='line'>        /* Too big header? This can happen with IPv6. */
-</span><span class='line'>        if (copy &lt; 0)
-</span><span class='line'>            return;
-</span><span class='line'>        if (end - start &lt; copy)
-</span><span class='line'>            copy = end - start;
-</span><span class='line'>        nskb = alloc_skb(copy + header, GFP_ATOMIC);
-</span><span class='line'>        if (!nskb)
-</span><span class='line'>            return;
-</span><span class='line'>
-</span><span class='line'>        skb_set_mac_header(nskb, skb_mac_header(skb) - skb-&gt;head);
-</span><span class='line'>        skb_set_network_header(nskb, (skb_network_header(skb) -
-</span><span class='line'>                          skb-&gt;head));
-</span><span class='line'>        skb_set_transport_header(nskb, (skb_transport_header(skb) -
-</span><span class='line'>                        skb-&gt;head));
-</span><span class='line'>        skb_reserve(nskb, header);
-</span><span class='line'>        memcpy(nskb-&gt;head, skb-&gt;head, header);
-</span><span class='line'>        memcpy(nskb-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));
-</span><span class='line'>        TCP_SKB_CB(nskb)-&gt;seq = TCP_SKB_CB(nskb)-&gt;end_seq = start;
-</span><span class='line'>        __skb_queue_before(list, skb, nskb);
-</span><span class='line'>        skb_set_owner_r(nskb, sk);
-</span><span class='line'>
-</span><span class='line'>        /* Copy data, releasing collapsed skbs. */
-</span><span class='line'>        while (copy &gt; 0) {    // 如果copy = 0，这里就会出BUG，但如果没有认为改，是不会的。ipv6会吗？？？。后面版本改进这函数了，也不会出现copy=0了
-</span><span class='line'>            int offset = start - TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>            int size = TCP_SKB_CB(skb)-&gt;end_seq - start;
-</span><span class='line'>
-</span><span class='line'>            BUG_ON(offset &lt; 0);
-</span><span class='line'>            if (size &gt; 0) { // copy旧的skb数据到新的skb上
-</span><span class='line'>                size = min(copy, size);
-</span><span class='line'>                if (skb_copy_bits(skb, offset, skb_put(nskb, size), size))
-</span><span class='line'>                    BUG();
-</span><span class='line'>                TCP_SKB_CB(nskb)-&gt;end_seq += size;
-</span><span class='line'>                copy -= size;
-</span><span class='line'>                start += size;
-</span><span class='line'>            }
-</span><span class='line'>            if (!before(start, TCP_SKB_CB(skb)-&gt;end_seq)) { // 旧的skb被copy完了就删掉
-</span><span class='line'>                skb = tcp_collapse_one(sk, skb, list);
-</span><span class='line'>                if (!skb ||
-</span><span class='line'>                    skb == tail ||
-</span><span class='line'>                    tcp_hdr(skb)-&gt;syn ||
-</span><span class='line'>                    tcp_hdr(skb)-&gt;fin)
-</span><span class='line'>                    return;
-</span><span class='line'>            }
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>来看sk_mem_reclaim函数，它只是简单的封装了<code>__sk_mem_reclaim</code>：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_mem_reclaim(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    if (!sk_has_account(sk))
-</span><span class='line'>        return;
-</span><span class='line'>    // 如果sk_forward_alloc大于1页则调用__sk_mem_reclaim，我们知道sk_forward_alloc是以页为单位的，因此这里也就是和大于0一样。
-</span><span class='line'>    if (sk-&gt;sk_forward_alloc &gt;= SK_MEM_QUANTUM)
-</span><span class='line'>        __sk_mem_reclaim(sk);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p><code>__sk_mem_reclaim</code>就是真正操作的函数，它会更新memory_allocated：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __sk_mem_reclaim(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>    struct proto *prot = sk-&gt;sk_prot;
-</span><span class='line'>    // 更新memory_allocated，这里我们知道memory_allocated也是以页为单位的，因此需要将sk_forward_alloc转化为页。
-</span><span class='line'>    atomic_sub(sk-&gt;sk_forward_alloc &gt;&gt; SK_MEM_QUANTUM_SHIFT,prot-&gt;memory_allocated);
-</span><span class='line'>
-</span><span class='line'>    // 更新这个sk的sk_forward_alloc为一页。
-</span><span class='line'>    sk-&gt;sk_forward_alloc &= SK_MEM_QUANTUM - 1;
-</span><span class='line'>    // 判断是否处于pressure区域，是的话更新memory_pressure变量。
-</span><span class='line'>    if (prot-&gt;memory_pressure && *prot-&gt;memory_pressure &&(atomic_read(prot-&gt;memory_allocated) &lt; （prot-&gt;sysctl_mem[0]))
-</span><span class='line'>        *prot-&gt;memory_pressure = 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后看一下读buf的释放。这个函数会在kfree_skb中被调用。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void sock_rfree(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>
-</span><span class='line'>    struct sock *sk = skb-&gt;sk;
-</span><span class='line'>    // 更新rmem_alloc
-</span><span class='line'>    atomic_sub(skb-&gt;truesize, &sk-&gt;sk_rmem_alloc);
-</span><span class='line'>    // 更新forward_alloc.
-</span><span class='line'>    sk_mem_uncharge(skb-&gt;sk, skb-&gt;truesize);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/3">&larr; Older</a>
@@ -4866,7 +4072,7 @@ if (!document.getElementById('system~centos')) document.getElementById('aexp_sys
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(120)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(121)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -4883,7 +4089,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>54</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>55</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -4892,8 +4098,8 @@ if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~sched')) document.getElementById('aexp_kernel~sched').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(18)</span></li>
-<div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>10</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('android~base')) document.getElementById('aexp_android~base').style.visibility = 'hidden';
 </script>
@@ -5003,8 +4209,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(115)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>21</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(117)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>23</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
 <li><a href='/blog/cats/2015~03/?opendiv=2015'>2015-03</a><span class='right_span'>19</span></li>
@@ -5087,6 +4293,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/06/18/android-bootloader/">Android系统典型bootloader分析</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/06/18/kernel-net-ipv6-code/">IPV6 实现</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/06/12/kernel-net-tcp-close/">linux内核中tcp连接的断开处理</a>
       </li>
     
@@ -5096,14 +4310,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/06/12/kernel-net-socket-wakeup/">Socket层实现系列 — 睡眠驱动的同步等待</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a>
       </li>
     
   </ul>
