@@ -13,12 +13,12 @@ module Jekyll
 					#p "ddd #{path}"
 					url = path[8..-1]
 					name = path[path.rindex('/')+1..-1]
-					html << "<li><a href=#{url}>#{name}</a></li>\n"
+					html << "<li><a href='#{url}'>#{name}</a></li>\n"
 				else
 					#p path
 					url = path[8..-1]
 					name = path[path.rindex('/')+1..-1]
-					html << "<li><a href=#{url} target='_blank'>#{name}</a></li>\n"
+					html << "<li><a href='#{url}' target='_blank'>#{name}</a></li>\n"
 				end
 			end
 			html << "</ul>"
