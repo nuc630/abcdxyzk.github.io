@@ -16,6 +16,20 @@ sudo apt-get install build-essential
 sudo apt-get install ia32-libs
 ```
 
+#### 开机自动开启小键盘
+```
+	sudo apt-get install numlockx
+	sudo gedit /etc/lightdm/lightdm.conf
+	打开lightdm.conf 文件后在文件最后一行加入：
+	greeter-setup-script=/usr/bin/numlockx on
+	保存，退出就可以解决问题
+
+	numlockx程序有3个参数：
+	numlockx on            打开数字小键盘
+	numlockx off           关闭数字小键盘
+	numlockx toggle        开关数字小键盘
+```
+
 #### bash
 修改sh默认连接到bash的一种方法：
 ```
