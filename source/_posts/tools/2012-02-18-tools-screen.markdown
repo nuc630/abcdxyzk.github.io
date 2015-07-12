@@ -73,5 +73,7 @@ screen -d -r pid
 	Ctrl + a + a	发送 C-a到当前窗口
 	Ctrl + a + d	暂时断开screen会话
 	Ctrl + a + k	杀掉当前窗口
-	Ctrl + a + [	进入拷贝/回滚模式
+	Ctrl + a + [ 或 Ctrl + a + Esc 进入拷贝/回滚模式
+	             Space 第一次按为标记copy区起点，第二次按为终点
+	Ctrl + a + ]	把刚刚在 copy mode 选定的内容贴上
 ```
