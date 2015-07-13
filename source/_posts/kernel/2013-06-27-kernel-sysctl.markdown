@@ -63,6 +63,48 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 	Hello, World
 	#
 ```
+----------
+
+struct ctl_table是相关的主要的数据结构。定义如下：
+```
+	struct ctl_table
+	{
+		int ctl_name;            /* Binary ID */
+		const char *procname;        /* Text ID for /proc/sys, or zero */
+		void *data;
+		int maxlen;
+		mode_t mode;
+		struct ctl_table *child;
+		struct ctl_table *parent;    /* Automatically set */
+		proc_handler *proc_handler;    /* Callback for text formatting */
+		ctl_handler *strategy;        /* Callback function for all r/w */
+		void *extra1;
+		void *extra2;
+	};
+```
+每个这样的数据结构，都对应了/proc/sys目录下的一项内核参数。
+
+其中各字段的意义如下：  
+  ctl_name: 唯一标识此表项的一个整数。  
+  proc_name: 相对于/proc/sys目录下对应的参数名称。  
+  data: 一个void *指针，指向与这个表项相关联的数据的指针。  
+  maxlen: 可以读取或者写入data的最大字节数。eg：data指向的是一个int型参数，则maxlen一般为sizeof(int)。  
+  mode: 文件的权限。  
+  child: 如果此数据结构对应的表项为一目录，则chind是指向其子表项的指针。  
+  parent: 同child，指向其所在目录对应的ctl_table。  
+  proc_handler: 如果是通过/proc/sys文件读写内核运行时的参数，则执行此操作。  
+  strategy: 如果是通过系统调用sysctl对内核参数进行读写，则调用此函数。  
+  extra1和extra2可以指向处理这个表项时的任何补充数据。  
+
+
+下面分别简单说下这两个函数大概的执行流程：  
+proc_handler:  
+一般情况下，proc_handler指向proc_dostring（操作数为string）或者proc_dointvec（操作数为int）。
+
+strategy:  
+sysctl ==> sys_sysctl ==> do_sysctl ==> parse_table ==> do_sysctl_strategy ==> ctl_table中strategy对应的操作。
+
+--------------
 
 ##### 示例：
 头文件：sysctl-exam.h：
