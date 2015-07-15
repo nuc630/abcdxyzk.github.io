@@ -62,6 +62,1341 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/01/23/kernel-irq-mark3/">linux软中断机制分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-23T14:29:00+08:00'><span class='date'>2015-01-23</span> <span class='time'>14:29:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>软中断分析</h3>
+
+<h4>1. 为什么要软中断</h4>
+
+<p>编写驱动的时候，一个中断产生之后，内核在中断处理函数中可能需要完成很多工作。但是中断处理函数的处理是关闭了中断的。也就是说在响应中断时，系统不能再次响应外部的其它中断。这样的后果会造成有可能丢失外部中断。于是，linux内核设计出了一种架构，中断函数需要处理的任务分为两部分，一部分在中断处理函数中执行，这时系统关闭中断。另外一部分在软件中断中执行，这个时候开启中断，系统可以响应外部中断。</p>
+
+<p>关于软件中断的理论各种书籍都有介绍，不多叙述。而要真正体会软件中断的作用就必须从代码的角度来分析。我们做工作时候讲求的是professional，当一个人在某个领域一无所知的时候，我们称他为小白，偶，非苹果电脑。小白的脑子里充满了各种问题。慢慢的当这些疑惑解释完之后，小白就脱白了。此时，我们对这个领域的基本框架有了解，但这和professional还有一定的差距。再加以时日，逐渐融会贯通该领域才能达到专业的境界。</p>
+
+<h4>2. 什么时候触发处理软件中断</h4>
+
+<p>说了这么多废话，赶快步入正题。初识软中断，脑子里肯定有不少的疑问，首先就是软件中断在什么地方被触发处理？这个问题的答案就是：一个硬件中断处理完成之后。下面的函数在处理完硬件中断之后推出中断处理函数，在irq_exit中会触发软件中断的处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>asmlinkage void __exception asm_do_IRQ(unsigned int irq, struct pt_regs *regs)
+</span><span class='line'>{
+</span><span class='line'>    struct pt_regs *old_regs = set_irq_regs(regs);
+</span><span class='line'> 
+</span><span class='line'>    irq_enter();
+</span><span class='line'> 
+</span><span class='line'>    /*
+</span><span class='line'>     * Some hardware gives randomly wrong interrupts.  Rather
+</span><span class='line'>     * than crashing, do something sensible.
+</span><span class='line'>     */ 
+</span><span class='line'>    if (irq &gt;= NR_IRQS)
+</span><span class='line'>        handle_bad_irq(irq, &bad_irq_desc);
+</span><span class='line'>    else 
+</span><span class='line'>        generic_handle_irq(irq);
+</span><span class='line'> 
+</span><span class='line'>    /* AT91 specific workaround */ 
+</span><span class='line'>    irq_finish(irq);
+</span><span class='line'> 
+</span><span class='line'>    irq_exit();
+</span><span class='line'>    set_irq_regs(old_regs);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里要注意，invoke_softirq必须满足两个条件才能被调用到，一个就是不是在硬件中断处理过程中或者在软件中断处理中，第二个就是必须有软件中断处于pending状态。第二个好理解，有软件中断产生才去处理，没有就不处理。第一个就不好理解了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'>* Exit an interrupt context. Process softirqs if needed and possible:
+</span><span class='line'>*/ 
+</span><span class='line'>void irq_exit(void)
+</span><span class='line'>{
+</span><span class='line'>    account_system_vtime(current);
+</span><span class='line'>    trace_hardirq_exit();
+</span><span class='line'>    sub_preempt_count(IRQ_EXIT_OFFSET);
+</span><span class='line'>    if (!in_interrupt() && local_softirq_pending())
+</span><span class='line'>        invoke_softirq();
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_NO_HZ
+</span><span class='line'>    /* Make sure that timer wheel updates are propagated */ 
+</span><span class='line'>    rcu_irq_exit();
+</span><span class='line'>    if (idle_cpu(smp_processor_id()) && !in_interrupt() && !need_resched())
+</span><span class='line'>        tick_nohz_stop_sched_tick(0);
+</span><span class='line'>#endif 
+</span><span class='line'>    preempt_enable_no_resched();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在linux系统的进程数据结构里，有这么一个数据结构</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define preempt_count() (current_thread_info()-&gt;preempt_count)，</span></code></pre></td></tr></table></div></figure>
+
+
+<p>利用preempt_count可以表示是否处于中断处理或者软件中断处理过程中。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define PREEMPT_MASK    (__IRQ_MASK(PREEMPT_BITS) &lt;&lt; PREEMPT_SHIFT)
+</span><span class='line'>#define SOFTIRQ_MASK    (__IRQ_MASK(SOFTIRQ_BITS) &lt;&lt; SOFTIRQ_SHIFT)
+</span><span class='line'>#define HARDIRQ_MASK    (__IRQ_MASK(HARDIRQ_BITS) &lt;&lt; HARDIRQ_SHIFT)
+</span><span class='line'> 
+</span><span class='line'>#define PREEMPT_OFFSET    (1UL &lt;&lt; PREEMPT_SHIFT)
+</span><span class='line'>#define SOFTIRQ_OFFSET    (1UL &lt;&lt; SOFTIRQ_SHIFT)
+</span><span class='line'>#define HARDIRQ_OFFSET    (1UL &lt;&lt; HARDIRQ_SHIFT)
+</span><span class='line'>
+</span><span class='line'>sub_preempt_count(IRQ_EXIT_OFFSET);
+</span><span class='line'>
+</span><span class='line'>#define in_interrupt() (irq_count())
+</span><span class='line'>
+</span><span class='line'>#define irq_count() (preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK))</span></code></pre></td></tr></table></div></figure>
+
+
+<p><img src="/images/kernel/2015-01-23-1.png" alt="" /></p>
+
+<p>preempt_count的8～23位记录中断处理和软件中断处理过程的计数。如果有计数，表示系统在硬件中断或者软件中断处理过程中。系统这么设计是为了避免软件中断在中断嵌套中被调用，并且达到在单个CPU上软件中断不能被重入的目的。对于ARM架构的CPU不存在中断嵌套中调用软件中断的问题，因为ARM架构的CPU在处理硬件中断的过程中是关闭掉中断的。只有在进入了软中断处理过程中之后才会开启硬件中断，如果在软件中断处理过程中有硬件中断嵌套，也不会再次调用软中断，because硬件中断是软件中断处理过程中再次进入的，此时preempt_count已经记录了软件中断！对于其它架构的CPU，有可能在触发调用软件中断前，也就是还在处理硬件中断的时候，就已经开启了硬件中断，可能会发生中断嵌套，在中断嵌套中是不允许调用软件中断处理的。Why？我的理解是，在发生中断嵌套的时候，表明这个时候是系统突发繁忙的时候，内核第一要务就是赶紧把中断中的事情处理完成，退出中断嵌套。避免多次嵌套，哪里有时间处理软件中断，所以把软件中断推迟到了所有中断处理完成的时候才能触发软件中断。</p>
+
+<h4>3. 软件中断的处理过程</h4>
+
+<p>之前我已经说到，软中断的一个很大的目的就是避免中断处理中，处理的操作过多而丢失中断。同时中断还需要考虑到一件事情就是中断处理过程过长就会影响系统响应时间。如果一个中断处理一秒钟，那你一定能感受到串口卡住的现象。从另外一方面说呢，我们又必须考虑中断处理的操作一定的优先度，毕竟是硬件触发的事务，关系到网络、块设备的效率问题。Linux内核就中断方面就必须考虑平衡这三个方面的问题。而下面我要分析的__do_softirq函数就恰似在这三者之间打太极，游刃有余，面面俱到！</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'>* We restart softirq processing MAX_SOFTIRQ_RESTART times,
+</span><span class='line'>* and we fall back to softirqd after that.
+</span><span class='line'>*
+</span><span class='line'>* This number has been established via experimentation.
+</span><span class='line'>* The two things to balance is latency against fairness -
+</span><span class='line'>* we want to handle softirqs as soon as possible, but they
+</span><span class='line'>* should not be able to lock up the box.
+</span><span class='line'>*/ 
+</span><span class='line'>#define MAX_SOFTIRQ_RESTART 10 
+</span><span class='line'> 
+</span><span class='line'>asmlinkage void __do_softirq(void)
+</span><span class='line'>{
+</span><span class='line'>    struct softirq_action *h;
+</span><span class='line'>    __u32 pending;
+</span><span class='line'>    int max_restart = MAX_SOFTIRQ_RESTART;
+</span><span class='line'>    int cpu;
+</span><span class='line'> 
+</span><span class='line'>    pending = local_softirq_pending();
+</span><span class='line'>    account_system_vtime(current);
+</span><span class='line'> 
+</span><span class='line'>    __local_bh_disable((unsigned long)__builtin_return_address(0));
+</span><span class='line'>    trace_softirq_enter();
+</span><span class='line'> 
+</span><span class='line'>    cpu = smp_processor_id();
+</span><span class='line'>restart:
+</span><span class='line'>    /* Reset the pending bitmask before enabling irqs */ 
+</span><span class='line'>    set_softirq_pending(0);
+</span><span class='line'> 
+</span><span class='line'>    local_irq_enable();
+</span><span class='line'> 
+</span><span class='line'>    h = softirq_vec;
+</span><span class='line'> 
+</span><span class='line'>    do 
+</span><span class='line'>    {
+</span><span class='line'>        if (pending & 1)
+</span><span class='line'>        {
+</span><span class='line'>            int prev_count = preempt_count();
+</span><span class='line'> 
+</span><span class='line'>            h-&gt;action(h);
+</span><span class='line'> 
+</span><span class='line'>            if (unlikely(prev_count != preempt_count()))
+</span><span class='line'>            {
+</span><span class='line'>                printk(KERN_ERR "huh, entered softirq %td %p" 
+</span><span class='line'>                       "with preempt_count %08x," 
+</span><span class='line'>                       " exited with %08x?\n", h - softirq_vec,
+</span><span class='line'>                       h-&gt;action, prev_count, preempt_count());
+</span><span class='line'>                preempt_count() = prev_count;
+</span><span class='line'>            }
+</span><span class='line'> 
+</span><span class='line'>            rcu_bh_qsctr_inc(cpu);
+</span><span class='line'>        }
+</span><span class='line'>        h++;
+</span><span class='line'>        pending &gt;&gt;= 1;
+</span><span class='line'>    }
+</span><span class='line'>    while (pending);
+</span><span class='line'> 
+</span><span class='line'>    local_irq_disable();
+</span><span class='line'> 
+</span><span class='line'>    pending = local_softirq_pending();
+</span><span class='line'>    if (pending && --max_restart)
+</span><span class='line'>        goto restart;
+</span><span class='line'> 
+</span><span class='line'>    if (pending)
+</span><span class='line'>        wakeup_softirqd();
+</span><span class='line'> 
+</span><span class='line'>    trace_softirq_exit();
+</span><span class='line'> 
+</span><span class='line'>    account_system_vtime(current);
+</span><span class='line'>    _local_bh_enable();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>__do_softirq函数处理软件中断过程如下图流程分析</p>
+
+<ol>
+<li><p>首先调用local_softirq_pending函数取得目前有哪些位存在软件中断</p></li>
+<li><p>调用<strong>local_bh_disable关闭软中断，其实就是设置正在处理软件中断标记，在同一个CPU上使得不能重入</strong>do_softirq函数</p></li>
+<li><p>重新设置软中断标记为0，set_softirq_pending重新设置软中断标记为0，这样在之后重新开启中断之后硬件中断中又可以设置软件中断位。</p></li>
+<li><p>开启硬件中断</p></li>
+<li><p>之后在一个循环中，遍历pending标志的每一位，如果这一位设置就会调用软件中断的处理函数。在这个过程中硬件中断是开启的，随时可以打断软件中断。这样保证硬件中断不会丢失。</p></li>
+<li><p>之后关闭硬件中断，查看是否又有软件中断处于pending状态，如果是，并且在本次调用__do_softirq函数过程中没有累计重复进入软件中断处理的次数超过10次，就可以重新调用软件中断处理。如果超过了10次，就调用wakeup_softirqd();唤醒内核的一个进程来处理软件中断。设立10次的限制，也是为了避免影响系统响应时间。</p></li>
+</ol>
+
+
+<p><img src="/images/kernel/2015-01-23-2.png" alt="" /></p>
+
+<h4>4. 处理软中断内核线程</h4>
+
+<p>之前我说到不能让CPU长时间来处理中断事务，这样会影响系统的响应时间，严重影响用户和系统之间的交互式体验。所以在之前的__do_softirq中最多将循环执行10次，那么当执行了10次仍然有软中断在pending状态，这个时候应该怎么处理呢？系统将唤醒一个软件中断处理的内核进程，在内核进程中处理pending中的软件中断。这里要注意，之前我们分析的触发软件中断的位置其实是中断上下文中，而在软中断的内核线程中实际已经是进程的上下文。</p>
+
+<p>这里说的软中断上下文指的就是系统为每个CPU建立的ksoftirqd进程。</p>
+
+<p>看完这个函数，我不得不佩服这个函数设计的精巧！而我更多的从中体会到其中蕴藏的一种做人的道理。那就是做人要霸道一点，太谦和太恭维不行，但是又不能横行霸道，原则的问题要公平讲理，一定的时候顾及别人的利益，好处不能一个人独吞。这就跟下面ksoftirqd处理过程一样，该狠的时候禁止抢占，其它进程别想调度到哦，但是自己占用CPU时间过长的话，也自觉的问一问是不是该释放CPU给其它进程了。</p>
+
+<p>下面我们就来分析一下这个处理过程怎么就体现了上面的这种说法呢？软中断的内核进程中主要有两个大循环，外层的循环处理有软件中断就处理，没有软件中断就休眠。内层的循环处理软件中断，并每循环一次都试探一次是否过长时间占据了CPU，需要调度释放CPU给其它进程。具体的操作在注释中做了解释。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int ksoftirqd(void *__bind_cpu)
+</span><span class='line'>{
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'> 
+</span><span class='line'>    while (!kthread_should_stop())
+</span><span class='line'>    {
+</span><span class='line'>        /*不管三七二十一首先禁止抢占，我掌握CPU，并全凭我自己掌握调度*/ 
+</span><span class='line'>        preempt_disable();
+</span><span class='line'>        if (!local_softirq_pending())
+</span><span class='line'>        {
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            /*如果没有软中断在pending，那就让出CPU来吧*/ 
+</span><span class='line'>            schedule();
+</span><span class='line'>           /*我被唤醒了，首先掌握CPU，不让自己被抢占，自己决定自己的是否要调度*/ 
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'> 
+</span><span class='line'>        __set_current_state(TASK_RUNNING);
+</span><span class='line'> 
+</span><span class='line'>        while (local_softirq_pending())
+</span><span class='line'>        {
+</span><span class='line'>            /* Preempt disable stops cpu going offline.
+</span><span class='line'>               If already offline, we'll be on wrong CPU:
+</span><span class='line'>               don't process */ 
+</span><span class='line'>            if (cpu_is_offline((long)__bind_cpu))
+</span><span class='line'>                goto wait_to_die;
+</span><span class='line'>            /*处理软中断*/ 
+</span><span class='line'>            do_softirq();
+</span><span class='line'>            /*虽然我自己掌握是否要调度，虽然我可以一直不调度，但是我是
+</span><span class='line'>            个正直的人，运行一段时间后我会看看是否需要调度，还其它进程运行*/ 
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            cond_resched();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>            rcu_qsctr_inc((long)__bind_cpu);
+</span><span class='line'>        }
+</span><span class='line'>        preempt_enable();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'> 
+</span><span class='line'>wait_to_die:
+</span><span class='line'>    preempt_enable();
+</span><span class='line'>    /* Wait for kthread_stop */ 
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop())
+</span><span class='line'>    {
+</span><span class='line'>        schedule();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/23/kernel-irq-mark2/">中断机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-23T14:03:00+08:00'><span class='date'>2015-01-23</span> <span class='time'>14:03:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>1、</h4>
+
+<p>cpu的中断管理和指令执行（运算器）是两套硬件，他们互相独立又有关联。</p>
+
+<h4>2、</h4>
+
+<p>无论中断是否允许，运算器都按自己的节奏工作，无须花时间去查询是否由中断到达。</p>
+
+<h4>3、</h4>
+
+<p>中断管理器则不断地探测是否有中断信号到达，若有且中断允许，则保存当前执行状态信息，然后打断当前取指序列，强行转到特定地址（中断向量）取指令，整个过程运算器并不知道，它只是忠实地执行取指电路取得的指令。<br/>
+  因此，只要没有中断信号到达，就不存在cpu边走边看的问题。
+  为保证正确访问临界数据区和正确执行临界代码段，操作系统一般有：关中断、关调度、信号量，还有些操作系统提供原子变量的方法，linux中广为人知的锁其实是用信号量实现的。那么，这么多的方法中，什么情况适用哪一种方法呢？是有规律的。</p>
+
+<h5>1、原子变量</h5>
+
+<p>  原子变量可以保证一个变量单次操作的正确性，其保护甚至比信号量还完善，信号量只能保护全局数据不被其他线程破坏，而原子变量能保证全局数据不被中断破坏。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>example1：
+</span><span class='line'>    atomic int a;
+</span><span class='line'>int b,c;
+</span><span class='line'>a = a + b + c;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上述代码中，cpu对a有一个读、修改、写的过程，这个过程如果被打断，并在其他线程中修改了a值，执行结果将出现错误，而原子变量将保证不会发生这样的错误。
+原子变量不能保护一系列操作的原子性，若把上述代码改为</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>example2：
+</span><span class='line'>atomic int a;
+</span><span class='line'>int b,c;
+</span><span class='line'>a = a + b; //L1
+</span><span class='line'>a = a + c; //L2</span></code></pre></td></tr></table></div></figure>
+
+
+<p>原子变量不能保证L1和L2两行程序间a不被其他线程修改，因此example2不一定能得到正确的结果。</p>
+
+<h5>2、信号量</h5>
+
+<p>  稍微完善一点的操作系统都提供信号量机制，用于保护临界代码。上述example2就应该用下列代码替代L1和L2：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>获取信号量；
+</span><span class='line'>a = a + b; //L1
+</span><span class='line'>a = a + c; //L2
+</span><span class='line'>释放信号量；</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当一个全局变量可能被多个线程操作时，就应该用信号量保护，注意，不能在中断中访问用信号量保护的变量。</p>
+
+<h5>3、关调度</h5>
+
+<p>  关调度是一种比较粗暴的方式，关调度后，操作系统不会再进行线程上下文切换，而是专心执行一个线程，但是中断仍然开着。关调度可以起到替代信号量保护全局变量的作用，但一般不这样用，太粗暴了。但是如果某一段代码的执行时间有要求，希望cpu全速执行不被打断，但又不希望关中断时，可用关调度的方法。注意，从逻辑上，关调度能替换信号量，但不能替换原子变量。</p>
+
+<h5>4、关中断</h5>
+
+<p>  关中断是最粗暴的一种方式，用于保证最严格的时序执行，比如某段代码要在IO上输出两个高精度脉冲，脉冲宽度2uS，间隔2uS，这种需求只能通过用精确的指令延时来实现，延时过程中，如果被中断，或者发生线程切换，将不能正确输出脉冲。从逻辑上，前面所讲的三种保护，都可以用关中断实现，只是，太粗暴了。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/22/kernel-sched-n2/">linux的调度分析（转）</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-22T17:42:00+08:00'><span class='date'>2015-01-22</span> <span class='time'>17:42:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/cybertan/article/details/5686451">http://blog.csdn.net/cybertan/article/details/5686451</a></p>
+
+<h3>调度</h3>
+
+<h3>公平调度 (fair-share scheduling) 的进程调度算法：</h3>
+
+<h4>一、公平分享的调度策略</h4>
+
+<p>  Linux 的调度算法是相对独立的一个模块，而且较容易理解。因此很多系统高手都爱对调度算法做改进。但是可以说调度器是一个非常神秘，难以捉摸的精灵。可能通过改变一个关键参数你就可以大大提高系统的效率。<br/>
+  对于一般进程， CPU 的使用时间都是系统平均分配给每一个进程的，因此这种公平分享都是从 进程的角度 出发的。 Bach 在 1986 年提出了公平分享调度策略（ Fair_Share scheduling ）来解决这个问题。和 Linux 三种内建策略比，公平分享调度策略是一种更抽象的调度策略。它认为 CPU 应该根据拥有进程的组（对 Linux 来说是用户）来分配时间，它实现了从 用户角度 考虑的公平原则。</p>
+
+<p>由内核的结构来看，实现这个算法有很多种方式。我们可以在与调度相关的程序里做小小的改动来实现，如改动一些数据结构并改写 schedule() 函数。当然也可以做得很复杂，比如重写 schedule() 来实现所需要的结果。但是有一点我们是要必须牢记的，那就是大部分的 Linux 核心都是以短小高效为最高目标。所以，改进的算法必须尽量向这个目标靠拢。</p>
+
+<h4>二、新调度策略的实现：分析</h4>
+
+<p>1 、这里所说的 ‘ 组 ’ 的概念，在 Linux 中是一个用户。我们所关心的是 Linux 的用户，而不是 UNIX 系统下的用户组或是别的什么概念。因此 在公平共享调度策略中，一个进程能够分配到的时间与登录的系统用户数以及拥有该进程用户开辟进程数的多少有关。<br/>
+2 、超级用户的进程是 独立于公平分享算法 的，因此它拥有的进程得到的调度时间应该和现在的进程调度算法分配时间相当。<br/>
+3 、对于实时进程，调度算法仍旧给予比普通进程更高的优先权。不过也不用担心会花太多的时间去实现，只要在现在调度算法的基础上稍做改进就可以简单实现。<br/>
+4 、新的调度算法对系统的吞吐量不能有太多的影响。比如说，如果定义的时间片少于 2 个 “ 滴答 ” ，那么新实现的调度器效率将变得很差。因为过于频繁的进程切换将耗费大部分的系统时间，而真正用于程序计算的时间则排在第二位了。 此条说明时间片的划分不能太小。<br/>
+5 、我们所实现的算法并不需要绝对的公平，严格的平均是需要用效率为代价来换取的。如果算法过于精确，那就需要复杂的数据结构和耗时的计算过程，所以我们可以在以速度为第一原则的基础上实现 “ 模糊 ” 的公平分享。<br/>
+6 、我们首先需要的是不断地思考和设计，只有将所有的问题都考虑清楚以后才可以开始动手。调度器是操作系统的核心，它将被频繁调用，因此其作用和影响也将是巨大的。我们要花费最小的代价实现算法，并且这种改动对系统核心的影响要降到最小。</p>
+
+<h4>Linux 的进程调度机制：</h4>
+
+<p>概述：<br/>
+在多进程的操作系统中，进程调度是一个全局性的、关键性的问题。可以说，关于进程调度的研究是整个操作系统理论的核心，它对系统的总体设计、系统的实现、功能设置以及各方面的性能都有着决定性的影响。</p>
+
+<h5>1、 150ms ：当系统中有大量进程共存时，根据测定，当每个用户可以接受的相应速度延迟超过１５０ ms 时，使用者就会明显地感觉到了。</h5>
+
+<h5>2、 在设计一个进程调度机制时要考虑的具体问题主要有：</h5>
+
+<p>调度的时机：什么情况下、什么时候进行调度；<br/>
+调度的政策：根据什么准则挑选下一个进入运行的进程；<br/>
+调度的方式：是 “ 可剥夺 ” 还是 “ 不可剥夺 ” 。当正在运行的进程并不自愿暂时放弃对ＣＰＵ的使用权时，是否可以强制性地暂时剥夺其使用权，停止其运行而给其他进程一个机会。如果是可剥夺的，那么是否在任何条件下都可剥夺，有没有例外？</p>
+
+<h5>3、linux 内核的调度机制：</h5>
+
+<h6>１）调度的时机：</h6>
+
+<ul>
+<li>首先，自愿的调度 ( 主动调度 ) 随时都可以进行：在内核里面，一个进程可以通过 schedule() 启动一次调度。也就是由当前进程自愿调用 schedule() 暂时放弃运行的情景。</li>
+<li>除此之外，调度还可以非自愿的，即强制地发生在每次从系统调用返回的前夕，以及每次从中断或者异常处理 返回到用户空间 的前夕。</li>
+</ul>
+
+
+<p>上述红字说明：只有在用户空间（当ＣＰＵ在用户空间运行时）发生的中断或者异常才会引起调度。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ret_from_exception:
+</span><span class='line'>    movl SYMBOL_NAME(bh_mask),%eax
+</span><span class='line'>    andl SYMBOL_NAME(bh_active),%eax
+</span><span class='line'>    jne handle_bottom_half
+</span><span class='line'>    ALIGN
+</span><span class='line'>ret_from_intr:
+</span><span class='line'>    GET_CURRENT(%ebx)
+</span><span class='line'>    movl EFLAGS(%esp),%eax        # mix EFLAGS and CS
+</span><span class='line'>    movb CS(%esp),%al
+</span><span class='line'>    testl $(VM_MASK | 3),%eax    # return to VM86 mode or non-supervisor?
+</span><span class='line'>    jne ret_with_reschedule
+</span><span class='line'>    jmp restore_all</span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　 从上述代码中 (arch/i386/kernel/entry.S) ，可以看出，转入 ret_with_reschedule 的条件为中断或异常发生前 CPU 的运行级别为３，即用户态。</p>
+
+<p>这一点 ( 只有在用户空间发生的中断或者异常才会引起调度 ) 对于系统的设计和实现有很重要的意义：因为这意味着当 CPU 在内核中运行时无需考虑强制调度的可能性。发生在系统空间中的中断或异常当然是可能的，但是这种中断或者异常不会引起调度。这使得内核的实现简化了，早期的 Unix 内核正是靠这个前提来简化其设计与实现的。否则的话，内核中所有可能为一个以上进程共享的变量和数据结构就全都要通过互斥机制 ( 如信号量 ) 加以保护，或者说放在临界区里面。即在内核中由于不会发生调度而无需考虑互斥。但是在多处理器 SMP 系统中，这种简化正在失去重要性：因为我们不得不考虑在另一个处理器上运行的进程访问共享资源的可能性。这样，不管在同一个 CPU 上是否可能在内核中发生调度，所有可能为多个进程 ( 可能在不同的 CPU 上运行 ) 共享的变量和数据结构，都得保护起来。这就是为什么读者在阅读代码时看到那么多的 up() 、 down() 等信号量操作或者加锁操作的原因。</p>
+
+<p>注意： “ 从系统空间返回到用户空间 ” 只是发生调度的必要条件，而不是充分条件。也就是说，这个条件满足了，调度并不是一定会发生的，具体是否发生调度还要判断当前进程的 task_struct 结构中的 need_resched 成员是否为非０，非０时才会转到 reschedule 处调用 schedule():</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> ret_with_reschedule:
+</span><span class='line'>    cmpl $0, need_resched(%ebx)
+</span><span class='line'>    jne reschedule
+</span><span class='line'>    cmpl $0,sigpending(%ebx)
+</span><span class='line'>    jne signal_return
+</span><span class='line'>....
+</span><span class='line'> reschedule:
+</span><span class='line'>    call SYMBOL_NAME( schedule )    # test
+</span><span class='line'>    jmp ret_from_sys_call</span></code></pre></td></tr></table></div></figure>
+
+
+<p>need_resched 成员是内核设置的，因为在用户空间是访问不到进程的 task_struct 结构的。除了当前进程通过系统调用自愿让出运行以及在系统调用中因某种原因受阻以外，主要就是当因某种原因唤醒一个进程的时候，以及在时钟中断服务程序发现当前进程已经连续运行太久的时候，内核会对
+need_resched 成员进行设置 ( 非０ ) ，以重新调度。</p>
+
+<h6>２）调度的方式：</h6>
+
+<p>Linux 内核的调度方式可以说是 “ 有条件的可剥夺 ” 方式。
+＊当进程在用户空间运行时，无论自愿不自愿，一旦有必要 ( 例如该进程已经运行了足够长的时间 ) ，内核就可以暂时剥夺其运行而调度其他进程进入运行。</p>
+
+<p>＊但是，一旦进程进入了内核空间，或者说进入 “ 系统态 ” 。这时候，尽管内核知道应该要调度了，但是实际上调度并不会发生，直到该进程即将 “ 下台 ” ，也就是 回到用户空间的前夕 才能剥夺其运行权力。所以， linux 的调度方式从原则上来说是可剥夺的，可是实际上由于调度时机的限制而变成了有条件的。</p>
+
+<h6>３）调度策略：</h6>
+
+<p>  基本上是从 UNIX 继承下来的 以优先级为基础 的调度。内核为系统中的每个进程计算出一个反映其运行 “ 资格 ” 的权值，然后挑选权值最高的进程投入运行。在运行的过程中，当前进程的资格 ( 权值 ) 随时间而递减，从而在下一次调度的时候原来资格较低的进程可能就更有资格运行了。到所有的进程的资格都变为０时，就重新计算一次所有进程的资格。<br/>
+  但是，为了适应各种不同应用的需要，内核 在此基础上 实现了三种不同的策略： SCHED_FIFO 、 SCHED_RR 、 SCHED_OTHER 。每个进程都有自己适用的调度策略，并且，进程还可以通过系统调用 sched_setscheduler() 设定自己适用的调度策略。下面介绍一下他们的区别：<br/>
+   SCHED_FIFO ：适用于时间性要求比较强，但每次运行所需的时间比较短的进程，因此多用于实时进程；<br/>
+   SCHED_RR:RR 表示 Round Robin ，是轮流的意思 ( 轮换调度 ) ，这种策略适合比较大、也就是每次运行时间较长的程序。使用 SCHED_RR 策略地进程在 schedule() 调度中有一点特殊的处理。　</p>
+
+<p>  上两者的比较： SCHED_FIFO 、 SCHED_RR 都是基于优先级的调度策略，可是在怎样调度具有相同优先级的进程的问题上两者有区别：<br/>
+   调度策略为 SCHED_FIFO 的进程一旦受到调度而开始运行之后，就要一直运行到自愿让出或者被优先级更高的进程剥夺为止。对于每次受到调度时要求运行时间不长的进程，这样并不会有多大的影响。可是， 如果是受到调度后可能执行很长时间的进程 ，这样就不公平了。这种不公正性是对具有相同优先级的进程而言的，同级的进程必须等待该进程自愿让出或者直到其运行结束。因为具有更高优先级的进程可以剥夺他的运行，而优先级则本来就没有机会运行，谈不上不公正。</p>
+
+<p>　所以，对于执行时间可能会很长的进程来说，应该使用 SCHED_RR 调度策略，这种策略 在相同的优先级的进程上实行轮换调度。 也就是说：对调度策略为 SCHED_RR 的进程有个时间配额，用完这个配额就要让具有相同优先级的其他就绪进程先运行。看 schedule() 的５４０行对调度策略为 SCHED_RR 的当前进程的处理。</p>
+
+<p> SCHED_OTHER ：是传统的调度策略，比较适合于交互式的分时应用。</p>
+
+<p> 问题：既然每个进程都有自己的适用的调度策略，内核怎样来调用使用不同调度策略的进程的呢？是根据什么挑选出下一个要运行的进程呢？</p>
+
+<p> 实际上，挑选的原则最后还是归结到每个进程的权值，只不过是在计算资格的时候将适用的策略也考虑进去了，就好像考大学时符合某些特殊条件的考生会获得加分一样。同时，对于适用不同策略地进程的优先级别也加了限制。</p>
+
+<h5>4、调度程序 schedule() ：</h5>
+
+<p>  调度程序 schedule() 是一个非常频繁地执行的函数，因此要将运行效率放在第一位，函数中使用了很多的 goto 语句。<br/>
+  前面讲过，对 schedule() 只能由进程在内核中主动 调用，或者在当前进程从系统空间返回用户空间的前夕被动的 发生，而不能在一个中断服务程序的内部发生。即使一个中断服务程序有调度的要求，也只能通过把当前进程的 need_resched 字段设为１来表达这种要求，而不能直接调用 schedule() 。所以，如果在某个中断服务程序内部调用了 schedule() ，那一定是有问题的，所以转向 scheduling_in_interrupt.(kernel/sched.c)</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>    asmlinkage void schedule(void)
+</span><span class='line'>509 {
+</span><span class='line'>510 struct schedule_data * sched_data;
+</span><span class='line'>511 struct task_struct *prev, *next, *p;
+</span><span class='line'>512 struct list_head *tmp;
+</span><span class='line'>513 int this_cpu, c;
+</span><span class='line'>514
+</span><span class='line'>515 if (!current&gt;
+</span><span class='line'>active_mm) BUG();
+</span><span class='line'>516 need_resched_back:
+</span><span class='line'>517 prev = current;
+</span><span class='line'>518 this_cpu = prev&gt;
+</span><span class='line'>processor;
+</span><span class='line'>519
+</span><span class='line'>520 if (in_interrupt())
+</span><span class='line'>521 goto scheduling_in_interrupt ;
+</span><span class='line'>522
+</span><span class='line'>523 release_kernel_lock(prev, this_cpu);
+</span><span class='line'>524
+</span><span class='line'>525 /* Do "administrative" work here while we don't hold any locks */
+</span><span class='line'>526 if (softirq_active(this_cpu) & softirq_mask(this_cpu))
+</span><span class='line'>　　 /* 检查是否有内核软中断服务请求在等待，若有，就转入 handle_softirq 为这些请求服务 */
+</span><span class='line'>527 goto handle_softirq;
+</span><span class='line'>528 handle_softirq_back:</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们来看一下内核对这种问题的响应：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[schedule()]
+</span><span class='line'>686 scheduling_in_interrupt:
+</span><span class='line'>687 　　 printk("Scheduling in interrupt/n");
+</span><span class='line'>688 　　 BUG();
+</span><span class='line'>689 　　 return;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>内核对此的响应是显示或者在 /var/log/messages 文件末尾添上一条出错信息，然后执行一个宏操作 BUG 。</p>
+
+<p>接着往下看 schedule() ：<br/>
+如果有内核软中断服务请求在等待，那么就转入 handle_softirq ：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>　 [schedule()]
+</span><span class='line'>675 handle_softirq:
+</span><span class='line'>676 　　　 do_softirq();
+</span><span class='line'>677 　　　 goto handle_softirq_back;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>执行 softirq 队列完毕以后继续往下看：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>　　 ==================== kernel/sched.c 528 541 ====================
+</span><span class='line'>[schedule()]
+</span><span class='line'>528 handle_softirq_back:
+</span><span class='line'>529
+</span><span class='line'>530 /*
+</span><span class='line'>531 * 'sched_data' is protected by the fact that we can run
+</span><span class='line'>532 * only one process per CPU.
+</span><span class='line'>533 */
+</span><span class='line'>534 sched_data = & aligned_data[this_cpu].schedule_data;
+</span><span class='line'>535
+</span><span class='line'>536 spin_lock_irq(&runqueue_lock);
+</span><span class='line'>537
+</span><span class='line'>538 /* move an exhausted RR process to be last.. */
+</span><span class='line'>539 if (prev&gt;policy == SCHED_RR)
+</span><span class='line'>540 　　　 goto move_rr_last;
+</span><span class='line'>541 move_rr_back:</span></code></pre></td></tr></table></div></figure>
+
+
+<p>指针 sched_data 指向一个 schedule_data 数据结构，用来保存供下一次调度时使用的信息。此数据结构的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>==================== kernel/sched.c 91 101 ====================
+</span><span class='line'>91 /*
+</span><span class='line'>92 * We align perCPU
+</span><span class='line'>scheduling data on cacheline boundaries,
+</span><span class='line'>93 * to prevent cacheline pingpong.
+</span><span class='line'>94 */
+</span><span class='line'>95 static union {
+</span><span class='line'>96 　　 struct schedule_data {
+</span><span class='line'>97 　　　　 struct task_struct * curr;
+</span><span class='line'>98 　　　　 cycles_t last_schedule;
+</span><span class='line'>99 　　　 } schedule_data;
+</span><span class='line'>100 　　　 char __pad [SMP_CACHE_BYTES];
+</span><span class='line'>101 } aligned_data [ NR_CPUS ] __cacheline_aligned = { };</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里的 cycles_t 实际上是无符号整数，用来记录调度发生的时间。这个数据结构是为多处理器 SMP 结构而设的，因此我们不必关心。数组中的第一个元素，即 CPU0 的 schedule_data 结构初始化为 {&amp;init_task,0} ，其余的则全为｛０，０｝。代码中的 __cacheline_aligned 表示数据结构的起点应与高速缓存中的缓冲线对齐。</p>
+
+<p>下面就要涉及可执行进程队列了，所以先将这个队列锁住 (536 行 ) ，以防止其他处理器的干扰。从 538 行开始：如果当前进程 prev 的调度策略是 SCHED_RR ，也就是轮换调度，那就要先进行一点特殊的处理 ( 540 : goto move_rr_last; ) 。
+（对使用 SCHED_RR 策略的当前进程的处理）</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>  ==================== kernel/sched.c 679 685 ====================
+</span><span class='line'> [schedule()]
+</span><span class='line'>679  move_rr_last:
+</span><span class='line'>680   if (!prev&gt;counter) {
+</span><span class='line'>681       prev&gt;counter = NICE_TO_TICKS (prev&gt;nice);
+</span><span class='line'>682       move_last_runqueue(prev);
+</span><span class='line'>683     }
+</span><span class='line'>684 goto move_rr_back;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里的 prev>counter ：代表这当前进程的运行时间配额，其数值在每次时钟中断时都要递减 (update_process_times() 中实现的 ) 。因此，不管一个进程的时间配额有多高，随着运行时间的积累最终总会递减到０。对于调度策略为 SCHED_RR 的进程，一旦其时间配额降到０，就要从 可执行进程队列 runqueue 中当前的位置上移动到队列的末尾，同时恢复其最初的时间配额（ NICE_TO_TICKS ），以等待下一次的调度。对于具有相同优先级的进程，调度的时候排在前面的进程优先，所以这使队列中具有相同优先级的其他进程有了优势。<br/>
+  宏操作 NICE_TO_TICKS 根据系统时钟的精度将进程的优先级别换算成可以运行的时间配额。在 kernel/sched.c 中定义。<br/>
+　将一个进程的 task_struct 结构从可执行队列中的当前位置移到队列的末尾是由 move_last_runqueue() 完成的 (kernel/sched.c) 。把进程移到可执行进程队列的末尾意味着：如果队列中没有资格更高的进程，但是有一个资格与之相同的进程存在，那么，这个资格虽然相同而排在前面的进程会被选中。</p>
+
+<p>继续看 schedule() ：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>==================== kernel/sched.c 541 553 ====================
+</span><span class='line'>[schedule()]
+</span><span class='line'>541 move_rr_back:
+</span><span class='line'>542
+</span><span class='line'>543 switch ( prev&gt;state ) {
+</span><span class='line'>544 case TASK_INTERRUPTIBLE:
+</span><span class='line'>545 　　　 if (signal_pending(prev)) {
+</span><span class='line'>546 　　　　　　 prev&gt;state = TASK_RUNNING;
+</span><span class='line'>547 　　　　　　 break;
+</span><span class='line'>548 　　　　 }
+</span><span class='line'>549 default:
+</span><span class='line'>550 　　　 del_from_runqueue(prev);
+</span><span class='line'>551 case TASK_RUNNING:
+</span><span class='line'>552 }
+</span><span class='line'>553 prev&gt;need_resched = 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  当前进程，就是正在执行的进程，当进入 schedule() 时其状态却不一定是 TASK_RUNNING 。例如：当前进程如已经在 do_exit() 中将其状态改成 TASK_ZOMBIE ，又如当前进程在 sys_wait4() 中调用 schedule() 时的状态为 TASK_INTERRUPTIBLE 。所以，这里的 prev>state 与其说是当前进程的状态不如说是其意愿。当其意愿既不是继续执行也不是可中断的睡眠时，就要通过 del_from_runqueue() 把这个进程从可执行队列中撤下来。另一方面， 也可以看出 TASK_INTERRUPTIBLE 和 TASK_UNINTERRUPTIBLE 两种睡眠状态之间的区别： 前者在进程有信号等待处理时要将其改成 TASK_RUNNING ，让其处理完这些信号再说，而后者则不受信号的影响。</p>
+
+<p>  最后，将 prev>need_resched 恢复为０，因为所需求的调度已经在进行了。 下面的任务就是要 挑选出一个进程来运行了 ( 这一部分是很重要的，通过对就绪进程队列进行扫描 ) 。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>==================== kernel/sched.c 555 576 ====================
+</span><span class='line'>[schedule()]
+</span><span class='line'>555 /*
+</span><span class='line'>556 * this is the scheduler proper:
+</span><span class='line'>557 */
+</span><span class='line'>558
+</span><span class='line'>559 repeat_schedule:
+</span><span class='line'>560 /*
+</span><span class='line'>561 * Default process to select..
+</span><span class='line'>562 */
+</span><span class='line'>563 next = idle_task (this_cpu);
+</span><span class='line'>564 c = 1000;
+</span><span class='line'>565 if ( prev&gt;state == TASK_RUNNING )
+</span><span class='line'>566      goto still_running;
+</span><span class='line'>567
+</span><span class='line'>568 still_running_back:
+</span><span class='line'>569      list_for_each (tmp, &runqueue_head) {
+</span><span class='line'>570          p = list_entry(tmp, struct task_struct, run_list);
+</span><span class='line'>571          if (can_schedule(p, this_cpu)) {
+</span><span class='line'>572           int weight = goodness (p, this_cpu, prev&gt;active_mm);
+</span><span class='line'>573           if ( weight &gt; c )
+</span><span class='line'>574            c = weight, next = p;
+</span><span class='line'>575          }
+</span><span class='line'>576 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这段程序中， next 总是指向已知最佳的候选进程， c 则是这个进程的综合权值，或者是运行资格。</p>
+
+<p>  挑选的过程是从 idle 进程即 0 号进程开始，其权值为－ 1000 ，这是可能的最低值，表示仅在没有其他进程可以运行时才会让他运行。<br/>
+  然后，遍历可执行队列 runqueue 中的每个进程 ( 在单 CPU 系统中 can_schedule() 的返回值永远是 1) ，也就是一般操作系统书中所称的就绪进程。为每一个就绪进程通过函数 goodness () 计算出他当前所具有的权值，然后与当前的最高值 c 相比。注意这里的条件： weight > c ， 这意味着 “ 先入为大 ” 。也就是说，如果两个进程有相同的权值的话，排在队列前面的进程胜出，优先运行。</p>
+
+<p>这里还有一个小插曲：如果当前进程的意图是继续运行，那么就要先执行一下 still_running(kernel/sched.c) ：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>  ==================== kernel/sched.c 670 674 ====================
+</span><span class='line'>[schedule()]
+</span><span class='line'>670 still_running:
+</span><span class='line'>671    c = goodness(prev, this_cpu, prev&gt;active_mm);
+</span><span class='line'>672    next = prev;
+</span><span class='line'>673    goto still_running_back;
+</span><span class='line'>674</span></code></pre></td></tr></table></div></figure>
+
+
+<p>也就是说，如果当前进程想要继续运行，那么在挑选候选进程时以当前进程此刻的权值开始比较。而且这意味着，对于具有相同权值的其他进程来说，当前进程优先。</p>
+
+<p>  那么，进程的当前权值是怎样计算的呢？也就是 goodness() 是怎样执行的呢？</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>==================== kernel/sched.c 123 187 ====================
+</span><span class='line'>[schedule()&gt; goodness() ]
+</span><span class='line'>123 /*
+</span><span class='line'>124 * This is the function that decides how desirable a process is..
+</span><span class='line'>125 * You can weigh different processes against each other depending
+</span><span class='line'>126 * on what CPU they've run on lately etc to try to handle cache
+</span><span class='line'>127 * and TLB miss penalties.
+</span><span class='line'>128 *
+</span><span class='line'>129 * Return values:
+</span><span class='line'>130 * 1000:never select this
+</span><span class='line'>131 * 0: out of time, recalculate counters (but it might still be
+</span><span class='line'>132 * selected)
+</span><span class='line'>133 * +ve: "goodness" value (the larger, the better)
+</span><span class='line'>134 * +1000: realtime process, select this.
+</span><span class='line'>135 */
+</span><span class='line'>136
+</span><span class='line'>137 static inline int goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
+</span><span class='line'>138 {
+</span><span class='line'>139 int weight;
+</span><span class='line'>140
+</span><span class='line'>141 /*
+</span><span class='line'>142 * select the current process after every other
+</span><span class='line'>143 * runnable process, but before the idle thread.
+</span><span class='line'>144 * Also, dont trigger a counter recalculation.
+</span><span class='line'>145 */
+</span><span class='line'>146 weight = -1 ;
+</span><span class='line'>147 if (p&gt;policy & SCHED_YIELD )
+</span><span class='line'>148 goto out;
+</span><span class='line'>149
+</span><span class='line'>150 /*
+</span><span class='line'>151 * Non RT process normal case first.
+</span><span class='line'>152 */
+</span><span class='line'>153 if ( p&gt;policy == SCHED_OTHER ) {
+</span><span class='line'>154 /*
+</span><span class='line'>155 * Give the process a firstapproximation goodness value
+</span><span class='line'>156 * according to the number of clockticks it has left.
+</span><span class='line'>157 *
+</span><span class='line'>158 * Don't do any other calculations if the time slice is
+</span><span class='line'>159 * over..
+</span><span class='line'>160 */
+</span><span class='line'>161    weight = p-&gt;counter;
+</span><span class='line'>162    if (!weight)
+</span><span class='line'>163    goto out;
+</span><span class='line'>164
+</span><span class='line'>165 #ifdef CONFIG_SMP
+</span><span class='line'>166 /* Give a largish advantage to the same processor... */
+</span><span class='line'>167 /* (this is equivalent to penalizing other processors) */
+</span><span class='line'>168 if (p-&gt;processor == this_cpu)
+</span><span class='line'>169    weight += PROC_CHANGE_PENALTY;
+</span><span class='line'>170 #endif
+</span><span class='line'>171
+</span><span class='line'>172 /* .. and a slight advantage to the current MM */
+</span><span class='line'>173   if (p-&gt;mm == this_mm || !p-&gt;mm)
+</span><span class='line'>174       weight += 1;
+</span><span class='line'>175    weight += 20- p&gt;nice;
+</span><span class='line'>176    goto out;
+</span><span class='line'>177 }
+</span><span class='line'>178
+</span><span class='line'>179 /*
+</span><span class='line'>180 * Realtime process, select the first one on the
+</span><span class='line'>181 * runqueue (taking priorities within processes
+</span><span class='line'>182 * into account).
+</span><span class='line'>183 */
+</span><span class='line'>184      weight = 1000 + p-&gt;rt_priority;
+</span><span class='line'>185 out:
+</span><span class='line'>186      return weight;
+</span><span class='line'>187 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  ＊首先，如果一个进程通过系统调用 sched_yield() 明确表示了 “ 礼让 ” 后，就将其权值定位 -1 。这是很低的权值，一般就绪进程的权值至少是 0 。<br/>
+  ＊对于没有实时要求的进程 ，即调度策略为 SCHED_OTHER 的进程，其权值主要取决于两个因素：一个是剩下的时间配额 p->counter ，如果用完了则权值为 0 。另一个是进程的优先级 nice ，这是从早期 Unix 沿用下来的负向优先级 ( 越负，优先级越高 ) ，其取值范围为 19~-20 ，只有特权用户才能把 nice 值设置为小于 0 。所以，综合的权值 weight 在时间配额尚未用完时基本上是二者之和。 此外，如果是内核线程，或者其用户 空间与当前进程的相同，因而无需切换用户空间，则会得到一点小 “ 奖励 ” ，将权值额外加 1 。<br/>
+  ＊对于实时进程，即调度策略为 SCHED_FIFO 或者 SCHED_RR 的进程，则另有一种正向的优先级 ，那就是实时优先级 rt_priority ，而权值为 1000 + p->rt_priority 。可见， SCHED_FIFO 或者 SCHED_RR 两种有时间要求的策略赋予进程很高的权值 ( 相对于 SCHED_OTHER) 。这种进程的权值至少是 1000 。另一方面， rt_priority 的值对于实时进程之间的权值比较也起着重要的作用，其数值也是在 sched_setscheduler() 中与调度策略一起设置的。</p>
+
+<p>从上面可以看出：对于这两种实时调度策略，一个进程已经运行了多久，即时间配额 p->counter 的当前值，对权值的计算不起所用。不过，前面讲到，对于使用 SCHED_RR 策略地进程，当 p->counter 达到 0 时会导致将进程移到队列尾部。<br/>
+  实时进程的 nice 数值与优先级无关，但是对 使用 SCHED_RR 策略地进程的时间配额大小有关 ( 宏操作 NICE_TO_TICKS()) 。由于实时进程的权值有个很大的基数 (1000) ，因此当有实时进程就绪时，非实时进程是没有机会运行的。</p>
+
+<p>由此可见， linux 内核中对权值的计算是很简单的，但是 goodness() 函数并不代表 linux 调度算法的全部，而要与前面讲到的 对 SCHED_RR 进程的特殊处理 、 对意欲继续运行的当前进程的特殊处理 ‘ 以及下面要讲到的 recalculate 结合起来分析。</p>
+
+<p>上面 still_running_back 运行结束后，变量 c 的值有几种可能：一种可能是一个大于 0 的正数，此时 next 指向挑选出来的进程；另一种可能是 c 的值为 0 ，发生于就绪队列中所有进程的权值都是 0 的时候。由于除了 init 进程和调用了 sched_yield() 的进程以外，每个进程的权值最低为 0 ，所以只要队列中有其他就绪进程存在就不可能为负数。因此，队列中所有其他进程的权值都已经降到 0 了，说明这些进程的调度策略都是 SCHED_OTHER ，即系统中当前没有就绪的实时进程，因为如果有策略为 SCHED_FIFO 或者 SCHED_RR 的进程存在，其权值至少也有 1000 。</p>
+
+<p>let`s go on ：回到 schedule()</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>==================== kernel/sched.c 578 580 ====================
+</span><span class='line'>[schedule()]
+</span><span class='line'>578 /* Do we need to recalculate
+</span><span class='line'>counters? */
+</span><span class='line'>579 if (!c)
+</span><span class='line'>580 goto recalculate;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果当前已经选择的进程（权值最高的进程）的权值为 0 ，那就要重新计算各个进程的时间配额。如上所述，这说明系统中当前没有就绪的实时进程。而且，这种情况已经持续了一段时间，否则 SCHED_OTHER 进程的权值就没有机会消耗到 0 。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> ==================== kernel/sched.c 658 669 ====================
+</span><span class='line'>[schedule()]
+</span><span class='line'>658 recalculate:
+</span><span class='line'>659 {
+</span><span class='line'>660     struct task_struct *p;
+</span><span class='line'>661     spin_unlock_irq(&runqueue_lock);
+</span><span class='line'>662     read_lock(&tasklist_lock);
+</span><span class='line'>663     for_each_task (p)
+</span><span class='line'>664         p-&gt;counter = (p-&gt;counter &gt;&gt; 1) + NICE_TO_TICKS(p-&gt;nice);
+</span><span class='line'>665     read_unlock(&tasklist_lock);
+</span><span class='line'>666     spin_lock_irq(&runqueue_lock);
+</span><span class='line'>667 }
+</span><span class='line'>668  goto repeat_schedule;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里所作的运算是将每个进程的当前的时间配额 p->counter 除以 2 ，再在上面加上由该进程的 nice 值换算过来的 tick 数量。宏操作 NICE_TO_TICKS 的定义在前面已经见过，显然 nice 值对于非实时进程既表示优先级也决定着时间配额。<br/>
+  注意：这里的 for_each_task() 是对所有进程的循环，而并不是仅对就绪进程队列的循环，对于不再就绪进程队列中的非实时进程 ，这里得到了提升其时间配额、从而提升其综合权值的机会。不过，这种对综合权值的提升是很有限的，每次重新计算都将原有的时间配额减半，再与 NICE_TO_TICKS(p->nice) 相加，这样就决定了重新计算以后的综合权值永远也不可能达到 NICE_TO_TICKS(p->nice) 的两倍。因此，即使经过很长时间的韬光养晦，也不可能达到可与实时进程竞争的地步，所以只是对非实时进程之间的竞争有意义。<br/>
+  至于实时进程，时间配额的增加并不会提升其综合权值，而且对于 SCHED_FIFO 进程，时间配额就没有什么意义。
+重新计算完权值以后，程序转回 repeat_schedule( 跳回前面，再次执行挑选进程 ) 处重新挑选。这样，当再次完成对就绪进程队列的扫描时，变量 c 的值就应该不为 0 了，此时 next 指向挑选出来的进程。<br/>
+至此，已经挑选好进程了（权值最高的进程）。</p>
+
+<p>还没有结束阿？哈哈<br/>
+进程挑好之后，接下来要做的就是切换的事情了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[schedule()]
+</span><span class='line'>581 /*
+</span><span class='line'>582 * from this point on nothing can prevent us from
+</span><span class='line'>583 * switching to the next task, save this fact in
+</span><span class='line'>584 * sched_data.
+</span><span class='line'>585 */
+</span><span class='line'>586 sched_data&gt;curr = next;
+</span><span class='line'>587 #ifdef CONFIG_SMP
+</span><span class='line'>.....
+</span><span class='line'>590 #endif
+</span><span class='line'>591 spin_unlock_irq(&runqueue_lock);
+</span><span class='line'>592
+</span><span class='line'>593 if ( prev == next ) 
+</span><span class='line'>594     goto same_process;
+</span><span class='line'>595
+</span><span class='line'>596 #ifdef CONFIG_SMP
+</span><span class='line'>==================== kernel/sched.c 612 657 ====================
+</span><span class='line'>612 #endif /* CONFIG_SMP */
+</span><span class='line'>613
+</span><span class='line'>614 kstat.context_swtch++;
+</span><span class='line'>615 /*
+</span><span class='line'>616 * there are 3 processes which are affected by a context switch:
+</span><span class='line'>617 *
+</span><span class='line'>618 * prev == .... ==&gt; (last =&gt; next)
+</span><span class='line'>620 * It's the 'much more previous' 'prev' that is on next's stack,
+</span><span class='line'>621 * but prev is set to (the just run) 'last' process by switch_to().
+</span><span class='line'>622 * This might sound slightly confusing but makes tons of sense.
+</span><span class='line'>623 */
+</span><span class='line'>624 prepare_to_switch ();
+</span><span class='line'>625 {
+</span><span class='line'>626   struct mm_struct *mm = next-&gt;mm;
+</span><span class='line'>627   struct mm_struct *oldmm = prev-&gt;active_mm;
+</span><span class='line'>628   if (!mm) {
+</span><span class='line'>629         if (next&gt;active_mm) BUG();
+</span><span class='line'>630         next&gt;active_mm = oldmm;
+</span><span class='line'>631         atomic_inc(&oldmm&gt;mm_count);
+</span><span class='line'>632          enter_lazy_tlb(oldmm, next, this_cpu);
+</span><span class='line'>633 } else {
+</span><span class='line'>634      if (next&gt;active_mm != mm) BUG();
+</span><span class='line'>635     switch_mm(oldmm, mm, next, this_cpu);
+</span><span class='line'>636 }
+</span><span class='line'>637
+</span><span class='line'>638 if (!prev&gt;mm) {
+</span><span class='line'>639       prev&gt;active_mm = NULL;
+</span><span class='line'>640       mmdrop(oldmm);
+</span><span class='line'>641 }
+</span><span class='line'>642 }
+</span><span class='line'>643
+</span><span class='line'>644 /*
+</span><span class='line'>645 * This just switches the register state and the
+</span><span class='line'>646 * stack.
+</span><span class='line'>647 */
+</span><span class='line'>648 switch_to(prev, next, prev);
+</span><span class='line'>649 __schedule_tail(prev);
+</span><span class='line'>650
+</span><span class='line'>651 same_process:
+</span><span class='line'>652     reacquire_kernel_lock(current);
+</span><span class='line'>653     if (current&gt;need_resched)
+</span><span class='line'>654        goto need_resched_back;
+</span><span class='line'>655
+</span><span class='line'>656    return;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>跳过对 SMP 结构的条件编译部分。<br/>
+  首先，如果挑选出来的进程 next 就是当前进程 prev ，就不用切换，直接跳转到 same_process 处就返回了。这里的 reacquire_kernel_lock() 对于 i386 单 CPU 结构而言是空语句。前面已经把当前进程的 need_resched 清 0 ，如果现在又成了非 0 ，则一定是发生了中断并且情况有了变化，所以转回 need_resched_back 再调度一次。<br/>
+  否则，如果挑选出来的进程 next 与当前进程 prev 不同，那就要切换了。对于 i386 单 CPU 结构而言， prepare_to_switch() 也是空语句。而 649 行的 __schedule_tail() 则只是将当前进程 prev 的 task_struct 结构中的 policy 字段里的 SCHED_YIELD 标志位清成 0 。所以实际上只剩下了两件事：对用户虚存空间的处理；进程的切换 switch_to() 。</p>
+
+<ol>
+<li></li>
+<li></li>
+</ol>
+
+
+<p>实验：<br/>
+第二部分：如何在 sched.c 中实现算法？</p>
+
+<p>首先，确定何时进行算法的计算过程。 是在 schedule() 中选择下一运行进程之前？<br/>
+选择下一运行进程时？选择下一运行进程之后？还是直接修改 goodness() 函数以确定下一运行进程呢？<br/>
+  在以上提到的各个位置都可以添加代码实现我们的算法，但是考虑到 schedule() 函数是被频繁调用的一个函数 ，它的运行效率直接影响到了系统的吞吐量，因此我们所添加的代码段应该是被调用的频率越小越好。<br/>
+  在这种原则的指导之下，我们发现有一段代码只有在 CPU 的时间段（ epoch ）全部耗尽的时候才去调用，而在此时刻可以根据一些信息调度进程，达到给每个用户平均分配 CPU 时间的效果。在 schedule() 函数选择了一个进程之后，它将判断是否需要重新计算进程的 counter 值，这个过程只有在运行队列中所有进程的都用完了时间片时才被调用。在这段代码中加入我们的算法是最合适不过的了。</p>
+
+<p>　原文为：<a href="http://www.cublog.cn/u2/69737/showart_1070708.html">http://www.cublog.cn/u2/69737/showart_1070708.html</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/01/22/kernel-sched-n1/">linux 调度总结</a></h2>
     
     
@@ -641,295 +1976,6 @@ b：从系统调用返回用户空间时。</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/15/tools-cscope/">vim+cscope</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-15T15:41:00+08:00'><span class='date'>2015-01-15</span> <span class='time'>15:41:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>Ctags:<br/>
-按下"Ctrl+]&ldquo;, 光标会自动跳转到其定义处<br/>
-按下"ctrl+t&rdquo;, 返回上一个查找的地方</p>
-
-<hr />
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install cscope
-</span><span class='line'>sudo apt-get install cscope</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>生成Cscope数据</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cscope –Rbq</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>Cscope相关命令</h3>
-
-<p>所有的cscope命令都是通过向主cscope命令”:cscope”传递参数选项。她最短的缩写是”:cs”。”:scscope”命令也做同样的事情并且同时会横向分隔窗口（简称：”scs”）。</p>
-
-<p>可用的缩写有：</p>
-
-<h4>add ：增加一个新的cscope数据库/链接库</h4>
-
-<p>  使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs add {file|dir} [pre-path] [flags]</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  其中：<br/>
- [pre-path] 就是以-p选项传递给cscope的文件路径，是以相对路径表示的文件前加上的path，这样你不要切换到你数据库文件所在的目录也可以使用它了。<br/>
- [flags] 你想传递给cscope的额外旗标</p>
-
-<p>  实例：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cscope add /root/code/vimtest/ftpd
-</span><span class='line'>:cscope add /project/vim/cscope.out /usr/local/vim
-</span><span class='line'>:cscope add cscope.out /usr/local/vim –C</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>find ：查询cscope。所有的cscope查询选项都可用除了数字5（“修改这个匹配模式”）。</h4>
-
-<p>  使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs find {querytype} {name}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  其中：
- {querytype} 即相对应于实际的cscope行接口数字，同时也相对应于nvi命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>0或者s   —— 查找这个C符号
-</span><span class='line'>1或者g   —— 查找这个定义
-</span><span class='line'>2或者d   —— 查找被这个函数调用的函数（们）
-</span><span class='line'>3或者c   —— 查找调用这个函数的函数（们）
-</span><span class='line'>4或者t   —— 查找这个字符串
-</span><span class='line'>6或者e   —— 查找这个egrep匹配模式
-</span><span class='line'>7或者f   —— 查找这个文件
-</span><span class='line'>8或者i   —— 查找#include这个文件的文件（们）</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  实例：（#号后为注释）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cscope find c ftpd_send_resp    # 查找所有调用这个函数的函数（们）
-</span><span class='line'>:cscope find 3 ftpd_send_resp # 和上面结果一样
-</span><span class='line'>
-</span><span class='line'>:cscope find 0 FTPD_CHECK_LOGIN   # 查找FTPD_CHECK_LOGIN这个符号
-</span><span class='line'>执行结果如下：
-</span><span class='line'>Cscope tag: FTPD_CHECK_LOGIN                   
-</span><span class='line'>   #   line  filename / context / line
-</span><span class='line'>   1     19  ftpd.h &lt;&lt;GLOBAL&gt;&gt;
-</span><span class='line'>             #define FTPD_CHECK_LOGIN() \
-</span><span class='line'>   2    648  ftpd.c &lt;&lt;ftpd_do_pwd&gt;&gt;
-</span><span class='line'>             FTPD_CHECK_LOGIN();
-</span><span class='line'>   3    661  ftpd.c &lt;&lt;ftpd_do_cwd&gt;&gt;
-</span><span class='line'>             FTPD_CHECK_LOGIN();
-</span><span class='line'>Enter nr of choice (&lt;CR&gt; to abort):
-</span><span class='line'>
-</span><span class='line'>然后输入最前面的序列号即可。</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>help ：显示一个简短的摘要。</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs help</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>kill ：杀掉一个cscope链接（或者杀掉所有的cscope链接）</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs kill {num|partial_name}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>为了杀掉一个cscope链接，那么链接数字或者一个部分名称必须被指定。部分名称可以简单的是cscope数据库文件路径的一部分。要特别小心使用部分路径杀死一个cscope链接。假如指定的链接数字为-1，那么所有的cscope链接都会被杀掉。</p>
-
-<h4>reset：重新初始化所有的cscope链接。</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs reset</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>show：显示cscope的链接</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs show</span></code></pre></td></tr></table></div></figure>
-
-
-<p>假如你在使用cscope的同时也使用ctags，|:cstag|可以允许你在跳转之前指定从一个或另一个中查找。例如，你可以选择首先从cscope数据库中查找，然后再查找你的tags文件（由ctags生成）。上述执行的顺序取决于|csto|的值。<br/>
-|:cstag|当从cscope数据库中查找标识符时等同于“:cs find g”。<br/>
-|:cstag|当从你的tags文件中查找标识符时等同于“|:tjump|”。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/14/debug-mod-timer/">mod_timer会切换cpu</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-14T23:59:01+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:59:01</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://lkml.org/lkml/2009/4/16/45">https://lkml.org/lkml/2009/4/16/45</a></p>
-
-<blockquote><p>Ingo, Thomas, all,</p>
-
-<p>In an SMP system, tasks are scheduled on different CPUs by the
-scheduler, interrupts are managed by irqbalancer daemon, but timers
-are still stuck to the CPUs that they have been initialised.  Timers
-queued by tasks gets re-queued on the CPU where the task gets to run
-next, but timers from IRQ context like the ones in device drivers are
-still stuck on the CPU they were initialised.  This framework will
-help move all &lsquo;movable timers&rsquo; using a sysctl interface.</p></blockquote>
-
-<p>kernel/timer.c 中 __mod_timer函数的部分patch：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>+    cpu = smp_processor_id();
-</span><span class='line'>+ if (get_sysctl_timer_migration() && idle_cpu(cpu) && !pinned) {
-</span><span class='line'>+#if defined(CONFIG_NO_HZ) && (CONFIG_SMP)
-</span><span class='line'>+     preferred_cpu = get_nohz_load_balancer();
-</span><span class='line'>+#endif
-</span><span class='line'>+     if (preferred_cpu &gt;= 0)
-</span><span class='line'>+         cpu = preferred_cpu;
-</span><span class='line'>+ }
-</span><span class='line'>+
-</span><span class='line'>+ new_base = per_cpu(tvec_bases, cpu);
-</span><span class='line'>+</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>也就是说：如果当前进程是idle（函数idle_cpu(cpu)判定），那么在mod_timer时会根据cpu的struct rq runqueues;中的 struct sched_domain *sd; 来选一个不是idle的cpu，然后把timer移到他上去。如果都是idle，就还在本cpu。<br/>
-禁用该功能可以 echo 0 > /proc/sys/kernel/timer_magration，默认的启用是1。</p>
-
-<p>也就是说：系统默认状态下mod_timer有可能会mod_timer到其他cpu上。</p>
-
-<hr />
-
-<p>但是基本只有softirq时（如 <a href="/blog/2015/01/14/debug-softirq-time-count/">/blog/2015/01/14/debug-softirq-time-count/</a>），这时会的当前进程就是idle，但cpu实际并不空闲。这样的话softirq的timer在mod_timer时，会被加到其他cpu的定时器队列。如果这些timer是不允许切换cpu的（如对per_cpu变量的操作），那么就会产生bug。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/14/debug-softirq-time-count/">中断时间统计</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-14T23:59:00+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:59:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>软中断运行在中断上下文，不会被抢占调度，只会被硬中断打断，但硬中断退出时还是继续执行没结束的软中断。</p>
-
-<p>因为软中断不是运行在进程上下文，不具备被调度的前提，也不具备统计运行时间。系统是将softirq的时间加到当前被他打断的进程上（还是不统计softirq时间？？？有待学习）。</p>
-
-<p>如果当前系统只运行数据包的接收服务，那么系统很可能显示的是100%idle，因为被softirq打断的进程就是idle。</p>
-
-<p>如果softirq足够多，导致启动了ksoftirqd进程来协助处理，那么softirq的时间会被记到ksoftirqd的进程上，显示有“有点正常”了。</p>
-
-<p>这样就会出现：当cpu个数充足时显示100%idle，然后减少到一半cpu就显示X%si。也就是说显示100%idle是不对，应该是近似的(x/2)%si</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/24">&larr; Older</a>
@@ -1023,7 +2069,7 @@ if (!document.getElementById('system~centos')) document.getElementById('aexp_sys
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(123)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(126)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -1040,7 +2086,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>57</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>60</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1160,8 +2206,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(123)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(126)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>8</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -1245,23 +2291,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/15/kernel-net-lvs-detail/">LVS详解</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/15/kernel-net-lvs-start/">LVS简介及使用</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/15/kernel-net-ethtool/">ethtool命令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/07/ubuntu-kvm/">ubuntu安装kvm虚拟机</a>
       </li>
     
       <li class="post">
         <a href="/blog/2015/07/07/centos-kvm/">centos安装kvm虚拟机</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/06/centos-vnc/">vnc远程连接，远程登录服务器或者虚拟机</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/02/debug-crash-kmem/">crash kmem</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/02/kernel-net-info/">查看所有tcp连接</a>
       </li>
     
   </ul>
