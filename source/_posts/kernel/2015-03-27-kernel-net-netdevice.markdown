@@ -32,6 +32,20 @@ tags:
 	  },
 ```
 
+#### 找到net_device对应的XXX_adapter, 如ixgbe_adapter
+ixgbe模块在申请net_device时会把需要预留给ixgbe_adapter的空间大小传给alloc_etherdev
+```
+	netdev = alloc_etherdev(sizeof(struct ixgbe_adapter));
+
+	adapter = netdev_priv(netdev);
+
+	static inline void *netdev_priv(const struct net_device *dev)
+	{
+		return (char *)dev + ALIGN(sizeof(struct net_device), NETDEV_ALIGN);
+	}
+```
+所以ixgbe_adapter在net_device结构按32位对其后面，偏移0x6c0（视内核而定）
+
 -----------
 
 http://blog.csdn.net/sfrysh/article/details/5736752
