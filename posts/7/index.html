@@ -62,6 +62,787 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-sched-user-to-kernel/">用户态到内核态切换</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-02T14:16:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>14:16:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/justcxtoworld/p/3155741.html">http://www.cnblogs.com/justcxtoworld/p/3155741.html</a></p>
+
+<p>本文将主要研究在X86体系下Linux系统中用户态到内核态切换条件，及切换过程中内核栈和任务状态段TSS在中断机制/任务切换中的作用及相关寄存器的变化。</p>
+
+<h4>一、用户态到内核态切换途径：</h4>
+
+<p> 1：系统调用        2：中断 　　3：异常</p>
+
+<p>对应代码，在3.3内核中，可以在/arch/x86/kernel/entry_32.S文件中查看。</p>
+
+<h4>二、内核栈</h4>
+
+<p>内核栈：Linux中每个进程有两个栈，分别用于用户态和内核态的进程执行，其中的内核栈就是用于内核态的堆栈，它和进程的task_struct结构，更具体的是thread_info结构一起放在两个连续的页框大小的空间内。</p>
+
+<p>在内核源代码中使用C语言定义了一个联合结构方便地表示一个进程的thread_info和内核栈：</p>
+
+<p>此结构在3.3内核版本中的定义在include/linux/sched.h文件的第2106行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>2016  union thread_union {
+</span><span class='line'>2017          struct thread_info thread_info;
+</span><span class='line'>2018          unsigned long stack[THREAD_SIZE/sizeof(long)];
+</span><span class='line'>2019     };        </span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中thread_info结构的定义如下：</p>
+
+<p>3.3内核 /arch/x86/include/asm/thread_info.h文件第26行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 26 　　struct thread_info {
+</span><span class='line'> 27         struct task_struct      *task;          /* main task structure */
+</span><span class='line'> 28         struct exec_domain      *exec_domain;   /* execution domain */
+</span><span class='line'> 29         __u32                   flags;          /* low level flags */
+</span><span class='line'> 30         __u32                   status;         /* thread synchronous flags */
+</span><span class='line'> 31         __u32                   cpu;            /* current CPU */
+</span><span class='line'> 32         int                     preempt_count;  /* 0 =&gt; preemptable,
+</span><span class='line'> 33                                                    &lt;0 =&gt; BUG */
+</span><span class='line'> 34         mm_segment_t            addr_limit;
+</span><span class='line'> 35         struct restart_block    restart_block;
+</span><span class='line'> 36         void __user             *sysenter_return;
+</span><span class='line'> 37 #ifdef CONFIG_X86_32
+</span><span class='line'> 38         unsigned long           previous_esp;   /* ESP of the previous stack in
+</span><span class='line'> 39                                                    case of nested (IRQ) stacks
+</span><span class='line'> 40                                                 */
+</span><span class='line'> 41         __u8                    supervisor_stack[0];
+</span><span class='line'> 42 #endif
+</span><span class='line'> 43         unsigned int            sig_on_uaccess_error:1;
+</span><span class='line'> 44         unsigned int            uaccess_err:1;  /* uaccess failed */
+</span><span class='line'> 45 };</span></code></pre></td></tr></table></div></figure>
+
+
+<p>它们的结构图大致如下：</p>
+
+<p><img src="/images/kernel/2015-06-02.png" alt="" /></p>
+
+<p>  esp寄存器是CPU栈指针，存放内核栈栈顶地址。在X86体系中，栈开始于末端，并朝内存区开始的方向增长。从用户态刚切换到内核态时，进程的内核栈总是空的，此时esp指向这个栈的顶端。</p>
+
+<p>  在X86中调用int指令型系统调用后会把用户栈的%esp的值及相关寄存器压入内核栈中，系统调用通过iret指令返回，在返回之前会从内核栈弹出用户栈的%esp和寄存器的状态，然后进行恢复。所以在进入内核态之前要保存进程的上下文，中断结束后恢复进程上下文，那靠的就是内核栈。</p>
+
+<p>  这里有个细节问题，就是要想在内核栈保存用户态的esp,eip等寄存器的值，首先得知道内核栈的栈指针，那在进入内核态之前，通过什么才能获得内核栈的栈指针呢？答案是：TSS</p>
+
+<h4>三、TSS</h4>
+
+<p>X86体系结构中包括了一个特殊的段类型：任务状态段（TSS），用它来存放硬件上下文。TSS反映了CPU上的当前进程的特权级。</p>
+
+<p>linux为每一个cpu提供一个tss段，并且在tr寄存器中保存该段。</p>
+
+<p>在从用户态切换到内核态时，可以通过获取TSS段中的esp0来获取当前进程的内核栈 栈顶指针，从而可以保存用户态的cs,esp,eip等上下文。</p>
+
+<p>注：linux中之所以为每一个cpu提供一个tss段，而不是为每个进程提供一个tss段，主要原因是tr寄存器永远指向它，在任务切换的适合不必切换tr寄存器，从而减小开销。</p>
+
+<p>下面我们看下在X86体系中Linux内核对TSS的具体实现：</p>
+
+<p>内核代码中TSS结构的定义：</p>
+
+<p>3.3内核中：/arch/x86/include/asm/processor.h文件的第248行处：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>248   struct tss_struct {
+</span><span class='line'>249         /*
+</span><span class='line'>250          * The hardware state:
+</span><span class='line'>251          */
+</span><span class='line'>252         struct x86_hw_tss       x86_tss;
+</span><span class='line'>253 
+</span><span class='line'>254         /*
+</span><span class='line'>255          * The extra 1 is there because the CPU will access an
+</span><span class='line'>256          * additional byte beyond the end of the IO permission
+</span><span class='line'>257          * bitmap. The extra byte must be all 1 bits, and must
+</span><span class='line'>258          * be within the limit.
+</span><span class='line'>259          */
+</span><span class='line'>260         unsigned long           io_bitmap[IO_BITMAP_LONGS + 1];
+</span><span class='line'>261 
+</span><span class='line'>262         /*
+</span><span class='line'>263          * .. and then another 0x100 bytes for the emergency kernel stack:
+</span><span class='line'>264          */
+</span><span class='line'>265         unsigned long           stack[64];
+</span><span class='line'>266 
+</span><span class='line'>267 } ____cacheline_aligned;    </span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中主要的内容是：<br/>
+  硬件状态结构:     x86_hw_tss<br/>
+  IO权位图: 　　　　io_bitmap<br/>
+  备用内核栈: 　　  stack</p>
+
+<p>其中硬件状态结构：其中在32位X86系统中x86_hw_tss的具体定义如下：</p>
+
+<p>/arch/x86/include/asm/processor.h文件中第190行处：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>190#ifdef CONFIG_X86_32
+</span><span class='line'>191 /* This is the TSS defined by the hardware. */
+</span><span class='line'>192 struct x86_hw_tss {
+</span><span class='line'>193         unsigned short          back_link, __blh;
+</span><span class='line'>194         unsigned long           sp0;　　            //当前进程的内核栈顶指针
+</span><span class='line'>195         unsigned short          ss0, __ss0h;       //当前进程的内核栈段描述符
+</span><span class='line'>196         unsigned long           sp1;
+</span><span class='line'>197         /* ss1 caches MSR_IA32_SYSENTER_CS: */
+</span><span class='line'>198         unsigned short          ss1, __ss1h;
+</span><span class='line'>199         unsigned long           sp2;
+</span><span class='line'>200         unsigned short          ss2, __ss2h;
+</span><span class='line'>201         unsigned long           __cr3;
+</span><span class='line'>202         unsigned long           ip;
+</span><span class='line'>203         unsigned long           flags;
+</span><span class='line'>204         unsigned long           ax;
+</span><span class='line'>205         unsigned long           cx;
+</span><span class='line'>206         unsigned long           dx;
+</span><span class='line'>207         unsigned long           bx;
+</span><span class='line'>208         unsigned long           sp;      　　　　　　//当前进程用户态栈顶指针
+</span><span class='line'>209         unsigned long           bp;
+</span><span class='line'>210         unsigned long           si;
+</span><span class='line'>211         unsigned long           di;
+</span><span class='line'>212         unsigned short          es, __esh;
+</span><span class='line'>213         unsigned short          cs, __csh;
+</span><span class='line'>214         unsigned short          ss, __ssh;
+</span><span class='line'>215         unsigned short          ds, __dsh;
+</span><span class='line'>216         unsigned short          fs, __fsh;
+</span><span class='line'>217         unsigned short          gs, __gsh;
+</span><span class='line'>218         unsigned short          ldt, __ldth;
+</span><span class='line'>219         unsigned short          trace;
+</span><span class='line'>220         unsigned short          io_bitmap_base;
+</span><span class='line'>221 
+</span><span class='line'>222 } __attribute__((packed));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>linux的tss段中只使用esp0和iomap等字段，并且不用它的其他字段来保存寄存器，在一个用户进程被中断进入内核态的时候，从tss中的硬件状态结构中取出esp0（即内核栈栈顶指针），然后切到esp0，其它的寄存器则保存在esp0指的内核栈上而不保存在tss中。</p>
+
+<p>每个CPU定义一个TSS段的具体实现代码：</p>
+
+<p>3.3内核中/arch/x86/kernel/init_task.c第35行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 35  * per-CPU TSS segments. Threads are completely 'soft' on Linux,
+</span><span class='line'> 36  * no more per-task TSS's. The TSS size is kept cacheline-aligned
+</span><span class='line'> 37  * so they are allowed to end up in the .data..cacheline_aligned
+</span><span class='line'> 38  * section. Since TSS's are completely CPU-local, we want them
+</span><span class='line'> 39  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
+</span><span class='line'> 40  */
+</span><span class='line'>
+</span><span class='line'> 41 DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>INIT_TSS的定义如下:</p>
+
+<p>3.3内核中 /arch/x86/include/asm/processor.h文件的第879行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>879 #define INIT_TSS  {                                                       \
+</span><span class='line'>880         .x86_tss = {                                                      \
+</span><span class='line'>881                 .sp0            = sizeof(init_stack) + (long)&init_stack, \
+</span><span class='line'>882                 .ss0            = __KERNEL_DS,                            \
+</span><span class='line'>883                 .ss1            = __KERNEL_CS,                            \
+</span><span class='line'>884                 .io_bitmap_base = INVALID_IO_BITMAP_OFFSET,               \
+</span><span class='line'>885          },                                                               \
+</span><span class='line'>886         .io_bitmap              = { [0 ... IO_BITMAP_LONGS] = ~0 },       \
+</span><span class='line'>887 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中init_stack是宏定义，指向内核栈：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>61 #define init_stack              (init_thread_union.stack)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里可以看到分别把内核栈栈顶指针、内核代码段、内核数据段赋值给TSS中的相应项。从而进程从用户态切换到内核态时，可以从TSS段中获取内核栈栈顶指针，进而保存进程上下文到内核栈中。</p>
+
+<h4>总结、有了上面的一些准备，现总结在进程从用户态到内核态切换过程中，Linux主要做的事：</h4>
+
+<p>  1：读取tr寄存器，访问TSS段<br/>
+  2：从TSS段中的sp0获取进程内核栈的栈顶指针<br/>
+  3：由控制单元在内核栈中保存当前eflags,cs,ss,eip,esp寄存器的值。<br/>
+  4：由SAVE_ALL保存其寄存器的值到内核栈<br/>
+  5：把内核代码选择符写入CS寄存器，内核栈指针写入ESP寄存器，把内核入口点的线性地址写入EIP寄存器</p>
+
+<p>此时，CPU已经切换到内核态，根据EIP中的值开始执行内核入口点的第一条指令。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-sched-switch/">进程切换过程分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-02T14:10:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>14:10:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/nkguohao/article/details/9187381">http://blog.csdn.net/nkguohao/article/details/9187381</a></p>
+
+<p>参考《深入理解Linux内核（第三版）》</p>
+
+<h4>进程切换</h4>
+
+<p>为了控制进程的执行，内核必须有能力挂起正在CPU上运行的进程，并恢复以前挂起的某个进程的执行。这种行为被称为进程切换，任务切换或上下文切换。下面几节描述在Linux中进行进程切换的主要内容。</p>
+
+<h4>硬件上下文</h4>
+
+<p>尽管每个进程可以拥有属于自己的地址空间，但所有进程必须共享CPU寄存器。因此要恢复一个进程的执行之前，内核必须确保每个寄存器装入了挂起进程时的值。</p>
+
+<p>进程恢复执行前必须装入寄存器的一组数据称为硬件上下文。硬件上下文是进程可执行上下文的一个子集，因为可执行上下文包含进程执行时需要的所有信息。在Linux中，进程硬件上下文的一部分存在TSS段，而剩余部分存放在内核态的堆栈中。</p>
+
+<p>在下面的描述中，我们假定用prev局部变量表示切换出的进程的描述符，next表示切换进的进程的描述符。因此，我们把进程切换定义为这样的行为：保存prev硬件上下文，用next硬件上下文代替prev。因为进程切换经常发生，因此减少和装入硬件上下文所花费的时间是非常重要的。</p>
+
+<p>早期的Linux版本利用80x86体系结构所提供的硬件支持，并通过far jmp指令跳到进程TSS描述符的选择符来执行进程切换。当执行这条指令时，CPU通过自动保存原来的硬件上下文，装入新的硬件上下文来执行硬件上下文切换。但是基于以下原因，Linux2.6使用软件执行进程切换：</p>
+
+<p>  通过一组mov指令逐步执行切换，这样能较好地控制所装入数据的合法性，尤其是，这使检查ds和es段寄存器的值成为可能，这些值有可能被恶意用户伪造。当用单独的farjmp指令时，不可能进行这类检查。</p>
+
+<p>  旧方法和新方法所需时间大致相同。然而，尽管当前的切换代码还有改进的余地，却不能对硬件上下文切换进行优化。</p>
+
+<p>进程切换只发生在内核态。在执行进程切换之前，用户态进程所使用的所有寄存器内容已保存在内核态堆栈上，这也包括ss和esp这对寄存器的内容。</p>
+
+<h4>任务状态段</h4>
+
+<p>80x86体系结构包括一个特殊的段类型，叫任务状态段（Task State Segment, TSS）来存放硬件上下文。尽管Linux并不使用硬件上下文切换，但是强制它为系统中每个不同的CPU创建一个TSS。这样做的两个主要理由为：<br/>
+  当80x86的一个CPU从用户态切换到内核态时，它就从TSS中获取内核态堆栈的地址。<br/>
+  当用户态进程试图通过in或out指令访问一个I/O端口时，CPU需要访问存放在TSS中的I/O许可图以检查该进程是否有访问端口的权力。</p>
+
+<p>更确切地说，当进程在用户态下执行in或out指令时，控制单元执行下列操作：<br/>
+  它检查eflags寄存器中的2位IOPL字段。如果该字段值为3，控制单元就执行I/O指令。否则，执行下一个检查。<br/>
+  访问tr寄存器以确定当前的TSS和相应的I/O许可权位图。<br/>
+  检查I/O指令中指定的I/O端口在I/O许可权位图中对应的位。如果该位清0，这条I/O指令就执行，否则控制单元产生一个”Generalprotetion”异常。</p>
+
+<p>tss_struct结构描述TSS的格式。正如第二章(《深入理解Linux内核（第三版）》)所提到的，init_tss数组为系统上每个不同的CPU存放一个TSS。在每次进程切换时，内核都更新TSS的某些字段以便相应的CPU控制单元可以安全地检索到它需要的信息。因此，TSS反映了CPU上的当前进程的特权级，但不必为没有在运行的进程保留TSS。</p>
+
+<p>每个TSS有它自己8字节的任务状态段描述符。这个描述符包括指向TSS起始地址的32位Base字段，20位Limit字段。TSSD的S标志被清0，以表示相应的TSS是系统段的事实。</p>
+
+<p>Type字段置为11或9以表示这个段实际上是TSS。在Intel的原始设计中，系统中的每个进程都应当指向自己的TSS；Type字段的第二个有效位叫做Busy位；如果进程正由CPU执行，则该位置为1，否则置为0。在Linux的设计中，每个CPU只有一个TSS，因此，Busy位总置为1。</p>
+
+<p>由linux创建的TSSD存放在全局描述符表中。GDT的基地址存放在每个CPU的gdtr寄存器中。每个CPU的tr寄存器包含相应TSS的TSSD选择符，也包括了两个隐藏了非编程字段；TSSD的Base字段和Limit字段。这样，处理器就能直接对TSS寻址而不用从GDT中检索TSS的地址。</p>
+
+<h4>Thread字段</h4>
+
+<p>在每次进程切换时，被替换进程的硬件上下文必须保存在别处。不能像Intel原始设计那样把它保存在TSS中，因为Linux为每个处理器而不是为每个进程使用TSS。</p>
+
+<p>因此，每个进程描述符包含一个类型为thread_struct的thread字段，只要进程被切换出去，内核就把其硬件上下文保存在这个结构中。随后我们会看到，这个数据结构包含的字段涉及大部分CPU寄存器，但不包括诸如exa、ebx等等这些通用寄存器，它们的值保留在内核堆栈中。</p>
+
+<h4>执行进程切换</h4>
+
+<p>进程切换可能只发生在精心定义的点：schedule()函数（《深入理解Linux内核（第三版）》第七章有详细讨论）。这里，我们仅关注内核如何执行一个进程切换。</p>
+
+<p>从本质上说，每个进程切换由两步组成：<br/>
+  切换页全局目录以安装一个新的地址空间；将在第九章（《深入理解Linux内核（第三版）》）描述这一步。<br/>
+  切换内核态堆栈和硬件上下文，因为硬件上下文提供了内核执行新进程所需要的所有信息，包含CPU寄存器。</p>
+
+<p>我们又一次假定prev指向被替换进程的描述符，而next指向被激活进程的描述符。prev和next是schedule()函数的局部变量。</p>
+
+<h4>switch_to宏</h4>
+
+<p>进程切换的第二步由switch_to宏执行。它是内核中与硬件关系最密切的例程之一，要理解它到低做了些什么我们必须下些功夫。</p>
+
+<p>首先，该宏有三个参数，它们是prev,next和last。你可能很容易猜到prev和next的作用：它们仅是局部变量prev和next的占位符，即它们是输入参数，分别表示被替换进程和新进程描述符的地址在内存中的位置。</p>
+
+<p>那第三个参数last呢？在任何进程切换中，涉及到三个进程而不是两个。假设内核决定暂停进程A而激活里程B。在schedule()函数中，prev指向A的描述符而next指向B的描述符。switch_to宏一但使A暂停，A的执行流就冻结。</p>
+
+<p>随后，当内核想再次此激活A，就必须暂停另一个进程C，于是就要用prev指向C而next指向A来执行另一个swithch_to宏。当A恢复它的执行流时，就会找到它原来的内核栈，于是prev局部变量还是指向A的描述符而next指向B的描述符。此时，代表进程A执行的内核就失去了对C的任何引用。但是，事实表明这个引用对于完成进程切换是很有用的。</p>
+
+<p>switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描述符地址写在内存的什么位置了。在进程切换之前，宏把第一个输入参数prev表示的变量的内容存入CPU的eax寄存器。在完成进程切换，A已经恢复执行时，宏把CPU的eax寄存器的内容写入由第三个输出参数&mdash;&mdash;-last所指示的A在内存中的位置。因为CPU寄存器不会在切换点发生变化，所以C的描述符地址也存在内存的这个位置。在schedule()执行过程中，参数last指向A的局部变量prev，所以prev被C的地址覆盖。</p>
+
+<p>图3-7显示了进程A，B，C内核堆栈的内容以及eax寄存器的内容。必须注意的是：图中显示的是在被eax寄存器的内容覆盖以前的prev局部变量的值。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define switch_to(prev, next, last)                 \
+</span><span class='line'>32do {                                  \
+</span><span class='line'>33  /*                              \
+</span><span class='line'>34   * Context-switching clobbers all registers, so we clobber  \
+</span><span class='line'>35   * them explicitly, via unused output variables.        \
+</span><span class='line'>36   * (EAX and EBP is not listed because EBP is saved/restored \
+</span><span class='line'>37   * explicitly for wchan access and EAX is the return value of   \
+</span><span class='line'>38   * __switch_to())                       \
+</span><span class='line'>39   */                             \
+</span><span class='line'>40  unsigned long ebx, ecx, edx, esi, edi;              \
+</span><span class='line'>41                                  \
+</span><span class='line'>42  asm volatile("pushfl\n\t"       /* save    flags */ \
+</span><span class='line'>43           "pushl %%ebp\n\t"      /* save    EBP   */ \
+</span><span class='line'>44           "movl %%esp,%[prev_sp]\n\t"    /* save    ESP   */ \
+</span><span class='line'>45           "movl %[next_sp],%%esp\n\t"    /* restore ESP   */ \
+</span><span class='line'>46           "movl $1f,%[prev_ip]\n\t"  /* save    EIP   */ \
+</span><span class='line'>47           "pushl %[next_ip]\n\t" /* restore EIP   */ \
+</span><span class='line'>48           __switch_canary                    \
+</span><span class='line'>49           "jmp __switch_to\n"    /* regparm call  */ \
+</span><span class='line'>50           "1:\t"                     \
+</span><span class='line'>51           "popl %%ebp\n\t"       /* restore EBP   */ \
+</span><span class='line'>52           "popfl\n"          /* restore flags */ \
+</span><span class='line'>53                                  \
+</span><span class='line'>54           /* output parameters */                \
+</span><span class='line'>55           : [prev_sp] "=m" (prev-&gt;thread.sp),     \
+</span><span class='line'>56             [prev_ip] "=m" (prev-&gt;thread.ip),     \
+</span><span class='line'>57             "=a" (last),                 \
+</span><span class='line'>58                                  \
+</span><span class='line'>59             /* clobbered output registers: */        \
+</span><span class='line'>60             "=b" (ebx), "=c" (ecx), "=d" (edx),      \
+</span><span class='line'>61             "=S" (esi), "=D" (edi)               \
+</span><span class='line'>62                                      \
+</span><span class='line'>63             __switch_canary_oparam               \
+</span><span class='line'>64                                  \
+</span><span class='line'>65             /* input parameters: */              \
+</span><span class='line'>66           : [next_sp]  "m" (next-&gt;thread.sp),     \
+</span><span class='line'>67             [next_ip]  "m" (next-&gt;thread.ip),     \
+</span><span class='line'>68                                      \
+</span><span class='line'>69             /* regparm parameters for __switch_to(): */  \
+</span><span class='line'>70             [prev]     "a" (prev),               \
+</span><span class='line'>71             [next]     "d" (next)                \
+</span><span class='line'>72                                  \
+</span><span class='line'>73             __switch_canary_iparam               \
+</span><span class='line'>74                                  \
+</span><span class='line'>75           : /* reloaded segment registers */         \
+</span><span class='line'>76          "memory");                  \
+</span><span class='line'>77} while (0)
+</span><span class='line'>78</span></code></pre></td></tr></table></div></figure>
+
+
+<p>由于switch_to宏采用扩展的内联汇编语言编码，所以可读性比较差：实际上这段代码通过特殊位置记数法使用寄存器，而实际使用的通用寄存器由编译器自由选择。我们将采用标准汇编语言而不是麻烦的内联汇编语言来描述switch_to宏在80x86微处理器上所完成的典型工作。</p>
+
+<p>  在eax和edx寄存器中分别保存prev和next的值。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl prev ,%eax
+</span><span class='line'>movl next ,%edx</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  把eflags和ebp寄存器的内容保存在prev内核栈中。必須保存它们的原因是编译器认为在switch_to结束之前它们的值应当保持不变。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pushf1
+</span><span class='line'>push %ebp</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  把esp的内容保存到prev->thread.esp中以使该字段指向prev内核栈的栈顶：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl %esp, 484(%eax)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  把next->thread.esp装入esp.此时，内核开始在next的内核栈上操作，因此这条指令实际上完成了从prev到next的切换。由于进程描述符的地址和内核栈的地址紧挨着，所以改变内核栈意味着改变进程。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl 484(%edx),%esp</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  把标记为1的地址存入prev->thread.eip。当被替换的进程重新恢复执行时，进程执行被标记为1的那条指令：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl $lf, 480(%eax)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  宏把next->thread.eip的值压入next的内核栈。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>push1 480(%edx)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  跳到<code>__switch_to()</code> 函数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>jmp __switch_to</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里被进程B替换的进程A再次获得CPU；它执行一些保存eflags和ebp寄存器内容的指令，这两条指令的第一条指令被标记为1。</p>
+
+<p>  拷贝eax寄存器的内容到switch_to宏的第三个参数lash标识的内存区域中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl  %eax, last</span></code></pre></td></tr></table></div></figure>
+
+
+<pre><code>正如以前讨论的，eax寄存器指向刚被替换的进程描述符。
+</code></pre>
+
+<h4><code>__switch_to()</code>函数</h4>
+
+<p><code>__switch_to()</code>函数执行大多数开始于switch_to()宏的进程切换。这个函数作用于prev_p和next_p参数，这两个参数表示前一个进程和新进程。这个函数的调用不同于一般函数的调用，因为<code>__switch_to()</code>从eax和edx取参数prev_p和next_p，而不像大多数函数一样从栈中取参数。为了强迫函数从寄存器取它的参数，内核利用<code>__attribute__</code>和regparm关键字，这两个关键字是C语言非标准的扩展名，由gcc编译程序实现。在include/asm-i386/system.h头文件中，<code>__switch_to()</code>函数的声明如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__switch_to(structtask_struct *prev_p,struct tast_struct *next_p)__attribute_(regparm(2));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>函数执行的步骤如下：<br/>
+  1、执行由<code>__unlazy_fpu()</code>宏产生的代码，以有选择地保存prev_p进程的FPU、MMX及XMM寄存器的内容。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__unlazy_fpu(prev_p);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  2、执行smp_processor_id()宏获得本地(local)CPU的下标，即执行代码的CPU。该宏从当前进程的thread_info结构的cpu字段获得下标将它保存到cpu局部变量。</p>
+
+<p>  3、把next_p->thread.esp0装入对应于本地CPU的TSS的esp0字段；将在通过sysenter指令发生系统调用一节看到，以后任何由sysenter汇编指令产生的从用户态到内核态的特权级转换将把这个地址拷贝到esp寄存器中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>init_tss[cpu].esp0= next_p-&gt;thread.esp0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  4、把next_p进程使用的线程局部存储段装入本地CPU的全局描述符表；三个段选择符保存在进程描述符内的tls_array数组中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cpu_gdt_table[cpu][6]= next_p-&gt;thread.tls_array[0];
+</span><span class='line'>cpu_gdt_table[cpu][7]= next_p-&gt;thread.tls_array[1];
+</span><span class='line'>cpu_gdt_table[cpu][8]= next_p-&gt;thread.tls_array[2];</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  5、把fs和gs段寄存器的内容分别存放在prev_p->thread.fs和prev_p->thread.gs中，对应的汇编语言指令是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl%fs,40(%esi)
+</span><span class='line'>movl%gs,44(%esi)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  6、如果fs或gs段寄存器已经被prev_p或next_p进程中的任意一个使用，则将next_p进程的thread_struct描述符中保存的值装入这些寄存器中。这一步在逻辑上补充了前一步中执行的操作。主要的汇编语言指令如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl40(%ebx),%fs
+</span><span class='line'>movl44(%edb),%gs</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  7、ebx寄存器指向next_p->thread结构。代码实际上更复杂，因为当它检测到一个无效的段寄存器值时，CPU可能产生一个异常。</p>
+
+<p>  8、用next_p->thread.debugreg数组的内容装载dr0,&hellip;,dr7中的6个调试寄存器。只有在next_p被挂起时正在使用调试寄存器，这种操作才能进行。这些寄存器不需要被保存，因为只有当一个调试器想要监控prev时prev_p->thread.debugreg才会修改。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if(next_p-&gt;thread.debugreg[7]){
+</span><span class='line'>loaddebug(&next_p-&gt;thread,0);
+</span><span class='line'>loaddebug(&next_p-&gt;thread,1);
+</span><span class='line'>loaddebug(&next_p-&gt;thread,2);
+</span><span class='line'>loaddebug(&next_p-&gt;thread,3);
+</span><span class='line'>loaddebug(&next_p-&gt;thread,6);
+</span><span class='line'>loaddebug(&next_p-&gt;thread,7);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  8、如果必要，更新TSS中的I/O位图。当next_p或prev_p有其自己的定制I/O权限位图时必须这么做：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if(prev_p-&gt;thread.io_bitmap_ptr|| next_p-&gt;thread.io_bitmap_ptr )
+</span><span class='line'>handle_io_bitmap(&next_p-&gt;thread,&init_tss[cpu]);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为进程很修改I/O权限位图，所以该位图在“懒”模式中被处理；当且仅当一个进程在当前时间片内实际访问I/O端口时，真实位图才被拷贝到本地CPU的TSS中。进程的定制I/O权限位图被保存在thread_info结构的io_bitmap_ptr字段指向的缓冲区中。handle_io_bitmap()函数为next_p进程设置本地CPU使用的TSS的in_bitmap字段如下：<br/>
+  (a)如果next_p进程不拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x8000.<br/>
+  (b) 如果next_p进程拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x9000。</p>
+
+<p>TSS的io_bitmap字段应当包含一个在TSS中的偏移量，其中存放实际位图。无论何时用户态进程试图访问一个I/O端口，0x8000和0x9000指向TSS界限之外并将因此引起”Generalprotection”异常。do_general_protection()异常处理程序将检查保存在io_bitmap字段的值：如果是0x8000，函数发送一个SIGSEGV信号给用户态进程；如果是0x9000，函数把进程位图拷贝拷贝到本地CPU的TSS中，把io_bitmap字段为实际位图的偏移(104)，并强制再一次执行有缺陷的汇编指令。</p>
+
+<p>  9、终止。
+<code>__switch_to()</code>函数通过使用下列声明结束：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>return prev_p;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  由编译器产生的相应汇编语言指令是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl %edl,%eax
+</span><span class='line'>ret</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  prev_p参数被拷贝到eax，因为缺省情况下任何C函数的返回值被传递给eax寄存器。注意eax的值因此在调用<code>__switch_to()</code>的过程中被保护起来；这非常重要，因为调用switch_to宏时会假定eax总是用来存放被替换的进程描述符的地址。</p>
+
+<p>  汇编语言指令ret把栈顶保存的返回地址装入eip程序计数器。不过，通过简单地跳转到<code>__switch_to()</code>函数来调用该函数。因此，ret汇编指令在栈中找到标号为1的指令的地址，其中标号为1的地址是由switch_to()宏推入栈中的。如果因为next_p第一次执行而以前从未被挂起，<code>__switch_to()</code>就找到ret_from_fork()函数的起始地址。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/01/debug-systemtap-with-c/">SystemTap---嵌入C代码</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-01T15:36:00+08:00'><span class='date'>2015-06-01</span> <span class='time'>15:36:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><ul>
+<li>访问参数的值是以STAP_ARG_+参数名的形式，这种方式是最新版本的SystemTap中的方式。1.7及更早的版本是通过THIS->+参数名的方式, 返回值<code>THIS-&gt;__returnval</code></li>
+</ul>
+
+
+<hr />
+
+<p><a href="http://www.4byte.cn/learning/53860.html">http://www.4byte.cn/learning/53860.html</a></p>
+
+<p>  SystemTap支持guru模式，通过-g选项来以这种模式执行SystemTap脚本。在guru模式下，嵌入的C代码在“%{&ldquo;和“%}"标记之间，这些代码会原封不动地放到生成的模块中。嵌入的C代码不仅可以作为函数体，还可以出现在SystemTap描述中（例如函数等），示例如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>%{
+</span><span class='line'>    #include &lt;linux/in.h&gt;
+</span><span class='line'>    #include &lt;linux/ip.h&gt;
+</span><span class='line'>%} /* &lt;-- top level */
+</span><span class='line'>
+</span><span class='line'>function read_iphdr:long(skb:long)
+</span><span class='line'>%{
+</span><span class='line'>    struct iphdr *iph = ip_hdr((struct sk_buff *)STAP_ARG_skb);
+</span><span class='line'>    STAP_RETVALUE = (long)iph;
+</span><span class='line'>%}
+</span><span class='line'>
+</span><span class='line'>/* Determines whether an IP packet is TCP, based on the iphdr: */
+</span><span class='line'>function is_tcp_packet:long(iphdr)
+</span><span class='line'>{
+</span><span class='line'>    protocol = @cast(iphdr, "iphdr")-&gt;protocol
+</span><span class='line'>    return (protocol == %{ IPPROTO_TCP %}) /* &lt;-- expression */
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>probe begin {
+</span><span class='line'>    printf("SystemTap start!\n");
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>probe kernel.function("ip_local_deliver") {
+</span><span class='line'>    iph = read_iphdr(pointer_arg(1));
+</span><span class='line'>    printf("tcp packet ? %s\n", is_tcp_packet(iph) ? "yes" : "no");
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这里read_iphdr函数就是使用嵌入的C代码作为函数体，is_tcp_packet中是作为systemtap辅助函数中的一部分。</p>
+
+<p>在使用嵌入C代码作为函数体的函数中，访问参数的值是以STAP_ARG_+参数名的形式，这种方式是最新版本的SystemTap中的方式。1.7及更早的版本是通过THIS->+参数名的方式。CentOS6.4中的SystemTap版本是1.8，所以你如果在SystemTap脚本中仍然使用老的访问方式会报错。同样，最新的设置返回值的方式是STAP_RETVALUE，1.7及更早的版本是THIS->__retvalue。</p>
+
+<p>由于在guru模式下，SystemTap对嵌入的C代码没有做任何的处理，所以如果在C代码中出现异常的访问或者其他错误，就会导致内核crash。不过SystemTap提供了kread宏来安全地访问指针，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct net_device *dev;
+</span><span class='line'>char *name;
+</span><span class='line'>dev = kread(&(skb-&gt;dev));
+</span><span class='line'>name = kread(&(dev-&gt;name));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>还有一点要特别注意，所有的SystemTap函数和probe都是在关闭中断下执行，所以在所有嵌入的C代码中都不能睡眠！</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/06/01/debug-systemtap-beginner/">SystemTap Beginner</a></h2>
     
     
@@ -1729,254 +2510,6 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-ext/">RHEL5/CentOS5 上支持 Ext4</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-29T15:40:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>15:40:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><ul>
-<li><p>记住，只能改数据分区，<code>/</code> 和 <code>/boot</code> 分区不要试，至少我没成功，启动参数加rootfstype=ext4也起不来。</p></li>
-<li><p><code>/</code> 分区要改成ext4的话，可以直接改<code>/etc/fstab</code>文件，ext3支持以ext4形式挂载。</p></li>
-<li><p>extents属性加上后去不掉，所以该不会ext3的，除非不加这个属性？？，去掉属性<code>tune4fs -O ^flex_bg /dev/sdb1</code></p></li>
-</ul>
-
-
-<hr />
-
-<p><a href="http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html">http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html</a></p>
-
-<p>根据我以前的测试 Ext4 的性能好过 Ext3,在 RHEL5 上的 2.6.18-110 也有加入 Ext4 了.但默认没有让我们使用,怎么样才能不重起,能使用这个啦.
-其实我们只要加入一个包e4fsprogs 就行,它其实和 e2fsprogs 是一样的功能,这 RHEL-6 中,会变成一个默认的包的.所以我们目前还只能使用这个包来调整和设置Ext4.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum -y install e4fsprogs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在 RHEL 和 Centos5 中使用 Ext4 前,很多想可能想先给现有的文件系统转换成 Ext4 ,只要运行下面的命令就行了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tune4fs -O extents,uninit_bg,dir_index,flex_bg /dev/sdb1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>记住，转换成 ext4 后必须用 fsck 扫描，否则不能 mount，-p 参数说明 “自动修复” 文件系统：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>fsck -pf /dev/sdb1 或 fsck -y /dev/sdb1</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>下面这个好像不需要</h5>
-
-<p>在重起前,我还要让内核支持 Ext4 的文件系统,需要修改 initrd 的文件本身的内容.如下命令来生成 支持 Ext4 的 initrd.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mkinitrd --with=ext4 --with=ext3 -f /boot/initrd-2.6.18-404.el5.img 2.6.18-404.el5</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-net-nfs/">网络硬盘NFS的安装与配置</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-29T14:23:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>14:23:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2014-11/109637.htm">http://www.linuxidc.com/Linux/2014-11/109637.htm</a></p>
-
-<p>NFS 是共享文件的服务的一种协议 下面给大家介绍一下这个服务器的的安装和配置。</p>
-
-<h4>安装</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo apt-get install nfs-common nfs-kernel-server</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>配置</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>vim /etc/exprots</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在正文的最下面输入一行</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share *(rw)
-</span><span class='line'>
-</span><span class='line'>/srv/nfs_share 表示的是我们要共享的文件目录
-</span><span class='line'>* 表示互联网上任何主机都可以访问 
-</span><span class='line'>(rw) 表示对服务器进行访问的主机可以进行的操作 也就是可读可写</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果我们只想让我们本地局域网上的主机对我们的服务器进行访问的话  可以这样写</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share 192.168.*.*(rw)</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>访问</h4>
-
-<p>本机访问</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -o rw locahost:/srv/nfs_share /mnt/nfs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的意思是把本地的目录/srv/nfs_share 挂载到 目录/mnt/nfs上 ，这时候我们体会不到挂载点发生了变化 我们可以自己用相关的命令查询，我就不多介绍了</p>
-
-<p>非本地的主机</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -o rw 域名:/srv/nfs_share /mnt/nfs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个时候我们会发现NFS太简单了，所以系统管理员就麻烦了</p>
-
-<h5>假如在共享的目录中有我们的重要的文件，怎么办？</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share/secret (noaccess)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>就是任何主机都不能访问/srv/nfs_share/secret 这个子目录</p>
-
-<h5>如何限制root的权限</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share 192.168.*。*（rw,root-aquash）</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>查看客户端挂载共享目录的状态</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ nfsstat -c</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>查看服务器的状态</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ nfsstat -s</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="http://stevenz.blog.hexun.com/16127677_d.html">http://stevenz.blog.hexun.com/16127677_d.html</a></p>
-
-<p>服务器IP：172.0.0.1，主机名：p470-1, 通过NFS共享/disk1目录</p>
-
-<p>在客户端使用 <code>mount -t nfs p470-1:/disk1 /disk1</code> 时出现</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mount: mount to NFS server 'p470-1' failed: RPC Error: Program not registered.</span></code></pre></td></tr></table></div></figure>
-
-
-<p>错误提示。</p>
-
-<p>出错原因：p470-1由于网络原因nfs服务被中断，重新开启p470-1的nfs服务然后在客户端重新mount disk1即可</p>
-
-<p>service nfs restart 或 /etc/rc.d/init.d/nfs restart</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/29/debug-kdump-vm/">VMware 'Host SMBus controller not enabled!'</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-29T14:21:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>14:21:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://www.centos.bz/faq/111/">https://www.centos.bz/faq/111/</a></p>
-
-<p>Ubuntu/CentOS guest instances in VMware sometimes come up with the boot error message:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>piix4_smbus 0000:00:007.3: Host SMBus controller not enabled!</span></code></pre></td></tr></table></div></figure>
-
-
-<p>This error is being caused because VMware doesn’t actually provide that level interface for CPU access, but Ubuntu try to load the kernel module anyway.</p>
-
-<p>How to fix it: <br/>
-在虚拟机中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo vim /etc/modprobe.d/blacklist.conf</span></code></pre></td></tr></table></div></figure>
-
-
-<p>add the line:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>blacklist i2c-piix4</span></code></pre></td></tr></table></div></figure>
-
-
-<p>reboot</p>
-
-<hr />
-
-<p>似乎这个错误在centos6 + 3.10* 的内核，有时kdump不起作用。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/8">&larr; Older</a>
@@ -2020,12 +2553,12 @@ if (!document.getElementById('compiler~base')) document.getElementById('aexp_com
 if (!document.getElementById('compiler')) document.getElementById('aexp_compiler').style.visibility = 'hidden';
 if (!document.getElementById('compiler~make')) document.getElementById('aexp_compiler~make').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(14)</span></li>
+<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(15)</span></li>
 <div id='assembly' class='catsub'><li><a href='/blog/cats/assembly~arm/?opendiv=assembly'>arm</a><a href='##' onmousedown=showDiv('assembly~arm') id='aexp_assembly~arm'><span class='exp_style' id='exp_assembly~arm'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly~arm')) document.getElementById('aexp_assembly~arm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>13</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
@@ -2118,7 +2651,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(60)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(62)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -2127,7 +2660,7 @@ if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>6</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>8</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -2207,8 +2740,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(126)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(129)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -2292,23 +2825,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/21/debug-gdb-info-set/">gdb 修改寄存器/变量</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/21/assembly-base-test/">test指令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/15/kernel-net-lvs-detail/">LVS详解</a>
       </li>
     
       <li class="post">
         <a href="/blog/2015/07/15/kernel-net-lvs-start/">LVS简介及使用</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/15/kernel-net-ethtool/">ethtool命令</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/07/ubuntu-kvm/">ubuntu安装kvm虚拟机</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/07/centos-kvm/">centos安装kvm虚拟机</a>
       </li>
     
   </ul>

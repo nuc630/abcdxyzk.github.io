@@ -62,6 +62,866 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq/">硬中断和软中断</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T15:15:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:15:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>关闭硬中断： spin_lock_irq和spin_unlock_irq以及spin_lock_irqsave和spin_unlock_irqrestore<br/>
+关闭软中断： spin_lock_bh和spin_unlock_bh</p>
+
+<hr />
+
+<p>netfilter：<br/>
+有些netfilter hooks可以从系统调用的context到达， 比如socket的send_msg()是可以到达LOCAL_OUT/POST_ROUTING的， <br/>
+这样，也就是说，在这些情况下操作conntrack链表的时候，是进程上下文，而不是软中断上下文， 因此，是需要关闭bh的。</p>
+
+<p>PRE_ROUTING上的按道理说，它只能从软中断到达，因此只需要spin_lock()就可以了。</p>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/zhangskd/article/details/21992933">http://blog.csdn.net/zhangskd/article/details/21992933</a></p>
+
+<h4>概述</h4>
+
+<p>从本质上来讲，中断是一种电信号，当设备有某种事件发生时，它就会产生中断，通过总线把电信号发送给中断控制器。
+如果中断的线是激活的，中断控制器就把电信号发送给处理器的某个特定引脚。处理器于是立即停止自己正在做的事，
+跳到中断处理程序的入口点，进行中断处理。</p>
+
+<h5>(1) 硬中断</h5>
+
+<p>由与系统相连的外设(比如网卡、硬盘)自动产生的。主要是用来通知操作系统系统外设状态的变化。比如当网卡收到数据包的时候，就会发出一个中断。我们通常所说的中断指的是硬中断(hardirq)。</p>
+
+<h5>(2) 软中断</h5>
+
+<p>为了满足实时系统的要求，中断处理应该是越快越好。linux为了实现这个特点，当中断发生的时候，硬中断处理那些短时间就可以完成的工作，而将那些处理事件比较长的工作，放到中断之后来完成，也就是软中断(softirq)来完成。</p>
+
+<h5>(3) 中断嵌套</h5>
+
+<p>Linux下硬中断是可以嵌套的，但是没有优先级的概念，也就是说任何一个新的中断都可以打断正在执行的中断，但同种中断除外。软中断不能嵌套，但相同类型的软中断可以在不同CPU上并行执行。</p>
+
+<h5>(4) 软中断指令</h5>
+
+<p>int是软中断指令。<br/>
+中断向量表是中断号和中断处理函数地址的对应表。<br/>
+int n - 触发软中断n。相应的中断处理函数的地址为：中断向量表地址 + 4 * n。</p>
+
+<h5>(5)硬中断和软中断的区别</h5>
+
+<p>软中断是执行中断指令产生的，而硬中断是由外设引发的。<br/>
+硬中断的中断号是由中断控制器提供的，软中断的中断号由指令直接指出，无需使用中断控制器。<br/>
+硬中断是可屏蔽的，软中断不可屏蔽。<br/>
+硬中断处理程序要确保它能快速地完成任务，这样程序执行时才不会等待较长时间，称为上半部。<br/>
+软中断处理硬中断未完成的工作，是一种推后执行的机制，属于下半部。</p>
+
+<h4>开关</h4>
+
+<h5>(1) 硬中断的开关</h5>
+
+<p>简单禁止和激活当前处理器上的本地中断：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>local_irq_disable();
+</span><span class='line'>local_irq_enable();</span></code></pre></td></tr></table></div></figure>
+
+
+<p>保存本地中断系统状态下的禁止和激活：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned long flags;
+</span><span class='line'>local_irq_save(flags);
+</span><span class='line'>local_irq_restore(flags);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(2) 软中断的开关</h5>
+
+<p>禁止下半部，如softirq、tasklet和workqueue等：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>local_bh_disable();
+</span><span class='line'>local_bh_enable();</span></code></pre></td></tr></table></div></figure>
+
+
+<p>需要注意的是，禁止下半部时仍然可以被硬中断抢占。</p>
+
+<h5>(3) 判断中断状态</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define in_interrupt() (irq_count()) // 是否处于中断状态(硬中断或软中断)
+</span><span class='line'>#define in_irq() (hardirq_count()) // 是否处于硬中断
+</span><span class='line'>#define in_softirq() (softirq_count()) // 是否处于软中断</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>硬中断</h4>
+
+<h5>(1) 注册中断处理函数</h5>
+
+<p>注册中断处理函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * irq: 要分配的中断号 
+</span><span class='line'> * handler: 要注册的中断处理函数 
+</span><span class='line'> * flags: 标志(一般为0) 
+</span><span class='line'> * name: 设备名(dev-&gt;name) 
+</span><span class='line'> * dev: 设备(struct net_device *dev)，作为中断处理函数的参数 
+</span><span class='line'> * 成功返回0 
+</span><span class='line'> */  
+</span><span class='line'>  
+</span><span class='line'>int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,   
+</span><span class='line'>    const char *name, void *dev);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>中断处理函数本身：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>typedef irqreturn_t (*irq_handler_t) (int, void *);  
+</span><span class='line'>  
+</span><span class='line'>/** 
+</span><span class='line'> * enum irqreturn 
+</span><span class='line'> * @IRQ_NONE: interrupt was not from this device 
+</span><span class='line'> * @IRQ_HANDLED: interrupt was handled by this device 
+</span><span class='line'> * @IRQ_WAKE_THREAD: handler requests to wake the handler thread 
+</span><span class='line'> */  
+</span><span class='line'>enum irqreturn {  
+</span><span class='line'>    IRQ_NONE,  
+</span><span class='line'>    IRQ_HANDLED,  
+</span><span class='line'>    IRQ_WAKE_THREAD,  
+</span><span class='line'>};  
+</span><span class='line'>typedef enum irqreturn irqreturn_t;  
+</span><span class='line'>#define IRQ_RETVAL(x) ((x) != IRQ_NONE)  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(2) 注销中断处理函数</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * free_irq - free an interrupt allocated with request_irq 
+</span><span class='line'> * @irq: Interrupt line to free 
+</span><span class='line'> * @dev_id: Device identity to free 
+</span><span class='line'> * 
+</span><span class='line'> * Remove an interrupt handler. The handler is removed and if the 
+</span><span class='line'> * interrupt line is no longer in use by any driver it is disabled. 
+</span><span class='line'> * On a shared IRQ the caller must ensure the interrupt is disabled 
+</span><span class='line'> * on the card it drives before calling this function. The function does 
+</span><span class='line'> * not return until any executing interrupts for this IRQ have completed. 
+</span><span class='line'> * This function must not be called from interrupt context. 
+</span><span class='line'> */  
+</span><span class='line'>  
+</span><span class='line'>void free_irq(unsigned int irq, void *dev_id);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>软中断</h4>
+
+<h5>(1) 定义</h5>
+
+<p>软中断是一组静态定义的下半部接口，可以在所有处理器上同时执行，即使两个类型相同也可以。<br/>
+但一个软中断不会抢占另一个软中断，唯一可以抢占软中断的是硬中断。</p>
+
+<p>软中断由softirq_action结构体表示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct softirq_action {  
+</span><span class='line'>    void (*action) (struct softirq_action *); /* 软中断的处理函数 */  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>目前已注册的软中断有10种，定义为一个全局数组：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct softirq_action softirq_vec[NR_SOFTIRQS];  
+</span><span class='line'>  
+</span><span class='line'>enum {  
+</span><span class='line'>    HI_SOFTIRQ = 0, /* 优先级高的tasklets */  
+</span><span class='line'>    TIMER_SOFTIRQ, /* 定时器的下半部 */  
+</span><span class='line'>    NET_TX_SOFTIRQ, /* 发送网络数据包 */  
+</span><span class='line'>    NET_RX_SOFTIRQ, /* 接收网络数据包 */  
+</span><span class='line'>    BLOCK_SOFTIRQ, /* BLOCK装置 */  
+</span><span class='line'>    BLOCK_IOPOLL_SOFTIRQ,  
+</span><span class='line'>    TASKLET_SOFTIRQ, /* 正常优先级的tasklets */  
+</span><span class='line'>    SCHED_SOFTIRQ, /* 调度程序 */  
+</span><span class='line'>    HRTIMER_SOFTIRQ, /* 高分辨率定时器 */  
+</span><span class='line'>    RCU_SOFTIRQ, /* RCU锁定 */  
+</span><span class='line'>    NR_SOFTIRQS /* 10 */  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(2) 注册软中断处理函数</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * @nr: 软中断的索引号 
+</span><span class='line'> * @action: 软中断的处理函数 
+</span><span class='line'> */  
+</span><span class='line'>  
+</span><span class='line'>void open_softirq(int nr, void (*action) (struct softirq_action *))  
+</span><span class='line'>{  
+</span><span class='line'>    softirq_vec[nr].action = action;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>例如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+</span><span class='line'>open_softirq(NET_RX_SOFTIRQ, net_rx_action);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(3) 触发软中断</h5>
+
+<p>调用raise_softirq()来触发软中断。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void raise_softirq(unsigned int nr)  
+</span><span class='line'>{  
+</span><span class='line'>    unsigned long flags;  
+</span><span class='line'>    local_irq_save(flags);  
+</span><span class='line'>    raise_softirq_irqoff(nr);  
+</span><span class='line'>    local_irq_restore(flags);  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>/* This function must run with irqs disabled */  
+</span><span class='line'>inline void rasie_softirq_irqsoff(unsigned int nr)  
+</span><span class='line'>{  
+</span><span class='line'>    __raise_softirq_irqoff(nr);  
+</span><span class='line'>  
+</span><span class='line'>    /* If we're in an interrupt or softirq, we're done 
+</span><span class='line'>     * (this also catches softirq-disabled code). We will 
+</span><span class='line'>     * actually run the softirq once we return from the irq 
+</span><span class='line'>     * or softirq. 
+</span><span class='line'>     * Otherwise we wake up ksoftirqd to make sure we 
+</span><span class='line'>     * schedule the softirq soon. 
+</span><span class='line'>     */  
+</span><span class='line'>    if (! in_interrupt()) /* 如果不处于硬中断或软中断 */  
+</span><span class='line'>        wakeup_softirqd(void); /* 唤醒ksoftirqd/n进程 */  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>Percpu变量irq_cpustat_t中的__softirq_pending是等待处理的软中断的位图，通过设置此变量</p>
+
+<p>即可告诉内核该执行哪些软中断。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __rasie_softirq_irqoff(unsigned int nr)  
+</span><span class='line'>{  
+</span><span class='line'>    trace_softirq_raise(nr);  
+</span><span class='line'>    or_softirq_pending(1UL &lt;&lt; nr);  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>typedef struct {  
+</span><span class='line'>    unsigned int __softirq_pending;  
+</span><span class='line'>    unsigned int __nmi_count; /* arch dependent */  
+</span><span class='line'>} irq_cpustat_t;  
+</span><span class='line'>  
+</span><span class='line'>irq_cpustat_t irq_stat[];  
+</span><span class='line'>#define __IRQ_STAT(cpu, member) (irq_stat[cpu].member)  
+</span><span class='line'>#define or_softirq_pending(x) percpu_or(irq_stat.__softirq_pending, (x))  
+</span><span class='line'>#define local_softirq_pending() percpu_read(irq_stat.__softirq_pending)  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>唤醒ksoftirqd内核线程处理软中断。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void wakeup_softirqd(void)  
+</span><span class='line'>{  
+</span><span class='line'>    /* Interrupts are disabled: no need to stop preemption */  
+</span><span class='line'>    struct task_struct *tsk = __get_cpu_var(ksoftirqd);  
+</span><span class='line'>  
+</span><span class='line'>    if (tsk && tsk-&gt;state != TASK_RUNNING)  
+</span><span class='line'>        wake_up_process(tsk);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>在下列地方，待处理的软中断会被检查和执行：<br/>
+1. 从一个硬件中断代码处返回时<br/>
+2. 在ksoftirqd内核线程中<br/>
+3. 在那些显示检查和执行待处理的软中断的代码中，如网络子系统中</p>
+
+<p>而不管是用什么方法唤起，软中断都要在do_softirq()中执行。如果有待处理的软中断，do_softirq()会循环遍历每一个，调用它们的相应的处理程序。在中断处理程序中触发软中断是最常见的形式。中断处理程序执行硬件设备的相关操作，然后触发相应的软中断，最后退出。内核在执行完中断处理程序以后，马上就会调用do_softirq()，于是软中断开始执行中断处理程序完成剩余的任务。</p>
+
+<p>下面来看下do_softirq()的具体实现。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>asmlinkage void do_softirq(void)  
+</span><span class='line'>{  
+</span><span class='line'>    __u32 pending;  
+</span><span class='line'>    unsigned long flags;  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果当前已处于硬中断或软中断中，直接返回 */  
+</span><span class='line'>    if (in_interrupt())   
+</span><span class='line'>        return;  
+</span><span class='line'>  
+</span><span class='line'>    local_irq_save(flags);  
+</span><span class='line'>    pending = local_softirq_pending();  
+</span><span class='line'>    if (pending) /* 如果有激活的软中断 */  
+</span><span class='line'>        __do_softirq(); /* 处理函数 */  
+</span><span class='line'>    local_irq_restore(flags);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* We restart softirq processing MAX_SOFTIRQ_RESTART times, 
+</span><span class='line'> * and we fall back to softirqd after that. 
+</span><span class='line'> * This number has been established via experimentation. 
+</span><span class='line'> * The two things to balance is latency against fairness - we want 
+</span><span class='line'> * to handle softirqs as soon as possible, but they should not be 
+</span><span class='line'> * able to lock up the box. 
+</span><span class='line'> */  
+</span><span class='line'>asmlinkage void __do_softirq(void)  
+</span><span class='line'>{  
+</span><span class='line'>    struct softirq_action *h;  
+</span><span class='line'>    __u32 pending;  
+</span><span class='line'>    /* 本函数能重复触发执行的次数，防止占用过多的cpu时间 */  
+</span><span class='line'>    int max_restart = MAX_SOFTIRQ_RESTART;  
+</span><span class='line'>    int cpu;  
+</span><span class='line'>  
+</span><span class='line'>    pending = local_softirq_pending(); /* 激活的软中断位图 */  
+</span><span class='line'>    account_system_vtime(current);  
+</span><span class='line'>    /* 本地禁止当前的软中断 */  
+</span><span class='line'>    __local_bh_disable((unsigned long)__builtin_return_address(0), SOFTIRQ_OFFSET);  
+</span><span class='line'>    lockdep_softirq_enter(); /* current-&gt;softirq_context++ */  
+</span><span class='line'>    cpu = smp_processor_id(); /* 当前cpu编号 */  
+</span><span class='line'>  
+</span><span class='line'>restart:  
+</span><span class='line'>    /* Reset the pending bitmask before enabling irqs */  
+</span><span class='line'>    set_softirq_pending(0); /* 重置位图 */  
+</span><span class='line'>    local_irq_enable();  
+</span><span class='line'>    h = softirq_vec;  
+</span><span class='line'>    do {  
+</span><span class='line'>        if (pending & 1) {  
+</span><span class='line'>            unsigned int vec_nr = h - softirq_vec; /* 软中断索引 */  
+</span><span class='line'>            int prev_count = preempt_count();  
+</span><span class='line'>            kstat_incr_softirqs_this_cpu(vec_nr);  
+</span><span class='line'>  
+</span><span class='line'>            trace_softirq_entry(vec_nr);  
+</span><span class='line'>            h-&gt;action(h); /* 调用软中断的处理函数 */  
+</span><span class='line'>            trace_softirq_exit(vec_nr);  
+</span><span class='line'>  
+</span><span class='line'>            if (unlikely(prev_count != preempt_count())) {  
+</span><span class='line'>                printk(KERN_ERR "huh, entered softirq %u %s %p" "with preempt_count %08x,"  
+</span><span class='line'>                    "exited with %08x?\n", vec_nr, softirq_to_name[vec_nr], h-&gt;action, prev_count,  
+</span><span class='line'>                    preempt_count());  
+</span><span class='line'>            }  
+</span><span class='line'>            rcu_bh_qs(cpu);  
+</span><span class='line'>        }  
+</span><span class='line'>        h++;  
+</span><span class='line'>        pending &gt;&gt;= 1;  
+</span><span class='line'>    } while(pending);  
+</span><span class='line'>  
+</span><span class='line'>    local_irq_disable();  
+</span><span class='line'>    pending = local_softirq_pending();  
+</span><span class='line'>    if (pending & --max_restart) /* 重复触发 */  
+</span><span class='line'>        goto restart;  
+</span><span class='line'>  
+</span><span class='line'>    /* 如果重复触发了10次了，接下来唤醒ksoftirqd/n内核线程来处理 */  
+</span><span class='line'>    if (pending)  
+</span><span class='line'>        wakeup_softirqd();   
+</span><span class='line'>  
+</span><span class='line'>    lockdep_softirq_exit();  
+</span><span class='line'>    account_system_vtime(current);  
+</span><span class='line'>    __local_bh_enable(SOFTIRQ_OFFSET);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(4) ksoftirqd内核线程</h5>
+
+<p>内核不会立即处理重新触发的软中断。<br/>
+当大量软中断出现的时候，内核会唤醒一组内核线程来处理。<br/>
+这些线程的优先级最低(nice值为19)，这能避免它们跟其它重要的任务抢夺资源。<br/>
+但它们最终肯定会被执行，所以这个折中的方案能够保证在软中断很多时用户程序不会因为得不到处理时间而处于饥饿状态，同时也保证过量的软中断最终会得到处理。</p>
+
+<p>每个处理器都有一个这样的线程，名字为ksoftirqd/n，n为处理器的编号。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int run_ksoftirqd(void *__bind_cpu)  
+</span><span class='line'>{  
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>    current-&gt;flags |= PF_KSOFTIRQD; /* I am ksoftirqd */  
+</span><span class='line'>  
+</span><span class='line'>    while(! kthread_should_stop()) {  
+</span><span class='line'>        preempt_disable();  
+</span><span class='line'>  
+</span><span class='line'>        if (! local_softirq_pending()) { /* 如果没有要处理的软中断 */  
+</span><span class='line'>            preempt_enable_no_resched();  
+</span><span class='line'>            schedule();  
+</span><span class='line'>            preempt_disable():  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        __set_current_state(TASK_RUNNING);  
+</span><span class='line'>  
+</span><span class='line'>        while(local_softirq_pending()) {  
+</span><span class='line'>            /* Preempt disable stops cpu going offline. 
+</span><span class='line'>             * If already offline, we'll be on wrong CPU: don't process. 
+</span><span class='line'>             */  
+</span><span class='line'>             if (cpu_is_offline(long)__bind_cpu))/* 被要求释放cpu */  
+</span><span class='line'>                 goto wait_to_die;  
+</span><span class='line'>  
+</span><span class='line'>            do_softirq(); /* 软中断的统一处理函数 */  
+</span><span class='line'>  
+</span><span class='line'>            preempt_enable_no_resched();  
+</span><span class='line'>            cond_resched();  
+</span><span class='line'>            preempt_disable();  
+</span><span class='line'>            rcu_note_context_switch((long)__bind_cpu);  
+</span><span class='line'>        }  
+</span><span class='line'>  
+</span><span class='line'>        preempt_enable();  
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    __set_current_state(TASK_RUNNING);  
+</span><span class='line'>    return 0;  
+</span><span class='line'>  
+</span><span class='line'>wait_to_die:  
+</span><span class='line'>    preempt_enable();  
+</span><span class='line'>    /* Wait for kthread_stop */  
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>    while(! kthread_should_stop()) {  
+</span><span class='line'>        schedule();  
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);  
+</span><span class='line'>    }  
+</span><span class='line'>  
+</span><span class='line'>    __set_current_state(TASK_RUNNING);  
+</span><span class='line'>    return 0;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq-ksoftirqd/">关于ksoftirqd进程</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T15:01:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:01:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>blog.chinaunix.net/uid-20737871-id-1881243.html</p>
+
+<p>每个处理器都有一组辅助处理器软中断(和tasklet)的内核线程。当内核中出现大量软中断的时候，这些内核进程就会辅助处理它们。</p>
+
+<h4>引入ksoftirq内核线程的原因：</h4>
+
+<p>对于软中断，内核会选择在几个特殊时机进行处理。而在中断处理程序返回时处理是最常见的。软中断被触发的频率有时可能很高，更不利的是，处理函数有时还会 字形重复触发，那么就会导致用户空间进程无法获得足够的处理时间，因而处于饥饿状态。单纯的对重新触发的软中断采取不立即处理的策略，也无法让人接受。</p>
+
+<h4>最初的解决方案：</h4>
+
+<p>1）只要还有被触发并等待处理的软中断，本次执行就要负责处理，重新触发的软中断也在本次执行返回前被处理。这样做可以保证对内核的软中断采取即时处理的 方式，关键在于，对重新触发的软中断也会立即处理。当负载很高的时候，此时若有大量被触发的软中断，而它们本身又会重复触发。系统可能会一直处理软中断根 本不能完成其他任务。</p>
+
+<p>2）不处理重新触发的软中断。在从中断返回的时候，内核和平常一样，也会检查所有挂起的软中断并处理他们。但是，任何自行重新触发的软中断不会马上处理， 它们被放到下一个软中断执行时机去处理。而这个时机通常也就是下一次中断返回的时候。可是，在比较空闲的系统中，立即处理软中断才是比较好的做法。尽管它 能保证用户空间不处于饥饿状态，但它却让软中断忍受饥饿的痛苦，而根本没有好好利用闲置的系统资源。</p>
+
+<h4>改进：</h4>
+
+<p>最终在内核中实现的方案是不会立即处理处理重新触发的软中断。而作为改进，当大量软中断出现的时候，内核会唤醒一组内核线程来处理这些负载。这些线程在最 低的优先级上运行（nice值是19），这能避免它们跟其他重要的任务抢夺资源。但它们最终肯定会被执行，所以这个折中方案能够保证在软中断负担很中的时 候用户程序不会因为得不到处理时间处于饥饿状态。相应的，也能保证”过量“的软中断终究会得到处理。</p>
+
+<p>每个处理器都有一个这样的线程。所有线程的名字都叫做ksoftirq/n，区别在于n，它对应的是处理器的编号。在一个双CPU的机器上就有两个这样的 线程，分别叫做ksoftirqd/0和ksoftirqd/1。为了保证只要有空闲的处理器，它们就会处理软中断，所以给每个处理器都分配一个这样的线 程。一旦该线程被初始化，它就会执行类似下面这样的死循环：</p>
+
+<p>在kernel/softirq.c中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int ksoftirqd(void * __bind_cpu)
+</span><span class='line'>{
+</span><span class='line'>    set_user_nice(current, 19);
+</span><span class='line'>    current-&gt;flags |= PF_NOFREEZE;
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop()) {
+</span><span class='line'>        preempt_disable();
+</span><span class='line'>        if (!local_softirq_pending()) {
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            schedule();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'>        __set_current_state(TASK_RUNNING);
+</span><span class='line'>        while (local_softirq_pending()) {
+</span><span class='line'>            /* Preempt disable stops cpu going offline.
+</span><span class='line'>                If already offline, we'll be on wrong CPU:
+</span><span class='line'>                don't process */
+</span><span class='line'>            if (cpu_is_offline((long)__bind_cpu))
+</span><span class='line'>                goto wait_to_die;
+</span><span class='line'>            do_softirq();
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            cond_resched();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'>        preempt_enable();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>wait_to_die:
+</span><span class='line'>    preempt_enable();
+</span><span class='line'>    /* Wait for kthread_stop */
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop()) {
+</span><span class='line'>        schedule();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只要有待处理的软中断(由softirq_pending()函数负责发现)，ksoftirq就会调用do_softirq去处理它们。通过重复执行这 样的操作，重新触发的软中断也会被执行。如果有必要，每次迭代后都会调用schedule()以便让更重要的进程得到处理机会。当所有需要执行的操作都完 成以后，该内核线程将自己设置为TASK_INTERRUPTIBLE状态，唤起调度程序选择其他可执行进程投入运行。</p>
+
+<p>只要do_softirq()函数发现已经执行过的内核线程重新触发了它自己，软中断内核线程就会被唤醒.</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/03/android-I9507V-kernel/">编译I9507V内核</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T14:52:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>14:52:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>源码地址 <a href="http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507">http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507</a></p>
+
+<p>好像三星android4.3版本后的bootloader会检测是否三星自编译内核，不是的会开机提示一下，不影响正常使用。</p>
+
+<p>按照README_Kernel.txt的做。</p>
+
+<p>内核中说明是用4.7编译器，但是4.7编译出来的装上去会挂，不知道为什么。<br/>
+但是换成4.6编译器就没问题。</p>
+
+<p>最后作成boot.img</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mkbootimg --kernel zImage --ramdisk boot.img-ramdisk.cpio.gz --base 80200000 --ramdisk_offset 1FF8000 --pagesize 2048 --cmdline "console=null androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x3F ehci-hcd.park=3 maxcpus=4" -o boot.img</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/01/03/android-img.ext4/">img.ext4格式</a></h2>
     
     
@@ -162,463 +1022,6 @@ make</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/31/android-base-disk/">Android分区</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-31T11:00:00+08:00'><span class='date'>2014-12-31</span> <span class='time'>11:00:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/kieven2008/article/details/19327907">http://blog.csdn.net/kieven2008/article/details/19327907</a></p>
-
-<p>安卓手机和平板一般包括以下标准内部分区：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/boot
-</span><span class='line'>/system
-</span><span class='line'>/recovery
-</span><span class='line'>/data
-</span><span class='line'>/cache
-</span><span class='line'>/misc</span></code></pre></td></tr></table></div></figure>
-
-
-<p>另外还与SD卡分区：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/sdcard
-</span><span class='line'>/sd-ext</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>system 分区</h4>
-
-<p>这里是挂载到/system目录下的分区。这里有 /system/bin 和 /system/sbin 保存很多系统命令。它是由编译出来的system.img来烧入。</p>
-
-<p>相当于你电脑的C盘，用来放系统。这个分区基本包含了整个安卓操作系统，除了内核（kerne）和ramdisk。包括安卓用户界面、和所有预装的系统应用程序。擦除这个分区，会删除整个安卓系统。你可以通过进入Recovery程序或者bootloader程序中，安装一个新ROM，也就是新安卓系统。</p>
-
-<h4>MISC分区</h4>
-
-<p>这个分区包括了一些杂项内容：比如一些系统设置和系统功能启用禁用设置。这些设置包括CID(运营商或区域识别码）、USB设置和一些硬件设置等等。这是一个很重要的分区，如果此分区损坏或者部分数据丢失，手机的一些特定功能可能不能正常工作。</p>
-
-<h4>recovery分区</h4>
-
-<p>recovery 分区即恢复分区，在正常分区被破坏后，仍可以进入这一分区进行备份和恢复.我的理解是这个分区保存一个简单的OS或底层软件，在Android的内核被破坏后可以用bootloader从这个分区引导进行操作。</p>
-
-<p>这个分区可以认为是一个boot分区的替代品，可以是你的手机进入Recovery程序，进行高级恢复或安卓系统维护工作。</p>
-
-<h4>boot 分区</h4>
-
-<p>一般的嵌入式Linux的设备中.bootloader,内核，根文件系统被分为三个不同分区。在Android做得比较复杂，从这个手机分区和来看，这里boot分区是把内核和ramdisk file的根文件系统打包在一起了，是编译生成boot.img来烧录的。</p>
-
-<p>如果没有这个分区，手机通常无法启动到安卓系统。只有必要的时候，才去通过Recovery软件擦除（format）这个分区，一旦擦除，设备只有再重新安装一个新的boot分区，可以通过安装一个包含boot分区的ROM来实现，否则无法启动安卓系统。</p>
-
-<h4>userdata 分区</h4>
-
-<p>它将挂载到 /data 目录下, 它是由编译出来的userdata.img来烧入。</p>
-
-<p>这个分区也叫用户数据区，包含了用户的数据：联系人、短信、设置、用户安装的程序。擦除这个分区，本质上等同于手机恢复出厂设置，也就是手机系统第一次启动时的状态，或者是最后一次安装官方或第三方ROM后的状态。在Recovery程序中进行的“data/factory reset ”操作就是在擦除这个分区。</p>
-
-<h4>cache 分区</h4>
-
-<p>它将挂载到 /cache 目录下。这个分区是安卓系统缓存区，保存系统最常访问的数据和应用程序。擦除这个分区，不会影响个人数据，只是删除了这个分区中已经保存的缓存内容，缓存内容会在后续手机使用过程中重新自动生成。</p>
-
-<h5>其它隐藏分区：</h5>
-
-<h4>HBOOT</h4>
-
-<p>保存的bootloader HBOOT。手机的启动引导的一段程序。
-类似电脑主板BIOS，这部分刷错了手机就会变成砖块。</p>
-
-<h4>Radio分区</h4>
-
-<p>保存是基带芯片的固件代码，Linux不认识其格式，在手机启动时装入特定内存中用于驱动芯片。所有与电信网络交互就是靠它了，一般往往用专用开发环境来开发。手机无线信号、蓝牙、wifi等无线管理。</p>
-
-<h4>splash分区</h4>
-
-<p>这里是启动画面。</p>
-
-<h4>SD卡分区</h4>
-
-<p>一般默认的是挂载在/sdcard目录。</p>
-
-<p>这个分区不是设备系统存储空间，是SD卡空间。从使用上讲，这个是你自己的存储空间，可以随便你任意存放相片、视频、文档、ROM安装包等。擦除这个分区是完全安全的，只要你把分区中你需要的数据都备份到了你的电脑中。虽然一些用户安装的程序会使用这个分区保存它的数据和设置信息，擦除了这个分区，这些程序的数据，比如有些游戏的存档，就会全部丢失。在既有内部SD卡和外部SD卡的设备中，比如三星Galaxy S和一些平板电脑，/sdcard分区通常指向内部SD卡。外部SD卡，如果存在的话，会对应一个新的分区，每个设备都不一样。在三星Galaxy S手机中， /sdcard/sd代表的是外部SD卡，而其它设备，有可能是/sdcard2。与/sdcard不同，没有系统或应用程序数据会自动存放在外部SD卡中。外部SD卡中的所有数据都是用户自己添加进去的。在你把分区中需要的数据都备份到了你的电脑中之后，你可以安全的擦除这个分区。
-SD卡扩展分区</p>
-
-<p>它的目录名是 /sd-ext ,它不是一个标准的Android分区，是运行APP2D软件扩展出来分区。目的是为了多扩展一个安装程序空间，这个对于Flash空间（或者说ROM空间）不够，又喜欢安装软件的人是有用应用。</p>
-
-<h3>二.各分区详细分析</h3>
-
-<p>  各个分区的内容，可以用cat命令直接导出，用一般的二进制的软件来分析，我一般用WinHex,并且自己写了几个模板。
-  导出分区内容,如果用adb 导出，必须有root权限，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/mounts
-</span><span class='line'>rootfs / rootfs ro,relatime 0 0 #根文件系统的格式，只读
-</span><span class='line'>tmpfs /dev tmpfs rw,relatime,mode=755 0 0
-</span><span class='line'>devpts /dev/pts devpts rw,relatime,mode=600 0 0
-</span><span class='line'>proc /proc proc rw,relatime 0 0
-</span><span class='line'>sysfs /sys sysfs rw,relatime 0 0
-</span><span class='line'>none /acct cgroup rw,relatime,cpuacct 0 0
-</span><span class='line'>tmpfs /mnt/asec tmpfs rw,relatime,mode=755,gid=1000 0 0
-</span><span class='line'>none /dev/cpuctl cgroup rw,relatime,cpu 0 0
-</span><span class='line'>/dev/block/mtdblock3 /system yaffs2 ro,relatime 0 0 #system分区,只读
-</span><span class='line'>/dev/block/mtdblock5 /data yaffs2 rw,nosuid,nodev,relatime 0 0 #data分区，可读写
-</span><span class='line'>/dev/block/mtdblock4 /cache yaffs2 rw,nosuid,nodev,relatime 0 0 #cache分区，可读写</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li><a href="http://bbs.hiapk.com/thread-1446706-1-1.html">http://bbs.hiapk.com/thread-1446706-1-1.html</a></li>
-<li><a href="http://www.addictivetips.com/mobile/android-partitions-explained-boot-system-recovery-data-cache-misc/">http://www.addictivetips.com/mobile/android-partitions-explained-boot-system-recovery-data-cache-misc/</a></li>
-<li><a href="http://www.addictivetips.com/mobile/what-is-clockworkmod-recovery-and-how-to-use-it-on-android-complete-guide/">http://www.addictivetips.com/mobile/what-is-clockworkmod-recovery-and-how-to-use-it-on-android-complete-guide/</a></li>
-</ol>
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/24/android-nubia-recovery/">【官方固件】努比亚Z5Smini官方4.4.2全新UI公测版</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-24T23:34:00+08:00'><span class='date'>2014-12-24</span> <span class='time'>23:34:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.onekeyrom.com/rom/zte_130038_10965.html">http://www.onekeyrom.com/rom/zte_130038_10965.html</a></p>
-
-<p>pan.baidu.com/s/1c0u18Ik</p>
-
-<p><span style="color:red">nx403a进入bootloader模式直接些boot分区，但是驱动没弄好起不来。这时再进bootloader却进不了（严重怀疑他们的bootloader建在boot上），只能进recovery模式。但是recovery是官方的，只能按官方方法升级整个系统救砖</span></p>
-
-<p>本次放出的压缩包内含两套固件：从4.2升级到4.4.2和从4.4.2再降级回4.2两套共计4个zip文件包<br/>
-所以请大家下载后先不要急于不要一键刷机，仔细阅读下面的使用说明和注意事项</p>
-
-<h4>【升级注意事项】</h4>
-
-<ol>
-<li>升级前，请取消手机的人脸解锁、图案锁、密码锁等各种屏幕锁。</li>
-<li>升级前，请务必备份好手机内的各项重要数据（联系人、短信、通话记录、程序等），避免异常丢失。</li>
-<li>升级前，请保证手机电池电量至少达到40%。</li>
-<li>在升级过程中，请将手机平放，务必不要触碰手机屏幕（否则可能导致触屏失准），直至确认升级成功。</li>
-<li>为了便于升级发生异常后的手机挽救，nubia UI ROM安装包同时提供升级文件与回退文件，请务必同时保留在手机里。</li>
-</ol>
-
-
-<h4>【Z5S mini 机型4.2到4.4版本升级操作说明】</h4>
-
-<p>步骤1： 下载Z5S mini机型的nubia UI ROM安装包（内含4个zip文件）<br/>
-步骤2： 将手机连接电脑，将安装包的4个zip文件并列拷贝至手机sdcard根目录下<br/>
-步骤3： 按开关机键，选择“重启”手机，在重启过程中一直长按音量上键进入recovery模式<br/>
-步骤4： 在recovery模式界面，请按音量键选择apply update from sdcard菜单项，并按开关机键确定，接着按音量键选择NX403A_4.2_to_4.4_recovery_xxx.zip文件，并按开关机键确定，开始升级<br/>
-步骤5： 步骤4升级完成后如下图所示，此时光标条位于reboot system now菜单项，直接按开关机键重启手机，请观察手机能否顺利进入桌面<br/>
-步骤6： 手机顺利进入桌面后，请重复步骤3，即再次重启手机，并在重启过程中一直长按音量上键，再次进入recovery模式<br/>
-步骤7： 在recovery模式界面，请按音量键选择wipe date/factory reset 菜单项，按开关机键进入，进行数据擦除<br/>
-步骤8： 数据擦除结束后，请按音量键选择apply update fromsdcard菜单项，按开关机键进入，再按音量键选择NX403A_4.4_update_xxx.zip文件，按开关机键  确认，执行升级，此过程要1到2分钟<br/>
-步骤9： 步骤8升级完成后如下图所示，此时光标条位于reboot system now菜单项，直接按开关机键重启手机</p>
-
-<h5>分区（看看就好）</h5>
-
-<p><a href="http://www.miui.com/forum.php?mod=viewthread&amp;tid=1804584&amp;extra=">http://www.miui.com/forum.php?mod=viewthread&amp;tid=1804584&amp;extra=</a></p>
-
-<p><a href="http://bbs.nubia.cn/thread-120471-1-1.html">http://bbs.nubia.cn/thread-120471-1-1.html</a></p>
-
-<p><a href="http://bbs.nubia.cn/thread-128729-1-1.html">http://bbs.nubia.cn/thread-128729-1-1.html</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/22/kernel-vermagic/">内核模块编译怎样绕过insmod时的版本检查</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-22T22:15:00+08:00'><span class='date'>2014-12-22</span> <span class='time'>22:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_53931eca01015uky.html">http://blog.sina.com.cn/s/blog_53931eca01015uky.html</a></p>
-
-<p>在開發kernel driver時，總是會遇到討人厭的vermagic檢查，只要目前在run的kernel版本跟driver編譯時用的kernel版本不一致，就沒辦法insmod。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>bash-3.2# insmod sdio.ko
-</span><span class='line'>sdio: version magic '2.6.28-271-gec75a15 preempt mod_unload modversions ARMv7 '
-</span><span class='line'>should be '2.6.28 preempt mod_unload ARMv7 '
-</span><span class='line'>insmod: init_module 'sdio.ko' failed (Exec format error)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>這大大降低了開發速度，尤其是當你拿不到客戶在用的kernel時，又要開發driver給他用，真的是很麻煩……</p>
-
-<p>那麼要怎麼利用噁心的方式繞過去呢???</p>
-
-<h5>一、先把 Moudle version 檢查關掉。</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>user@host # ARCH=arm make menuconfig
-</span><span class='line'>    --- Enable loadable module support                                             │ │
-</span><span class='line'>    │ │         [ ]   Forced module loading                                      │ │
-</span><span class='line'>    │ │         [*]   Module unloading                                           │ │
-</span><span class='line'>    │ │         [*]     Forced module unloading                                  │ │
-</span><span class='line'>    │ │         [ ]   Module versioning support                                  │ │
-</span><span class='line'>    │ │         [ ]   Source checksum for all modules</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>二、 使用modinfo時，可以看到目前這driver的vermagic</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>filename: external_drivers/omap3530/Linux/sdio/sdio.ko
-</span><span class='line'>author: Texas Instruments Inc
-</span><span class='line'>alias: TIWLAN_SDIO
-</span><span class='line'>license: GPL
-</span><span class='line'>description: TI WLAN SDIO driver
-</span><span class='line'>depends:
-</span><span class='line'>vermagic: 2.6.28-271-gec75a15 preempt mod_unload ARMv7
-</span><span class='line'>parm: g_sdio_debug_level:debug level (int)</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>三、 修改 kernel 的 vermagic，再重新編譯driver</h5>
-
-<p>vermagic 的第一個值 2.6.28-noneed 是由這 include/linux/utsrelease.h裡的 UTS_RELEASE 所定義。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define UTS_RELEASE "2.6.28-271-gec75a15"</span></code></pre></td></tr></table></div></figure>
-
-
-<p>之後再由 include/linux/vermagic.h 裡的 macro<br/>
-去組合出 VERMAGIC_STRING ， 也就是 kernel 的vermagic。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;generated/utsrelease.h&gt;
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_SMP
-</span><span class='line'>#define MODULE_VERMAGIC_SMP "SMP "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_SMP ""
-</span><span class='line'>#endif
-</span><span class='line'>#ifdef CONFIG_PREEMPT
-</span><span class='line'>#define MODULE_VERMAGIC_PREEMPT "preempt "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_PREEMPT ""
-</span><span class='line'>#endif完成編譯後，你就可以得
-</span><span class='line'>#ifdef CONFIG_MODULE_UNLOAD
-</span><span class='line'>#define MODULE_VERMAGIC_MODULE_UNLOAD "mod_unload "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_MODULE_UNLOAD ""
-</span><span class='line'>#endif
-</span><span class='line'>#ifndef CONFIG_MODVERSIONS
-</span><span class='line'>#define MODULE_VERMAGIC_MODVERSIONS "modversions "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_MODVERSIONS ""
-</span><span class='line'>#endif
-</span><span class='line'>#ifndef MODULE_ARCH_VERMAGIC
-</span><span class='line'>#define MODULE_ARCH_VERMAGIC ""
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>#define VERMAGIC_STRING \
-</span><span class='line'>UTS_RELEASE " " \
-</span><span class='line'>MODULE_VERMAGIC_SMP MODULE_VERMAGIC_PREEMPT \
-</span><span class='line'>MODULE_VERMAGIC_MODULE_UNLOAD MODULE_VERMAGIC_MODVERSIONS \
-</span><span class='line'>MODULE_ARCH_VERMAGIC</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以， 我們只要把 UTS_RELEASE 改成我們的數字即可，當然若是懶得去try組合後的字串，也可以直接將VERMAGIC_STRING改成你要的字串</p>
-
-<p>建議修改完 vermagic.h, utsrelease.h後，還是把kernel重編完再編kernel，比較保險。</p>
-
-<p>以下是修改後，用modinfo看的結果</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>filename: external_drivers/omap3530/Linux/sdio/sdio.ko
-</span><span class='line'>author: Texas Instruments Inc
-</span><span class='line'>alias: TIWLAN_SDIO
-</span><span class='line'>license: GPL
-</span><span class='line'>description: TI WLAN SDIO driver
-</span><span class='line'>depends:
-</span><span class='line'>vermagic: 2.6.28 preempt mod_unload ARMv7
-</span><span class='line'>parm: g_sdio_debug_level:debug level (int)</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<hr />
-
-<p>另外若你是用git 做版本控制 , 那就會出現git的版本號在kernel 編號上<br/>
-所以要把他關掉</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>General setup  ---&gt;
-</span><span class='line'> [ ] Automatically append version information to the version strin
-</span><span class='line'>
-</span><span class='line'>解釋;
-</span><span class='line'>CONFIG_LOCALVERSION_AUTO:                                                   │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ This will try to automatically determine if the current tree is a       │ 
-</span><span class='line'>  │ release tree by looking for git tags that belong to the current         │ 
-</span><span class='line'>  │ top of tree revision.                                                   │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ A string of the format -gxxxxxxxx will be added to the localversion     │ 
-</span><span class='line'>  │ if a git-based tree is found.  The string generated by this will be     │ 
-</span><span class='line'>  │ appended after any matching localversion* files, and after the value    │ 
-</span><span class='line'>  │ set in CONFIG_LOCALVERSION.                                             │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ (The actual string used here is the first eight characters produced     │ 
-</span><span class='line'>  │ by running the command:                                                 │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ which is done within the script "scripts/setlocalversion".)             │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ Symbol: LOCALVERSION_AUTO [=y]                                          │ 
-</span><span class='line'>  │ Prompt: Automatically append version information to the version string  │ 
-</span><span class='line'>  │   Defined at init/Kconfig:84                                            │ 
-</span><span class='line'>  │   Location:                                                             │ 
-</span><span class='line'>  │ ingT</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/27">&larr; Older</a>
@@ -662,12 +1065,12 @@ if (!document.getElementById('compiler~base')) document.getElementById('aexp_com
 if (!document.getElementById('compiler')) document.getElementById('aexp_compiler').style.visibility = 'hidden';
 if (!document.getElementById('compiler~make')) document.getElementById('aexp_compiler~make').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(14)</span></li>
+<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(15)</span></li>
 <div id='assembly' class='catsub'><li><a href='/blog/cats/assembly~arm/?opendiv=assembly'>arm</a><a href='##' onmousedown=showDiv('assembly~arm') id='aexp_assembly~arm'><span class='exp_style' id='exp_assembly~arm'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly~arm')) document.getElementById('aexp_assembly~arm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>13</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
@@ -760,7 +1163,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(60)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(62)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -769,7 +1172,7 @@ if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>6</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>8</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -849,8 +1252,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(126)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(129)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -934,23 +1337,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/21/debug-gdb-info-set/">gdb 修改寄存器/变量</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/21/assembly-base-test/">test指令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/15/kernel-net-lvs-detail/">LVS详解</a>
       </li>
     
       <li class="post">
         <a href="/blog/2015/07/15/kernel-net-lvs-start/">LVS简介及使用</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/15/kernel-net-ethtool/">ethtool命令</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/07/ubuntu-kvm/">ubuntu安装kvm虚拟机</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/07/centos-kvm/">centos安装kvm虚拟机</a>
       </li>
     
   </ul>

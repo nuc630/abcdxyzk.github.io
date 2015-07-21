@@ -62,6 +62,741 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-signal/">linux内核中异步通知机制--信号处理机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-02-11T15:08:00+08:00'><span class='date'>2015-02-11</span> <span class='time'>15:08:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/yusiguyuan/article/details/23168363">http://blog.csdn.net/yusiguyuan/article/details/23168363</a></p>
+
+<p>  什么是异步通知：很简单，一旦设备准备好，就主动通知应用程序，这种情况下应用程序就不需要查询设备状态， 特像硬件上常提的“中断的概念”。 比较准确的说法其实应该叫做“信号驱动的异步I/O”,信号是在软件层次上对中断机制的一种模拟。阻塞I/O意味着一直等待设备可访问再访问，非阻塞I/O意味着使用poll()来查询是否可访问，而异步通知则意味着设备通知应用程序自身可访问。（希望用这么一句话能表达我的意思）</p>
+
+<h4>一、系统中存在的异步机制</h4>
+
+<p>  我认为异步机制是一种理念，并不是某一种具体实现，同步/异步的核心理解应该是如何获取消息的问题，你自身（在计算机中当然是进程本身了）亲自去获取消息，那么就是同步机制，但是如果别人使用某种方式通知你某一个消息，那么你采用的就是异步机制。内核中使用到异步机制的大概有：信号，这是一种进程间通信的异步机制；epoll，这是一种高效处理IO的异步通信机制。也就是从通信和IO两个方面通过不同的方式使用了异步机制。（可能还有别的，暂时不知道）</p>
+
+<p>下面进入正题：</p>
+
+<h4>二、信号的基本概念</h4>
+
+<h5>1）信号的本质</h5>
+
+<p>  软中断信号（signal，又简称为信号）用来通知进程发生了异步事件。在软件层次上是对中断机制的一种模拟，在原理上，一个进程收到一个信号与处理器收到一个中断请求可以说是一样的。信号是进程间通信机制中唯一的异步通信机制，一个进程不必通过任何操作来等待信号的到达，事实上，进程也不知道信号到底什么时候到达。进程之间可以互相通过系统调用kill发送软中断信号。内核也可以因为内部事件而给进程发送信号，通知进程发生了某个事件。信号机制除了基本通知功能外，还可以传递附加信息。</p>
+
+<p>收到信号的进程对各种信号有不同的处理方法。处理方法可以分为三类：<br/>
+第一种是类似中断的处理程序，对于需要处理的信号，进程可以指定处理函数，由该函数来处理。<br/>
+第二种方法是，忽略某个信号，对该信号不做任何处理，就象未发生过一样。<br/>
+第三种方法是，对该信号的处理保留系统的默认值，这种缺省操作，对大部分的信号的缺省操作是使得进程终止。进程通过系统调用signal来指定进程对某个信号的处理行为。</p>
+
+<p>  在进程表的表项中有一个软中断信号域，该域中每一位对应一个信号，当有信号发送给进程时，对应位置位。由此可以看出，进程对不同的信号可以同时保留，但对于同一个信号，进程并不知道在处理之前来过多少个。</p>
+
+<h5>2）信号的种类</h5>
+
+<p>可以从两个不同的分类角度对信号进行分类：<br/>
+可靠性方面：可靠信号与不可靠信号；<br/>
+与时间的关系上：实时信号与非实时信号。</p>
+
+<h5>3）可靠信号与不可靠信号</h5>
+
+<p>  Linux信号机制基本上是从Unix系统中继承过来的。早期Unix系统中的信号机制比较简单和原始，信号值小于SIGRTMIN的信号都是不可靠信号。这就是"不可靠信号"的来源。它的主要问题是信号可能丢失。</p>
+
+<p>  随着时间的发展，实践证明了有必要对信号的原始机制加以改进和扩充。由于原来定义的信号已有许多应用，不好再做改动，最终只好又新增加了一些信号，并在一开始就把它们定义为可靠信号，这些信号支持排队，不会丢失。</p>
+
+<p>  信号值位于SIGRTMIN和SIGRTMAX之间的信号都是可靠信号，可靠信号克服了信号可能丢失的问题。Linux在支持新版本的信号安装函数sigation()以及信号发送函数sigqueue()的同时，仍然支持早期的signal()信号安装函数，支持信号发送函数kill()。</p>
+
+<p>信号的可靠与不可靠只与信号值有关，与信号的发送及安装函数无关。目前linux中的signal()是通过sigation()函数实现的，因此，即使通过signal()安装的信号，在信号处理函数的结尾也不必再调用一次信号安装函数。同时，由signal()安装的实时信号支持排队，同样不会丢失。</p>
+
+<p>  对于目前linux的两个信号安装函数：signal()及sigaction()来说，它们都不能把SIGRTMIN以前的信号变成可靠信号（都不支持排队，仍有可能丢失，仍然是不可靠信号），而且对SIGRTMIN以后的信号都支持排队。这两个函数的最大区别在于，经过sigaction安装的信号都能传递信息给信号处理函数，而经过signal安装的信号不能向信号处理函数传递信息。对于信号发送函数来说也是一样的。</p>
+
+<h5>4）实时信号与非实时信号</h5>
+
+<p>  早期Unix系统只定义了32种信号，前32种信号已经有了预定义值，每个信号有了确定的用途及含义，并且每种信号都有各自的缺省动作。如按键盘的CTRL ^C时，会产生SIGINT信号，对该信号的默认反应就是进程终止。后32个信号表示实时信号，等同于前面阐述的可靠信号。这保证了发送的多个实时信号都被接收。</p>
+
+<p>非实时信号都不支持排队，都是不可靠信号；实时信号都支持排队，都是可靠信号。</p>
+
+<h5>5)linux 下信号的生命周期如下：</h5>
+
+<p>  在目的进程中安装该信号。即是设置捕获该信号时进程进程该执行的操作码。采用signal（）;sigaction（）系统调用来实现。<br/>
+  信号被某个进程产生，同时设置该信号的目的进程（使用pid），之后交给操作系统进行管理。采用kill()、arise()、alarm()等系统调用来实现。<br/>
+  信号在目的进程被注册。信号被添加进进程的PCB（task_struct）中相关的数据结构里——未决信号的数据成员。信号在进程中注册就是把信号值加入到进程的未决信号集里。并且，信号携带的其他信息被保留到未决信的队列的某个sigqueue结构中。<br/>
+  信号在进程中注销。在执行信号处理函数前，要把信号在进程中注销。对于非实时信号（不可靠信号），其在信号未决信号信息链中最多只有一个sigqueue结构，因此该结构被释放后，相应的信号要在未决信号集删除。而实时信号（可靠信号），如果有多个sigqueue，则不会把信号从进程的未决信号集中删除。<br/>
+  信号生命的终结。进程终止当前的工作，保护上下文，执行信号处理函数，之后回复。如果内核是可抢占的，那么还需要调度。</p>
+
+<h4>三、信 号 机 制</h4>
+
+<p>  上 一节中介绍了信号的基本概念，在这一节中，我们将介绍内核如何实现信号机制。即内核如何向一个进程发送信号、进程如何接收一个信号、进程怎样控制自己对信 号的反应、内核在什么时机处理和怎样处理进程收到的信号。还要介绍一下setjmp和longjmp在信号中起到的作用。</p>
+
+<h5>1、内核对信号的基本处理方法</h5>
+
+<p>  内核给一个进程发送软中断信号的方法，是在进程所在的进程表项的信号域设置对应于该信号的位。这里要补充的是，如果信号发送给一个正在睡眠的进程，那么要看 该进程进入睡眠的优先级，如果进程睡眠在可被中断的优先级上，则唤醒进程；否则仅设置进程表中信号域相应的位，而不唤醒进程。这一点比较重要，因为进程检 查是否收到信号的时机是：一个进程在即将从内核态返回到用户态时；或者，在一个进程要进入或离开一个适当的低调度优先级睡眠状态时。</p>
+
+<p>进程的task_struct结构中有关于本进程中未决信号的数据成员：struct sigpending pending：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sigpending{
+</span><span class='line'>    struct sigqueue *head, *tail;
+</span><span class='line'>    sigset_t signal;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>
+第三个成员是进程中所有未决信号集，第一、第二个成员分别指向一个sigqueue类型的结构链（称之为"未决信号信息链"）的首尾，信息链中的每个sigqueue结构刻画一个特定信号所携带的信息，并指向下一个sigqueue结构:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sigqueue{
+</span><span class='line'>    struct sigqueue *next;
+</span><span class='line'>    siginfo_t info;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>
+信号在进程中注册指的就是信号值加入到进程的未决信号集sigset_t signal（每个信号占用一位）中，并且信号所携带的信息被保留到未决信号信息链的某个sigqueue结构中。只要信号在进程的未决信号集中，表明进程已经知道这些信号的存在，但还没来得及处理，或者该信号被进程阻塞。</p>
+
+<p>当一个实时信号发送给一个进程时，不管该信号是否已经在进程中注册，都会被再注册一次，因此，信号不会丢失，因此，实时信号又叫做"可靠信号"。这意味着同一个实时信号可以在同一个进程的未决信号信息链中占有多个sigqueue结构（进程每收到一个实时信号，都会为它分配一个结构来登记该信号信息，并把该结构添加在未决信号链尾，即所有诞生的实时信号都会在目标进程中注册）。</p>
+
+<p>当一个非实时信号发送给一个进程时，如果该信号已经在进程中注册（通过sigset_t signal指示），则该信号将被丢弃，造成信号丢失。因此，非实时信号又叫做"不可靠信号"。这意味着同一个非实时信号在进程的未决信号信息链中，至多占有一个sigqueue结构。</p>
+
+<p>总之信号注册与否，与发送信号的函数（如kill()或sigqueue()等）以及信号安装函数（signal()及sigaction()）无关，只与信号值有关（信号值小于SIGRTMIN的信号最多只注册一次，信号值在SIGRTMIN及SIGRTMAX之间的信号，只要被进程接收到就被注册）</p>
+
+<p>内核处理一个进程收到的信号的时机是在一个进程从内核态返回用户态时。所以，当一个进程在内核态下运行时，软中断信号并不立即起作用，要等到将返回用户态时才处理。进程只有处理完信号才会返回用户态，进程在用户态下不会有未处理完的信号。</p>
+
+<p>内核处理一个进程收到的软中断信号是在该进程的上下文中，因此，进程必须处于运行状态。前面介绍概念的时候讲过，处理信号有三种类型：进程接收到信号后退 出；进程忽略该信号；进程收到信号后执行用户设定用系统调用signal的函数。当进程接收到一个它忽略的信号时，进程丢弃该信号，就象没有收到该信号似 的继续运行。如果进程收到一个要捕捉的信号，那么进程从内核态返回用户态时执行用户定义的函数。而且执行用户定义的函数的方法很巧妙，内核是在用户栈上创 建一个新的层，该层中将返回地址的值设置成用户定义的处理函数的地址，这样进程从内核返回弹出栈顶时就返回到用户定义的函数处，从函数返回再弹出栈顶时， 才返回原先进入内核的地方。这样做的原因是用户定义的处理函数不能且不允许在内核态下执行（如果用户定义的函数在内核态下运行的话，用户就可以获得任何权 限）。</p>
+
+<p>对于非实时信号来说，由于在未决信号信息链中最多只占用一个sigqueue结构，因此该结构被释放后，应该把信号在进程未决信号集中删除（信号注销完毕）；而对于实时信号来说，可能在未决信号信息链中占用多个sigqueue结构，因此应该针对占用sigqueue结构的数目区别对待：如果只占用一个sigqueue结构（进程只收到该信号一次），则执行完相应的处理函数后应该把信号在进程的未决信号集中删除（信号注销完毕）。否则待该信号的所有sigqueue处理完毕后再在进程的未决信号集中删除该信号。</p>
+
+<p>当所有未被屏蔽的信号都处理完毕后，即可返回用户空间。对于被屏蔽的信号，当取消屏蔽后，在返回到用户空间时会再次执行上述检查处理的一套流程。</p>
+
+<h6>在信号的处理方法中有几点特别要引起注意。</h6>
+
+<p>第一，在一些系统中，当一个进程处理完中断信号返回用户态之前，内核清除用户区中设 定的对该信号的处理例程的地址，即下一次进程对该信号的处理方法又改为默认值，除非在下一次信号到来之前再次使用signal系统调用。这可能会使得进程 在调用signal之前又得到该信号而导致退出。在BSD中，内核不再清除该地址。但不清除该地址可能使得进程因为过多过快的得到某个信号而导致堆栈溢 出。为了避免出现上述情况。在BSD系统中，内核模拟了对硬件中断的处理方法，即在处理某个中断时，阻止接收新的该类中断。</p>
+
+<p>第二个要 引起注意的是，如果要捕捉的信号发生于进程正在一个系统调用中时，并且该进程睡眠在可中断的优先级上，这时该信号引起进程作一次longjmp，跳出睡眠 状态，返回用户态并执行信号处理例程。当从信号处理例程返回时，进程就象从系统调用返回一样，但返回了一个错误代码，指出该次系统调用曾经被中断。这要注 意的是，BSD系统中内核可以自动地重新开始系统调用。</p>
+
+<p>第三个要注意的地方：若进程睡眠在可中断的优先级上，则当它收到一个要忽略的信号时，该进程被唤醒，但不做longjmp，一般是继续睡眠。但用户感觉不到进程曾经被唤醒，而是象没有发生过该信号一样。</p>
+
+<p>第四个要注意的地方：内核对子进程终止（SIGCLD）信号的处理方法与其他信号有所区别。当进程检查出收到了一个子进程终止的信号时，缺省情况下，该进程 就象没有收到该信号似的，如果父进程执行了系统调用wait，进程将从系统调用wait中醒来并返回wait调用，执行一系列wait调用的后续操作（找 出僵死的子进程，释放子进程的进程表项），然后从wait中返回。SIGCLD信号的作用是唤醒一个睡眠在可被中断优先级上的进程。如果该进程捕捉了这个 信号，就象普通信号处理一样转到处理例程。如果进程忽略该信号，那么系统调用wait的动作就有所不同，因为SIGCLD的作用仅仅是唤醒一个睡眠在可被 中断优先级上的进程，那么执行wait调用的父进程被唤醒继续执行wait调用的后续操作，然后等待其他的子进程。</p>
+
+<p> 如果一个进程调用signal系统调用，并设置了SIGCLD的处理方法，并且该进程有子进程处于僵死状态，则内核将向该进程发一个SIGCLD信号。</p>
+
+<h5>2、setjmp和longjmp的作用</h5>
+
+<p>  前面在介绍信号处理机制时，多次提到了setjmp和longjmp，但没有仔细说明它们的作用和实现方法。这里就此作一个简单的介绍。 <br/>
+  在 介绍信号的时候，我们看到多个地方要求进程在检查收到信号后，从原来的系统调用中直接返回，而不是等到该调用完成。这种进程突然改变其上下文的情况，就是 使用setjmp和longjmp的结果。setjmp将保存的上下文存入用户区，并继续在旧的上下文中执行。这就是说，进程执行一个系统调用，当因为资 源或其他原因要去睡眠时，内核为进程作了一次setjmp，如果在睡眠中被信号唤醒，进程不能再进入睡眠时，内核为进程调用longjmp，该操作是内核 为进程将原先setjmp调用保存在进程用户区的上下文恢复成现在的上下文，这样就使得进程可以恢复等待资源前的状态，而且内核为setjmp返回1，使 得进程知道该次系统调用失败。这就是它们的作用。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-balance/">Linux内核CPU负载均衡机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-02-11T14:00:00+08:00'><span class='date'>2015-02-11</span> <span class='time'>14:00:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.oenhan.com/cpu-load-balance">http://www.oenhan.com/cpu-load-balance</a></p>
+
+<p> 还是神奇的进程调度问题引发的，参看Linux进程组调度机制分析，组调度机制是看清楚了，发现在重启过程中，很多内核调用栈阻塞在了double_rq_lock函数上，而double_rq_lock则是load_balance触发的，怀疑当时的核间调度出现了问题，在某个负责场景下产生了多核互锁，后面看了一下CPU负载平衡下的代码实现，写一下总结。</p>
+
+<p>内核代码版本：kernel-3.0.13-0.27。</p>
+
+<p>内核代码函数起自load_balance函数,从load_balance函数看引用它的函数可以一直找到schedule函数这里，便从这里开始往下看，在__schedule中有下面一句话。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!rq-&gt;nr_running))
+</span><span class='line'>    idle_balance(cpu, rq);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从上面可以看出什么时候内核会尝试进行CPU负载平衡：即当前CPU运行队列为NULL的时候。</p>
+
+<p>CPU负载平衡有两种方式：pull和push，即空闲CPU从其他忙的CPU队列中拉一个进程到当前CPU队列；或者忙的CPU队列将一个进程推送到空闲的CPU队列中。idle_balance干的则是pull的事情，具体push下面会提到。</p>
+
+<p>在idle_balance里面，有一个proc阀门控制当前CPU是否pull:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (this_rq-&gt;avg_idle &lt; sysctl_sched_migration_cost)
+</span><span class='line'>    return;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sysctl_sched_migration_cost对应proc控制文件是/proc/sys/kernel/sched_migration_cost，开关代表如果CPU队列空闲了500ms（sysctl_sched_migration_cost默认值）以上，则进行pull，否则则返回。</p>
+
+<p>for_each_domain(this_cpu, sd) 则是遍历当前CPU所在的调度域，可以直观的理解成一个CPU组，类似task_group，核间平衡指组内的平衡。负载平衡有一个矛盾就是：负载平衡的频度和CPU cache的命中率是矛盾的，CPU调度域就是将各个CPU分成层次不同的组，低层次搞定的平衡就绝不上升到高层次处理，避免影响cache的命中率。</p>
+
+<p>图例如下;</p>
+
+<p><img src="/images/kernel/2015-02-11-1.jpg" alt="" /></p>
+
+<p>最终通过load_balance进入正题。</p>
+
+<p>首先通过find_busiest_group获取当前调度域中的最忙的调度组，首先update_sd_lb_stats更新sd的状态，也就是遍历对应的sd，将sds里面的结构体数据填满，如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sd_lb_stats {
+</span><span class='line'>    struct sched_group *busiest; /* Busiest group in this sd */
+</span><span class='line'>    struct sched_group *this;  /* Local group in this sd */
+</span><span class='line'>    unsigned long total_load;  /* Total load of all groups in sd */
+</span><span class='line'>    unsigned long total_pwr;   /*   Total power of all groups in sd */
+</span><span class='line'>    unsigned long avg_load;    /* Average load across all groups in sd */
+</span><span class='line'> 
+</span><span class='line'>    /** Statistics of this group */
+</span><span class='line'>    unsigned long this_load; //当前调度组的负载
+</span><span class='line'>    unsigned long this_load_per_task; //当前调度组的平均负载
+</span><span class='line'>    unsigned long this_nr_running; //当前调度组内运行队列中进程的总数
+</span><span class='line'>    unsigned long this_has_capacity;
+</span><span class='line'>    unsigned int  this_idle_cpus;
+</span><span class='line'> 
+</span><span class='line'>    /* Statistics of the busiest group */
+</span><span class='line'>    unsigned int  busiest_idle_cpus;
+</span><span class='line'>    unsigned long max_load; //最忙的组的负载量
+</span><span class='line'>    unsigned long busiest_load_per_task; //最忙的组中平均每个任务的负载量
+</span><span class='line'>    unsigned long busiest_nr_running; //最忙的组中所有运行队列中进程的个数
+</span><span class='line'>    unsigned long busiest_group_capacity;
+</span><span class='line'>    unsigned long busiest_has_capacity;
+</span><span class='line'>    unsigned int  busiest_group_weight;</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>do
+</span><span class='line'>{
+</span><span class='line'>    local_group = cpumask_test_cpu(this_cpu, sched_group_cpus(sg));
+</span><span class='line'>    if (local_group) {
+</span><span class='line'>                  //如果是当前CPU上的group，则进行赋值
+</span><span class='line'>        sds-&gt;this_load = sgs.avg_load;
+</span><span class='line'>        sds-&gt;this = sg;
+</span><span class='line'>        sds-&gt;this_nr_running = sgs.sum_nr_running;
+</span><span class='line'>        sds-&gt;this_load_per_task = sgs.sum_weighted_load;
+</span><span class='line'>        sds-&gt;this_has_capacity = sgs.group_has_capacity;
+</span><span class='line'>        sds-&gt;this_idle_cpus = sgs.idle_cpus;
+</span><span class='line'>    } else if (update_sd_pick_busiest(sd, sds, sg, &sgs, this_cpu)) {
+</span><span class='line'>                 //在update_sd_pick_busiest判断当前sgs的是否超过了之前的最大值，如果是
+</span><span class='line'>                 //则将sgs值赋给sds
+</span><span class='line'>        sds-&gt;max_load = sgs.avg_load;
+</span><span class='line'>        sds-&gt;busiest = sg;
+</span><span class='line'>        sds-&gt;busiest_nr_running = sgs.sum_nr_running;
+</span><span class='line'>        sds-&gt;busiest_idle_cpus = sgs.idle_cpus;
+</span><span class='line'>        sds-&gt;busiest_group_capacity = sgs.group_capacity;
+</span><span class='line'>        sds-&gt;busiest_load_per_task = sgs.sum_weighted_load;
+</span><span class='line'>        sds-&gt;busiest_has_capacity = sgs.group_has_capacity;
+</span><span class='line'>        sds-&gt;busiest_group_weight = sgs.group_weight;
+</span><span class='line'>        sds-&gt;group_imb = sgs.group_imb;
+</span><span class='line'>    }
+</span><span class='line'>    sg = sg-&gt;next;
+</span><span class='line'>} while (sg != sd-&gt;groups);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>决定选择调度域中最忙的组的参照标准是该组内所有 CPU上负载(load) 的和， 找到组中找到忙的运行队列的参照标准是该CPU运行队列的长度， 即负载，并且 load 值越大就表示越忙。在平衡的过程中，通过比较当前队列与以前记录的busiest 的负载情况，及时更新这些变量，让 busiest 始终指向域内最忙的一组，以便于查找。</p>
+
+<p>调度域的平均负载计算</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sds.avg_load = (SCHED_POWER_SCALE * sds.total_load) / sds.total_pwr;
+</span><span class='line'>if (sds.this_load &gt;= sds.avg_load)
+</span><span class='line'>    goto out_balanced;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在比较负载大小的过程中， 当发现当前运行的CPU所在的组中busiest为空时，或者当前正在运行的 CPU队列就是最忙的时， 或者当前 CPU队列的负载不小于本组内的平均负载时，或者不平衡的额度不大时，都会返回 NULL 值，即组组之间不需要进行平衡；当最忙的组的负载小于该调度域的平均负载时，只需要进行小范围的负载平衡；当要转移的任务量小于每个进程的平均负载时，如此便拿到了最忙的调度组。</p>
+
+<p>然后find_busiest_queue中找到最忙的调度队列，遍历该组中的所有 CPU 队列，经过依次比较各个队列的负载，找到最忙的那个队列。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_cpu(i, sched_group_cpus(group)) {
+</span><span class='line'>    /*rq-&gt;cpu_power表示所在处理器的计算能力,在函式sched_init初始化时,会把这值设定为SCHED_LOAD_SCALE (=Nice 0的Load Weight=1024).并可透过函式update_cpu_power (in kernel/sched_fair.c)更新这个值.*/
+</span><span class='line'>    unsigned long power = power_of(i);
+</span><span class='line'>    unsigned long capacity = DIV_ROUND_CLOSEST(power,SCHED_POWER_SCALE);
+</span><span class='line'>    unsigned long wl;
+</span><span class='line'>    if (!cpumask_test_cpu(i, cpus))
+</span><span class='line'>        continue;
+</span><span class='line'> 
+</span><span class='line'>    rq = cpu_rq(i);
+</span><span class='line'>/*获取队列负载cpu_rq(cpu)-&gt;load.weight;*/
+</span><span class='line'>    wl = weighted_cpuload(i);
+</span><span class='line'> 
+</span><span class='line'>    /*
+</span><span class='line'>     * When comparing with imbalance, use weighted_cpuload()
+</span><span class='line'>     * which is not scaled with the cpu power.
+</span><span class='line'>     */
+</span><span class='line'>    if (capacity && rq-&gt;nr_running == 1 && wl &gt; imbalance)
+</span><span class='line'>        continue;
+</span><span class='line'> 
+</span><span class='line'>    /*
+</span><span class='line'>     * For the load comparisons with the other cpu's, consider
+</span><span class='line'>     * the weighted_cpuload() scaled with the cpu power, so that
+</span><span class='line'>     * the load can be moved away from the cpu that is potentially
+</span><span class='line'>     * running at a lower capacity.
+</span><span class='line'>     */
+</span><span class='line'>    wl = (wl * SCHED_POWER_SCALE) / power;
+</span><span class='line'> 
+</span><span class='line'>    if (wl &gt; max_load) {
+</span><span class='line'>        max_load = wl;
+</span><span class='line'>        busiest = rq;
+</span><span class='line'>    }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过上面的计算，便拿到了最忙队列。<br/>
+当busiest->nr_running运行数大于1的时候，进行pull操作，pull前对move_tasks,先进行double_rq_lock加锁处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>double_rq_lock(this_rq, busiest);
+</span><span class='line'>ld_moved = move_tasks(this_rq, this_cpu, busiest,
+</span><span class='line'>        imbalance, sd, idle, &all_pinned);
+</span><span class='line'>double_rq_unlock(this_rq, busiest);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>move_tasks进程pull task是允许失败的，即move_tasks->balance_tasks，在此处，有sysctl_sched_nr_migrate开关控制进程迁移个数，对应proc的是/proc/sys/kernel/sched_nr_migrate。</p>
+
+<p>下面有can_migrate_task函数检查选定的进程是否可以进行迁移，迁移失败的原因有3个，1.迁移的进程处于运行状态；2.进程被绑核了，不能迁移到目标CPU上；3.进程的cache仍然是hot，此处也是为了保证cache命中率。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*关于cache cold的情况下，如果迁移失败的个数太多，仍然进行迁移
+</span><span class='line'> * Aggressive migration if:
+</span><span class='line'> * 1) task is cache cold, or
+</span><span class='line'> * 2) too many balance attempts have failed.
+</span><span class='line'> */
+</span><span class='line'> 
+</span><span class='line'>tsk_cache_hot = task_hot(p, rq-&gt;clock_task, sd);
+</span><span class='line'>if (!tsk_cache_hot ||
+</span><span class='line'>    sd-&gt;nr_balance_failed &gt; sd-&gt;cache_nice_tries) {
+</span><span class='line'>#ifdef CONFIG_SCHEDSTATS
+</span><span class='line'>    if (tsk_cache_hot) {
+</span><span class='line'>        schedstat_inc(sd, lb_hot_gained[idle]);
+</span><span class='line'>        schedstat_inc(p, se.statistics.nr_forced_migrations);
+</span><span class='line'>    }
+</span><span class='line'>#endif
+</span><span class='line'>    return 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>判断进程cache是否有效，判断条件，进程的运行的时间大于proc控制开关sysctl_sched_migration_cost，对应目录/proc/sys/kernel/sched_migration_cost_ns</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int
+</span><span class='line'>task_hot(struct task_struct *p, u64 now, struct sched_domain *sd)
+</span><span class='line'>{
+</span><span class='line'>        s64 delta;
+</span><span class='line'>    delta = now - p-&gt;se.exec_start;
+</span><span class='line'>    return delta &lt; (s64)sysctl_sched_migration_cost;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在load_balance中，move_tasks返回失败也就是ld_moved==0，其中sd->nr_balance_failed++对应can_migrate_task中的”too many balance attempts have failed”,然后busiest->active_balance = 1设置，active_balance = 1。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (active_balance)
+</span><span class='line'>//如果pull失败了，开始触发push操作
+</span><span class='line'>stop_one_cpu_nowait(cpu_of(busiest),
+</span><span class='line'>    active_load_balance_cpu_stop, busiest,
+</span><span class='line'>    &busiest-&gt;active_balance_work);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>push整个触发操作代码机制比较绕，stop_one_cpu_nowait把active_load_balance_cpu_stop添加到cpu_stopper每CPU变量的任务队列里面，如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
+</span><span class='line'>            struct cpu_stop_work *work_buf)
+</span><span class='line'>{
+</span><span class='line'>    *work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, };
+</span><span class='line'>    cpu_stop_queue_work(&per_cpu(cpu_stopper, cpu), work_buf);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>而cpu_stopper则是cpu_stop_init函数通过cpu_stop_cpu_callback创建的migration内核线程，触发任务队列调度。因为migration内核线程是绑定每个核心上的，进程迁移失败的1和3问题就可以通过push解决。active_load_balance_cpu_stop则调用move_one_task函数迁移指定的进程。</p>
+
+<p>上面描述的则是整个pull和push的过程，需要补充的pull触发除了schedule后触发，还有scheduler_tick通过触发中断，调用run_rebalance_domains再调用rebalance_domains触发，不再细数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init sched_init(void)
+</span><span class='line'>{
+</span><span class='line'>      open_softirq(SCHED_SOFTIRQ, run_rebalance_domains);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-trywakeup/">try_to_wake_up函数</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-02-11T11:32:00+08:00'><span class='date'>2015-02-11</span> <span class='time'>11:32:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>  try_to_wake_up函数通过把进程状态设置为TASK_RUNNING，并把该进程插入本地CPU运行队列rq来达到唤醒睡眠和停止的进程的目的。<br/>
+例如：调用该函数唤醒等待队列中的进程，或恢复执行等待信号的进程。该函数接受的参数有：<br/>
+- 被唤醒进程的描述符指针（p）<br/>
+- 可以被唤醒的进程状态掩码（state）<br/>
+- 一个标志（sync），用来禁止被唤醒的进程抢占本地CPU上正在运行的进程</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int try_to_wake_up(struct task_struct *p, unsigned int state, int sync)
+</span><span class='line'>{
+</span><span class='line'>    int cpu, this_cpu, success = 0;
+</span><span class='line'>    unsigned long flags;
+</span><span class='line'>    long old_state;
+</span><span class='line'>    struct rq *rq;
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>    struct sched_domain *sd, *this_sd = NULL;
+</span><span class='line'>    unsigned long load, this_load;
+</span><span class='line'>    int new_cpu;
+</span><span class='line'>#endif
+</span><span class='line'>    rq = task_rq_lock(p, &flags);
+</span><span class='line'>    old_state = p-&gt;state;
+</span><span class='line'>    if (!(old_state & state))
+</span><span class='line'>        goto out;
+</span><span class='line'>    if (p-&gt;array)
+</span><span class='line'>        goto out_running;
+</span><span class='line'>    cpu = task_cpu(p);
+</span><span class='line'>    this_cpu = smp_processor_id();
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>... // [多处理器负载平衡工作](/blog/2015/02/11/kernel-sched-balance/)
+</span><span class='line'>#endif /* CONFIG_SMP */
+</span><span class='line'>    if (old_state == TASK_UNINTERRUPTIBLE) {
+</span><span class='line'>        rq-&gt;nr_uninterruptible--;
+</span><span class='line'>        /*
+</span><span class='line'>         * Tasks on involuntary sleep don't earn
+</span><span class='line'>         * sleep_avg beyond just interactive state.
+</span><span class='line'>         */
+</span><span class='line'>        p-&gt;sleep_type = SLEEP_NONINTERACTIVE; //简单判断出非交互进程
+</span><span class='line'>    } else
+</span><span class='line'>        if (old_state & TASK_NONINTERACTIVE)
+</span><span class='line'>            p-&gt;sleep_type = SLEEP_NONINTERACTIVE;//同上
+</span><span class='line'>    activate_task(p, rq, cpu == this_cpu);
+</span><span class='line'>    if (!sync || cpu != this_cpu) {
+</span><span class='line'>        if (TASK_PREEMPTS_CURR(p, rq))
+</span><span class='line'>            resched_task(rq-&gt;curr);
+</span><span class='line'>    }
+</span><span class='line'>    success = 1;
+</span><span class='line'>out_running:
+</span><span class='line'>    trace_sched_wakeup(rq, p, success);
+</span><span class='line'>    p-&gt;state = TASK_RUNNING;
+</span><span class='line'>out:
+</span><span class='line'>    task_rq_unlock(rq, &flags);
+</span><span class='line'>    return success;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>代码解释如下：<br/>
+1.首先调用task_rq_lock( )禁止本地中断，并获得最后执行进程的CPU（他可能不同于本地CPU）所拥有的运行队列rq的锁。CPU的逻辑号存储在p->thread_info->cpu字段。</p>
+
+<p>2.检查进程的状态p->state是否属于被当作参数传递给函数的状态掩码state，如果不是，就跳到第9步终止函数。</p>
+
+<p>3.如果p->array字段不等于NULL，那么进程已经属于某个运行队列，因此跳转到第8步。</p>
+
+<p>4.在多处理器系统中，该函数检查要被唤醒的进程是否应该从最近运行的CPU的运行队列迁移到另外一个CPU的运行队列。实际上，函数就是根据一些启发式规则选择一个目标运行队列。</p>
+
+<p>5.如果进程处于TASK_UNINTERRUPTIBLE状态，函数递减目标运行队列的nr_uninterruptible字段，并把进程描述符的p->activated字段设置为-1。</p>
+
+<p>6.调用activate_task( )函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void activate_task(struct task_struct *p, struct rq *rq, int local)
+</span><span class='line'>{
+</span><span class='line'>    unsigned long long now;
+</span><span class='line'>    now = sched_clock();
+</span><span class='line'>#ifdef CONFIG_SMP
+</span><span class='line'>...
+</span><span class='line'>#endif
+</span><span class='line'>    if (!rt_task(p))
+</span><span class='line'>        p-&gt;prio = recalc_task_prio(p, now); //计算平均睡眠时间并返回之后的优先级。
+</span><span class='line'>    if (p-&gt;sleep_type == SLEEP_NORMAL) {
+</span><span class='line'>        if (in_interrupt())
+</span><span class='line'>            p-&gt;sleep_type = SLEEP_INTERRUPTED;
+</span><span class='line'>        else {
+</span><span class='line'>            p-&gt;sleep_type = SLEEP_INTERACTIVE;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    p-&gt;timestamp = now;
+</span><span class='line'>    __activate_task(p, rq);
+</span><span class='line'>}
+</span><span class='line'>static void __activate_task(struct task_struct *p, struct rq *rq)
+</span><span class='line'>{
+</span><span class='line'>    struct prio_array *target = rq-&gt;active;
+</span><span class='line'>    trace_activate_task(p, rq);
+</span><span class='line'>    if (batch_task(p))
+</span><span class='line'>        target = rq-&gt;expired;
+</span><span class='line'>    enqueue_task(p, target);
+</span><span class='line'>    inc_nr_running(p, rq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>它依次执行下面的子步骤：<br/>
+  a) 调用sched_clock( )获取以纳秒为单位的当前时间戳。如果目标CPU不是本地CPU，就要补偿本地时钟中断的偏差，这是通过使用本地CPU和目标CPU上最近一次发生时钟中断的相对时间戳来达到的：now = (sched_clock( ) - this_rq( )->timestamp_last_tick)  +  rq->timestamp_last_tick;<br/>
+  b) 调用recalc_task_prio()，把进程描述的指针和上一步计算出的时间戳传递给它。recalc_task_prio()主要更新进程的平均睡眠时间和动态优先级，下一篇博文将详细说明这个函数。<br/>
+  c) 根据下表设置p->activated字段的值，该字段的意义为：<br/>
+        值             说明<br/>
+        0   进程处于TASK_RUNNING 状态。<br/>
+        1   进程处于TASK_INTERRUPTIBLE 或TASK_STOPPED 状态，而且正在被系统调用服务例程或内核线程唤醒。<br/>
+        2   进程处于TASK_INTERRUPTIBLE 或TASK_STOPPED 状态，而且正在被中断处理程序或可延迟函数唤醒。<br/>
+        -1  进程处于TASK_UNINTERRUPTIBLE 状态而且正在被唤醒。
+  d) 使用在第6a步中计算的时间戳设置p->timestamp字段。<br/>
+  e) 把进程描述符插入活动进程集合：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enqueue_task(p, rq-&gt;active);
+</span><span class='line'>rq-&gt;nr_running++;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>7.如果目标CPU不是本地CPU，或者没有设置sync标志，就检查可运行的新进程的动态优先级是否比rq运行对了中当前进程的动态优先级高（p->prio &lt; rq->curr->prio）；如果是，就调用resched_task()抢占rq->curr。在单处理器系统中，后面的函数只是执行set_tsk_need_resched()来设置rq->curr进程的TIF_NEED_RESCHED标志。在多处理器系统中，resched_task()也检查TIF_NEED_RESCHED的旧值是否为0、目标CPU与本地CPU是否不同、rq->curr进程的TIF_POLLING_NRFLAG标志是否清0（目标CPU没有轮询进程TIF_NEED_RESCHED标志的值）。如果是，resched_task()调用smp_send_reschedule()产生IPI，并强制目标CPU重新调度。</p>
+
+<p>8.把进程的p->state字段设置为TASK_RUNNING状态。</p>
+
+<p>9.调用task_rq_unlock()来打开rq运行队列的锁并打开本地中断。</p>
+
+<p>10.返回1（若成功唤醒进程）或0（如果进程没有被唤醒）</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/02/11/kernel-sched-kthread/">内核线程使用</a></h2>
     
     
@@ -436,889 +1171,6 @@ other_node是其他节点进程在该节点上分配的次数</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/09/kernel-mm-numa/">玩转CPU Topology</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-02-09T16:19:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>16:19:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.searchtb.com/2012/12/%E7%8E%A9%E8%BD%ACcpu-topology.html">http://www.searchtb.com/2012/12/%E7%8E%A9%E8%BD%ACcpu-topology.html</a></p>
-
-<h4>先温习几个概念</h4>
-
-<p>请原谅对部分术语笔者直接引用了wikipedia上的英文解释，因为哥实在做不到比wikipedia上更准确描述。我会试着解释部分的术语，并在本节的最后梳理一下这些术语之间的关系。注意，笔者对由于不准确的描述导致的性能下降，进程crash等任何问题不承担任何责任☺</p>
-
-<p>NUMA：Non-Uniform Memory Access (NUMA) is a computer memory design used in multiprocessing, where the memory access time depends on the memory location relative to a processor. Under NUMA, a processor can access its own local memory faster than non-local memory, that is, memory local to another processor or memory shared between processors.NUMA architectures logically follow in scaling from symmetric multiprocessing (SMP) architectures.</p>
-
-<p>提到NUMA就不能不对比SMP，</p>
-
-<p>SMP：Symmetric multiprocessing (SMP) involves a multiprocessor computer hardware architecture where two or more identical processors are connected to a single shared main memory and are controlled by a single OS instance.</p>
-
-<p>说了这么多其实都是为了介绍NUMA Node:</p>
-
-<p>A fairly technically correct and also fairly ugly definition of a node is: a region of memory in which every byte has the same distance from each CPU.<br/>
-A more common definition is: a block of memory and the CPUs, I/O, etc. physically on the same bus as the memory.</p>
-
-<p>CPU：这个不解释，原因你懂得。想当年CPU拼的是频率，频率越高越NB，但是提升频率和制程密切相关。</p>
-
-<p><img src="/images/kernel/2015-02-09-11.jpg" alt="" /></p>
-
-<p>Intel cpu制程<br/>
-但是制程这玩意有一个物理天花板，提升越来越难，有报道指出，现阶段普遍应用的硅晶体管在尺寸上有一个10nm的物理极限。为了提升性能cpu走上了多核的道路，即在一个封装（socket或者processor）里放多个core。这还不够，又发明了超线程技术Hyper-threading</p>
-
-<p>HT：HT Technology is used to improve parallelization of computations (doing multiple tasks at once) performed on PC microprocessors. For each processor core that is physically present, the operating system addresses two virtual or logical cores, and shares the workload between them when possible. They appear to the OS as two processors, thus the OS can schedule two processes at once. 一个core 在HT之后OS看到的就是2个Logical Processor。</p>
-
-<p>下图展示了这些术语之间的逻辑关系：</p>
-
-<p><img src="/images/kernel/2015-02-09-12.jpg" alt="" /></p>
-
-<h4>cpu 概念逻辑关系</h4>
-
-<p>一个NUMA node包括一个或者多个Socket，以及与之相连的local memory。一个多核的Socket有多个Core。如果CPU支持HT，OS还会把这个Core看成 2个Logical Processor。为了避免混淆，在下文中统一用socket指代Processor or Socket;为了偷懒，下文中用Processor指代Logical Processor，击键能省则省不是。</p>
-
-<h4>查看CPU Topology</h4>
-
-<p>本文以笔者能访问的某台Red Hat Enterprise Linux Server release 5.4为例介绍，其他系统请自行google。</p>
-
-<h5>NUMA Node</h5>
-
-<p>第一种方法使用numactl查看</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>numactl --hardware
-</span><span class='line'>available: 2 nodes (0-1)  //当前机器有2个NUMA node,编号0&amp;1
-</span><span class='line'>node 0 size: 12091 MB  //node 0 物理内存大小
-</span><span class='line'>node 0 free: 988 MB    //node 0 当前free内存大小
-</span><span class='line'>node 1 size: 12120 MB
-</span><span class='line'>node 1 free: 1206 MB
-</span><span class='line'>node distances:        //node 距离，可以简单认为是CPU本node内存访问和跨node内存访问的成本。从下表可知跨node的内存访问成本（20）是本地node内存（10）的2倍。
-</span><span class='line'>node   0   1
-</span><span class='line'>  0:  10  20
-</span><span class='line'>  1:  20  10</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第二种方法是通过sysfs查看，这种方式可以查看到更多的信息</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls /sys/devices/system/node/
-</span><span class='line'>1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>node0  node1 //两个目标表示本机有2个node，每个目录内部有多个文件和子目录描述node内cpu，内存等信息。比如说node0/meminfo描述了node0内存相关信息。</p>
-
-<h5>Socket</h5>
-
-<p>可以直接通过/proc/cpuinfo查看，cpuinfo里的physical id描述的就是Socket的编号，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep "physical id"
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 0
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 1
-</span><span class='line'>physical id     : 1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由上可知本机有2个Socket，编号为0和1。
-还可以简单的使用如下命令直接查看Socket个数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo|grep "physical id" | sort -u | wc –l
-</span><span class='line'>2   //本机有2个物理CPU封装</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>Core</h5>
-
-<p>仍然是可以通过/proc/cpuinfo查看，cpuinfo中跟core相关的信息有2行。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cpu cores : 4 //一个socket有4个核，
-</span><span class='line'>core id : 1 //一个core在socket内的编号</span></code></pre></td></tr></table></div></figure>
-
-
-<p>通过如下命令可以直接查看core的数量</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep "cpu cores" | uniq | cut -d: -f2
-</span><span class='line'>4  //1个socket有4个core</span></code></pre></td></tr></table></div></figure>
-
-
-<ul>
-<li>本机有2个socket，每个有4个core，所以一共有8个core</li>
-</ul>
-
-
-<p>还可以查看core在Socket里的编号</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep "core id" | sort -u
-</span><span class='line'>core id         : 0
-</span><span class='line'>core id         : 1
-</span><span class='line'>core id         : 10
-</span><span class='line'>core id         : 9</span></code></pre></td></tr></table></div></figure>
-
-
-<p>一个socket里面4个core的编号为0,1,9,10。是的，core id是不连续的。如果谁知道为啥麻烦通知我，先谢了。</p>
-
-<h5>Logical Processor</h5>
-
-<p>仍然是可以通过/proc/cpuinfo查看在OS的眼里有多少个Logical Processor</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/cpuinfo | grep processor | wc –l
-</span><span class='line'>16</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Ok，8个core变成了16个Logical Processor，所以本机开启了HT。</p>
-
-<p>问题来了，cpuinfo里面16个Processor编号为0-15，Core的id为0,1,9,10，Socket的id为0,1。这些编号是如何对应的呢？</p>
-
-<p>我们查看一个Processor完整的cpuinfo就比较清楚了，我剔除了不相关的行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>processor : 0    processor : 5
-</span><span class='line'>physical id : 0
-</span><span class='line'>siblings : 8
-</span><span class='line'>core id : 0
-</span><span class='line'>cpu cores : 4     physical id : 1
-</span><span class='line'>siblings : 8
-</span><span class='line'>core id : 1
-</span><span class='line'>cpu cores : 4</span></code></pre></td></tr></table></div></figure>
-
-
-<p>明白了？<br/>
-Processor 0:在socket 0的core 0 里。<br/>
-Processor 5：在socket 1的core 1 里。</p>
-
-<h5>Cache</h5>
-
-<p>仍然可以通过/proc/cpuinfo查看，OMG， cpuinfo难道是万能的？</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>processor       : 0
-</span><span class='line'>cache size      : 12288 KB //cpu cache 大小
-</span><span class='line'>cache_alignment : 64 </span></code></pre></td></tr></table></div></figure>
-
-
-<p>问题又来了，我们知道CPU cache分为L1，L2，L3, L1一般还分为独立的指令cache和数据cache。Cpuinfo里这个cache size指的是？</p>
-
-<p>好吧，cpuinfo也不是万能的。详细的cache信息可以通过sysfs查看</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls /sys/devices/system/cpu/cpu0/cache/
-</span><span class='line'>index0  index1  index2  index3</span></code></pre></td></tr></table></div></figure>
-
-
-<p>4个目录 <br/>
-index0: 1级数据cache<br/>
-index1: 1级指令cache<br/>
-index2: 2级cache<br/>
-index3: 3级cache ,对应cpuinfo里的cache</p>
-
-<p>目录里的文件是cache信息描述，以本机的cpu0/index0为例简单解释一下：</p>
-
-<table border="1">
-<tr>
-<td>文件</td>
-<td>内容</td>
-<td>说明</td>
-</tr>
-<tr>
-<td>type</td>
-<td>Data</td>
-<td>数据cache，如果查看index1就是Instruction</td>
-</tr>
-<tr>
-<td>Level</td>
-<td>1</td>
-<td>L1</td>
-</tr>
-<tr>
-<td>Size</td>
-<td>32K</td>
-<td>大小为32K</td>
-</tr>
-<tr>
-<td>coherency_line_size</td>
-<td>64</td>
-<th rowspan="4">64*4*128=32K</th>
-</tr>
-<tr>
-<td>physical_line_partition</td>
-<td>1</td>
-</tr>
-<tr>
-<td>ways_of_associativity</td>
-<td>4</td>
-</tr>
-<tr>
-<td>number_of_sets</td>
-<td>128</td>
-</tr>
-<tr>
-<td>shared_cpu_map</td>
-<td>00000101</td>
-<td>表示这个cache被CPU0和CPU8 share</td>
-</tr>
-</table>
-
-
-<p>解释一下shared_cpu_map内容的格式：<br />
-表面上看是2进制，其实是16进制表示，每个bit表示一个cpu，1个数字可以表示4个cpu<br />
-截取00000101的后4位，转换为2进制表示</p>
-
-
-<table border="1">
-<tr>
-<td>CPU id</td>
-<td>15</td>
-<td>14</td>
-<td>13</td>
-<td>12</td>
-<td>11</td>
-<td>10</td>
-<td>9</td>
-<td>8</td>
-<td>7</td>
-<td>6</td>
-<td>5</td>
-<td>4</td>
-<td>3</td>
-<td>2</td>
-<td>1</td>
-<td>0</td>
-</tr>
-<tr>
-<td>0&#215;0101的2进制表示</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>1</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>1</td>
-</tr>
-</table>
-
-
-<p>0101表示cpu8和cpu0，即cpu0的L1 data cache是和cpu8共享的。<br/>
-验证一下？</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /sys/devices/system/cpu/cpu8/cache/index0/shared_cpu_map
-</span><span class='line'>00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000101</span></code></pre></td></tr></table></div></figure>
-
-
-<p>再看一下index3 shared_cpu_map的例子</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_map
-</span><span class='line'>00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000f0f</span></code></pre></td></tr></table></div></figure>
-
-
-<table border="1">
-<tr>
-<td>CPU id</td>
-<td>15</td>
-<td>14</td>
-<td>13</td>
-<td>12</td>
-<td>11</td>
-<td>10</td>
-<td>9</td>
-<td>8</td>
-<td>7</td>
-<td>6</td>
-<td>5</td>
-<td>4</td>
-<td>3</td>
-<td>2</td>
-<td>1</td>
-<td>0</td>
-</tr>
-<tr>
-<td>0x0f0f的2进制表示</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>1</td>
-<td>1</td>
-<td>1</td>
-<td>1</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>0</td>
-<td>1</td>
-<td>1</td>
-<td>1</td>
-<td>1</td>
-</tr>
-</table>
-
-
-<p>cpu0,1,2,3和cpu8,9,10,11共享L3 cache</p>
-
-<h4>小结</h4>
-
-<p>综合以上信息可以绘制出以下的cpu topology图:</p>
-
-<p><img src="/images/kernel/2015-02-09-13.jpg" alt="" /></p>
-
-<p>抱歉，图比较大，网页上看不清楚，下面放大单node图，另一个node基本上可以类推。</p>
-
-<p><img src="/images/kernel/2015-02-09-14.jpg" alt="" /></p>
-
-<h5>使用CPU Topology</h5>
-
-<p>好吧，现在我们知道了如何查看CPU topology。那么这与各位攻城狮的工作有什么关系呢？</p>
-
-<p>以淘宝搜索常见的服务模型为例，服务端把离线处理的数据load到内存中，开始监听某个服务端口，接收到客户端请求后从线程池中分配一个工作线程，该线程解析请求，读取内存中对应的数据，进行一些计算，然后把结果返回给客户端。</p>
-
-<p>把这个过程简化简化再简化，抽象抽象再抽象，可以得到一个简单的测试程序，程序流程为：<br/>
-1. 主线程申请2块256M的内存，使用memset初始化这两块内存的每个byte<br/>
-2. 启动2个子线程，每个线程内循环16M次，在每次循环中随机读取2块内存中的各1K数据，对每个byte进行简单加和，返回。<br/>
-3. 主线程等待子线程结束，打印每个线程的结果，结束。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;pthread.h&gt;
-</span><span class='line'>#include &lt;stdlib.h&gt;
-</span><span class='line'>#include &lt;string.h&gt;
-</span><span class='line'>
-</span><span class='line'>char *p1, *p2;
-</span><span class='line'>
-</span><span class='line'>int run(unsigned r)
-</span><span class='line'>{
-</span><span class='line'>        int i,j,k,ret=0;
-</span><span class='line'>        unsigned r1,r2;
-</span><span class='line'>        srand(r);
-</span><span class='line'>        for (i=0;i&lt;(16&lt;&lt;20);i++) {
-</span><span class='line'>                r1 = (unsigned)(rand() % ((256&lt;&lt;20)-(1&lt;&lt;10)));
-</span><span class='line'>                r2 = (unsigned)(rand() % ((256&lt;&lt;20)-(1&lt;&lt;10)));
-</span><span class='line'>                k = 0;
-</span><span class='line'>                for (j=0;j&lt;(1&lt;&lt;10);j++) {
-</span><span class='line'>                        k += *(p1+r1+j);
-</span><span class='line'>                        k += *(p2+r2+j);
-</span><span class='line'>                }
-</span><span class='line'>                ret += k;
-</span><span class='line'>        }
-</span><span class='line'>        return ret;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>        int i,j;
-</span><span class='line'>        pthread_t pth1, pth2;
-</span><span class='line'>        p1 = (char*)malloc(256&lt;&lt;20);
-</span><span class='line'>        p2 = (char*)malloc(256&lt;&lt;20);
-</span><span class='line'>        memset(p1, sizeof(p1), 0);
-</span><span class='line'>        memset(p2, sizeof(p2), 0);
-</span><span class='line'>        pthread_create(&pth1, NULL, run, 123);
-</span><span class='line'>        pthread_create(&pth2, NULL, run, 456);
-</span><span class='line'>        pthread_join(pth1, NULL);
-</span><span class='line'>        pthread_join(pth2, NULL);
-</span><span class='line'>        return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用-O2编译出可执行文件test，分别使用下面2个命令运行该程序。运行时间和机器配置以及当前load有关，绝对值没有意义，这里仅比较相对值。</p>
-
-<table border="1">
-<tr>
-<td>命令</td>
-<td>time ./test</td>
-<td>time numactl -m 0 &#8211;physcpubind=2,3  ./test</td>
-</tr>
-<tr>
-<td>用时</td>
-<td><strong>real    0m38.678s</strong><br />
-user    1m6.270s<br />
-sys     0m5.569s
-</td>
-<td><strong>real    0m28.410s</strong><br />
-user    0m54.997s<br />
-sys     0m0.961s
-</td>
-</tr>
-</table>
-
-
-<p>发生了什么？为什么有这么大的差异？
-第一个命令直观，那么我们看一下第二个命令具体做了什么：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>numactl -m 0 --physcpubind=2,3 ./test
-</span><span class='line'>-m 0：在node 0上分配内存
-</span><span class='line'>--physcpubind=2,3：在cpu 2和3上运行程序，即一个线程运行在cpu2上，另一个运行在cpu3上。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>参考上面的CPUtopology图就很容易理解了，由于线程绑定cpu2和3执行，共享了L3 cache，且全部内存都是本node访问，运行效率自然比随机选择cpu运行，运行中还有可能切换cpu，内存访问有可能跨node的第一种方式要快了。</p>
-
-<p>接下来，让我们看看完整的表格，读者可以看看有没有惊喜：</p>
-
-<table border="1">
-<tr>
-<td>情况</td>
-<td>命令</td>
-<td>用时</td>
-<td>解释</td>
-</tr>
-<tr>
-<td>完全由OS控制</td>
-<td>time ./test</td>
-<td>real    0m38.678s<br />
-user    1m6.270s<br />
-sys     0m5.569s
-</td>
-<td>乐观主义者，甩手掌柜型</td>
-</tr>
-<tr>
-<td>绑定跨node的Cpu执行</td>
-<td>time numactl &#8211;physcpubind=2,6  ./test</td>
-<td>real    0m38.657s<br />
-user    1m7.126s<br />
-sys     0m5.045s
-</td>
-<td>Cpu 2和6不在同一个node，不能share L3 cache</td>
-</tr>
-<tr>
-<td>绑定单node的Cpu执行</td>
-<td>time numactl &#8211;physcpubind=2,3  ./test</td>
-<td>real    0m28.605s<br />
-user    0m55.161s<br />
-sys     0m0.856s
-</td>
-<td>Cpu 2和3在同一个node，share L3 cache。内存使用由OS控制，一般来说node 0和1内存都会使用。</td>
-</tr>
-<tr>
-<td>跨node内存访问+绑定单node CPU执行</td>
-<td>time numactl -m 1 &#8211;physcpubind=2,3  ./test</td>
-<td>real    0m33.218s<br />
-user    1m4.494s<br />
-sys     0m0.911s
-</td>
-<td>内存全使用node1，2个cpu在node0，内存访问比较吃亏</td>
-</tr>
-<tr>
-<td>单node内存访问+绑定本node CPU执行</td>
-<td>time numactl -m 0 &#8211;physcpubind=2,3  ./test</td>
-<td>real    0m28.367s<br />
-user    0m55.062s<br />
-sys     0m0.825s
-</td>
-<td>内存&amp;cpu都使用node0</td>
-</tr>
-<tr>
-<td>单node内存访问+绑定本node 单core执行</td>
-<td>time numactl -m 0 &#8211;physcpubind=2,10  ./test</td>
-<td>real    0m58.062s<br />
-user    1m55.520s<br />
-sys     0m0.270s
-</td>
-<td>CPU2和10不但在同一个node，且在同一个core，本意是希望共享L1，L2cache，提升性能。但是不要忘了，CPU2和10是HT出来的logical Processor，在本例cpu密集型的线程中硬件争用严重，效率急剧下降。有没有发现和上一个case的时间比率很有意思？</td>
-</tr>
-</table>
-
-
-<p>现在谁还能说了解点cpu topology没用呢？☺</p>
-
-<h4>Tips</h4>
-
-<p>补充几个小tips，方便有兴趣的同学分析上面表格的各个case</p>
-
-<h5>1.查看进程的内存numa node分布</h5>
-
-<p>简单的说可以查看进程的numa_maps文件</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/pid/numa_maps</span></code></pre></td></tr></table></div></figure>
-
-
-<p>文件格式可以直接：man numa_maps<br/>
-为了避免输入数字pid，我使用如下命令查看：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/$(pidof test|cut –d” ” -f1)/numa_maps</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2.查看线程run在哪个processor</h5>
-
-<p>可以使用top命令查看一个进程的各个线程分别run在哪个processor上<br/>
-同样，为了避免输入数字pid，我使用如下命令启动top：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>top -p$(pidof test |sed -e ‘s/ /,/g’)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在默认配置下不显示线程信息，需要进入Top后按“shift+H”，打开线程显示。<br/>
-另外，如果没有P列，还需要按“f”，按“j”，添加，这一列显示的数字就是这个线程上次run的processor id。<br/>
-关于top的使用，请读者自行man top</p>
-
-<h5>3.另一种绑定cpu执行的方法</h5>
-
-<p>如果读者的程序不涉及大量内存的访问，可以通过taskset绑定cpu执行。别怪我没提醒你，仔细判断是否应该绑定到同一个core的processor上哦。<br/>
-关于命令的使用，请读者自行Man taskset</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/09/system-base-attr/">隐藏权限--无法添加用户和组等</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-02-09T15:59:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>15:59:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>执行命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost softwaretools]# groupadd mysql
-</span><span class='line'>groupadd：无法打开组文件（groupadd: unable to open group file）</span></code></pre></td></tr></table></div></figure>
-
-
-<p>此时就奇怪了，当前用的明明是root用户，为什么没有创建组和用户的权限呢。</p>
-
-<p>结论：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1，添加用户需要用到passwd和shadow这两个文件
-</span><span class='line'>2，添加组需要用到shadow和gshadow这两个文件</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用 ls -l 命令发现权限正常。</p>
-
-<p>最终发现问题，找到了2个命令（lsattr和chattr），是因为隐藏权限在作怪：<br/>
-对这2个命令的简单做下说明：<br/>
-  对于某些有特殊要求的档案(如服务器日志)还可以追加隐藏权限的设定。这些隐藏权限包括： Append only (a), compressed &copy;, no dump (d), immutable (i), data journalling (j),secure deletion (s), no tail-merging (t), undeletable (u), no atime updates (A), synchronous directory updates (D), synchronous updates (S), and top of directory hierarchy (T).  <br/>
-  lsattr命令是查看隐藏权限设定情况的，chattr是变更隐藏权限的命令。</p>
-
-<p>首先使用使用lsattr查看了一下这几个文件：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost ~]# lsattr /etc/passwd  
-</span><span class='line'>------------- /etc/passwd  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/group  
-</span><span class='line'>----i-------- /etc/group  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/shadow  
-</span><span class='line'>------------- /etc/shadow  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/gshadow  
-</span><span class='line'>----i-------- /etc/gshadow  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到文件被设置的 i 这个隐藏权限，<br/>
-i：设定文件不能被删除、改名、设定链接关系，同时不能写入或新增内容。<br/>
-i参数对于文件 系统的安全设置有很大帮助。</p>
-
-<p>既然这样只要把i权限去掉就应该好了。</p>
-
-<p>使用命令chattr命令修改文件隐藏权限，执行如下命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>chattr -i /etc/gshadow
-</span><span class='line'>chattr -i /etc/group</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后可以正常执行了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/09/kernel-mm-shm3/">Linux的IPC命令 查看共享内存</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-02-09T15:46:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>15:46:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/cocowool/archive/2012/05/22/2513027.html">http://www.cnblogs.com/cocowool/archive/2012/05/22/2513027.html</a></p>
-
-<h4>进程间通信概述</h4>
-
-<p>进程间通信有如下的目的：<br/>
-1、数据传输，一个进程需要将它的数据发送给另一个进程，发送的数据量在一个字节到几M之间；<br/>
-2、共享数据，多个进程想要操作共享数据，一个进程对数据的修改，其他进程应该立刻看到；<br/>
-3、通知事件，一个进程需要向另一个或一组进程发送消息，通知它们发生了某件事情；<br/>
-4、资源共享，多个进程之间共享同样的资源。为了做到这一点，需要内核提供锁和同步机制；<br/>
-5、进程控制，有些进程希望完全控制另一个进程的执行（如Debug进程），此时控制进程希望能够拦截另一个进程的所有陷入和异常，并能够及时知道它的状态改变。</p>
-
-<p>Linux进程间通信由以下几部分发展而来：<br/>
-早期UNIX进程间通信：包括管道、FIFO、信号。<br/>
-基于System V的进程间通信：包括System V消息队列、System V信号灯（Semaphore）、System V共享内存。<br/>
-基于Socket进程间通信。<br/>
-基于POSIX进程间通信：包括POSIX消息队列、POSIX信号灯、POSIX共享内存。<br/>
-Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
-
-<p>IPCS命令是Linux下显示进程间通信设施状态的工具。我们知道，系统进行进程间通信（IPC）的时候，可用的方式包括信号量、共享内存、消息队列、管道、信号（signal）、套接字等形式[2]。使用IPCS可以查看共享内存、信号量、消息队列的状态。</p>
-
-<p>例如在CentOS6.0上执行ipcs</p>
-
-<p><img src="/images/kernel/2015-02-09-2.png" alt="" /></p>
-
-<p>具体的用法总结如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1、显示所有的IPC设施
-</span><span class='line'># ipcs -a
-</span><span class='line'>
-</span><span class='line'>2、显示所有的消息队列Message Queue
-</span><span class='line'># ipcs -q
-</span><span class='line'>
-</span><span class='line'>3、显示所有的信号量
-</span><span class='line'># ipcs -s
-</span><span class='line'>
-</span><span class='line'>4、显示所有的共享内存
-</span><span class='line'># ipcs -m
-</span><span class='line'>
-</span><span class='line'>5、显示IPC设施的详细信息
-</span><span class='line'># ipcs -q -i id
-</span><span class='line'>id 对应shmid、semid、msgid等。-q对应设施的类型（队列），查看信号量详细情况使用-s，查看共享内存使用-m。
-</span><span class='line'>
-</span><span class='line'>6、显示IPC设施的限制大小
-</span><span class='line'># ipcs -m -l
-</span><span class='line'>-m对应设施类型，可选参数包括-q、-m、-s。
-</span><span class='line'>
-</span><span class='line'>7、显示IPC设施的权限关系
-</span><span class='line'># ipcs -c
-</span><span class='line'># ipcs -m -c
-</span><span class='line'># ipcs -q -c
-</span><span class='line'># ipcs -s -c
-</span><span class='line'>
-</span><span class='line'>8、显示最近访问过IPC设施的进程ID。
-</span><span class='line'># ipcs -p
-</span><span class='line'># ipcs -m -p
-</span><span class='line'># ipcs -q -p
-</span><span class='line'>
-</span><span class='line'>9、显示IPC设施的最后操作时间
-</span><span class='line'># ipcs -t
-</span><span class='line'># ipcs -q -t
-</span><span class='line'># ipcs -m -t
-</span><span class='line'># ipcs -s -t
-</span><span class='line'>
-</span><span class='line'>10、显示IPC设施的当前状态
-</span><span class='line'># ipcs -u</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Linux上的ipcs命令，不支持UNIX上的-b、-o指令，同样UNIX中不支持-l、-u指令，所以在编写跨平台的脚本时，需要注意这个问题。</p>
-
-<h4>参考资料：</h4>
-
-<p>1、<a href="http://wenku.baidu.com/view/58048caddd3383c4bb4cd26f.html">Linux下IPCS的用法详解</a><br/>
-2、<a href="http://www.cnblogs.com/linshui91/archive/2010/09/29/1838770.html">Linux进程间通信</a><br/>
-3、<a href="http://blog.csdn.net/bonny95/article/details/6442821">Linux下IPCS的10种用法</a><br/>
-4、<a href="http://www.linuxdiyf.com/viewarticle.php?id=6783">Linux IPC小结</a><br/>
-5、<a href="http://www.cnblogs.com/wangkangluo1/archive/2012/05/14/2498786.html">Linux IPC总结</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/22">&larr; Older</a>
@@ -1362,12 +1214,12 @@ if (!document.getElementById('compiler~base')) document.getElementById('aexp_com
 if (!document.getElementById('compiler')) document.getElementById('aexp_compiler').style.visibility = 'hidden';
 if (!document.getElementById('compiler~make')) document.getElementById('aexp_compiler~make').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(14)</span></li>
+<li class='catclass'><a href='/blog/cats/assembly/'>assembly</a><a href='##' onmousedown=showDiv('assembly') id='aexp_assembly'><span class='exp_style' id='exp_assembly'>[+]</span></a><span class='right_span'>(15)</span></li>
 <div id='assembly' class='catsub'><li><a href='/blog/cats/assembly~arm/?opendiv=assembly'>arm</a><a href='##' onmousedown=showDiv('assembly~arm') id='aexp_assembly~arm'><span class='exp_style' id='exp_assembly~arm'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly~arm')) document.getElementById('aexp_assembly~arm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/assembly~base/?opendiv=assembly'>base</a><a href='##' onmousedown=showDiv('assembly~base') id='aexp_assembly~base'><span class='exp_style' id='exp_assembly~base'>[+]</span></a><span class='right_span'>13</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
@@ -1460,7 +1312,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(60)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(62)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -1469,7 +1321,7 @@ if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>6</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>8</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -1549,8 +1401,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(126)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(129)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -1634,23 +1486,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/21/debug-gdb-info-set/">gdb 修改寄存器/变量</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/21/assembly-base-test/">test指令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/15/kernel-net-lvs-detail/">LVS详解</a>
       </li>
     
       <li class="post">
         <a href="/blog/2015/07/15/kernel-net-lvs-start/">LVS简介及使用</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/15/kernel-net-ethtool/">ethtool命令</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/07/ubuntu-kvm/">ubuntu安装kvm虚拟机</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/07/centos-kvm/">centos安装kvm虚拟机</a>
       </li>
     
   </ul>
