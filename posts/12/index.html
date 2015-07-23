@@ -62,6 +62,380 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-stack/">中断栈溢出后的结果</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-07T15:54:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:54:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a></p>
+
+<p>说一下上文中最开始提到的“某个问题”：如果一台主机网卡比较多，然后每个网卡分队列又比较多，总之结果就是系统里的网卡设备的中断号比较多（关于超过256个中断数的情况，请见参考1，2，3），一旦所有这些中断都绑定到同一个CPU，那么如果网卡收到数据包进而触发中断，而众多硬中断一嵌套就非常容易出现中断栈溢出。一旦中断栈溢出，那么将会导致怎样的结果，这曾在之前的文章里隐含的提到过，这里再重新整理一遍。</p>
+
+<p>在继续下面的描述之前，先看两个知识点：</p>
+
+<h5>1，Linux 2.4.x的中断栈：</h5>
+
+<p>a)，由硬中断/软中断共同使用同一个中断栈<br/>
+b)，中断栈与内核栈共享一个栈<br/>
+c)，中断执行的时候使用的栈就是当前进程的内核栈</p>
+
+<h5>2，Linux 2.6.x的中断栈：</h5>
+
+<p>a)，硬中断与软中断分离使用不同的中断栈<br/>
+b)，中断栈与内核栈分离<br/>
+c)，X86_64 double fault、NMI还可以有额外的栈（64bit特性：IST(Interrupt Stack Table)）</p>
+
+<p>可以看到，对于Linux 2.4.x内核而言，因为中断处理函数使用内核栈作为中断栈，所以导致更加容易发生内核栈溢出（因内核函数本身用栈过多导致溢出，或内核函数本身还未导致内核栈溢出，但此时来了一个中断，因中断函数使用栈而导致溢出，即中断函数成了压死骆驼的最后一根稻草），而内核栈溢出的直接结果就是踩坏task结构体，从而无法正常执行对应的task进程而出现oops宕机。</p>
+
+<p>由于“中断执行的时候使用的栈就是当前进程的内核栈”，所以如果是执行到中断函数后才溢出，那么导致oops里提示的进程信息可能每次都不一样，因此如果出现这种情况，需要考虑是中断函数导致内核栈溢出，否则需怀疑普通的内核函数导致栈溢出即可。</p>
+
+<p>对于Linux 2.6.x内核而言，因为其中断/内核栈分离、软/硬中断栈分离，即每个CPU私有两个栈（见下面注释）分别处理软中断和硬中断，因此出现内核栈溢出，特别是中断栈溢出的概率大大降低。</p>
+
+<p>注释：这个说法来之书本《Understanding.the.Linux.Kernel.3rd.Edition》4.6.1.4. Multiple Kernel Mode stacks，而这本书针对的内核版本是2.6.11，且主要是指32位架构，所以与现在的新版内核源码有些许出入（比如现在情况的栈大小可能是占用2页），但这些细微改变与本文的具体问题相关不大（无非是溢出的难易程度问题），这里不再深入研究，具体情况请参考源代码自行斟酌。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>The hard IRQ stack is used when handling interrupts. There is one hard IRQ stack for each CPU in the system, and each stack is contained in a single page frame.
+</span><span class='line'>
+</span><span class='line'>The soft IRQ stack is used when handling deferrable functions (softirqs or tasklets; see the later section “Softirqs and Tasklets”). There is one soft IRQ stack for each CPU in the system, and each stack is contained in a single page frame. </span></code></pre></td></tr></table></div></figure>
+
+
+<p>回到本文的主题，在之前的文章里提到过，即如果中断/异常处理函数本身在处理的过程中出现异常，那么就有可能发生double fault，比如中断栈溢出。中断栈溢出导致的最终结果有两种情况，这由所使用的具体Linux内核版本来决定，更具体点说是由double fault异常的栈是否单独来决定（见参考1）。</p>
+
+<p>1，double fault的栈被单独出来<br/>
+这意味着double fault的处理函数还能正常执行，因此打印oops，宕机。</p>
+
+<p>2，double fault的栈没有被单独出来<br/>
+这意味着double fault的处理函数也无法正常执行，进而触发triple fault，机器直接重启。</p>
+
+<p>对于86-64架构下的Linux 2.6.x内核，因为IST(Interrupt Stack Table)的帮助，所以中断栈溢出导致的最终结果就是打印oops，宕机。</p>
+
+<p>下面来看内核源码文档kernel-stacks，<br/>
+1，每一个活动线程都有一个内核栈，大小为2页。<br/>
+2，每一个cpu有一些专门的栈，只有当cpu执行在内核态时，这些栈才有用；一旦cpu回退到用户态，这些特定栈就不再包含任何有用数据。<br/>
+3，主要的特定栈有：<br/>
+a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提供给中断处理函数更多的栈空间。<br/>
+这里还提到，在2.6.x-i386下，如果设置内核栈只有4K，即CONFIG_4KSTACKS，那么中断栈也是单独开的。备注：这个已有修改，2010-06-29 x86: Always use irq stacks，即不管设置的内核栈是否只有4K，中断栈都是独立的了。</p>
+
+<p>另外，这里有个说法与前面的引用有点出入：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>The interrupt stack is also used when processing a softirq. </span></code></pre></td></tr></table></div></figure>
+
+
+<p>即软中断和硬中断一样，也是使用这个中断栈。</p>
+
+<p>b，x86_64所特有的（也就是i386没有，即同时2.6.30.8内核，32位的Linux就不具备下面所说的这个特性），为double fault或NMI单独准备的栈，这个特性被称为Interrupt Stack Table(IST)。每个cpu最多支持7个IST。关于IST的具体原理与实现暂且不说，直接来看当前已经分配的IST独立栈：</p>
+
+<ul>
+<li><p>STACKFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+12号中断Stack Fault Exception (#SS)使用</p></li>
+<li><p>DOUBLEFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+8号中断Double Fault Exception (#DF)使用</p></li>
+<li><p>NMI_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+2号中断non-maskable interrupts (NMI)使用</p></li>
+<li><p>DEBUG_STACK. DEBUG_STKSZ<br/>
+1号中断硬件调试和3号中断软件调试使用</p></li>
+<li><p>MCE_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+18号中断Machine Check Exception (#MC)使用</p></li>
+</ul>
+
+
+<p>正因为double fault异常处理函数所使用的栈被单独了出来，所以在出现中断栈溢出时，double fault异常的处理函数还能正常执行，顺利打印出oops信息。</p>
+
+<p>最后的最后，有补丁移除IST功能（貌似是因为如果没有IST功能，那么kvm可以得到更好的优化，具体请见参考5），但通过对比补丁修改与实际源码（2.6.30.8以及3.6.11）来看，这个补丁并没有合入mainline主线。</p>
+
+<h4>参考资料：</h4>
+
+<p>1，where is hardware timer interrupt?<br/>
+<a href="http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt">http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt</a></p>
+
+<p>2，The MSI Driver Guide HOWTO<br/>
+<a href="https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  ">https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  </a>
+对应的翻译版：<a href="http://blog.csdn.net/reviver/article/details/6802347">http://blog.csdn.net/reviver/article/details/6802347</a></p>
+
+<p>3，[PATCH] x86: 64bit support more than 256 irq v2<br/>
+<a href="http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html">http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html</a></p>
+
+<p>4，How is an Interrupt handled in Linux?<br/>
+<a href="http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux">http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux</a></p>
+
+<p>5，Remove interrupt stack table usage from x86_64 kernel (v2)<br/>
+<a href="http://lwn.net/Articles/313029/  ">http://lwn.net/Articles/313029/  </a>
+<a href="http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741">http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741</a></p>
+
+<p>6，Interrupt Descriptor Table<br/>
+<a href="http://wiki.osdev.org/IDT">http://wiki.osdev.org/IDT</a></p>
+
+<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a> 或 <a href="http://lenky.info/?p=2247">http://lenky.info/?p=2247</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-irq/">对Linux x86-64架构上硬中断的重新认识</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-07T15:48:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:48:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a></p>
+
+<p>对于x86硬中断的概念，一直都落在理论的认识之上，直到这两天才（因某个问题）发现Linux的实现却并非如此，这里纠正一下（注意：Linux内核源码更新太快，一个说法的时效性太短，所以需注意我提到的香草内核版本，并且以x86-64架构为基准）。</p>
+
+<p>以前的认识：Linux对硬中断（本文如无特殊说明，都是指普通意义上的可屏蔽硬件中断）的处理有优先级概念，高优先级硬中断可以打断低优先级硬中断。</p>
+
+<h4>重新认识：</h4>
+
+<p>1，对于x86硬件而言，在文档325462.pdf卷3章节6.9 PRIORITY AMONG SIMULTANEOUS EXCEPTIONS AND INTERRUPTS 提到一个表格，是指如果在同一时刻有多个异常或中断到达，那么CPU会按照一个指定的优先级顺序对它们进行响应和服务，而并不是我之前所想的判断是否可相互打断执行的高低级别。</p>
+
+<p>2，对于Linux系统而言，硬中断之间并没有优先级的概念（虽然Intel CPU提供支持，请参考文档325462.pdf卷3章节10.8.3 Interrupt, Task, and Processor Priority），或者说优先级只有两个，全部关闭或全部开启，如下：</p>
+
+<blockquote><blockquote><p>Regardless of what the hardware might support, typical UNIX-type systems only make use of two levels: the minimum (all interrupts enabled) and the maximum (all interrupts disabled).</p></blockquote></blockquote>
+
+<p>这意味着，如果一个硬中断处理函数正在执行，只要当前是处于开启中断的情况，那么此时发生的任何另外一个中断都可以打断当前处理函数，从而出现中断嵌套的情况。
+值得注意的是，Linux提供对单个中断开启/禁止的接口（以软件实现为主，比如给对应中断描述符desc的status打上IRQ_DISABLED旗标）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void disable_irq(unsigned int irq)
+</span><span class='line'>void enable_irq(unsigned int irq)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面来看看Linux的实际处理，其硬中断的一般处理流程（具体可见参考1、2、3以及源代码，以2.6.30.8为例）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>硬件中断 -&gt; common_interrupt -&gt; do_IRQ -&gt; handle_irq -&gt; generic_handle_irq_desc -&gt; desc-&gt;handle_irq或__do_IRQ。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中desc->handle_irq是一个回调函数，会根据不同中断类型（I/O APIC、MSI）有不同的指向，比如：handle_fasteoi_irq()、handle_edge_irq()，这可以参考设置函数ioapic_register_intr()和setup_msi_irq()。通过/proc/interrupts可以看到各个中断的具体类型：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost ~]# cat /proc/interrupts
+</span><span class='line'>           CPU0       CPU1      
+</span><span class='line'>  0:        888          0   IO-APIC-edge      timer
+</span><span class='line'>  1:         96        112   IO-APIC-edge      i8042
+</span><span class='line'>  3:          1          0   IO-APIC-edge   
+</span><span class='line'>  4:          1          0   IO-APIC-edge   
+</span><span class='line'>  7:          0          0   IO-APIC-edge      parport0
+</span><span class='line'>  8:          1          0   IO-APIC-edge      rtc0
+</span><span class='line'>  9:          0          0   IO-APIC-fasteoi   acpi
+</span><span class='line'> 12:        204          0   IO-APIC-edge      i8042
+</span><span class='line'> 14:          0          0   IO-APIC-edge      ata_piix
+</span><span class='line'> 15:     460641        900   IO-APIC-edge      ata_piix
+</span><span class='line'> 16:          0          0   IO-APIC-fasteoi   Ensoniq AudioPCI
+</span><span class='line'> 17:     118347          0   IO-APIC-fasteoi   ehci_hcd:usb1, ioc0
+</span><span class='line'> 18:         70          0   IO-APIC-fasteoi   uhci_hcd:usb2
+</span><span class='line'> 19:     115143          0   IO-APIC-fasteoi   eth0
+</span><span class='line'> 24:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 25:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 26:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 27:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 28:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>不管是desc->handle_irq还是__do_IRQ，它们都会调入到另外一个函数handle_IRQ_event()。重点：从CPU接收到中断信号并开始处理，到这个函数为止，都是处于中断禁止状态。为什么？很简单，因为Intel开发者手册上是这么说的，在文档325462.pdf卷3章节6.8.1 Masking Maskable Hardware Interrupts提到：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>When an interrupt is handled through an interrupt gate, the IF flag is automati-
+</span><span class='line'>cally cleared, which disables maskable hardware interrupts. (If an interrupt is
+</span><span class='line'>handled through a trap gate, the IF flag is not cleared.)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在CPU开始处理一个硬中断到进入函数handle_IRQ_event()为止的这段时间里，因为处于中断禁止状态，所以不会出现被其它中断打断的情况。但是，在进入到函数handle_IRQ_event()后，立马有了这么两句：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
+</span><span class='line'>{
+</span><span class='line'>    irqreturn_t ret, retval = IRQ_NONE;
+</span><span class='line'>    unsigned int status = 0;
+</span><span class='line'> 
+</span><span class='line'>    if (!(action-&gt;flags & IRQF_DISABLED))
+</span><span class='line'>        local_irq_enable_in_hardirq();
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>函数local_irq_enable_in_hardirq()的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_LOCKDEP
+</span><span class='line'># define local_irq_enable_in_hardirq()  do { } while (0)
+</span><span class='line'>#else
+</span><span class='line'># define local_irq_enable_in_hardirq()  local_irq_enable()
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>宏CONFIG_LOCKDEP用于表示当前是否开启内核Lockdep功能，这是一个调试功能，用于检测潜在的死锁类风险，如果开启，那么函数local_irq_enable_in_hardirq()为空，即继续保持中断禁止状态，为什么Lockdep功能需要保持中断禁止待后文再述，这里考虑一般情况，即不开启Lockdep功能，那么执行函数local_irq_enable_in_hardirq()就会开启中断。
+看函数handle_IRQ_event()里的代码，如果没有带上IRQF_DISABLED旗标，那么就会执行函数local_irq_enable_in_hardirq()，从而启用中断。旗标IRQF_DISABLED可在利用函数request_irq()注册中断处理回调时设置，比如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (request_irq(uart-&gt;port.irq, bfin_serial_rx_int, IRQF_DISABLED,
+</span><span class='line'>     "BFIN_UART_RX", uart)) {</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果没有设置，那么到函数handle_IRQ_event()这里的代码后，因为中断已经开启，当前中断的后续处理就可能被其它中断打断，从而出现中断嵌套的情况。</p>
+
+<p>3，如果新来的中断类型与当前正在执行的中断类型相同，那么会暂时挂起。主要实现代码在函数__do_IRQ()（handle_fasteoi_irq()、handle_edge_irq()类似）内：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * If the IRQ is disabled for whatever reason, we cannot
+</span><span class='line'> * use the action we have.
+</span><span class='line'> */
+</span><span class='line'>action = NULL;
+</span><span class='line'>if (likely(!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))) {
+</span><span class='line'>    action = desc-&gt;action;
+</span><span class='line'>    status &= ~IRQ_PENDING; /* we commit to handling */
+</span><span class='line'>    status |= IRQ_INPROGRESS; /* we are handling it */
+</span><span class='line'>}
+</span><span class='line'>desc-&gt;status = status;
+</span><span class='line'> 
+</span><span class='line'>/*
+</span><span class='line'> * If there is no IRQ handler or it was disabled, exit early.
+</span><span class='line'> * Since we set PENDING, if another processor is handling
+</span><span class='line'> * a different instance of this same irq, the other processor
+</span><span class='line'> * will take care of it.
+</span><span class='line'> */
+</span><span class='line'>if (unlikely(!action))
+</span><span class='line'>    goto out;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>逻辑很简单，如果当前中断被禁止（IRQ_DISABLED）或正在执行（IRQ_INPROGRESS），那么goto cot，所以同种类型中断不会相互嵌套。</p>
+
+<p>4，从这个补丁开始，Linux内核已经全面禁止硬中断嵌套了，即从2.6.35开始，默认就是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>run the irq handlers with interrupts disabled.</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为这个补丁，所以旗标IRQF_DISABLED没用了，mainline内核在逐步删除它。</p>
+
+<p>我仔细检查了一下，对于2.6.34以及以前的内核，如果要合入这个补丁，那么有略微影响的主要是两个慢速驱动，分别为rtc-twl4030和twl4030-usb，需要按照类似开启Lockdep功能一样：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_LOCKDEP
+</span><span class='line'>/* WORKAROUND for lockdep forcing IRQF_DISABLED on us, which
+</span><span class='line'> * we don't want and can't tolerate.  Although it might be
+</span><span class='line'> * friendlier not to borrow this thread context...
+</span><span class='line'> */
+</span><span class='line'>local_irq_enable();
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>进行主动启用中断。还有另个一个慢速驱动IDE，其驱动中调用的是函数local_irq_enable_in_hardirq()，即它在开启Lockdep功能的情况下并没有明确要求启用中断，所以它应该不受补丁合入影响。嘛，我只是理论分析研究一下，仅供参考，如有风险，请实际操作者自行承担，:)。其它请看参考4，5，6。</p>
+
+<h4>参考：</h4>
+
+<p>1，Linux下386中断处理<br/>
+2，Linux中断基础构架<br/>
+3，linux源码entry_32.S中interrupt数组的分析<br/>
+4，<a href="http://lwn.net/Articles/321663/  ">http://lwn.net/Articles/321663/  </a>
+5，<a href="http://lwn.net/Articles/380931/  ">http://lwn.net/Articles/380931/  </a>
+6，<a href="http://thread.gmane.org/gmane.linux.kernel/801267">http://thread.gmane.org/gmane.linux.kernel/801267</a></p>
+
+<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a> 或 <a href="http://lenky.info/?p=2245">http://lenky.info/?p=2245</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-mm-splice/">Linux 中的零拷贝技术 splice</a></h2>
     
     
@@ -812,428 +1186,6 @@ socket to socket</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/04/28/debug-ubuntu-stap/">ubuntu安装systemtap</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-04-28T14:42:00+08:00'><span class='date'>2015-04-28</span> <span class='time'>14:42:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/ustc_dylan/article/details/7079876">http://blog.csdn.net/ustc_dylan/article/details/7079876</a></p>
-
-<h4>1. 从源安装systemtap</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo apt-get install systemtap</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. 安装kernel-debug-info</h4>
-
-<p>由于ubuntu 桌面版默认没有安装kernel-debug-info，所以安装了systemtap后仍然不能够追踪内核信息，因此需要手动安装kernel-debug-info包。</p>
-
-<h5>（1）查看当前内核版本</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ uname -a
-</span><span class='line'>Linux kk-desktop 2.6.32-73-generic #141-Ubuntu SMP Tue Mar 10 17:15:10 UTC 2015 x86_64 GNU/Linux</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>（2）下载对应内核版本的debug-info package</h5>
-
-<p><a href="http://ddebs.ubuntu.com/pool/main/l/linux/">http://ddebs.ubuntu.com/pool/main/l/linux/</a></p>
-
-<p><a href="http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb">http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb</a></p>
-
-<h4>3. 安装kernel-debug-info</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo dpkg -i linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb</span></code></pre></td></tr></table></div></figure>
-
-
-<p>经过以上安装配置后，就可以跟踪监控内核信息了，但是现在还不能跟踪linux内核模块的信息，因为，systemtap对linux内核模块的跟踪是通过libelf库来查找
-/usr/lib/debug目录下以.ko.dedug结尾的模块，但是linux发行版通常将linux模块的扩展名修改为.ko。</p>
-
-<h4>4. 安装elfutils并进行相应配置</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo apt-get install elfutils</span></code></pre></td></tr></table></div></figure>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 这些似乎不用
-</span><span class='line'>for file in `find /usr/lib/debug-name'*.ko' -print`
-</span><span class='line'>    do
-</span><span class='line'>    buildid=`eu-readelf-n $file| grep Build.ID:| awk '{print $3}'`
-</span><span class='line'>    dir=`echo $buildid| cut-c1-2`
-</span><span class='line'>    fn=`echo $buildid| cut-c3-`
-</span><span class='line'>    rm -fr /usr/lib/debug/.build-id
-</span><span class='line'>    mkdir -p/usr/lib/debug/.build-id/$dir
-</span><span class='line'>    ln -s $file/usr/lib/debug/.build-id/$dir/$fn
-</span><span class='line'>    ln -s $file/usr/lib/debug/.build-id/$dir/${fn}.debug
-</span><span class='line'>    done</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>5. 写个例子测试下</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo stap -ve 'probe begin { log("hello world") exit() }'</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果能够打印出hello world，说明安装配置成功!</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-reclaim2/">Linux物理内存回收机制</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-04-18T23:33:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>23:33:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>blog.tek-life.com/认识linux物理内存回收机制/</p>
-
-<h4>Introduction</h4>
-
-<p>本文所讲的物理页面回收是指动态的回收：即，空闲的内存不够用的时候，系统采取相应的方法将正在使用的内存释放，补充空闲内存，以满足内存的分配。</p>
-
-<h3>Text</h3>
-
-<h4>1.All channels for page freeing。首先先简单看一下系统中的内存释放的三种渠道。</h4>
-
-<p>  1-1>. 在用户进程退出的时候，释放内存。当用户进程退出的时候，会调用do_exit. do_exit最终会调用free_pagetables函数。该函数的作用是：遍历vma，根据vma中的虚拟地址找到实际的物理页，将其释放。在之前讲过，对于用户进程的虚拟地址区间，是以红黑树组织的。</p>
-
-<p>  1-2>. 手动的释放。在驱动中，分配内存使用alloc_pages()，释放内存用free_pages(这一点，类似于c语言中的malloc和free)。必须配对使用。否则会造成内存泄漏。</p>
-
-<p>  1-3>. 按需求调用内存回收例程来释放内存。这个区别于前两种的最大不同：它是动态的，按需的。当内存不够的时候，系统会自动按照一定的方式，将某些正在使用的内存释放掉，放进buddy system中再利用。</p>
-
-<h4>2. Overview for page frame reclaiming。</h4>
-
-<p>  2-1>. 先来看一下内存将会回收哪些页面<br/>
-  用户进程的页面都是通过page fault进行分配的。通过page fault进行分配的页面都是可以进行回收的。 这些页面总体可以划分为两种，分别是文件页(file cache)和匿名页(anonymous cache). 文件页，顾名思义，它是和外部存储设备上的某个文件相对应。匿名页，其内容不来自于外部存储设备，例如用户进程中的堆栈。这两种页面是内存回收的目标页面。</p>
-
-<p>  2-2>. 内存回收采用的主要算法是近似于LRU的算法。位于LRU链表前面的页是活跃的，位于LRU链表后面的页是不活跃的。为什么说是近似呢？<br/>
-   1. 页面在链表上排序并不是严格依据LRU不断移动的。他们挂上去后是不移动的。除非在进行页面回收的时候，有些页面从后面，可能会插入到前面；<br/>
-   2. Linux在LRU的基础上又引入了一个Referrenced标志。这种带Referenced标志的近似LRU的算法被有些人称之为Second-Chance Algorithm.</p>
-
-<p>简单看一下Second-Chance Algorithm. 当一个页从一个LRU链表上除去的时候，需要再看一下Referenced标志。如果该标志设置了，就将其置为0，不能将该页移出。</p>
-
-<p><img src="/images/kernel/2015-04-18-20.png" alt="" /><br/>
-图1</p>
-
-<p>以图一为例，当某个页面被访问后，Referenced标志被设置。当需要从该list上面回收某些页时，从后向前扫描该list上的页面。对于那些设置为1(Referenced标志被设置)，reset为0，不被移出链表。对于那些设置为0的页面，移出链表。</p>
-
-<p>  2-3>. Linux为了实现该算法，给每个zone都提供了5个LRU链表。这5个LRU链表分为3类，一类是活跃链表(active list)，活跃链表有两个：一个是链接file page cache的LRU list, 另一个是链接anonymous page cache的LRU list. 另一类是非活跃链表(inactive list)，非活跃链表也有两个：一个是链接file page cache 的LRU list, 另一个是链接anonymous page cache的LRU list. 内存回收例程从inactive list链表上获取页进行回收。第三类是unevictable链表，这个链表上挂载的是那些被mlock()或者locked的页面。Mlock(),是一个系统调用，用户程序通过该系统调用锁定某些页阻止系统将其换出。被Locked的页面通常是文件系统防止其他进程touch的页面。被锁定的页面都挂载unevictable链表上。</p>
-
-<p>  加入到active list链表上的页其page->flags上都要设置PG_active标志。凡是设置了PG_unevictable标志的都要挂载unevictable LRU list上。没有设置PG_active/PG_unevictable标志的都处于inactive状态。处于相关状态的页面通过page->lru 链接到对应的链表上。</p>
-
-<p>  当某个页被访问后，提高该页面的活跃度。提高活跃度的方法是:或者对page->flags设置PG_referenced标志，或者对page->flags设置PG_active(同时该物理页面从inactive_list链表上转移到active_list链表上). 有PG_referenced和PG_active标志，可以得到页面的状态，该活跃度由低到高依次为：00->01->10->11</p>
-
-<p>  2-4>. 对于一个可回收页面，按照LRU的算法，只有处于inactive状态的页并且没有设置PG_referenced标志位的页才能被回收。但实际上Linux在实现的时候并没有严格按照这中算法，PG_referenced位只是用来参考的。从下面的状态转换图中可以看出这一点。状态转换图一共有4种状态。</p>
-
-<p><img src="/images/kernel/2015-04-18-21.png" alt="" /><br/>
-图2</p>
-
-<p>当页面通过page fault被分配的时候，file page cache 被加入到非活动链表中(inactive list)， 匿名页(anonymous page cache)被加入到活动链表中(active list)。该状态迁移图所涉及的函数主要有以下几个：shrink_active_list，make_page_accessed，page_check_references。</p>
-
-<p>1)当inactive链表上的页数不够的时候，会调用shrink_active_list，该函数会将active链表上的页move到inactive链表上。对应于上图标号为1的转移；</p>
-
-<p>2). make_page_accessed().</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>355 /*
-</span><span class='line'>356  * Mark a page as having seen activity.
-</span><span class='line'>357  *
-</span><span class='line'>358  * inactive,unreferenced        -&gt;      inactive,referenced
-</span><span class='line'>359  * inactive,referenced          -&gt;      active,unreferenced
-</span><span class='line'>360  * active,unreferenced         -&gt;      active,referenced
-</span><span class='line'>361  */
-</span><span class='line'>362 void mark_page_accessed(struct page *page)
-</span><span class='line'>363 {
-</span><span class='line'>364         if (!PageActive(page) && !PageUnevictable(page) &&
-</span><span class='line'>365                         PageReferenced(page) && PageLRU(page)) {
-</span><span class='line'>366                 activate_page(page);
-</span><span class='line'>367                 ClearPageReferenced(page);
-</span><span class='line'>368         } else if (!PageReferenced(page)) {
-</span><span class='line'>369                 SetPageReferenced(page);
-</span><span class='line'>370         }
-</span><span class='line'>371 }
-</span><span class='line'>372 EXPORT_SYMBOL(mark_page_accessed);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>当通过read()系统调用或者读已经在cache中的页面时，会提高页面的活跃度。对应于上图标号为2的转移(00->01->10->11)；
-3) shrink_page_list->page_check_references()</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>704 static enum page_references page_check_references(struct page *page,
-</span><span class='line'>705                                                   struct mem_cgroup_zone *mz,
-</span><span class='line'>706                                                   struct scan_control *sc)
-</span><span class='line'>707 {
-</span><span class='line'>708         int referenced_ptes, referenced_page;
-</span><span class='line'>709         unsigned long vm_flags;
-</span><span class='line'>710
-</span><span class='line'>711         referenced_ptes = page_referenced(page, 1, mz-&gt;mem_cgroup, &vm_flags);
-</span><span class='line'>712         referenced_page = TestClearPageReferenced(page);
-</span><span class='line'>713
-</span><span class='line'>714         /* Lumpy reclaim – ignore references */
-</span><span class='line'>715         if (sc-&gt;reclaim_mode & RECLAIM_MODE_LUMPYRECLAIM)
-</span><span class='line'>716                 return PAGEREF_RECLAIM;
-</span><span class='line'>717
-</span><span class='line'>718         /*
-</span><span class='line'>719          * Mlock lost the isolation race with us.  Let try_to_unmap()
-</span><span class='line'>720          * move the page to the unevictable list.
-</span><span class='line'>721          */
-</span><span class='line'>722         if (vm_flags & VM_LOCKED)
-</span><span class='line'>723                 return PAGEREF_RECLAIM;
-</span><span class='line'>724
-</span><span class='line'>725         if (referenced_ptes) {
-</span><span class='line'>726                 if (PageAnon(page))
-</span><span class='line'>727                         return PAGEREF_ACTIVATE;
-</span><span class='line'>728                 /*
-</span><span class='line'>729                  * All mapped pages start out with page table
-</span><span class='line'>730                  * references from the instantiating fault, so we need
-</span><span class='line'>731                  * to look twice if a mapped file page is used more
-</span><span class='line'>732                  * than once.
-</span><span class='line'>733                  *
-</span><span class='line'>734                  * Mark it and spare it for another trip around the
-</span><span class='line'>735                  * inactive list.  Another page table reference will
-</span><span class='line'>736                  * lead to its activation.
-</span><span class='line'>737                  *
-</span><span class='line'>738                  * Note: the mark is set for activated pages as well
-</span><span class='line'>739                  * so that recently deactivated but used pages are
-</span><span class='line'>740                  * quickly recovered.
-</span><span class='line'>741                  */
-</span><span class='line'>742                 SetPageReferenced(page);
-</span><span class='line'>743
-</span><span class='line'>744                 if (referenced_page || referenced_ptes &gt; 1)
-</span><span class='line'>745                         return PAGEREF_ACTIVATE;
-</span><span class='line'>746
-</span><span class='line'>747                 /*
-</span><span class='line'>748                  * Activate file-backed executable pages after first usage.
-</span><span class='line'>749                  */
-</span><span class='line'>750                 if (vm_flags & VM_EXEC)
-</span><span class='line'>751                         return PAGEREF_ACTIVATE;
-</span><span class='line'>752
-</span><span class='line'>753                 return PAGEREF_KEEP;
-</span><span class='line'>754         }
-</span><span class='line'>755
-</span><span class='line'>756         /* Reclaim if clean, defer dirty pages to writeback */
-</span><span class='line'>757         if (referenced_page && !PageSwapBacked(page))
-</span><span class='line'>758                 return PAGEREF_RECLAIM_CLEAN;
-</span><span class='line'>759
-</span><span class='line'>760         return PAGEREF_RECLAIM;
-</span><span class='line'>761 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>该函数被真正的页面回收函数shrink_page_list调用。所处理的对象是处于inactive状态的页面。分以下几种情况：</p>
-
-<p>  3-a). 如果是匿名页，并且最近被访问过(PTE_young置位)，对应3-a的转移(Line 726)。即(inactive+PG_referenced)->active，inactive->active. (01->10或者00->10).</p>
-
-<p>  3-b). 如果是已经映射的文件页,最近被访问过(PTE_young置位)，如果PG_referenced置位或者被两个进程最近访问过(这一点不知道理解的对否)(Line 744~745)，对应于3-b的转移(01->11)。</p>
-
-<p>  3-c). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 并且该page cache中的内容是可执行的(例如，用户进程的代码段)，则inactive->(active+PG_referenced).(00->11, 01->11)</p>
-
-<p>  3-d). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 则，设置PG_referenced标志，仍旧保留inactive状态，不进行回收。(00->01,01-01)</p>
-
-<p>  3-e). 除了以上情况，均进行回收。即：最近没有被访问过(PTE_YOUNG没有设置)的匿名页和文件页。</p>
-
-<p>  对于page_check_references()中的返回值，简单介绍一下：<br/>
-   PAGEREF_RECLAIM：进行回收；<br/>
-   PAGEREF_RECLAIM_CLEAN：若该页是干净的(clean)，则进行回收；<br/>
-   PAGEREF_KEEP：仍然保持在inactive LRU list上，不进行回收。<br/>
-   PAGEREF_ACTIVATE：不进行回收，并将该页转移到active LRU list上。</p>
-
-<p>  2-5>. 由以上的状态转换图，简单了解一下一个可回收的物理页面可能的生命周期。</p>
-
-<p>Free->inactive->[active]&lt;–>inactive->reclaimable->free</p>
-
-<p>  对于一个文件页，其在buddy system中未被分配时，处于free状态。当被分配后，首先挂载在inactive LRU list上。若被进程访问，便会被active。当一段时间没有被访问后，就处于inactive状态，挂载在inactive 链表上等待回收。被回收例程回收后，就进入buddy system中，回归到free状态。</p>
-
-<p>Free->Active&lt;–>[inactive]->reclaimable->free</p>
-
-<p>  对于一个匿名页，通过page fault被分配后，挂载在active链表上，然后经过deactive变为inactive然后被回收进buddy system中。</p>
-
-<p>  对于匿名页和文件页，刚被分配后所设置的状态，可以得出：系统总是想尽快老化文件页面。在系统的眼中，文件页的换出成本要低于匿名页。</p>
-
-<h4>3. Synchronization Reclaiming</h4>
-
-<p>  当内存分配不足的时候，内存回收例程就会被调用了。相关的代码在<code>__alloc_pages</code>中。</p>
-
-<p><img src="/images/kernel/2015-04-18-22.png" alt="" /><br/>
-图3</p>
-
-<p>  若分配失败，就会进入到<code>__alloc_pages_slowpath</code>中。</p>
-
-<p><img src="/images/kernel/2015-04-18-23.png" alt="" /><br/>
-图4</p>
-
-<p>  该函数功能正如其名字所属，属于slow path。首先会唤醒各个node上的kswapd例程。kswapd是一个kernel thread,每一个node都有一个例程。该例程的函数体是kswapd().该例程会在第4节中降到。唤醒kwspad后，尝试重新调用get_page_from_freelist，分配内存。若失败，继续往下，如果需要分配内存的主儿在系统中的地位比较重要的话，会调用<code>__alloc_pages_high_priority()</code>. 该函数不会顾及系统设置的安全警告线(min water mark. 对于1GB左右的内存是min water mark是16MB)，分配内存。如果仍然失败；则会调用<code>__alloc_pages_direct_compat</code>来migrate内存来达到compat的目的。这个内存的compat类似于磁盘的压缩整理，把在物理内存中正在使用的分散内存，给迁移整合，以便腾出大的连续的物理内存，满足某些进程大页面的需求。需要注意的是，压缩内存需要在build kernel的时候enable CONFIG_COMPACTION。若仍然失败，就调用<code>__alloc_pages_direct_reclaim</code>来回收内存了。回收内存后，会继续调用get_page_from_freelist,尝试看是否能否分配成功。如果仍然失败，并且分配内存的时候要求不允许失败，那么就进入OOM中。OOM主要的功能是选择一个占用内存量比较大的用户进程，杀掉以释放内存。释放结束后，跳到<code>__alloc_pages_slowpath</code>函数的开头，重新执行一遍，以满足内存分配。如果，允许内存分配失败，则就不会OOM了。以分配失败返回给调用者。</p>
-
-<p>  <code>__alloc_pages_direct_reclaim</code>函数主要调用try_to_free_pages.</p>
-
-<p><img src="/images/kernel/2015-04-18-24.png" alt="" /><br/>
-图5</p>
-
-<p>  try_to_free_pages()做的事情是，按照自定义的优先级从12开始，递减循环（优先级越小代表级别越高，回收的程度越剧烈）从要分配内存的zone以及其fall-back zone list中回收可用内存释放到buddy system中。它通过调用shrink_zones来达到依次扫描zone以及fall-back zone list的目的。对各个zone进行回收结束后，对slab也进行回收（本文不对slab的回收做分析）。如果至此，已经回收了足够多的内存（32个页），那么就返回。如果没有回收到32个页，则是否需要唤醒pdflush进程，该进程的作用是唤醒块设备的读写进程将脏页写到块设备上。唤醒pdflush的条件是看是否扫描了超过48个页。之后，如果这是的扫描优先级已经小于10了，那么睡眠1/10HZ，即1S.然后递减优先级，进行下一遍的循环。</p>
-
-<p><img src="/images/kernel/2015-04-18-25.png" alt="" /><br/>
-图6</p>
-
-<p><img src="/images/kernel/2015-04-18-26.png" alt="" /><br/>
-图7</p>
-
-<p><img src="/images/kernel/2015-04-18-27.png" alt="" /><br/>
-图8</p>
-
-<p>关于swap cache的作用，请看下图（图9）。</p>
-
-<p><img src="/images/kernel/2015-04-18-28.png" alt="" /><br/>
-图9</p>
-
-<p>  有关对swap cache 作用的描述，最靠谱的分析是来自Understanding Linux Kernel. 摘录如下：<br/>
-Consider a page P that is shared among two processes, A and B. Initially, the Page Table entries of both processes contain a reference to the page frame, and the page has two owners; this case is illustrated in Figure 17-8(a). When the PFRA selects the page for reclaiming, shrink_list( ) inserts the page frame in the swap cache. As illustrated in Figure 17-8(b), now the page frame has three owners, while the page slot in the swap area is referenced only by the swap cache. Next, the PFRA invokes try_to_unmap( ) to remove the references to the page frame from the Page Table of the processes; once this function terminates, the page frame is referenced only by the swap cache, while the page slot is referenced by the two processes and the swap cache, as illustrated in Figure 17-8&copy;. Let’s suppose that, while the page’s contents are being written to disk, process B accesses the pagethat is, it tries to access a memory cell using a linear address inside the page. Then, the page fault handler finds the page frame in the swap cache and puts back its physical address in the Page Table entry of process B, as illustrated in Figure 17-8(d). Conversely, if the swap-out operation terminates without concurrent swap-in operations,the shrink_list( ) function removes the page frame from the swap cache and releases the page frame to the Buddy system, as illustrated in Figure 17-8(e).</p>
-
-<h5>Remark:</h5>
-
-<ol>
-<li> Figure 17-8 请对照图9.</li>
-<li> 上图的函数都是来自于2.6.11内核。本文所参考的内核是3.4.因此引用中的函数可能和本文所述的函数不匹配。</li>
-</ol>
-
-
-<h4>4. Asynchronization reclaiming.</h4>
-
-<h3>References</h3>
-
-<ol>
-<li>Understanding Linux Kernel (3rd).</li>
-<li>Understanding virtual memory manager (2nd).</li>
-<li>Professional Linux Kernel Architecture.</li>
-</ol>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/13">&larr; Older</a>
@@ -1287,8 +1239,8 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(38)</span></li>
-<div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>13</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(40)</span></li>
+<div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>15</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
 </script>
@@ -1464,8 +1416,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(129)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>11</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(131)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>13</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -1549,6 +1501,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/23/tools-haproxy/">haproxy安装配置</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/23/tools-squid-muti/">同时运行多个squid</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
       </li>
     
@@ -1558,14 +1518,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/07/21/assembly-base-test/">test指令</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/15/kernel-net-lvs-detail/">LVS详解</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/15/kernel-net-lvs-start/">LVS简介及使用</a>
       </li>
     
   </ul>
