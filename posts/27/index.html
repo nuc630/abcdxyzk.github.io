@@ -62,6 +62,185 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq-ksoftirqd/">关于ksoftirqd进程</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T15:01:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:01:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>blog.chinaunix.net/uid-20737871-id-1881243.html</p>
+
+<p>每个处理器都有一组辅助处理器软中断(和tasklet)的内核线程。当内核中出现大量软中断的时候，这些内核进程就会辅助处理它们。</p>
+
+<h4>引入ksoftirq内核线程的原因：</h4>
+
+<p>对于软中断，内核会选择在几个特殊时机进行处理。而在中断处理程序返回时处理是最常见的。软中断被触发的频率有时可能很高，更不利的是，处理函数有时还会 字形重复触发，那么就会导致用户空间进程无法获得足够的处理时间，因而处于饥饿状态。单纯的对重新触发的软中断采取不立即处理的策略，也无法让人接受。</p>
+
+<h4>最初的解决方案：</h4>
+
+<p>1）只要还有被触发并等待处理的软中断，本次执行就要负责处理，重新触发的软中断也在本次执行返回前被处理。这样做可以保证对内核的软中断采取即时处理的 方式，关键在于，对重新触发的软中断也会立即处理。当负载很高的时候，此时若有大量被触发的软中断，而它们本身又会重复触发。系统可能会一直处理软中断根 本不能完成其他任务。</p>
+
+<p>2）不处理重新触发的软中断。在从中断返回的时候，内核和平常一样，也会检查所有挂起的软中断并处理他们。但是，任何自行重新触发的软中断不会马上处理， 它们被放到下一个软中断执行时机去处理。而这个时机通常也就是下一次中断返回的时候。可是，在比较空闲的系统中，立即处理软中断才是比较好的做法。尽管它 能保证用户空间不处于饥饿状态，但它却让软中断忍受饥饿的痛苦，而根本没有好好利用闲置的系统资源。</p>
+
+<h4>改进：</h4>
+
+<p>最终在内核中实现的方案是不会立即处理处理重新触发的软中断。而作为改进，当大量软中断出现的时候，内核会唤醒一组内核线程来处理这些负载。这些线程在最 低的优先级上运行（nice值是19），这能避免它们跟其他重要的任务抢夺资源。但它们最终肯定会被执行，所以这个折中方案能够保证在软中断负担很中的时 候用户程序不会因为得不到处理时间处于饥饿状态。相应的，也能保证”过量“的软中断终究会得到处理。</p>
+
+<p>每个处理器都有一个这样的线程。所有线程的名字都叫做ksoftirq/n，区别在于n，它对应的是处理器的编号。在一个双CPU的机器上就有两个这样的 线程，分别叫做ksoftirqd/0和ksoftirqd/1。为了保证只要有空闲的处理器，它们就会处理软中断，所以给每个处理器都分配一个这样的线 程。一旦该线程被初始化，它就会执行类似下面这样的死循环：</p>
+
+<p>在kernel/softirq.c中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int ksoftirqd(void * __bind_cpu)
+</span><span class='line'>{
+</span><span class='line'>    set_user_nice(current, 19);
+</span><span class='line'>    current-&gt;flags |= PF_NOFREEZE;
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop()) {
+</span><span class='line'>        preempt_disable();
+</span><span class='line'>        if (!local_softirq_pending()) {
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            schedule();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'>        __set_current_state(TASK_RUNNING);
+</span><span class='line'>        while (local_softirq_pending()) {
+</span><span class='line'>            /* Preempt disable stops cpu going offline.
+</span><span class='line'>                If already offline, we'll be on wrong CPU:
+</span><span class='line'>                don't process */
+</span><span class='line'>            if (cpu_is_offline((long)__bind_cpu))
+</span><span class='line'>                goto wait_to_die;
+</span><span class='line'>            do_softirq();
+</span><span class='line'>            preempt_enable_no_resched();
+</span><span class='line'>            cond_resched();
+</span><span class='line'>            preempt_disable();
+</span><span class='line'>        }
+</span><span class='line'>        preempt_enable();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>wait_to_die:
+</span><span class='line'>    preempt_enable();
+</span><span class='line'>    /* Wait for kthread_stop */
+</span><span class='line'>    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    while (!kthread_should_stop()) {
+</span><span class='line'>        schedule();
+</span><span class='line'>        set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    }
+</span><span class='line'>    __set_current_state(TASK_RUNNING);
+</span><span class='line'>    return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只要有待处理的软中断(由softirq_pending()函数负责发现)，ksoftirq就会调用do_softirq去处理它们。通过重复执行这 样的操作，重新触发的软中断也会被执行。如果有必要，每次迭代后都会调用schedule()以便让更重要的进程得到处理机会。当所有需要执行的操作都完 成以后，该内核线程将自己设置为TASK_INTERRUPTIBLE状态，唤起调度程序选择其他可执行进程投入运行。</p>
+
+<p>只要do_softirq()函数发现已经执行过的内核线程重新触发了它自己，软中断内核线程就会被唤醒.</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/03/android-I9507V-kernel/">编译I9507V内核</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T14:52:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>14:52:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>源码地址 <a href="http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507">http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507</a></p>
+
+<p>好像三星android4.3版本后的bootloader会检测是否三星自编译内核，不是的会开机提示一下，不影响正常使用。</p>
+
+<p>按照README_Kernel.txt的做。</p>
+
+<p>内核中说明是用4.7编译器，但是4.7编译出来的装上去会挂，不知道为什么。<br/>
+但是换成4.6编译器就没问题。</p>
+
+<p>最后作成boot.img</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mkbootimg --kernel zImage --ramdisk boot.img-ramdisk.cpio.gz --base 80200000 --ramdisk_offset 1FF8000 --pagesize 2048 --cmdline "console=null androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x3F ehci-hcd.park=3 maxcpus=4" -o boot.img</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/01/03/android-img.ext4/">img.ext4格式</a></h2>
     
     
@@ -309,316 +488,6 @@ SD卡扩展分区</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/24/android-nubia-recovery/">【官方固件】努比亚Z5Smini官方4.4.2全新UI公测版</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-24T23:34:00+08:00'><span class='date'>2014-12-24</span> <span class='time'>23:34:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.onekeyrom.com/rom/zte_130038_10965.html">http://www.onekeyrom.com/rom/zte_130038_10965.html</a></p>
-
-<p>pan.baidu.com/s/1c0u18Ik</p>
-
-<p><span style="color:red">nx403a进入bootloader模式直接些boot分区，但是驱动没弄好起不来。这时再进bootloader却进不了（严重怀疑他们的bootloader建在boot上），只能进recovery模式。但是recovery是官方的，只能按官方方法升级整个系统救砖</span></p>
-
-<p>本次放出的压缩包内含两套固件：从4.2升级到4.4.2和从4.4.2再降级回4.2两套共计4个zip文件包<br/>
-所以请大家下载后先不要急于不要一键刷机，仔细阅读下面的使用说明和注意事项</p>
-
-<h4>【升级注意事项】</h4>
-
-<ol>
-<li>升级前，请取消手机的人脸解锁、图案锁、密码锁等各种屏幕锁。</li>
-<li>升级前，请务必备份好手机内的各项重要数据（联系人、短信、通话记录、程序等），避免异常丢失。</li>
-<li>升级前，请保证手机电池电量至少达到40%。</li>
-<li>在升级过程中，请将手机平放，务必不要触碰手机屏幕（否则可能导致触屏失准），直至确认升级成功。</li>
-<li>为了便于升级发生异常后的手机挽救，nubia UI ROM安装包同时提供升级文件与回退文件，请务必同时保留在手机里。</li>
-</ol>
-
-
-<h4>【Z5S mini 机型4.2到4.4版本升级操作说明】</h4>
-
-<p>步骤1： 下载Z5S mini机型的nubia UI ROM安装包（内含4个zip文件）<br/>
-步骤2： 将手机连接电脑，将安装包的4个zip文件并列拷贝至手机sdcard根目录下<br/>
-步骤3： 按开关机键，选择“重启”手机，在重启过程中一直长按音量上键进入recovery模式<br/>
-步骤4： 在recovery模式界面，请按音量键选择apply update from sdcard菜单项，并按开关机键确定，接着按音量键选择NX403A_4.2_to_4.4_recovery_xxx.zip文件，并按开关机键确定，开始升级<br/>
-步骤5： 步骤4升级完成后如下图所示，此时光标条位于reboot system now菜单项，直接按开关机键重启手机，请观察手机能否顺利进入桌面<br/>
-步骤6： 手机顺利进入桌面后，请重复步骤3，即再次重启手机，并在重启过程中一直长按音量上键，再次进入recovery模式<br/>
-步骤7： 在recovery模式界面，请按音量键选择wipe date/factory reset 菜单项，按开关机键进入，进行数据擦除<br/>
-步骤8： 数据擦除结束后，请按音量键选择apply update fromsdcard菜单项，按开关机键进入，再按音量键选择NX403A_4.4_update_xxx.zip文件，按开关机键  确认，执行升级，此过程要1到2分钟<br/>
-步骤9： 步骤8升级完成后如下图所示，此时光标条位于reboot system now菜单项，直接按开关机键重启手机</p>
-
-<h5>分区（看看就好）</h5>
-
-<p><a href="http://www.miui.com/forum.php?mod=viewthread&amp;tid=1804584&amp;extra=">http://www.miui.com/forum.php?mod=viewthread&amp;tid=1804584&amp;extra=</a></p>
-
-<p><a href="http://bbs.nubia.cn/thread-120471-1-1.html">http://bbs.nubia.cn/thread-120471-1-1.html</a></p>
-
-<p><a href="http://bbs.nubia.cn/thread-128729-1-1.html">http://bbs.nubia.cn/thread-128729-1-1.html</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/22/kernel-vermagic/">内核模块编译怎样绕过insmod时的版本检查</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-22T22:15:00+08:00'><span class='date'>2014-12-22</span> <span class='time'>22:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_53931eca01015uky.html">http://blog.sina.com.cn/s/blog_53931eca01015uky.html</a></p>
-
-<p>在開發kernel driver時，總是會遇到討人厭的vermagic檢查，只要目前在run的kernel版本跟driver編譯時用的kernel版本不一致，就沒辦法insmod。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>bash-3.2# insmod sdio.ko
-</span><span class='line'>sdio: version magic '2.6.28-271-gec75a15 preempt mod_unload modversions ARMv7 '
-</span><span class='line'>should be '2.6.28 preempt mod_unload ARMv7 '
-</span><span class='line'>insmod: init_module 'sdio.ko' failed (Exec format error)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>這大大降低了開發速度，尤其是當你拿不到客戶在用的kernel時，又要開發driver給他用，真的是很麻煩……</p>
-
-<p>那麼要怎麼利用噁心的方式繞過去呢???</p>
-
-<h5>一、先把 Moudle version 檢查關掉。</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>user@host # ARCH=arm make menuconfig
-</span><span class='line'>    --- Enable loadable module support                                             │ │
-</span><span class='line'>    │ │         [ ]   Forced module loading                                      │ │
-</span><span class='line'>    │ │         [*]   Module unloading                                           │ │
-</span><span class='line'>    │ │         [*]     Forced module unloading                                  │ │
-</span><span class='line'>    │ │         [ ]   Module versioning support                                  │ │
-</span><span class='line'>    │ │         [ ]   Source checksum for all modules</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>二、 使用modinfo時，可以看到目前這driver的vermagic</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>filename: external_drivers/omap3530/Linux/sdio/sdio.ko
-</span><span class='line'>author: Texas Instruments Inc
-</span><span class='line'>alias: TIWLAN_SDIO
-</span><span class='line'>license: GPL
-</span><span class='line'>description: TI WLAN SDIO driver
-</span><span class='line'>depends:
-</span><span class='line'>vermagic: 2.6.28-271-gec75a15 preempt mod_unload ARMv7
-</span><span class='line'>parm: g_sdio_debug_level:debug level (int)</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>三、 修改 kernel 的 vermagic，再重新編譯driver</h5>
-
-<p>vermagic 的第一個值 2.6.28-noneed 是由這 include/linux/utsrelease.h裡的 UTS_RELEASE 所定義。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define UTS_RELEASE "2.6.28-271-gec75a15"</span></code></pre></td></tr></table></div></figure>
-
-
-<p>之後再由 include/linux/vermagic.h 裡的 macro<br/>
-去組合出 VERMAGIC_STRING ， 也就是 kernel 的vermagic。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;generated/utsrelease.h&gt;
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_SMP
-</span><span class='line'>#define MODULE_VERMAGIC_SMP "SMP "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_SMP ""
-</span><span class='line'>#endif
-</span><span class='line'>#ifdef CONFIG_PREEMPT
-</span><span class='line'>#define MODULE_VERMAGIC_PREEMPT "preempt "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_PREEMPT ""
-</span><span class='line'>#endif完成編譯後，你就可以得
-</span><span class='line'>#ifdef CONFIG_MODULE_UNLOAD
-</span><span class='line'>#define MODULE_VERMAGIC_MODULE_UNLOAD "mod_unload "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_MODULE_UNLOAD ""
-</span><span class='line'>#endif
-</span><span class='line'>#ifndef CONFIG_MODVERSIONS
-</span><span class='line'>#define MODULE_VERMAGIC_MODVERSIONS "modversions "
-</span><span class='line'>#else
-</span><span class='line'>#define MODULE_VERMAGIC_MODVERSIONS ""
-</span><span class='line'>#endif
-</span><span class='line'>#ifndef MODULE_ARCH_VERMAGIC
-</span><span class='line'>#define MODULE_ARCH_VERMAGIC ""
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>#define VERMAGIC_STRING \
-</span><span class='line'>UTS_RELEASE " " \
-</span><span class='line'>MODULE_VERMAGIC_SMP MODULE_VERMAGIC_PREEMPT \
-</span><span class='line'>MODULE_VERMAGIC_MODULE_UNLOAD MODULE_VERMAGIC_MODVERSIONS \
-</span><span class='line'>MODULE_ARCH_VERMAGIC</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以， 我們只要把 UTS_RELEASE 改成我們的數字即可，當然若是懶得去try組合後的字串，也可以直接將VERMAGIC_STRING改成你要的字串</p>
-
-<p>建議修改完 vermagic.h, utsrelease.h後，還是把kernel重編完再編kernel，比較保險。</p>
-
-<p>以下是修改後，用modinfo看的結果</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>filename: external_drivers/omap3530/Linux/sdio/sdio.ko
-</span><span class='line'>author: Texas Instruments Inc
-</span><span class='line'>alias: TIWLAN_SDIO
-</span><span class='line'>license: GPL
-</span><span class='line'>description: TI WLAN SDIO driver
-</span><span class='line'>depends:
-</span><span class='line'>vermagic: 2.6.28 preempt mod_unload ARMv7
-</span><span class='line'>parm: g_sdio_debug_level:debug level (int)</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<hr />
-
-<p>另外若你是用git 做版本控制 , 那就會出現git的版本號在kernel 編號上<br/>
-所以要把他關掉</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>General setup  ---&gt;
-</span><span class='line'> [ ] Automatically append version information to the version strin
-</span><span class='line'>
-</span><span class='line'>解釋;
-</span><span class='line'>CONFIG_LOCALVERSION_AUTO:                                                   │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ This will try to automatically determine if the current tree is a       │ 
-</span><span class='line'>  │ release tree by looking for git tags that belong to the current         │ 
-</span><span class='line'>  │ top of tree revision.                                                   │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ A string of the format -gxxxxxxxx will be added to the localversion     │ 
-</span><span class='line'>  │ if a git-based tree is found.  The string generated by this will be     │ 
-</span><span class='line'>  │ appended after any matching localversion* files, and after the value    │ 
-</span><span class='line'>  │ set in CONFIG_LOCALVERSION.                                             │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ (The actual string used here is the first eight characters produced     │ 
-</span><span class='line'>  │ by running the command:                                                 │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ which is done within the script "scripts/setlocalversion".)             │ 
-</span><span class='line'>  │                                                                         │ 
-</span><span class='line'>  │ Symbol: LOCALVERSION_AUTO [=y]                                          │ 
-</span><span class='line'>  │ Prompt: Automatically append version information to the version string  │ 
-</span><span class='line'>  │   Defined at init/Kconfig:84                                            │ 
-</span><span class='line'>  │   Location:                                                             │ 
-</span><span class='line'>  │ ingT</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/28">&larr; Older</a>
@@ -672,8 +541,8 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(40)</span></li>
-<div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>15</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(42)</span></li>
+<div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
 </script>
@@ -688,6 +557,10 @@ if (!document.getElementById('tools~command')) document.getElementById('aexp_too
 <li><a href='/blog/cats/tools~git/?opendiv=tools'>git</a><a href='##' onmousedown=showDiv('tools~git') id='aexp_tools~git'><span class='exp_style' id='exp_tools~git'>[+]</span></a><span class='right_span'>6</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~git')) document.getElementById('aexp_tools~git').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/tools~haproxy/?opendiv=tools'>haproxy</a><a href='##' onmousedown=showDiv('tools~haproxy') id='aexp_tools~haproxy'><span class='exp_style' id='exp_tools~haproxy'>[+]</span></a><span class='right_span'>3</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_tools~haproxy').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>6</span></li>
 <script language='javascript' type='text/javascript'>
@@ -849,8 +722,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(131)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>13</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(133)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -934,6 +807,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/24/tools-haproxy-splice/">haproxy splice</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/07/24/tools-haproxy-log/">haproxy log</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/23/tools-haproxy/">haproxy安装配置</a>
       </li>
     
@@ -943,14 +824,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/21/debug-gdb-info-set/">gdb 修改寄存器/变量</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/21/assembly-base-test/">test指令</a>
       </li>
     
   </ul>
