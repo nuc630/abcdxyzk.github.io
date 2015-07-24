@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~07
 - tools
-- tools~base
+- tools~haproxy
 tags:
 ---
 
@@ -28,7 +28,7 @@ haproxy 配置中分成五部分内容，分别如下：
 #### 一、安装HAProxy
 
 ##### 1.下载最新haproxy安装包
-官网：http://www.haproxy.org ,如果不能访问，可以使用在线代理访问下载。下载：http://fossies.org/linux/misc/haproxy-1.5.14.tar.gz
+官网：http://www.haproxy.org ,如果不能访问，可以使用在线代理访问下载。下载：http://fossies.org/linux/misc/haproxy-1.5.14.tar.gz 或 [haproxy-1.5.14.tar.gz](/download/tools/haproxy-1.5.14.tar.gz)
 
 ##### 2.上传到linux的haproxy用户根目录下，并解压：
 ```
