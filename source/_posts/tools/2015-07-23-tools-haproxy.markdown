@@ -37,6 +37,9 @@ haproxy 配置中分成五部分内容，分别如下：
 创建目录/home/haproxy/haproxy
 
 ##### 3.安装
+
+CentOS5编译新的haproxy需要在Makefile中禁掉USE_ACCEPT4
+
 ```
 	cd haproxy-1.5.14
 	make  TARGET=linux26 ARCH=x86_64 PREFIX=/home/haproxy/haproxy   #将haproxy安装到/home/haproxy/haproxy ,TARGET是指定内核版本
