@@ -62,6 +62,205 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-base-rcu-apply/">Linux kernel 内存屏障在RCU上的应用</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-02T17:36:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>17:36:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/jianchaolv/article/details/7527647">http://blog.csdn.net/jianchaolv/article/details/7527647</a></p>
+
+<p>内存屏障主要解决的问题是编译器的优化和CPU的乱序执行。</p>
+
+<p>编译器在优化的时候，生成的汇编指令可能和c语言程序的执行顺序不一样，在需要程序严格按照c语言顺序执行时，需要显式的告诉编译不需要优化，这在linux下是通过barrier()宏完成的，它依靠volidate关键字和memory关键字，前者告诉编译barrier()周围的指令不要被优化，后者作用是告诉编译器汇编代码会使内存里面的值更改，编译器应使用内存里的新值而非寄存器里保存的老值。</p>
+
+<p>同样，CPU执行会通过乱序以提高性能。汇编里的指令不一定是按照我们看到的顺序执行的。linux中通过mb()系列宏来保证执行的顺序。简单的说，如果在程序某处插入了mb()/rmb()/wmb()宏，则宏之前的程序保证比宏之后的程序先执行，从而实现串行化。</p>
+
+<p>即使是编译器生成的汇编码有序，处理器也不一定能保证有序。就算编译器生成了有序的汇编码，到了处理器那里也拿不准是不 是会按照代码顺序执行。所以就算编译器保证有序了，程序员也还是要往代码里面加内存屏障才能保证绝对访存有序，这倒不如编译器干脆不管算了，因为内存屏障 本身就是一个sequence point，加入后已经能够保证编译器也有序。</p>
+
+<p>处理器虽然乱序执行，但最终会得出正确的结果，所以逻辑上讲程序员本不需要关心处理器乱序的问题。但是在SMP并发执行的情况下，处理器无法知道并发程序之间的逻辑，比如，在不同core上的读者和写者之间的逻辑。简单讲，处理器只保证在单个core上按照code中的顺序给出最终结果。这就要求程序员通过mb()/rmb()/wmb()/read_barrier_depends来告知处理器，从而得到正确的并发结果。内存屏障、数据依赖屏障都是为了处理SMP环境下的数据同步问题，UP根本不存在这个问题。</p>
+
+<p>下面分析下内存屏障在RCU上的应用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define rcu_assign_pointer(p, v) ({ \
+</span><span class='line'>    smp_wmb();                      \
+</span><span class='line'>    (p)= (v);                       \
+</span><span class='line'>})
+</span><span class='line'>
+</span><span class='line'>#define rcu_dereference(p) ({     \
+</span><span class='line'>    typeof(p)_________p1 = p;     \
+</span><span class='line'>    smp_read_barrier_depends();   \
+</span><span class='line'>    (_________p1);                \
+</span><span class='line'>}) </span></code></pre></td></tr></table></div></figure>
+
+
+<p>rcu_assign_pointer()通常用于写者的发布，rcu_dereference()通常用于读者的订阅。</p>
+
+<p>写者：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>p-&gt;a = 1;
+</span><span class='line'>p-&gt;b = 2;
+</span><span class='line'>p-&gt;c = 3;
+</span><span class='line'>rcu_assign_pointer(gp, p);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>读者：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>rcu_read_lock();
+</span><span class='line'>p = rcu_dereference(gp);
+</span><span class='line'>if (p != NULL) {
+</span><span class='line'>    do_something_with(p-&gt;a, p-&gt;b, p-&gt;c);
+</span><span class='line'>}
+</span><span class='line'>rcu_read_unlock();</span></code></pre></td></tr></table></div></figure>
+
+
+<p>rcu_assign_pointer()是说，先把那块内存写好，再把指针指过去。这里使用的内存写屏障是为了保证并发的读者读到数据一致性。在这条语句之前的读者读到旧的指针和旧的内存，这条语句之后的读者读到新的指针和新的内存。如果没有这条语句，很有可能出现读者读到新的指针和旧的内存。也就是说，这里通过内存屏障刷新了p所指向的内存的值，至于gp本身的值有没有更新还不确定。实际上，gp本身值的真正更新要等到并发的读者来促发。</p>
+
+<p>rcu_dereference() 原语用的是数据依赖屏障，smp_read_barrier_dependence,它要求后面的读操作如果依赖前面的读操作，则前面的读操作需要首先完成。根据数据之间的依赖，要读p->a, p->b, p->c, 就必须先读p，要先读p，就必须先读p1，要先读p1，就必须先读gp。也就是说读者所在的core在进行后续的操作之前，gp必须是同步过的当前时刻的最新值。如果没有这个数据依赖屏障，有可能读者所在的core很长一段时间内一直用的是旧的gp值。所以，这里使用数据依赖屏障是为了督促写者将gp值准备好，是为了呼应写者，这个呼应的诉求是通过数据之间的依赖关系来促发的，也就是说到了非呼应不可的地步了。</p>
+
+<p>下面看看kernel中常用的链表操作是如何使用这样的发布、订阅机制的：</p>
+
+<p>写者：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void list_add_rcu(struct list_head *new, struct list_head *head)
+</span><span class='line'>{
+</span><span class='line'>    __list_add_rcu(new, head, head-&gt;next);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void __list_add_rcu(struct list_head * new,
+</span><span class='line'>struct list_head * prev, struct list_head * next)
+</span><span class='line'>{
+</span><span class='line'>    new-&gt;next = next;
+</span><span class='line'>    new-&gt;prev = prev;
+</span><span class='line'>    smp_wmb();
+</span><span class='line'>    next-&gt;prev = new;
+</span><span class='line'>    prev-&gt;next = new;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>读者：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define list_for_each_entry_rcu(pos, head, member)                \
+</span><span class='line'>    for(pos = list_entry((head)-&gt;next, typeof(*pos), member);     \
+</span><span class='line'>            prefetch(rcu_dereference(pos)-&gt;member.next),          \
+</span><span class='line'>            &pos-&gt;member!= (head);                                \
+</span><span class='line'>        pos= list_entry(pos-&gt;member.next, typeof(*pos), member))</span></code></pre></td></tr></table></div></figure>
+
+
+<p>写者通过调用list_add_rcu来发布新的节点，其实是发布next->prev, prev->next这两个指针。读者通过list_for_each_entry_rcu来订阅这连个指针，我们将list_for_each_entry_rcu订阅部分简化如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pos = prev-&gt;next;
+</span><span class='line'>prefetch(rcu_dereference(pos)-&gt;next);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>读者通过rcu_dereference订阅的是pos，而由于数据依赖关系，又间接订阅了prev->next指针，或者说是促发prev->next的更新。</p>
+
+<p>下面介绍下其他相关链表操作的函数：</p>
+
+<p>safe版本的iterate的函数？为什么就safe了？</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define list_for_each_safe(pos,n, head)                    \
+</span><span class='line'>    for(pos = (head)-&gt;next, n = pos-&gt;next; pos != (head);  \
+</span><span class='line'>            pos= n, n = pos-&gt;next)
+</span><span class='line'>
+</span><span class='line'>#define list_for_each(pos, head)                                \
+</span><span class='line'>    for(pos = (head)-&gt;next; prefetch(pos-&gt;next), pos != (head); \
+</span><span class='line'>            pos= pos-&gt;next)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当在iterate的过程中执行删除操作的时候，比如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>list_for_each(pos,head)
+</span><span class='line'>    list_del(pos)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这样会断链，为了避免这种断链，增加了safe版本的iterate函数。另外，由于preftech的缘故，有可能引用一个无效的指针LIST_POISON1。这里的safe是指，为避免有些cpu的preftech的影响，干脆在iterate的过程中去掉preftech。</p>
+
+<p>还有一个既有rcu+safe版本的iterative函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define list_for_each_safe_rcu(pos, n, head)              \
+</span><span class='line'>    for(pos = (head)-&gt;next;                               \
+</span><span class='line'>            n= rcu_dereference(pos)-&gt;next, pos != (head); \
+</span><span class='line'>            pos= n)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只要用这个版本的iterate函数，就可以和多个_rcu版本的写操作(如：list_add_rcu())并发执行。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-mm-mm/">kmalloc、vmalloc、malloc的区别</a></h2>
     
     
@@ -2011,318 +2210,6 @@ bitmap的虚拟地直为：bootmem_data_t->node_bootmem_map</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-sched-user-to-kernel/">用户态到内核态切换</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-02T14:16:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>14:16:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/justcxtoworld/p/3155741.html">http://www.cnblogs.com/justcxtoworld/p/3155741.html</a></p>
-
-<p>本文将主要研究在X86体系下Linux系统中用户态到内核态切换条件，及切换过程中内核栈和任务状态段TSS在中断机制/任务切换中的作用及相关寄存器的变化。</p>
-
-<h4>一、用户态到内核态切换途径：</h4>
-
-<p> 1：系统调用        2：中断 　　3：异常</p>
-
-<p>对应代码，在3.3内核中，可以在/arch/x86/kernel/entry_32.S文件中查看。</p>
-
-<h4>二、内核栈</h4>
-
-<p>内核栈：Linux中每个进程有两个栈，分别用于用户态和内核态的进程执行，其中的内核栈就是用于内核态的堆栈，它和进程的task_struct结构，更具体的是thread_info结构一起放在两个连续的页框大小的空间内。</p>
-
-<p>在内核源代码中使用C语言定义了一个联合结构方便地表示一个进程的thread_info和内核栈：</p>
-
-<p>此结构在3.3内核版本中的定义在include/linux/sched.h文件的第2106行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>2016  union thread_union {
-</span><span class='line'>2017          struct thread_info thread_info;
-</span><span class='line'>2018          unsigned long stack[THREAD_SIZE/sizeof(long)];
-</span><span class='line'>2019     };        </span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中thread_info结构的定义如下：</p>
-
-<p>3.3内核 /arch/x86/include/asm/thread_info.h文件第26行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> 26 　　struct thread_info {
-</span><span class='line'> 27         struct task_struct      *task;          /* main task structure */
-</span><span class='line'> 28         struct exec_domain      *exec_domain;   /* execution domain */
-</span><span class='line'> 29         __u32                   flags;          /* low level flags */
-</span><span class='line'> 30         __u32                   status;         /* thread synchronous flags */
-</span><span class='line'> 31         __u32                   cpu;            /* current CPU */
-</span><span class='line'> 32         int                     preempt_count;  /* 0 =&gt; preemptable,
-</span><span class='line'> 33                                                    &lt;0 =&gt; BUG */
-</span><span class='line'> 34         mm_segment_t            addr_limit;
-</span><span class='line'> 35         struct restart_block    restart_block;
-</span><span class='line'> 36         void __user             *sysenter_return;
-</span><span class='line'> 37 #ifdef CONFIG_X86_32
-</span><span class='line'> 38         unsigned long           previous_esp;   /* ESP of the previous stack in
-</span><span class='line'> 39                                                    case of nested (IRQ) stacks
-</span><span class='line'> 40                                                 */
-</span><span class='line'> 41         __u8                    supervisor_stack[0];
-</span><span class='line'> 42 #endif
-</span><span class='line'> 43         unsigned int            sig_on_uaccess_error:1;
-</span><span class='line'> 44         unsigned int            uaccess_err:1;  /* uaccess failed */
-</span><span class='line'> 45 };</span></code></pre></td></tr></table></div></figure>
-
-
-<p>它们的结构图大致如下：</p>
-
-<p><img src="/images/kernel/2015-06-02.png" alt="" /></p>
-
-<p>  esp寄存器是CPU栈指针，存放内核栈栈顶地址。在X86体系中，栈开始于末端，并朝内存区开始的方向增长。从用户态刚切换到内核态时，进程的内核栈总是空的，此时esp指向这个栈的顶端。</p>
-
-<p>  在X86中调用int指令型系统调用后会把用户栈的%esp的值及相关寄存器压入内核栈中，系统调用通过iret指令返回，在返回之前会从内核栈弹出用户栈的%esp和寄存器的状态，然后进行恢复。所以在进入内核态之前要保存进程的上下文，中断结束后恢复进程上下文，那靠的就是内核栈。</p>
-
-<p>  这里有个细节问题，就是要想在内核栈保存用户态的esp,eip等寄存器的值，首先得知道内核栈的栈指针，那在进入内核态之前，通过什么才能获得内核栈的栈指针呢？答案是：TSS</p>
-
-<h4>三、TSS</h4>
-
-<p>X86体系结构中包括了一个特殊的段类型：任务状态段（TSS），用它来存放硬件上下文。TSS反映了CPU上的当前进程的特权级。</p>
-
-<p>linux为每一个cpu提供一个tss段，并且在tr寄存器中保存该段。</p>
-
-<p>在从用户态切换到内核态时，可以通过获取TSS段中的esp0来获取当前进程的内核栈 栈顶指针，从而可以保存用户态的cs,esp,eip等上下文。</p>
-
-<p>注：linux中之所以为每一个cpu提供一个tss段，而不是为每个进程提供一个tss段，主要原因是tr寄存器永远指向它，在任务切换的适合不必切换tr寄存器，从而减小开销。</p>
-
-<p>下面我们看下在X86体系中Linux内核对TSS的具体实现：</p>
-
-<p>内核代码中TSS结构的定义：</p>
-
-<p>3.3内核中：/arch/x86/include/asm/processor.h文件的第248行处：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>248   struct tss_struct {
-</span><span class='line'>249         /*
-</span><span class='line'>250          * The hardware state:
-</span><span class='line'>251          */
-</span><span class='line'>252         struct x86_hw_tss       x86_tss;
-</span><span class='line'>253 
-</span><span class='line'>254         /*
-</span><span class='line'>255          * The extra 1 is there because the CPU will access an
-</span><span class='line'>256          * additional byte beyond the end of the IO permission
-</span><span class='line'>257          * bitmap. The extra byte must be all 1 bits, and must
-</span><span class='line'>258          * be within the limit.
-</span><span class='line'>259          */
-</span><span class='line'>260         unsigned long           io_bitmap[IO_BITMAP_LONGS + 1];
-</span><span class='line'>261 
-</span><span class='line'>262         /*
-</span><span class='line'>263          * .. and then another 0x100 bytes for the emergency kernel stack:
-</span><span class='line'>264          */
-</span><span class='line'>265         unsigned long           stack[64];
-</span><span class='line'>266 
-</span><span class='line'>267 } ____cacheline_aligned;    </span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中主要的内容是：<br/>
-  硬件状态结构:     x86_hw_tss<br/>
-  IO权位图: 　　　　io_bitmap<br/>
-  备用内核栈: 　　  stack</p>
-
-<p>其中硬件状态结构：其中在32位X86系统中x86_hw_tss的具体定义如下：</p>
-
-<p>/arch/x86/include/asm/processor.h文件中第190行处：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>190#ifdef CONFIG_X86_32
-</span><span class='line'>191 /* This is the TSS defined by the hardware. */
-</span><span class='line'>192 struct x86_hw_tss {
-</span><span class='line'>193         unsigned short          back_link, __blh;
-</span><span class='line'>194         unsigned long           sp0;　　            //当前进程的内核栈顶指针
-</span><span class='line'>195         unsigned short          ss0, __ss0h;       //当前进程的内核栈段描述符
-</span><span class='line'>196         unsigned long           sp1;
-</span><span class='line'>197         /* ss1 caches MSR_IA32_SYSENTER_CS: */
-</span><span class='line'>198         unsigned short          ss1, __ss1h;
-</span><span class='line'>199         unsigned long           sp2;
-</span><span class='line'>200         unsigned short          ss2, __ss2h;
-</span><span class='line'>201         unsigned long           __cr3;
-</span><span class='line'>202         unsigned long           ip;
-</span><span class='line'>203         unsigned long           flags;
-</span><span class='line'>204         unsigned long           ax;
-</span><span class='line'>205         unsigned long           cx;
-</span><span class='line'>206         unsigned long           dx;
-</span><span class='line'>207         unsigned long           bx;
-</span><span class='line'>208         unsigned long           sp;      　　　　　　//当前进程用户态栈顶指针
-</span><span class='line'>209         unsigned long           bp;
-</span><span class='line'>210         unsigned long           si;
-</span><span class='line'>211         unsigned long           di;
-</span><span class='line'>212         unsigned short          es, __esh;
-</span><span class='line'>213         unsigned short          cs, __csh;
-</span><span class='line'>214         unsigned short          ss, __ssh;
-</span><span class='line'>215         unsigned short          ds, __dsh;
-</span><span class='line'>216         unsigned short          fs, __fsh;
-</span><span class='line'>217         unsigned short          gs, __gsh;
-</span><span class='line'>218         unsigned short          ldt, __ldth;
-</span><span class='line'>219         unsigned short          trace;
-</span><span class='line'>220         unsigned short          io_bitmap_base;
-</span><span class='line'>221 
-</span><span class='line'>222 } __attribute__((packed));</span></code></pre></td></tr></table></div></figure>
-
-
-<p>linux的tss段中只使用esp0和iomap等字段，并且不用它的其他字段来保存寄存器，在一个用户进程被中断进入内核态的时候，从tss中的硬件状态结构中取出esp0（即内核栈栈顶指针），然后切到esp0，其它的寄存器则保存在esp0指的内核栈上而不保存在tss中。</p>
-
-<p>每个CPU定义一个TSS段的具体实现代码：</p>
-
-<p>3.3内核中/arch/x86/kernel/init_task.c第35行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> 35  * per-CPU TSS segments. Threads are completely 'soft' on Linux,
-</span><span class='line'> 36  * no more per-task TSS's. The TSS size is kept cacheline-aligned
-</span><span class='line'> 37  * so they are allowed to end up in the .data..cacheline_aligned
-</span><span class='line'> 38  * section. Since TSS's are completely CPU-local, we want them
-</span><span class='line'> 39  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
-</span><span class='line'> 40  */
-</span><span class='line'>
-</span><span class='line'> 41 DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>INIT_TSS的定义如下:</p>
-
-<p>3.3内核中 /arch/x86/include/asm/processor.h文件的第879行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>879 #define INIT_TSS  {                                                       \
-</span><span class='line'>880         .x86_tss = {                                                      \
-</span><span class='line'>881                 .sp0            = sizeof(init_stack) + (long)&init_stack, \
-</span><span class='line'>882                 .ss0            = __KERNEL_DS,                            \
-</span><span class='line'>883                 .ss1            = __KERNEL_CS,                            \
-</span><span class='line'>884                 .io_bitmap_base = INVALID_IO_BITMAP_OFFSET,               \
-</span><span class='line'>885          },                                                               \
-</span><span class='line'>886         .io_bitmap              = { [0 ... IO_BITMAP_LONGS] = ~0 },       \
-</span><span class='line'>887 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中init_stack是宏定义，指向内核栈：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>61 #define init_stack              (init_thread_union.stack)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里可以看到分别把内核栈栈顶指针、内核代码段、内核数据段赋值给TSS中的相应项。从而进程从用户态切换到内核态时，可以从TSS段中获取内核栈栈顶指针，进而保存进程上下文到内核栈中。</p>
-
-<h4>总结、有了上面的一些准备，现总结在进程从用户态到内核态切换过程中，Linux主要做的事：</h4>
-
-<p>  1：读取tr寄存器，访问TSS段<br/>
-  2：从TSS段中的sp0获取进程内核栈的栈顶指针<br/>
-  3：由控制单元在内核栈中保存当前eflags,cs,ss,eip,esp寄存器的值。<br/>
-  4：由SAVE_ALL保存其寄存器的值到内核栈<br/>
-  5：把内核代码选择符写入CS寄存器，内核栈指针写入ESP寄存器，把内核入口点的线性地址写入EIP寄存器</p>
-
-<p>此时，CPU已经切换到内核态，根据EIP中的值开始执行内核入口点的第一条指令。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/8">&larr; Older</a>
@@ -2468,7 +2355,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(62)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(63)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -2496,6 +2383,10 @@ if (!document.getElementById('debug~kprobe')) document.getElementById('aexp_debu
 <li><a href='/blog/cats/debug~mark/?opendiv=debug'>mark</a><a href='##' onmousedown=showDiv('debug~mark') id='aexp_debug~mark'><span class='exp_style' id='exp_debug~mark'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~mark')) document.getElementById('aexp_debug~mark').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/debug~perf/?opendiv=debug'>perf</a><a href='##' onmousedown=showDiv('debug~perf') id='aexp_debug~perf'><span class='exp_style' id='exp_debug~perf'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('debug~perf')) document.getElementById('aexp_debug~perf').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/debug~systemtap/?opendiv=debug'>systemtap</a><a href='##' onmousedown=showDiv('debug~systemtap') id='aexp_debug~systemtap'><span class='exp_style' id='exp_debug~systemtap'>[+]</span></a><span class='right_span'>5</span></li>
 </div><script language='javascript' type='text/javascript'>
@@ -2557,8 +2448,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(133)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>15</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(134)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>16</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -2642,6 +2533,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/27/debug-perf/">系统级性能分析工具 --- Perf</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/24/tools-haproxy-splice/">haproxy splice</a>
       </li>
     
@@ -2655,10 +2550,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/07/23/tools-squid-muti/">同时运行多个squid</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
       </li>
     
   </ul>

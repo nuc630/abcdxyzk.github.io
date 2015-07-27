@@ -62,6 +62,318 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-sched-user-to-kernel/">用户态到内核态切换</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-02T14:16:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>14:16:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/justcxtoworld/p/3155741.html">http://www.cnblogs.com/justcxtoworld/p/3155741.html</a></p>
+
+<p>本文将主要研究在X86体系下Linux系统中用户态到内核态切换条件，及切换过程中内核栈和任务状态段TSS在中断机制/任务切换中的作用及相关寄存器的变化。</p>
+
+<h4>一、用户态到内核态切换途径：</h4>
+
+<p> 1：系统调用        2：中断 　　3：异常</p>
+
+<p>对应代码，在3.3内核中，可以在/arch/x86/kernel/entry_32.S文件中查看。</p>
+
+<h4>二、内核栈</h4>
+
+<p>内核栈：Linux中每个进程有两个栈，分别用于用户态和内核态的进程执行，其中的内核栈就是用于内核态的堆栈，它和进程的task_struct结构，更具体的是thread_info结构一起放在两个连续的页框大小的空间内。</p>
+
+<p>在内核源代码中使用C语言定义了一个联合结构方便地表示一个进程的thread_info和内核栈：</p>
+
+<p>此结构在3.3内核版本中的定义在include/linux/sched.h文件的第2106行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>2016  union thread_union {
+</span><span class='line'>2017          struct thread_info thread_info;
+</span><span class='line'>2018          unsigned long stack[THREAD_SIZE/sizeof(long)];
+</span><span class='line'>2019     };        </span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中thread_info结构的定义如下：</p>
+
+<p>3.3内核 /arch/x86/include/asm/thread_info.h文件第26行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 26 　　struct thread_info {
+</span><span class='line'> 27         struct task_struct      *task;          /* main task structure */
+</span><span class='line'> 28         struct exec_domain      *exec_domain;   /* execution domain */
+</span><span class='line'> 29         __u32                   flags;          /* low level flags */
+</span><span class='line'> 30         __u32                   status;         /* thread synchronous flags */
+</span><span class='line'> 31         __u32                   cpu;            /* current CPU */
+</span><span class='line'> 32         int                     preempt_count;  /* 0 =&gt; preemptable,
+</span><span class='line'> 33                                                    &lt;0 =&gt; BUG */
+</span><span class='line'> 34         mm_segment_t            addr_limit;
+</span><span class='line'> 35         struct restart_block    restart_block;
+</span><span class='line'> 36         void __user             *sysenter_return;
+</span><span class='line'> 37 #ifdef CONFIG_X86_32
+</span><span class='line'> 38         unsigned long           previous_esp;   /* ESP of the previous stack in
+</span><span class='line'> 39                                                    case of nested (IRQ) stacks
+</span><span class='line'> 40                                                 */
+</span><span class='line'> 41         __u8                    supervisor_stack[0];
+</span><span class='line'> 42 #endif
+</span><span class='line'> 43         unsigned int            sig_on_uaccess_error:1;
+</span><span class='line'> 44         unsigned int            uaccess_err:1;  /* uaccess failed */
+</span><span class='line'> 45 };</span></code></pre></td></tr></table></div></figure>
+
+
+<p>它们的结构图大致如下：</p>
+
+<p><img src="/images/kernel/2015-06-02.png" alt="" /></p>
+
+<p>  esp寄存器是CPU栈指针，存放内核栈栈顶地址。在X86体系中，栈开始于末端，并朝内存区开始的方向增长。从用户态刚切换到内核态时，进程的内核栈总是空的，此时esp指向这个栈的顶端。</p>
+
+<p>  在X86中调用int指令型系统调用后会把用户栈的%esp的值及相关寄存器压入内核栈中，系统调用通过iret指令返回，在返回之前会从内核栈弹出用户栈的%esp和寄存器的状态，然后进行恢复。所以在进入内核态之前要保存进程的上下文，中断结束后恢复进程上下文，那靠的就是内核栈。</p>
+
+<p>  这里有个细节问题，就是要想在内核栈保存用户态的esp,eip等寄存器的值，首先得知道内核栈的栈指针，那在进入内核态之前，通过什么才能获得内核栈的栈指针呢？答案是：TSS</p>
+
+<h4>三、TSS</h4>
+
+<p>X86体系结构中包括了一个特殊的段类型：任务状态段（TSS），用它来存放硬件上下文。TSS反映了CPU上的当前进程的特权级。</p>
+
+<p>linux为每一个cpu提供一个tss段，并且在tr寄存器中保存该段。</p>
+
+<p>在从用户态切换到内核态时，可以通过获取TSS段中的esp0来获取当前进程的内核栈 栈顶指针，从而可以保存用户态的cs,esp,eip等上下文。</p>
+
+<p>注：linux中之所以为每一个cpu提供一个tss段，而不是为每个进程提供一个tss段，主要原因是tr寄存器永远指向它，在任务切换的适合不必切换tr寄存器，从而减小开销。</p>
+
+<p>下面我们看下在X86体系中Linux内核对TSS的具体实现：</p>
+
+<p>内核代码中TSS结构的定义：</p>
+
+<p>3.3内核中：/arch/x86/include/asm/processor.h文件的第248行处：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>248   struct tss_struct {
+</span><span class='line'>249         /*
+</span><span class='line'>250          * The hardware state:
+</span><span class='line'>251          */
+</span><span class='line'>252         struct x86_hw_tss       x86_tss;
+</span><span class='line'>253 
+</span><span class='line'>254         /*
+</span><span class='line'>255          * The extra 1 is there because the CPU will access an
+</span><span class='line'>256          * additional byte beyond the end of the IO permission
+</span><span class='line'>257          * bitmap. The extra byte must be all 1 bits, and must
+</span><span class='line'>258          * be within the limit.
+</span><span class='line'>259          */
+</span><span class='line'>260         unsigned long           io_bitmap[IO_BITMAP_LONGS + 1];
+</span><span class='line'>261 
+</span><span class='line'>262         /*
+</span><span class='line'>263          * .. and then another 0x100 bytes for the emergency kernel stack:
+</span><span class='line'>264          */
+</span><span class='line'>265         unsigned long           stack[64];
+</span><span class='line'>266 
+</span><span class='line'>267 } ____cacheline_aligned;    </span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中主要的内容是：<br/>
+  硬件状态结构:     x86_hw_tss<br/>
+  IO权位图: 　　　　io_bitmap<br/>
+  备用内核栈: 　　  stack</p>
+
+<p>其中硬件状态结构：其中在32位X86系统中x86_hw_tss的具体定义如下：</p>
+
+<p>/arch/x86/include/asm/processor.h文件中第190行处：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>190#ifdef CONFIG_X86_32
+</span><span class='line'>191 /* This is the TSS defined by the hardware. */
+</span><span class='line'>192 struct x86_hw_tss {
+</span><span class='line'>193         unsigned short          back_link, __blh;
+</span><span class='line'>194         unsigned long           sp0;　　            //当前进程的内核栈顶指针
+</span><span class='line'>195         unsigned short          ss0, __ss0h;       //当前进程的内核栈段描述符
+</span><span class='line'>196         unsigned long           sp1;
+</span><span class='line'>197         /* ss1 caches MSR_IA32_SYSENTER_CS: */
+</span><span class='line'>198         unsigned short          ss1, __ss1h;
+</span><span class='line'>199         unsigned long           sp2;
+</span><span class='line'>200         unsigned short          ss2, __ss2h;
+</span><span class='line'>201         unsigned long           __cr3;
+</span><span class='line'>202         unsigned long           ip;
+</span><span class='line'>203         unsigned long           flags;
+</span><span class='line'>204         unsigned long           ax;
+</span><span class='line'>205         unsigned long           cx;
+</span><span class='line'>206         unsigned long           dx;
+</span><span class='line'>207         unsigned long           bx;
+</span><span class='line'>208         unsigned long           sp;      　　　　　　//当前进程用户态栈顶指针
+</span><span class='line'>209         unsigned long           bp;
+</span><span class='line'>210         unsigned long           si;
+</span><span class='line'>211         unsigned long           di;
+</span><span class='line'>212         unsigned short          es, __esh;
+</span><span class='line'>213         unsigned short          cs, __csh;
+</span><span class='line'>214         unsigned short          ss, __ssh;
+</span><span class='line'>215         unsigned short          ds, __dsh;
+</span><span class='line'>216         unsigned short          fs, __fsh;
+</span><span class='line'>217         unsigned short          gs, __gsh;
+</span><span class='line'>218         unsigned short          ldt, __ldth;
+</span><span class='line'>219         unsigned short          trace;
+</span><span class='line'>220         unsigned short          io_bitmap_base;
+</span><span class='line'>221 
+</span><span class='line'>222 } __attribute__((packed));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>linux的tss段中只使用esp0和iomap等字段，并且不用它的其他字段来保存寄存器，在一个用户进程被中断进入内核态的时候，从tss中的硬件状态结构中取出esp0（即内核栈栈顶指针），然后切到esp0，其它的寄存器则保存在esp0指的内核栈上而不保存在tss中。</p>
+
+<p>每个CPU定义一个TSS段的具体实现代码：</p>
+
+<p>3.3内核中/arch/x86/kernel/init_task.c第35行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 35  * per-CPU TSS segments. Threads are completely 'soft' on Linux,
+</span><span class='line'> 36  * no more per-task TSS's. The TSS size is kept cacheline-aligned
+</span><span class='line'> 37  * so they are allowed to end up in the .data..cacheline_aligned
+</span><span class='line'> 38  * section. Since TSS's are completely CPU-local, we want them
+</span><span class='line'> 39  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
+</span><span class='line'> 40  */
+</span><span class='line'>
+</span><span class='line'> 41 DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>INIT_TSS的定义如下:</p>
+
+<p>3.3内核中 /arch/x86/include/asm/processor.h文件的第879行：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>879 #define INIT_TSS  {                                                       \
+</span><span class='line'>880         .x86_tss = {                                                      \
+</span><span class='line'>881                 .sp0            = sizeof(init_stack) + (long)&init_stack, \
+</span><span class='line'>882                 .ss0            = __KERNEL_DS,                            \
+</span><span class='line'>883                 .ss1            = __KERNEL_CS,                            \
+</span><span class='line'>884                 .io_bitmap_base = INVALID_IO_BITMAP_OFFSET,               \
+</span><span class='line'>885          },                                                               \
+</span><span class='line'>886         .io_bitmap              = { [0 ... IO_BITMAP_LONGS] = ~0 },       \
+</span><span class='line'>887 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中init_stack是宏定义，指向内核栈：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>61 #define init_stack              (init_thread_union.stack)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里可以看到分别把内核栈栈顶指针、内核代码段、内核数据段赋值给TSS中的相应项。从而进程从用户态切换到内核态时，可以从TSS段中获取内核栈栈顶指针，进而保存进程上下文到内核栈中。</p>
+
+<h4>总结、有了上面的一些准备，现总结在进程从用户态到内核态切换过程中，Linux主要做的事：</h4>
+
+<p>  1：读取tr寄存器，访问TSS段<br/>
+  2：从TSS段中的sp0获取进程内核栈的栈顶指针<br/>
+  3：由控制单元在内核栈中保存当前eflags,cs,ss,eip,esp寄存器的值。<br/>
+  4：由SAVE_ALL保存其寄存器的值到内核栈<br/>
+  5：把内核代码选择符写入CS寄存器，内核栈指针写入ESP寄存器，把内核入口点的线性地址写入EIP寄存器</p>
+
+<p>此时，CPU已经切换到内核态，根据EIP中的值开始执行内核入口点的第一条指令。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-sched-switch/">进程切换过程分析</a></h2>
     
     
@@ -2198,73 +2510,6 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-ext/">RHEL5/CentOS5 上支持 Ext4</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-29T15:40:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>15:40:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><ul>
-<li><p>记住，只能改数据分区，<code>/</code> 和 <code>/boot</code> 分区不要试，至少我没成功，启动参数加rootfstype=ext4也起不来。</p></li>
-<li><p><code>/</code> 分区要改成ext4的话，可以直接改<code>/etc/fstab</code>文件，ext3支持以ext4形式挂载。</p></li>
-<li><p>extents属性加上后去不掉，所以该不会ext3的，除非不加这个属性？？，去掉属性<code>tune4fs -O ^flex_bg /dev/sdb1</code></p></li>
-</ul>
-
-
-<hr />
-
-<p><a href="http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html">http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html</a></p>
-
-<p>根据我以前的测试 Ext4 的性能好过 Ext3,在 RHEL5 上的 2.6.18-110 也有加入 Ext4 了.但默认没有让我们使用,怎么样才能不重起,能使用这个啦.
-其实我们只要加入一个包e4fsprogs 就行,它其实和 e2fsprogs 是一样的功能,这 RHEL-6 中,会变成一个默认的包的.所以我们目前还只能使用这个包来调整和设置Ext4.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum -y install e4fsprogs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在 RHEL 和 Centos5 中使用 Ext4 前,很多想可能想先给现有的文件系统转换成 Ext4 ,只要运行下面的命令就行了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tune4fs -O extents,uninit_bg,dir_index,flex_bg /dev/sdb1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>记住，转换成 ext4 后必须用 fsck 扫描，否则不能 mount，-p 参数说明 “自动修复” 文件系统：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>fsck -pf /dev/sdb1 或 fsck -y /dev/sdb1</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>下面这个好像不需要</h5>
-
-<p>在重起前,我还要让内核支持 Ext4 的文件系统,需要修改 initrd 的文件本身的内容.如下命令来生成 支持 Ext4 的 initrd.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mkinitrd --with=ext4 --with=ext3 -f /boot/initrd-2.6.18-404.el5.img 2.6.18-404.el5</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/9">&larr; Older</a>
@@ -2410,7 +2655,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(62)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(63)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -2438,6 +2683,10 @@ if (!document.getElementById('debug~kprobe')) document.getElementById('aexp_debu
 <li><a href='/blog/cats/debug~mark/?opendiv=debug'>mark</a><a href='##' onmousedown=showDiv('debug~mark') id='aexp_debug~mark'><span class='exp_style' id='exp_debug~mark'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~mark')) document.getElementById('aexp_debug~mark').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/debug~perf/?opendiv=debug'>perf</a><a href='##' onmousedown=showDiv('debug~perf') id='aexp_debug~perf'><span class='exp_style' id='exp_debug~perf'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('debug~perf')) document.getElementById('aexp_debug~perf').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/debug~systemtap/?opendiv=debug'>systemtap</a><a href='##' onmousedown=showDiv('debug~systemtap') id='aexp_debug~systemtap'><span class='exp_style' id='exp_debug~systemtap'>[+]</span></a><span class='right_span'>5</span></li>
 </div><script language='javascript' type='text/javascript'>
@@ -2499,8 +2748,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(133)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>15</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(134)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>16</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -2584,6 +2833,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/27/debug-perf/">系统级性能分析工具 --- Perf</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/24/tools-haproxy-splice/">haproxy splice</a>
       </li>
     
@@ -2597,10 +2850,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/07/23/tools-squid-muti/">同时运行多个squid</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
       </li>
     
   </ul>

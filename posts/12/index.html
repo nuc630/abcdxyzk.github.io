@@ -62,6 +62,329 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/05/08/debug-mark-write_queue/">如果sk_write_queue异常</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-08T14:14:00+08:00'><span class='date'>2015-05-08</span> <span class='time'>14:14:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><ul>
+<li>注意，以下情况内核都不可能产生，纯属假设</li>
+</ul>
+
+
+<h4>一、连续的SYN/FIN</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>|---FIN---|---SYN/FIN---|
+</span><span class='line'>    skb       next_skb</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>内核不可能出现是因为：发送FIN包后就不再发包。所以FIN包只可能在sk_write_queue的最后一个包</li>
+</ul>
+
+
+<p>假设skb和next_skb发出去后都丢了，那tcp_retransmit_skb会重传skb，
+重传的时候会调用tcp_retrans_try_collapse尝试去和下一个包合并。</p>
+
+<p>skb和next_skb合并过程：<br/>
+先检查一些条件，然后</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>...
+</span><span class='line'>skb_copy_from_linear_data(next_skb, skb_put(skb, next_skb_size), next_skb_size);
+</span><span class='line'>...
+</span><span class='line'>TCP_SKB_CB(skb)-&gt;end_seq = TCP_SKB_CB(next_skb)-&gt;end_seq;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>也就是skb->len += next_skb->len; skb->end_seq = next_skb->end_seq;</p>
+
+<p>假设:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb-&gt;len = 0;      skb-&gt;seq = 10;      skb-&gt;end_seq = 10 + FIN = 11;
+</span><span class='line'>next_skb-&gt;len = 0; next_skb-&gt;seq = 11; next_skb-&gt;end_seq = 11 + SYN/FIN = 12;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>那么合并后：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb-&gt;len = 0;      skb-&gt;seq = 10;      skb-&gt;end_seq = 12;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>很明显不正常了，正常情况下：skb->len &lt;= skb->end_seq - skb->seq &lt;= skb->len+1</p>
+
+<p>这时如果来了ack 11，那么会再重传合并后的skb，然后会调用tcp_trim_head(struct ws_st_sock <em>sk, struct sk_buff </em>skb, u32 len)，参数len = tp->snd_una - TCP_SKB_CB(skb)->seq = 1，但skb->len = 0;</p>
+
+<p>tcp_trim_head函数中会：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb-&gt;len -= len;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这时skb->len = (U32)-1 = 0xFFFFFFFF，skb->len错误后，再调用skb_copy之类的就会访问越界，报BUG。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 821 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)
+</span><span class='line'> 822 {
+</span><span class='line'>        ......
+</span><span class='line'> 835         if (skb_copy_bits(skb, -headerlen, n-&gt;head, headerlen + skb-&gt;len))
+</span><span class='line'> 836                 BUG();</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>二、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
+
+<ul>
+<li>内核用tp->write_seq控制，保证了write_queue的skb->end_seq == next_skb->seq</li>
+</ul>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
+</span><span class='line'>next_skb:  |---------------------|
+</span><span class='line'>
+</span><span class='line'>假设skb已经发送出去，并被ack了，这时tp-&gt;snd_una = skb-&gt;end_seq
+</span><span class='line'>此时再发送next_skb，并且mss变小了，需要对next_skb分包，分包后如下：
+</span><span class='line'>
+</span><span class='line'>skb:       |------------------|
+</span><span class='line'>next_skb:  |-------|-------:-----|
+</span><span class='line'>              skb1       skb2
+</span><span class='line'>
+</span><span class='line'>next_skb 被分成了两个包，skb1-&gt;len = mss, skb1-&gt;gso_segs = 1; skb2-&gt;len &gt; mss, skb2-&gt;gso_segs = 2;
+</span><span class='line'>skb1, skb2发送出去，丢了，然后重传skb1，
+</span><span class='line'>此时 skb1-&gt;end_seq &lt; tp-&gt;snd_una
+</span><span class='line'>
+</span><span class='line'>2092 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>2093 {
+</span><span class='line'>        ......
+</span><span class='line'>2111         if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {
+</span><span class='line'>2112                 if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))
+</span><span class='line'>2113                         BUG();</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>三、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
+</span><span class='line'>next_skb:  |---------------------|
+</span><span class='line'>
+</span><span class='line'>skb, next_skb 发送出去丢了，重传，调用tcp_retrans_try_collapse合并。
+</span><span class='line'>合并后：skb-&gt;len += next_skb-&gt;len; skb-&gt;end_seq = next_skb-&gt;end_seq;
+</span><span class='line'>
+</span><span class='line'>假设   skb-&gt;len = 100;      skb-&gt;seq = 0;      skb-&gt;end_seq = 100;
+</span><span class='line'>      next_skb-&gt;len = 120  next_skb-&gt;seq = 0; next_skb-&gt;end_seq = 120;
+</span><span class='line'>合并后 skb-&gt;len = 200;      skb-&gt;seq = 0;      skb-&gt;end_seq = 120;
+</span><span class='line'>
+</span><span class='line'>发送合并后的skb，再丢包，再重传，mss = 150，skb-&gt;len &gt; mss, 会分包
+</span><span class='line'>      skb-&gt;len = 150;      skb-&gt;seq = 0;      skb-&gt;end_seq = 150;
+</span><span class='line'>      next_skb-&gt;len = 50;  next_skb-&gt;seq = 150; next_skb-&gt;end_seq = 120;
+</span><span class='line'>也就是出现了next_skb-&gt;seq &gt; next_skb-&gt;end_seq
+</span><span class='line'>(此时如果ack skb也会把next_skb一起清了，因为next_skb-&gt;end_seq &lt; skb-&gt;end_seq)
+</span><span class='line'>
+</span><span class='line'>这时如果skb再重传分包，分成skb3，skb4
+</span><span class='line'>    skb3-&gt;len = 130;   skb3-&gt;seq = 0;   skb3-&gt;end_seq = 130;
+</span><span class='line'>    skb4-&gt;len = 20;    skb4-&gt;seq = 130; skb4-&gt;end_seq = 150;
+</span><span class='line'>
+</span><span class='line'>这时ack了skb3，tp-&gt;snd_una = 130 (虽然next_skb-&gt;end_seq &lt; skb3-&gt;end_seq, 但skb4-&gt;end_seq &gt; skb3-&gt;end_seq, 所以不会把next_skb清掉)
+</span><span class='line'>重传skb4，skb5，此时skb5-&gt;end_seq &lt; tp-&gt;snd_una
+</span><span class='line'>
+</span><span class='line'>2092 int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>2093 {
+</span><span class='line'>        ......
+</span><span class='line'>2111         if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {
+</span><span class='line'>2112                 if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))
+</span><span class='line'>2113                         BUG();</span></code></pre></td></tr></table></div></figure>
+
+
+<p></p>
+
+<h4>四、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
+</span><span class='line'>next_skb:  |---------------------|
+</span><span class='line'>
+</span><span class='line'>发送 skb，next_skb
+</span><span class='line'>接收到 sack:|---------------------|
+</span><span class='line'>
+</span><span class='line'>调用tcp_sacktag_walk() ---&gt; tcp_shift_skb_data() 将多个被sack的包合并成一个。
+</span><span class='line'>合并过程：
+</span><span class='line'>    skb-&gt;len += next_skb-&gt;len; skb-&gt;end_seq += next_skb-&gt;len;
+</span><span class='line'>那么就会合并出一超出原来end_seq的包：
+</span><span class='line'>           |----------------------------------------|
+</span><span class='line'>然后再ack:  |----------------------|
+</span><span class='line'>这时把合并出的包trim掉一部分，剩skb7:  |-----------------|
+</span><span class='line'>
+</span><span class='line'>再发包skb_new:                     |-------|
+</span><span class='line'>这时tp-&gt;snd_nxt = skb_new-&gt;end_seq
+</span><span class='line'>再重传skb7, 并分包:                 |----------|------|
+</span><span class='line'>分包时skb7-&gt;end_seq &gt; tp-&gt;snd_nxt, 所以不会调整tp-&gt;packets_out，
+</span><span class='line'>但ack到来时(tcp_clean_rtx_queue)tp-&gt;packets_out却会减去分包后的gso_segs。
+</span><span class='line'>导致tp-&gt;packets_out &lt; 0, 但sk_write_queue却是空的。
+</span><span class='line'>tcp_rearm_rto()判断tp-&gt;packets_out不为0，启动重传定时器，然后重传时取出的是list_head的地址，不是skb的地址，导致后面异常。
+</span><span class='line'>代码：
+</span><span class='line'> 974 int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
+</span><span class='line'> 975                  unsigned int mss_now)
+</span><span class='line'> 976 {
+</span><span class='line'>    ......
+</span><span class='line'>1047         if (!before(tp-&gt;snd_nxt, TCP_SKB_CB(buff)-&gt;end_seq)) {
+</span><span class='line'>1048                 int diff = old_factor - tcp_skb_pcount(skb) -
+</span><span class='line'>1049                         tcp_skb_pcount(buff);
+</span><span class='line'>1050 
+</span><span class='line'>1051                 if (diff)
+</span><span class='line'>1052                         tcp_adjust_pcount(sk, skb, diff);
+</span><span class='line'>1053         }
+</span><span class='line'>
+</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>五（发现好像没错）、write_queue的skb->end_seq > next_skb->seq可能的问题</h4>
+
+<ul>
+<li>内核用tp->write_seq控制，保证了write_queue的skb->end_seq == next_skb->seq</li>
+</ul>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skb:       |------------------|
+</span><span class='line'>next_skb:  |---------------------|
+</span><span class='line'>
+</span><span class='line'>假设skb已经发送出去，这时tp-&gt;snd_nxt = skb-&gt;end_seq
+</span><span class='line'>发送next_skb时mss变小了，需要对next_skb分包，分包后如下：
+</span><span class='line'>
+</span><span class='line'>skb:       |------------------|
+</span><span class='line'>next_skb:  |-------|-------:-----|
+</span><span class='line'>              skb1       skb2
+</span><span class='line'>next_skb 被分成了两个包，skb1-&gt;len = mss, skb1-&gt;gso_segs = 1; skb2-&gt;len &gt; mss, skb2-&gt;gso_segs = 2;
+</span><span class='line'>
+</span><span class='line'>然后将skb1, skb2发送出去, tp-&gt;packets_out += 3; 这时假设ack了skb，清掉skb1和skb2的一个mss，。。。没错。。。
+</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-softirq/">中断子系统之（八）：softirq</a></h2>
     
     
@@ -1215,220 +1538,6 @@ a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-mm-splice/">Linux 中的零拷贝技术 splice</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-07T15:26:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:26:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415">http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415</a></p>
-
-<p>linux下如何实现文件对拷呢？</p>
-
-<p>最容易想到的方法就是，申请一份内存buf，read 源文件一段数据到buf，然后将此buf write到目标文件，示例代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>char buf[max_read];
-</span><span class='line'>off_t size = stat_buf.st_size;
-</span><span class='line'>while ( off_in &lt; size ) {
-</span><span class='line'>    int len = size - off_in &gt; max_read ? max_read : size - off_in;
-</span><span class='line'>    len = read(f_in, buf, len);
-</span><span class='line'>    off_in += len;
-</span><span class='line'>    write(f_out, buf, len);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>还有一种大家都知道的方式，就是通过mmap实现，示例代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>size_t filesize = stat_buf.st_size;
-</span><span class='line'>source = mmap(0, filesize, PROT_READ, MAP_SHARED, f_in, 0);
-</span><span class='line'>target = mmap(0, filesize, PROT_WRITE, MAP_SHARED, f_out, 0);
-</span><span class='line'>memcpy(target, source, filesize);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为mmap不需要内核态和用户态的内存拷贝，效率大大提高。</p>
-
-<p>本文还想介绍另外一种，是今天无意google到的，就是如标题所述，基于splice实现，splice是Linux 2.6.17新加入的系统调用，官方文档的描述是，用于在两个文件间移动数据，而无需内核态和用户态的内存拷贝，但需要借助管道（pipe）实现。大概原理就是通过pipe buffer实现一组内核内存页（pages of kernel memory）的引用计数指针（reference-counted pointers），数据拷贝过程中并不真正拷贝数据，而是创建一个新的指向内存页的指针。也就是说拷贝过程实质是指针的拷贝。示例代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int pipefd[2];
-</span><span class='line'>pipe( pipefd );
-</span><span class='line'>int max_read = 4096;
-</span><span class='line'>off_t size = stat_buf.st_size;
-</span><span class='line'>while ( off_in &lt; size ) {
-</span><span class='line'>    int len = size - off_in &gt; max_read ? max_read : size - off_in;
-</span><span class='line'>    len = splice(f_in, &off_in, pipefd[1], NULL, len, SPLICE_F_MORE |SPLICE_F_MOVE);
-</span><span class='line'>    splice(pipefd[0], NULL, f_out, &off_out, len, SPLICE_F_MORE |SPLICE_F_MOVE);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用splice一定要注意，因为其借助管道实现，而管道有众所周知的空间限制问题，超过了限制就会hang住，所以每次写入管道的数据量好严格控制，保守的建议值是一个内存页大小，即4k。另外，off_in和off_out传递的是指针，其值splice会做一定变动，使用时应注意。</p>
-
-<p>splice kernel bug: <a href="https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae">https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae</a></p>
-
-<hr />
-
-<p><a href="http://ogris.de/howtos/splice.html">http://ogris.de/howtos/splice.html</a></p>
-
-<p><a href="http://blog.csdn.net/eroswang/article/details/1999034">http://blog.csdn.net/eroswang/article/details/1999034</a></p>
-
-<p><a href="http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file">http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file</a></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>   EINVAL Target  file  system  doesn't  support  splicing; target file is
-</span><span class='line'>          opened in append mode; neither of the descriptors  refers  to  a
-</span><span class='line'>          pipe; or offset given for non-seekable device.</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>file to file sample</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define _GNU_SOURCE
-</span><span class='line'>#include &lt;fcntl.h&gt;
-</span><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>#include &lt;errno.h&gt;
-</span><span class='line'>#include &lt;string.h&gt;
-</span><span class='line'>#include &lt;time.h&gt;
-</span><span class='line'>
-</span><span class='line'>int main(int argc, char **argv)
-</span><span class='line'>{
-</span><span class='line'>    int pipefd[2];
-</span><span class='line'>    int result;
-</span><span class='line'>    FILE *in_file;
-</span><span class='line'>    FILE *out_file;
-</span><span class='line'>    char buff[65537];
-</span><span class='line'>
-</span><span class='line'>    if (argc != 3) {
-</span><span class='line'>        printf("usage: ./client infile outfile\n");
-</span><span class='line'>        exit(0);
-</span><span class='line'>    }
-</span><span class='line'>    result = pipe(pipefd);
-</span><span class='line'>
-</span><span class='line'>    in_file = fopen(argv[1], "rb");
-</span><span class='line'>    out_file = fopen(argv[2], "wb");
-</span><span class='line'>
-</span><span class='line'>    off_t off_in = 0, off_out = 0;
-</span><span class='line'>    int len = 1024*1024*30;
-</span><span class='line'>    while (len &gt; 0) {
-</span><span class='line'>        int size = 65536;
-</span><span class='line'>        if (len &lt; size) size = len;
-</span><span class='line'>        len -= size;
-</span><span class='line'>
-</span><span class='line'>        result = splice(fileno(in_file), &off_in, pipefd[1], NULL, size, SPLICE_F_MORE | SPLICE_F_MOVE);
-</span><span class='line'>        result = splice(pipefd[0], NULL, fileno(out_file), &off_out, size, SPLICE_F_MORE | SPLICE_F_MOVE);
-</span><span class='line'>        //printf("%d\n", result);
-</span><span class='line'>
-</span><span class='line'>//          read(fileno(in_file), buff, size);
-</span><span class='line'>//          write(fileno(out_file), buff, size);
-</span><span class='line'>    }
-</span><span class='line'>    close(pipefd[0]);
-</span><span class='line'>    close(pipefd[1]);
-</span><span class='line'>    fclose(in_file);
-</span><span class='line'>    fclose(out_file);
-</span><span class='line'>
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>more sample</h4>
-
-<p><a href="/download/kernel/splice_sample.tar.gz">splice sample</a></p>
-
-<p>like:<br/>
-file to socket<br/>
-socket to file<br/>
-socket to socket</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/13">&larr; Older</a>
@@ -1574,7 +1683,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(62)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(63)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -1602,6 +1711,10 @@ if (!document.getElementById('debug~kprobe')) document.getElementById('aexp_debu
 <li><a href='/blog/cats/debug~mark/?opendiv=debug'>mark</a><a href='##' onmousedown=showDiv('debug~mark') id='aexp_debug~mark'><span class='exp_style' id='exp_debug~mark'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~mark')) document.getElementById('aexp_debug~mark').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/debug~perf/?opendiv=debug'>perf</a><a href='##' onmousedown=showDiv('debug~perf') id='aexp_debug~perf'><span class='exp_style' id='exp_debug~perf'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('debug~perf')) document.getElementById('aexp_debug~perf').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/debug~systemtap/?opendiv=debug'>systemtap</a><a href='##' onmousedown=showDiv('debug~systemtap') id='aexp_debug~systemtap'><span class='exp_style' id='exp_debug~systemtap'>[+]</span></a><span class='right_span'>5</span></li>
 </div><script language='javascript' type='text/javascript'>
@@ -1663,8 +1776,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(133)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>15</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(134)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>16</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
 <li><a href='/blog/cats/2015~05/?opendiv=2015'>2015-05</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2015~04/?opendiv=2015'>2015-04</a><span class='right_span'>23</span></li>
@@ -1748,6 +1861,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/07/27/debug-perf/">系统级性能分析工具 --- Perf</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/07/24/tools-haproxy-splice/">haproxy splice</a>
       </li>
     
@@ -1761,10 +1878,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2015/07/23/tools-squid-muti/">同时运行多个squid</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/07/21/debug-gdb-break/">gdb break/watch/catch</a>
       </li>
     
   </ul>
