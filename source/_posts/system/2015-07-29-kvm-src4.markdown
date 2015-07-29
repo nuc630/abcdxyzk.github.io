@@ -1,0 +1,164 @@
+---
+layout: post
+title: "KVM源代码分析4:内存虚拟化"
+date: 2015-07-29 14:49:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~07
+- system
+- system~kvm
+tags:
+---
+http://www.oenhan.com/kvm-src-4-mem
+
+在虚拟机的创建与运行中pc_init_pci负责在qemu中初始化虚拟机，内存初始化也是在这里完成的，还是一步步从qemu说起，在vl.c的main函数中有ram_size参数，由qemu入参标识QEMU_OPTION_m设定，顾名思义就是虚拟机内存的大小，通过machine->init一步步传递给pc_init1函数。在这里分出了above_4g_mem_size和below_4g_mem_size，即高低端内存（也不一定是32bit机器..），然后开始初始化内存，即pc_memory_init，内存通过memory_region_init_ram下面的qemu_ram_alloc分配，使用qemu_ram_alloc_from_ptr。
+
+插播qemu对内存条的模拟管理，是通过RAMBlock和ram_list管理的，RAMBlock就是每次申请的内存池，ram_list则是RAMBlock的链表，他们结构如下：
+
+```
+	typedef struct RAMBlock {
+		//对应宿主的内存地址
+		uint8_t *host;
+		//block在ramlist中的偏移
+		ram_addr_t offset;
+		//block长度
+		ram_addr_t length;
+		uint32_t flags;
+		//block名字
+		char idstr[256];
+		QLIST_ENTRY(RAMBlock) next;
+	#if defined(__linux__) && !defined(TARGET_S390X)
+		int fd;
+	#endif
+	} RAMBlock;
+
+	typedef struct RAMList {
+		//看代码理解就是list的head，但是不知道为啥叫dirty...
+		uint8_t *phys_dirty;
+		QLIST_HEAD(ram, RAMBlock) blocks;
+	} RAMList;
+```
+
+下面再回到qemu_ram_alloc_from_ptr函数，使用find_ram_offset赋值给new block的offset，find_ram_offset具体工作模型已经在KVM源代码分析2:虚拟机的创建与运行中提到了，不赘述。然后是一串判断，在kvm_enabled的情况下使用new_block->host = kvm_vmalloc(size)，最终内存是qemu_vmalloc分配的，使用qemu_memalign干活。
+
+```
+	void *qemu_memalign(size_t alignment, size_t size)
+	{
+		void *ptr;
+		//使用posix进行内存针对页大小对齐
+	#if defined(_POSIX_C_SOURCE) && !defined(__sun__)
+		int ret;
+		ret = posix_memalign(&ptr, alignment, size);
+		if (ret != 0) {
+			fprintf(stderr, "Failed to allocate %zu B: %s\n",
+					size, strerror(ret));
+			abort();
+		}
+	#elif defined(CONFIG_BSD)
+		ptr = qemu_oom_check(valloc(size));
+	#else
+		//所谓检查oom就是看memalign对应malloc申请内存是否成功
+		ptr = qemu_oom_check(memalign(alignment, size));
+	#endif
+		trace_qemu_memalign(alignment, size, ptr);
+		return ptr;
+	}
+```
+
+以上qemu_vmalloc进行内存申请就结束了。在qemu_ram_alloc_from_ptr函数末尾则是将block添加到链表，realloc整个ramlist，用memset初始化整个ramblock，madvise对内存使用限定。
+然后一层层的退回到pc_memory_init函数。
+
+此时pc.ram已经分配完成，ram_addr已经拿到了分配的内存地址，MemoryRegion ram初始化完成。下面则是对已有的ram进行分段，即ram-below-4g和ram-above-4g，也就是高端内存和低端内存。用memory_region_init_alias初始化子MemoryRegion，然后将memory_region_add_subregion添加关联起来，memory_region_add_subregion具体细节“KVM源码分析2”中已经说了，参考对照着看吧，中间很多映射代码过程也只是qemu遗留的软件实现，没看到具体存在的意义，直接看到kvm_set_user_memory_region函数，内核真正需要kvm_vm_ioctl传递过去的参数是什么， struct kvm_userspace_memory_region mem而已，也就是
+
+```
+	struct kvm_userspace_memory_region {
+		__u32 slot;
+		__u32 flags;
+		__u64 guest_phys_addr;
+		__u64 memory_size;    /* bytes */
+		__u64 userspace_addr; /* start of the userspace allocated memory */
+	};
+```
+
+kvm_vm_ioctl进入到内核是在KVM_SET_USER_MEMORY_REGION参数中，即执行kvm_vm_ioctl_set_memory_region，然后一直向下，到`__kvm_set_memory_region`函数，check_memory_region_flags检查mem->flags是否合法，而当前flag也就使用了两位，KVM_MEM_LOG_DIRTY_PAGES和KVM_MEM_READONLY，从qemu传递过来只能是KVM_MEM_LOG_DIRTY_PAGES,下面是对mem中各参数的合规检查，(mem->memory_size & (PAGE_SIZE – 1))要求以页为单位，(mem->guest_phys_addr & (PAGE_SIZE – 1))要求guest_phys_addr页对齐，而`((mem->userspace_addr & (PAGE_SIZE – 1)) || !access_ok(VERIFY_WRITE,(void __user *)(unsigned long)mem->userspace_addr,mem->memory_size))`则保证host的线性地址页对齐而且该地址域有写权限。
+
+id_to_memslot则是根据qemu的内存槽号得到kvm结构下的内存槽号，转换关系来自id_to_index数组，那映射关系怎么来的，映射关系是一一对应的，在kvm_create_vm虚拟机创建过程中，kvm_init_memslots_id初始化对应关系，即slots->id_to_index[i] = slots->memslots[i].id = i，当前映射是没有意义的，估计是为了后续扩展而存在的。
+
+扩充了new的kvm_memory_slot，下面直接在代码中注释更方便：
+
+```
+	//映射内存有大小，不是删除内存条
+	if (npages) {
+		//内存槽号没有虚拟内存条，意味内存新创建
+		if (!old.npages)
+			change = KVM_MR_CREATE;
+		else { /* Modify an existing slot. */
+			//修改已存在的内存修改标志或者平移映射地址
+			//下面是不能处理的状态（内存条大小不能变，物理地址不能变，不能修改只读）
+			if ((mem->userspace_addr != old.userspace_addr) ||
+				(npages != old.npages) ||
+				((new.flags ^ old.flags) & KVM_MEM_READONLY))
+				goto out;
+			//guest地址不同，内存条平移
+			if (base_gfn != old.base_gfn)
+				change = KVM_MR_MOVE;
+			else if (new.flags != old.flags)
+				//修改属性
+				change = KVM_MR_FLAGS_ONLY;
+			else { /* Nothing to change. */
+				r = 0;
+				goto out;
+			}
+		}
+	} else if (old.npages) {
+		//申请插入的内存为0，而内存槽上有内存，意味删除
+		change = KVM_MR_DELETE;
+	} else /* Modify a non-existent slot: disallowed. */
+		goto out;
+```
+另外看kvm_mr_change就知道memslot的变动值了：
+
+```
+	enum kvm_mr_change {
+		KVM_MR_CREATE,
+		KVM_MR_DELETE,
+		KVM_MR_MOVE,
+		KVM_MR_FLAGS_ONLY,
+	};
+```
+
+在往下是一段检查
+
+```
+	if ((change == KVM_MR_CREATE) || (change == KVM_MR_MOVE)) {
+		/* Check for overlaps */
+		r = -EEXIST;
+		kvm_for_each_memslot(slot, kvm->memslots) {
+			if ((slot->id >= KVM_USER_MEM_SLOTS) ||
+				//下面排除掉准备操作的内存条，在KVM_MR_MOVE中是有交集的
+				(slot->id == mem->slot))
+				continue;
+			//下面就是当前已有的slot与new在guest线性区间上有交集
+			if (!((base_gfn + npages <= slot->base_gfn) ||
+				  (base_gfn >= slot->base_gfn + slot->npages)))
+				goto out;
+				//out错误码就是EEXIST
+		}
+	}
+```
+
+如果是新插入内存条，代码则走入kvm_arch_create_memslot函数，里面主要是一个循环，KVM_NR_PAGE_SIZES是分页的级数，此处是3，第一次循环，lpages = gfn_to_index(slot->base_gfn + npages – 1,slot->base_gfn, level) + 1，lpages就是一级页表所需要的page数，大致是npages>>0*9,然后为slot->arch.rmap[i]申请了内存空间，此处可以猜想，rmap就是一级页表了，继续看，lpages约为npages>>1*9,此处又多为lpage_info申请了同等空间，然后对lpage_info初始化赋值，现在看不到lpage_info的具体作用，看到后再补上。整体上看kvm_arch_create_memslot做了一个3级的软件页表。
+
+如果有脏页,并且脏页位图为空,则分配脏页位图, kvm_create_dirty_bitmap实际就是”页数/8″.
+
+```
+	if ((new.flags & KVM_MEM_LOG_DIRTY_PAGES) && !new.dirty_bitmap) {
+		if (kvm_create_dirty_bitmap(&new) < 0)
+			goto out_free;
+	}
+```
+
+当内存条的改变是KVM_MR_DELETE或者KVM_MR_MOVE,先申请一个slots,把kvm->memslots暂存到这里,首先通过id_to_memslot获取准备插入的内存条对应到kvm的插槽是slot,无论删除还是移动,将其先标记为KVM_MEMSLOT_INVALID,然后是install_new_memslots,其实就是更新了一下slots->generation的值,
+
+
