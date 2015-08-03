@@ -174,8 +174,8 @@ synchronize_rcu()在RCU中是一个最核心的函数,它用来等待之前的�
 在这里看到了RCU的另一个核心API,它就是call_run().它的定义如下:
 
 ```
-void call_rcu(struct rcu_head *head,
-				void (*func)(struct rcu_head *rcu))
+	void call_rcu(struct rcu_head *head,
+					void (*func)(struct rcu_head *rcu))
 ```
 
 它用来等待之前的读者操作完成之后,就会调用函数func.
