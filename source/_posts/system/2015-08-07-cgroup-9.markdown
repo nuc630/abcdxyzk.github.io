@@ -1,0 +1,159 @@
+---
+layout: post
+title: "cpuset子系统"
+date: 2015-08-07 17:26:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~08
+- system
+- system~cgroup
+tags:
+---
+http://www.cnblogs.com/lisperl/archive/2012/05/02/2478817.html
+
+cpuset子系统为cgroup 中的任务分配独立 CPU（在多核系统）和内存节点。Cpuset子系统为定义了一个叫cpuset的数据结构来管理cgroup中的任务能够使用的cpu和内存节点。Cpuset定义如下：
+```
+	struct cpuset {
+		struct cgroup_subsys_state css;
+ 
+		unsigned long flags; /* "unsigned long" so bitops work */
+		cpumask_var_t cpus_allowed; /* CPUs allowed to tasks in cpuset */
+		nodemask_t mems_allowed; /* Memory Nodes allowed to tasks */
+ 
+		struct cpuset *parent; /* my parent */
+ 
+		struct fmeter fmeter; /* memory_pressure filter */
+ 
+		/* partition number for rebuild_sched_domains() */
+		int pn;
+ 
+		/* for custom sched domain */
+		int relax_domain_level;
+ 
+		/* used for walking a cpuset heirarchy */
+		struct list_head stack_list;
+	};
+```
+其中css字段用于task或cgroup获取cpuset结构。
+
+cpus_allowed和mems_allowed定义了该cpuset包含的cpu和内存节点。
+
+Parent字段用于维持cpuset的树状结构，stack_list则用于遍历cpuset的层次结构。
+
+Pn和relax_domain_level是跟Linux 调度域相关的字段，pn指定了cpuset的调度域的分区号，而relax_domain_level表示进行cpu负载均衡寻找空闲cpu的策略。
+
+除此之外，进程的task_struct结构体里面还有一个cpumask_t cpus_allowed成员，用以存储进程的cpus_allowed信息;一个nodemask_t mems_allowed成员，用于存储进程的mems_allowed信息。
+
+Cpuset子系统的实现是通过在内核代码加入一些hook代码。由于代码比较散，我们逐条分析。
+
+在内核初始化代码（即start_kernel函数）中插入了对cpuset_init调用的代码，这个函数用于cpuset的初始化。
+
+下面我们来看这个函数：
+```
+	int __init cpuset_init(void)
+	{
+		int err = 0;
+ 
+		if (!alloc_cpumask_var(&top_cpuset.cpus_allowed, GFP_KERNEL))
+			BUG();
+ 
+		cpumask_setall(top_cpuset.cpus_allowed);
+		nodes_setall(top_cpuset.mems_allowed);
+ 
+		fmeter_init(&top_cpuset.fmeter);
+		set_bit(CS_SCHED_LOAD_BALANCE, &top_cpuset.flags);
+		top_cpuset.relax_domain_level = -1;
+ 
+		err = register_filesystem(&cpuset_fs_type);
+		if (err < 0)
+			return err;
+ 
+		if (!alloc_cpumask_var(&cpus_attach, GFP_KERNEL))
+			BUG();
+ 
+		number_of_cpusets = 1;
+		return 0;
+	}
+```
+cpumask_setall和nodes_setall将top_cpuset能使用的cpu和内存节点设置成所有节点。紧接着，初始化fmeter，设置top_cpuset的load balance标志。最后注册cpuset文件系统，这个是为了兼容性，因为在cgroups之前就有cpuset了，不过在具体实现时，对cpuset文件系统的操作都被重定向了cgroup文件系统。
+
+除了这些初始化工作，cpuset子系统还在do_basic_setup函数（此函数在kernel_init中被调用）中插入了对cpuset_init_smp的调用代码，用于smp相关的初始化工作。
+
+下面我们看这个函数：
+```
+	void __init cpuset_init_smp(void)
+	{
+		cpumask_copy(top_cpuset.cpus_allowed, cpu_active_mask);
+		top_cpuset.mems_allowed = node_states[N_HIGH_MEMORY];
+ 
+		hotcpu_notifier(cpuset_track_online_cpus, 0);
+		hotplug_memory_notifier(cpuset_track_online_nodes, 10);
+ 
+		cpuset_wq = create_singlethread_workqueue("cpuset");
+		BUG_ON(!cpuset_wq);
+	}
+```
+首先，将top_cpuset的cpu和memory节点设置成所有online的节点，之前初始化时还不知道有哪些online节点所以只是简单设成所有，在smp初始化后就可以将其设成所有online节点了。然后加入了两个hook函数，cpuset_track_online_cpus和cpuset_track_online_nodes，这个两个函数将在cpu和memory热插拔时被调用。
+
+cpuset_track_online_cpus函数中调用scan_for_empty_cpusets函数扫描空的cpuset，并将其下的进程移到其非空的parent下，同时更新cpuset的cpus_allowed信息。cpuset_track_online_nodes的处理类似。
+
+那cpuset又是怎么对进程的调度起作用的呢？
+
+这个就跟task_struct中cpu_allowed字段有关了。首先，这个cpu_allowed和进程所属的cpuset的cpus_allowed保持一致；其次，在进程被fork出来的时候，进程继承了父进程的cpuset和cpus_allowed字段；最后，进程被fork出来后，除非指定CLONE_STOPPED标记，都会被调用wake_up_new_task唤醒，在wake_up_new_task中有：
+```
+	cpu = select_task_rq(rq, p, SD_BALANCE_FORK, 0);
+	set_task_cpu(p, cpu);
+```
+即为新fork出来的进程选择运行的cpu，而select_task_rq会调用进程所属的调度器的函数，对于普通进程，其调度器是CFS，CFS对应的函数是select_task_rq_fair。在select_task_rq_fair返回选到的cpu后，select_task_rq会对结果和cpu_allowed比较：
+
+```
+	if (unlikely(!cpumask_test_cpu(cpu, &p->cpus_allowed) ||
+	     !cpu_online(cpu)))
+	cpu = select_fallback_rq(task_cpu(p), p);
+```
+这就保证了新fork出来的进程只能在cpu_allowed中的cpu上运行。
+
+对于被wake up的进程来说，在被调度之前，也会调用select_task_rq选择可运行的cpu。
+
+这就保证了进程任何时候都只会在cpu_allowed中的cpu上运行。
+
+最后说一下，如何保证task_struct中的cpus_allowd和进程所属的cpuset中的cpus_allowed一致。首先，在cpu热插拔时，scan_for_empty_cpusets会更新task_struct中的cpus_allowed信息，其次对cpuset下的控制文件写入操作时也会更新task_struct中的cpus_allowed信息,最后当一个进程被attach到其他cpuset时，同样会更新task_struct中的cpus_allowed信息。
+
+在cpuset之前，Linux内核就提供了指定进程可以运行的cpu的方法。通过调用sched_setaffinity可以指定进程可以运行的cpu。Cpuset对其进行了扩展，保证此调用设定的cpu仍然在cpu_allowed的范围内。在sched_setaffinity中，插入了这样两行代码：
+```
+	cpuset_cpus_allowed(p, cpus_allowed);
+	cpumask_and(new_mask, in_mask, cpus_allowed);
+```
+其中cpuset_cpus_allowed返回进程对应的cpuset中的cpus_allowed，cpumask_and则将cpus_allowed和调用sched_setaffinity时的参数in_mask相与得出进程新的cpus_allowed。
+
+通过以上代码的嵌入，Linux内核实现了对进程可调度的cpu的控制。下面我们来分析一下cpuset对memory节点的控制。
+
+Linux中内核分配物理页框的函数有6个:alloc_pages,alloc_page,__get_free_pages,__get_free_page,get_zeroed_page,__get_dma_pages,这些函数最终都通过alloc_pages实现，而alloc_pages又通过__alloc_pages_nodemask实现，在__alloc_pages_nodemask中，调用get_page_from_freelist从zone list中分配一个page，在get_page_from_freelist中调用cpuset_zone_allowed_softwall判断当前节点是否属于mems_allowed。通过附加这样一个判断，保证进程从mems_allowed中的节点分配内存。
+
+Linux在cpuset出现之前，也提供了mbind, set_mempolicy来限定进程可用的内存节点。Cpuset子系统对其做了扩展，扩展的方法跟扩展sched_setaffinity类似，通过导出cpuset_mems_allowed，返回进程所属的cupset允许的内存节点，对mbind，set_mempolicy的参数进行过滤。
+
+最后让我们来看一下，cpuset子系统最重要的两个控制文件：
+```
+	{
+		.name = "cpus",
+		.read = cpuset_common_file_read,
+		.write_string = cpuset_write_resmask,
+		.max_write_len = (100U + 6 * NR_CPUS),
+		.private = FILE_CPULIST,
+	},
+ 
+	{
+		.name = "mems",
+		.read = cpuset_common_file_read,
+		.write_string = cpuset_write_resmask,
+		.max_write_len = (100U + 6 * MAX_NUMNODES),
+		.private = FILE_MEMLIST,
+	},
+```
+通过cpus文件，我们可以指定进程可以使用的cpu节点，通过mems文件，我们可以指定进程可以使用的memory节点。
+
+这两个文件的读写都是通过cpuset_common_file_read和cpuset_write_resmask实现的，通过private属性区分。
+
+在cpuset_common_file_read中读出可用的cpu或memory节点；在cpuset_write_resmask中则根据文件类型分别调用update_cpumask和update_nodemask更新cpu或memory节点信息。
+

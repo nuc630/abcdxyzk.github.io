@@ -1,0 +1,179 @@
+---
+layout: post
+title: "freezer子系统"
+date: 2015-08-07 17:15:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~08
+- system
+- system~cgroup
+tags:
+---
+http://www.cnblogs.com/lisperl/archive/2012/04/25/2469587.html
+
+freezer子系统用于挂起和恢复cgroup中的进程。freezer有一个控制文件：freezer.state，将FROZEN写入该文件，可以将cgroup中的进程挂起，将THAWED写入该文件，可以将已挂起的进程恢复。该文件可能读出的值有三种，其中两种就是前面已提到的FROZEN和THAWED，分别代表进程已挂起和已恢复（正常运行），还有一种可能的值为FREEZING，显示该值表示该cgroup中有些进程现在不能被frozen。当这些不能被frozen的进程从该cgroup中消失的时候，FREEZING会变成FROZEN，或者手动将FROZEN或THAWED写入一次。
+
+Freezer子系统用来管理cgroup状态的数据结构：
+```
+	struct freezer {
+		struct cgroup_subsys_state css;
+		enum freezer_state state;
+		spinlock_t lock; /* protects _writes_ to state */
+	};
+```
+
+其中内嵌一个cgroup_subsys_state，便于从cgroup或task获得freezer结构，另一个字段存储cgroup当前的状态。
+
+Freezer子系统是通过对freezer.state文件进行写入来控制进程的，那我们就从这个文件的cftype定义出发。
+
+```
+	static struct cftype files[] = {
+		{
+			.name = "state",
+			.read_seq_string = freezer_read,
+			.write_string = freezer_write,
+		},
+	};
+```
+从文件读取是freezer_read实现的，该函数比较简单，主要就是从freezer结构体从读出状态，但是对FREEZING状态做了特殊处理：
+```
+	state = freezer->state;
+	if (state == CGROUP_FREEZING) {
+		/* We change from FREEZING to FROZEN lazily if the cgroup was
+		 * only partially frozen when we exitted write. */
+		update_freezer_state(cgroup, freezer);
+		state = freezer->state;
+	}
+```
+如果是FREEZING状态，则需要更新状态（因为之前不能frozen的进程可能已经不在了）。我们来看update_freezer_state：
+```
+	cgroup_iter_start(cgroup, &it);
+	while ((task = cgroup_iter_next(cgroup, &it))) {
+		ntotal++;
+		if (is_task_frozen_enough(task))
+			nfrozen++;
+	}
+ 
+	/*
+	 * Transition to FROZEN when no new tasks can be added ensures
+	 * that we never exist in the FROZEN state while there are unfrozen
+	 * tasks.
+	 */
+	if (nfrozen == ntotal)
+		freezer->state = CGROUP_FROZEN;
+	else if (nfrozen > 0)
+		freezer->state = CGROUP_FREEZING;
+	else
+		freezer->state = CGROUP_THAWED;
+	cgroup_iter_end(cgroup, &it);
+```
+这里对该cgroup所有的进程迭代了一遍，分别统计进程数和已经frozen的进程数，然后根据统计结果改变状态。
+
+下面我们来看对freezer.state写入的情况，该情况由freezer_write来处理，该函数中从写入值获取目标状态，然后调用freezer_change_state(cgroup, goal_state)来完成操作。在freezer_change_state中，根据goal_state分别调用不同的实现函数：
+```
+	switch (goal_state) {
+	case CGROUP_THAWED:
+		unfreeze_cgroup(cgroup, freezer);
+		break;
+	case CGROUP_FROZEN:
+		retval = try_to_freeze_cgroup(cgroup, freezer);
+		break;
+	default:
+		BUG();
+	}
+```
+我们先来看frozen的情况，该情况由try_to_freeze_cgroup来处理，该函数中有：
+```
+	freezer->state = CGROUP_FREEZING;
+	cgroup_iter_start(cgroup, &it);
+	while ((task = cgroup_iter_next(cgroup, &it))) {
+		if (!freeze_task(task, true))
+			continue;
+		if (is_task_frozen_enough(task))
+			continue;
+		if (!freezing(task) && !freezer_should_skip(task))
+			num_cant_freeze_now++;
+	}
+	cgroup_iter_end(cgroup, &it);
+ 
+	return num_cant_freeze_now ? -EBUSY : 0;
+```
+首先将当前状态设成CGROUP_FREEZING，然后对cgroup中的进程进行迭代，while循环中对进程进行freeze操作，如果成功直接进行下一次迭代，如果不成功则进行进一步的判断，如果是进程已经frozen了，那也直接进行下一次迭代，如果不是，则进行计数。最后根据计数结果进行返回，如果所有进程都顺利frozen，则返回0，否则返回-EBUSY表示有进程不能被frozen。
+
+下面我们来看free_task这个函数，在这个函数中对task进行freeze操作。
+```
+	if (!freezing(p)) {
+		rmb();
+		if (frozen(p))
+			return false;
+ 
+		if (!sig_only || should_send_signal(p))
+			set_freeze_flag(p);
+		else
+			return false;
+	}
+ 
+	if (should_send_signal(p)) {
+		if (!signal_pending(p))
+			fake_signal_wake_up(p);
+	} else if (sig_only) {
+		return false;
+	} else {
+		wake_up_state(p, TASK_INTERRUPTIBLE);
+	}
+
+	return true;
+```
+首先检查进程是不是已经被标记为正在freezing，如果不是再做判断。如果进程已经被frozen，则返回false。如果进程不是sig_only的或者可以发送信号（即进程无PF_FREEZER_NOSIG 标记），则设置进程的TIF_FREEZE标记。
+
+然后根据进程是否有PF_FREEZER_NOSIG 标记进行进一步处理，如果无这个标记，则给进程发送一个信号，唤醒进程，让进程处理TIF_FREEZE，即进行freeze操作，如果有这个标记，则如果进程是sig_only的，返回false（即不能完成free操作），否则直接唤醒进程去处理TIF_FREEZE。
+
+总结一下，对于我们这个freezer子系统的调用来说，sig_only=true，那么能成功的执行过程就是set_freeze_flag(p)->fake_signal_wake_up(p)。
+
+下面我们来看thaw 进程的情况，该情况由unfreeze_cgroup处理，在unfreeze_cgroup中有
+```
+	cgroup_iter_start(cgroup, &it);
+	while ((task = cgroup_iter_next(cgroup, &it))) {
+		thaw_process(task);
+	}
+	cgroup_iter_end(cgroup, &it);
+ 
+	freezer->state = CGROUP_THAWED;
+```
+对该cgroup中所有的进程调用thaw_process，我们来看thaw_process。该函数中有：
+```
+	if (__thaw_process(p) == 1) {
+		task_unlock(p);
+		wake_up_process(p);
+		return 1;
+	}
+```
+其中__thaw_process中
+```
+	if (frozen(p)) {
+		p->flags &= ~PF_FROZEN;
+		return 1;
+	}
+	clear_freeze_flag(p);
+```
+如果进程已经frozen，则清掉其frozen标记，如果不是的话，说明进程已经设置了TIF_FREEZE，但还没有frozen，所以只需要清掉TIF_FREEZE即可。
+
+回到thaw_process中，清掉了相关标记后，只需要唤醒进程，然后内核会自动处理。
+
+最后，我们再来看看freezer子系统结构体的定义：
+```
+	struct cgroup_subsys freezer_subsys = {
+		.name = "freezer",
+		.create = freezer_create,
+		.destroy = freezer_destroy,
+		.populate = freezer_populate,
+		.subsys_id = freezer_subsys_id,
+		.can_attach = freezer_can_attach,
+		.attach = NULL,
+		.fork = freezer_fork,
+		.exit = NULL,
+	};
+```
+这里说一下can_attach，can_attach是在一个进程加入到一个cgroup之前调用的，检查是否可以attach，freezer_can_attach中对cgroup当前的状态做了检查，如果是frozen就返回错误，这说明不能将一个进程加入到一个frozen的cgroup。
+

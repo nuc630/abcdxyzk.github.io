@@ -1,0 +1,202 @@
+---
+layout: post
+title: "memory子系统"
+date: 2015-08-07 17:22:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~08
+- system
+- system~cgroup
+tags:
+---
+http://www.cnblogs.com/lisperl/archive/2012/04/28/2474872.html
+
+memory 子系统可以设定 cgroup 中任务使用的内存限制，并自动生成由那些任务使用的内存资源报告。memory子系统是通过linux的resource counter机制实现的。下面我们就先来看一下resource counter机制。
+
+resource counter是内核为子系统提供的一种资源管理机制。这个机制的实现包括了用于记录资源的数据结构和相关函数。Resource counter定义了一个res_counter的结构体来管理特定资源，定义如下：
+```
+	struct res_counter {
+		unsigned long long usage;
+		unsigned long long max_usage;
+		unsigned long long limit;
+		unsigned long long soft_limit;
+		unsigned long long failcnt; /*
+		spinlock_t lock;
+		struct res_counter *parent;
+	};
+```
+ 
+Usage用于记录当前已使用的资源，max_usage用于记录使用过的最大资源量，limit用于设置资源的使用上限，进程组不能使用超过这个限制的资源，soft_limit用于设定一个软上限，进程组使用的资源可以超过这个限制，failcnt用于记录资源分配失败的次数，管理可以根据这个记录，调整上限值。Parent指向父节点，这个变量用于处理层次性的资源管理。
+
+除了这个关键的数据结构，resource counter还定义了一系列相关的函数。下面我们来看几个关键的函数。
+
+```
+	void res_counter_init(struct res_counter *counter, struct res_counter *parent)
+	{
+		spin_lock_init(&counter->lock);
+		counter->limit = RESOURCE_MAX;
+		counter->soft_limit = RESOURCE_MAX;
+		counter->parent = parent;
+	}
+```
+这个函数用于初始化一个res_counter。
+
+第二个关键的函数是int res_counter_charge(struct res_counter *counter, unsigned long val, struct res_counter **limit_fail_at)。当资源将要被分配的时候，资源就要被记录到相应的res_counter里。这个函数作用就是记录进程组使用的资源。在这个函数中有：
+
+```
+	for (c = counter; c != NULL; c = c->parent) {
+		spin_lock(&c->lock);
+		ret = res_counter_charge_locked(c, val);
+		spin_unlock(&c->lock);
+		if (ret < 0) {
+			*limit_fail_at = c;
+			goto undo;
+		}
+	}
+```
+在这个循环里，从当前res_counter开始，从下往上逐层增加资源的使用量。我们来看一下res_counter_charge_locked这个函数，这个函数顾名思义就是在加锁的情况下增加使用量。实现如下：
+```
+	{
+		if (counter->usage + val > counter->limit) {
+			counter->failcnt++;
+			return -ENOMEM;
+		}
+ 
+		counter->usage += val;
+		if (counter->usage > counter->max_usage)
+			counter->max_usage = counter->usage;
+		return 0;
+	}
+```
+首先判断是否已经超过使用上限，如果是的话就增加失败次数，返回相关代码；否则就增加使用量的值，如果这个值已经超过历史最大值，则更新最大值。
+
+第三个关键的函数是void res_counter_uncharge(struct res_counter *counter, unsigned long val)。当资源被归还到系统的时候，要在相应的res_counter减轻相应的使用量。这个函数作用就在于在于此。实现如下：
+
+```
+	for (c = counter; c != NULL; c = c->parent) {
+		spin_lock(&c->lock);
+		res_counter_uncharge_locked(c, val);
+		spin_unlock(&c->lock);
+	}
+```
+从当前counter开始，从下往上逐层减少使用量，其中调用了res_counter_uncharge_locked，这个函数的作用就是在加锁的情况下减少相应的counter的使用量。
+
+有这些数据结构和函数，只需要在内核分配资源的时候，植入相应的charge函数，释放资源时，植入相应的uncharge函数，就能实现对资源的控制了。
+
+介绍完resource counter，我们再来看memory子系统是利用resource counter实现对内存资源的管理的。
+
+memory子系统定义了一个叫mem_cgroup的结构体来管理cgroup相关的内存使用信息，定义如下：
+```
+	struct mem_cgroup {
+		struct cgroup_subsys_state css;
+		struct res_counter res;
+		struct res_counter memsw;
+		struct mem_cgroup_lru_info info;
+		spinlock_t reclaim_param_lock;
+		int prev_priority;
+		int last_scanned_child;
+		bool use_hierarchy;
+		atomic_t oom_lock;
+		atomic_t refcnt;
+		unsigned int swappiness;
+		int oom_kill_disable;
+		bool memsw_is_minimum;
+		struct mutex thresholds_lock;
+		struct mem_cgroup_thresholds thresholds;
+		struct mem_cgroup_thresholds memsw_thresholds;
+		struct list_head oom_notify;
+		unsigned long  move_charge_at_immigrate;
+		struct mem_cgroup_stat_cpu *stat;
+	};
+```
+跟其他子系统一样，mem_cgroup也包含了一个cgroup_subsys_state成员，便于task或cgroup获取mem_cgroup。
+
+mem_cgroup中包含了两个res_counter成员，分别用于管理memory资源和memory+swap资源，如果memsw_is_minimum为true，则res.limit=memsw.limit，即当进程组使用的内存超过memory的限制时，不能通过swap来缓解。
+
+use_hierarchy则用来标记资源控制和记录时是否是层次性的。
+
+oom_kill_disable则表示是否使用oom-killer。
+
+oom_notify指向一个oom notifier event fd链表。
+
+另外memory子系统还定义了一个叫page_cgroup的结构体：
+
+```
+	struct page_cgroup {
+		unsigned long flags;
+		struct mem_cgroup *mem_cgroup;
+		struct page *page;
+		struct list_head lru; /* per cgroup LRU list */
+	};
+```
+此结构体可以看作是mem_map的一个扩展，每个page_cgroup都和所有的page关联，而其中的mem_cgroup成员，则将page与特定的mem_cgroup关联起来。
+
+我们知道在linux系统中，page结构体是用来管理物理页框的，一个物理页框对应一个page结构体，而每个进程中的task_struct中都有一个mm_struct来管理进程的内存信息。每个mm_struct知道它属于的进程，进而知道所属的mem_cgroup，而每个page都知道它属于的page_cgroup，进而也知道所属的mem_cgroup，而内存使用量的计算是按cgroup为单位的，这样以来，内存资源的管理就可以实现了。
+
+memory子系统既然是通过resource counter实现的，那肯定会在内存分配给进程时进行charge操作的。下面我们就来看一下这些charge操作：
+
+1.page fault发生时，有两种情况内核需要给进程分配新的页框。一种是进程请求调页（demand paging），另一种是copy on write。内核在handle_pte_fault中进行处理。其中，do_linear_fault处理pte不存在且页面线性映射了文件的情况，do_anonymous_page处理pte不存在且页面没有映射文件的情况，do_nonlinear_fault处理pte存在且页面非线性映射文件的情况，do_wp_page则处理copy on write的情况。其中do_linear_fault和do_nonlinear_fault都会调用__do_fault来处理。Memory子系统则__do_fault、do_anonymous_page、do_wp_page植入mem_cgroup_newpage_charge来进行charge操作。
+
+2.内核在handle_pte_fault中进行处理时，还有一种情况是pte存在且页又没有映射文件。这种情况说明页面之前在内存中，但是后面被换出到swap空间了。内核用do_swap_page函数处理这种情况，memory子系统在do_swap_page加入了mem_cgroup_try_charge_swapin函数进行charge。mem_cgroup_try_charge_swapin是处理页面换入时的charge的，当执行swapoff系统调用（关掉swap空间），内核也会执行页面换入操作，因此mem_cgroup_try_charge_swapin也被植入到了相应的函数中。
+
+3.当内核将page加入到page cache中时，也需要进行charge操作，mem_cgroup_cache_charge函数正是处理这种情况，它被植入到系统处理page cache的add_to_page_cache_locked函数中。
+
+4.最后mem_cgroup_prepare_migration是用于处理内存迁移中的charge操作。
+
+除了charge操作，memory子系统还需要处理相应的uncharge操作。下面我们来看一下uncharge操作：
+
+1.mem_cgroup_uncharge_page用于当匿名页完全unmaped的时候。但是如果该page是swap cache的话，uncharge操作延迟到mem_cgroup_uncharge_swapcache被调用时执行。
+
+2.mem_cgroup_uncharge_cache_page用于page cache从radix-tree删除的时候。但是如果该page是swap cache的话，uncharge操作延迟到mem_cgroup_uncharge_swapcache被调用时执行。
+
+3.mem_cgroup_uncharge_swapcache用于swap cache从radix-tree删除的时候。Charge的资源会被算到swap_cgroup，如果mem+swap controller被禁用了，就不需要这样做了。
+
+4.mem_cgroup_uncharge_swap用于swap_entry的引用数减到0的时候。这个函数主要在mem+swap controller可用的情况下使用的。
+
+5.mem_cgroup_end_migration用于内存迁移结束时相关的uncharge操作。
+
+Charge函数最终都是通过调用__mem_cgroup_try_charge来实现的。在__mem_cgroup_try_charge函数中，调用res_counter_charge(&mem->res, csize, &fail_res)对memory进行charge，调用res_counter_charge(&mem->memsw, csize, &fail_res)对memory+swap进行charge。
+
+Uncharge函数最终都是通过调用__do_uncharge来实现的。在__do_uncharge中，分别调用res_counter_uncharge(&mem->res,PAGE_SIZE)和res_counter_uncharge(&mem->memsw, PAGE_SIZE)来uncharge memory和memory+swap。
+
+跟其他子系统一样，memory子系统也实现了一个cgroup_subsys。
+```
+	struct cgroup_subsys mem_cgroup_subsys = {
+		.name = "memory",
+		.subsys_id = mem_cgroup_subsys_id,
+		.create = mem_cgroup_create,
+		.pre_destroy = mem_cgroup_pre_destroy,
+		.destroy = mem_cgroup_destroy,
+		.populate = mem_cgroup_populate,
+		.can_attach = mem_cgroup_can_attach,
+		.cancel_attach = mem_cgroup_cancel_attach,
+		.attach = mem_cgroup_move_task,
+		.early_init = 0,
+		.use_id = 1,
+	};
+```
+Memory子系统中重要的文件有
+```
+	memsw.limit_in_bytes
+	{
+		.name = "memsw.limit_in_bytes",
+		.private = MEMFILE_PRIVATE(_MEMSWAP, RES_LIMIT),
+		.write_string = mem_cgroup_write,
+		.read_u64 = mem_cgroup_read,
+	},
+```
+这个文件用于设定memory+swap上限值。
+
+Limit_in_bytes
+
+```
+	{
+		.name = "limit_in_bytes",
+		.private = MEMFILE_PRIVATE(_MEM, RES_LIMIT),
+		.write_string = mem_cgroup_write,
+		.read_u64 = mem_cgroup_read,
+	},
+```
+这个文件用于设定memory上限值。
+

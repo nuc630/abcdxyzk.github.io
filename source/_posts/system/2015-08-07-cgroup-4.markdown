@@ -1,0 +1,184 @@
+---
+layout: post
+title: "cpu子系统"
+date: 2015-08-07 16:41:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~08
+- system
+- system~cgroup
+tags:
+---
+http://www.cnblogs.com/lisperl/archive/2012/04/23/2466721.html
+
+cpu子系统用于控制cgroup中所有进程可以使用的cpu时间片。附加了cpu子系统的hierarchy下面建立的cgroup的目录下都有一个cpu.shares的文件，对其写入整数值可以控制该cgroup获得的时间片。例如：在两个 cgroup 中都将 cpu.shares 设定为 1 的任务将有相同的 CPU 时间，但在 cgroup 中将 cpu.shares 设定为 2 的任务可使用的 CPU 时间是在 cgroup 中将 cpu.shares 设定为 1 的任务可使用的 CPU 时间的两倍。
+
+cpu子系统是通过Linux CFS调度器实现的。所以在介绍cpu子系统之前，先简单说一下CFS调度器。按照作者Ingo Molnar的说法："CFS百分之八十的工作可以用一句话概括：CFS在真实的硬件上模拟了完全理想的多任务处理器"。在“完全理想的多任务处理器”下，每个进程都能同时获得CPU的执行时间。当系统中有两个进程时，CPU的计算时间被分成两份，每个进程获得50%。然而在实际的硬件上，当一个进程占用CPU时，其它进程就必须等待。所以CFS将惩罚当前进程，使其它进程能够在下次调度时尽可能取代当前进程。最终实现所有进程的公平调度。  
+
+CFS调度器将所有状态为RUNABLE的进程都被插入红黑树。在每个调度点，CFS调度器都会选择红黑树的最左边的叶子节点作为下一个将获得cpu的进程。 那红黑树的键值是怎么计算的呢？红黑树的键值是进程所谓的虚拟运行时间。一个进程的虚拟运行时间是进程时间运行的时间按整个红黑树中所有的进程数量normalized的结果。
+
+每次tick中断，CFS调度器都要更新进程的虚拟运行时间，然后调整当前进程在红黑树中的位置，调整完成后如果发现当前进程不再是最左边的叶子，就标记need_resched 标志，中断返回时就会调用scheduler()完成进程切换。
+
+最后再说一下，进程的优先级和进程虚拟运行时间的关系。前面提到了，每次tick中断，CFS调度器都要更新进程的虚拟运行时间。那这个时间是怎么计算的呢？CFS首先计算出进程的时间运行时间delta_exec，然后计算normalized后的delta_exec_weighted，最后再将delta_exec_weighted加到进程的虚拟运行时间上。跟进程优先级有关的就是delta_exec_weighted，delta_exec_weighted=delta_exec_weighted*NICE_0_LOAD/se->load，其中NICE_0_LOAD是个常量，而se->load跟进程的nice值成反比，因此进程优先级越高（nice值越小）则se->load越大，则计算出来的delta_exec_weighted越小，这样进程优先级高的进程就可以获得更多的cpu时间。
+
+介绍完CFS调度器，我们开始介绍cpu子系统是如何通过CFS调度器实现的。CFS调度器不仅支持基于进程的调度，还支持基于进程组的组调度。CFS中定义了一个task_group的数据结构来管理组调度。
+
+```
+	struct task_group {
+		struct cgroup_subsys_state css;
+ 
+	#ifdef CONFIG_FAIR_GROUP_SCHED
+		/* schedulable entities of this group on each cpu */
+		struct sched_entity **se;
+		/* runqueue "owned" by this group on each cpu */
+		struct cfs_rq **cfs_rq;
+		unsigned long shares;
+	#endif
+ 
+	#ifdef CONFIG_RT_GROUP_SCHED
+		struct sched_rt_entity **rt_se;
+		struct rt_rq **rt_rq;
+ 
+		struct rt_bandwidth rt_bandwidth;
+	#endif
+ 
+		struct rcu_head rcu;
+		struct list_head list;
+ 
+		struct task_group *parent;
+		struct list_head siblings;
+		struct list_head children;
+	};
+```
+
+task_group中内嵌了一个cgroup_subsys_state,也就是说进程可以通过cgroup_subsys_state来获取它所在的task_group,同样地cgroup也可以通过cgroup_subsys_state来获取它对应的task_group，因此进程和cgroup都存在了一组cgroup_subsys_state指针。
+
+struct sched_entity **se是一个指针数组，存了一组指向该task_group在每个cpu的调度实体（即一个struct sched_entity）。
+
+struct cfs_rq **cfs_rq也是一个指针数组，存在一组指向该task_group在每个cpu上所拥有的一个可调度的进程队列。
+
+Parent、siblings和children三个指针负责将task_group 连成一颗树，这个跟cgroup树类似。
+
+有了这个数据结构，我们来CFS在调度的时候是怎么处理进程组的。我们还是从CFS对tick中断的处理开始。
+
+CFS对tick中断的处理在task_tick_fair中进行，在task_tick_fair中有：
+```
+	for_each_sched_entity(se) {
+		cfs_rq = cfs_rq_of(se);
+		entity_tick(cfs_rq, se, queued);
+	}
+```
+
+我们首先来看一下在组调度的情况下，for_each_sched_entity是怎么定义的：
+```
+	#define for_each_sched_entity(se) \
+		for (; se; se = se->parent)
+```
+
+即从当前进程的se开始，沿着task_group树从下到上对se调用entity_tick，即更新各个se的虚拟运行时间。
+
+在非组调度情况下，
+```
+	#define for_each_sched_entity(se) \
+		for (; se; se = NULL)
+```
+
+即只会对当前se做处理。
+
+CFS处理完tick中断后，如果有必要就会进行调度，CFS调度是通过pick_next_task_fair函数选择下一个运行的进程的。在pick_next_task_fair中有：
+```
+	do {
+		se = pick_next_entity(cfs_rq);
+		set_next_entity(cfs_rq, se);
+		cfs_rq = group_cfs_rq(se);
+	} while (cfs_rq);
+```
+在这个循环中，首先从当前的队列选一个se，这个跟非组调度一样的（红黑树最左边的节点），再将se设置成下一个运行的se，再从该se获取该se对应的task_group拥有的cfs_rq（如果该se对应一个进程而非一个task_group的话，cfs_rq会变成NULL），继续这个过程直到cfs_rq为空，即当se对应的是一个进程。
+
+简而言之，同一层的task_group跟进程被当成同样的调度实体来选择，当被选到的是task_group时，则对task_group的孩子节点重复这个过程，直到选到一个运行的进程。因此当设置一个cgroup的shares值时，该cgroup当作一个整体和剩下的进程或其他cgroup分享cpu时间。比如,我在根cgroup下建立cgroup A，将其shares值设1024，再建立cgroup B,将其shares设为2048，再将一些进程分别加入到这两个cgroup中，则长期调度的结果应该是A:B:C=1:2:1（即cpu占用时间,其中C是系统中为加入到A或B的进程）。
+
+引起CFS调度的除了tick中断外，还有就是有新的进程加入可运行队列这种情况。CFS处理这个情况的函数是enqueue_task_fair,在enqueue_task_fair中有：
+
+```
+	for_each_sched_entity(se) {
+		if (se->on_rq)
+			break;
+		cfs_rq = cfs_rq_of(se);
+		enqueue_entity(cfs_rq, se, flags);
+		flags = ENQUEUE_WAKEUP;
+	}
+```
+
+我们前面已经看过for_each_sched_entity在组调度下的定义了，这里是将当前se和se的直系祖先节点都加入到红黑树（enqueue_entity），而在非组调度情况下，只需要将当前se本身加入即可。造成这种差异的原因，在于在pick_next_task_fair中选择se时，是从上往下的，如果一个se的祖先节点不在红黑树中，它永远都不会被选中。而在非组调度的情况下，se之间并没有父子关系，所有se都是平等独立，在pick_next_task_fair，第一次选中的肯定就是进程，不需要向下迭代。
+
+类似的处理还发生在将一个se出列（dequeue_task_fair）和put_prev_task_fair中。
+
+以上是cpu系统通过CFS调度器实现以cgroup为单位的cpu时间片分享，下面我们来看一下cpu子系统本身。cpu子系统通过一个cgroup_subsys结构体来管理：
+```
+	struct cgroup_subsys cpu_cgroup_subsys = {
+		.name = "cpu",
+		.create = cpu_cgroup_create,
+		.destroy = cpu_cgroup_destroy,
+		.can_attach = cpu_cgroup_can_attach,
+		.attach = cpu_cgroup_attach,
+		.populate = cpu_cgroup_populate,
+		.subsys_id = cpu_cgroup_subsys_id,
+		.early_init = 1,
+	};
+```
+
+Cpu_cgroup_subsys其实是对抽象的cgroup_subsys的实现，其中的函数指针指向了特定于cpu子系统的实现。这里再说一下，Cgroups的整体设计。当用户使用cgroup文件系统，创建cgroup的时候，会调用cgroup目录操作的mkdir指针指向的函数，该函数调用了cgroup_create，而cgroup_create会根据该cgroup关联的子系统，分别调用对应的子系统实现的create指针指向的函数。即做了两次转换，一次从系统通用命令到cgroup文件系统，另一次从cgroup文件系统再特定的子系统实现。
+
+Cgroups中除了通用的控制文件外，每个子系统还有自己的控制文件，子系统也是通过cftype来管理这些控制文件。Cpu子系统很重要的一个文件就是cpu.shares文件，因为就是通过这个文件的数值来调节cgroup所占用的cpu时间。Shares文件对应的cftype结构为：
+```
+	#ifdef CONFIG_FAIR_GROUP_SCHED
+	{
+		.name = "shares",
+		.read_u64 = cpu_shares_read_u64,
+		.write_u64 = cpu_shares_write_u64,
+	},
+	#endif
+```
+当对cgroup目录下的文件进行操作时，该结构体中定义的函数指针指向的函数就会被调用.下面我们就在看看这个两个函数的实现吗，从而发现shares文件的值是如何起作用的。
+```
+	static u64 cpu_shares_read_u64(struct cgroup *cgrp, struct cftype *cft)
+	{
+		struct task_group *tg = cgroup_tg(cgrp);
+ 
+		return (u64) tg->shares;
+	}
+```
+比较简单，简单的读取task_group中存储的shares就行了。
+
+```
+	static int cpu_shares_write_u64(struct cgroup *cgrp, struct cftype *cftype,
+					u64 shareval)
+	{
+		return sched_group_set_shares(cgroup_tg(cgrp), shareval);
+	}
+```
+则是设定cgroup对应的task_group的shares值。
+
+那这个shares值是怎么起作用的呢？在sched_group_set_shares中有:
+
+```
+	tg->shares = shares;
+	for_each_possible_cpu(i) {
+		/*
+		 * force a rebalance
+		 */
+		cfs_rq_set_shares(tg->cfs_rq[i], 0);
+		set_se_shares(tg->se[i], shares);
+	}
+```
+cfs_rq_set_shares强制做一次cpu SMP负载均衡。
+
+真正起作用的是在set_se_shares中，它调用了__set_se_shares，在__set_se_shares中有：
+```
+	se->load.weight = shares;
+	se->load.inv_weight = 0;
+```
+
+根据之前我们分析的CFS的调度原理可以知道，load.weight的值越大，算出来的虚拟运行时间越小，进程能使用的cpu时间越多。这样以来，shares值最终就是通过调度实体的load值来起作用的。
+

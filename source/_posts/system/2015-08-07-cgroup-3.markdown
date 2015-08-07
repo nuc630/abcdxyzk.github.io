@@ -1,0 +1,150 @@
+---
+layout: post
+title: "cgroup文件系统"
+date: 2015-08-07 16:41:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~08
+- system
+- system~cgroup
+tags:
+---
+http://www.cnblogs.com/lisperl/archive/2012/04/23/2466151.html
+
+#### Cgroups用户空间管理
+
+Cgroups用户空间的管理是通过cgroup文件系统实现的。
+
+比如要创建一个层级：
+```
+	mount -t cgroup -o cpu,cpuset,memory cpu_and_mem /cgroup/cpu_and_mem
+```
+
+这个命令就创建一个名为cpu_and_mem的层级，这个层级上附加了cpu,cpuset,memory三个子系统，并把层级挂载到了/cgroup/cpu_and_mem.
+
+创建一个cgroup：
+
+```
+	cd /cgroup/cpu_and_mem
+	mkdir foo
+```
+
+通过以上两个命令，我们就在刚才创建的层级下创建了一个叫foo的cgroup。
+
+你再cd foo，然后ls
+
+你会发现一些文件，这是cgroups相关子系统的控制文件，你可以读取这些控制文件，这些控制文件存储的值就是对相应的cgrouop的控制信息，你也可以写控制文件来更改控制信息。
+在这些文件中，有一个叫tasks的文件，里面的包含了所有属于这个cgroup的进程的进程号。
+
+在刚才创建的foo下，你cat tasks，应该是空的，因为此时这个cgroup里面还没有进程。你cd /cgroup/cpu_and_mem 再cat tasks，你可以看到系统中所有进程的进程号，这是因为每创建一个层级的时候，系统的所有进程都会自动被加到该层级的根cgroup里面。Tasks文件不仅可以读，还可以写，你将一个进程的进程号写入到某个cgroup目录下的tasks里面，你就将这个进程加入了相应的cgroup。
+
+#### Cgroup文件系统的实现
+
+在讲cgroup文件系统的实现之前，必须简单的介绍一下Linux VFS。
+
+VFS是所谓的虚拟文件系统转换，是一个内核软件层，用来处理与Unix标准文件系统的所有系统调用。VFS对用户提供统一的读写等文件操作调用接口，当用户调用读写等函数时，内核则调用特定的文件系统实现。具体而言，文件在内核内存中是一个file数据结构来表示的。这个数据结构包含一个f_op的字段，该字段中包含了一组指向特定文件系统实现的函数指针。当用户执行read()操作时，内核调用sys_read(),然后sys_read（）查找到指向该文件属于的文件系统的读函数指针，并调用它，即file->f_op->read().
+
+VFS其实是面向对象的，在这里，对象是一个软件结构，既定义数据也定义了之上的操作。处于效率，Linux并没有采用C++之类的面向对象的语言，而是采用了C的结构体，然后在结构体里面定义了一系列函数指针，这些函数指针对应于对象的方法。
+
+VFS文件系统定义了以下对象模型：   
+超级块对象(superblock object)
+存放已安装文件系统的有关信息。
+索引节点对象(inode object)
+存放关于具体文件的一般信息。
+文件对象（file  object）
+存放打开文件与进程之间的交互信息
+目录项对象(dentry object)
+存放目录项与对应文件进行链接的有关信息。
+ 
+基于VFS实现的文件系统，都必须实现定义这些对象，并实现这些对象中定义的函数指针。cgroup文件系统也不例外，下面我们来看cgroups中这些对象的定义。
+
+cgroup文件系统的定义：
+
+```
+	static struct file_system_type cgroup_fs_type = {
+		.name = "cgroup",
+		.get_sb = cgroup_get_sb,
+		.kill_sb = cgroup_kill_sb,
+	};
+```
+
+这里有定义了两个函数指针，定义了一个文件系统必须实现了的两个操作get_sb,kill_sb，即获得超级块和释放超级块。这两个操作会在使用mount系统调用挂载cgroup文件系统时使用。
+
+cgroup 超级块的定义:
+```
+	static const struct super_operations cgroup_ops = {
+		.statfs = simple_statfs,
+		.drop_inode = generic_delete_inode,
+		.show_options = cgroup_show_options,
+		.remount_fs = cgroup_remount,
+	};
+```
+
+Cgroup 索引块定义：
+
+```
+	static const struct inode_operations cgroup_dir_inode_operations = {
+		.lookup = simple_lookup,
+		.mkdir = cgroup_mkdir,
+		.rmdir = cgroup_rmdir,
+		.rename = cgroup_rename,
+	};
+```
+
+在cgroup文件系统中，使用mkdir创建cgroup或者用rmdir删除cgroup时，就会调用相应的函数指针指向的函数。比如：使用mkdir创建cgroup时，会调用cgroup_mkdir，然后在cgroup_mkdir中再调用具体实现的cgroup_create函数。
+
+Cgroup 文件操作定义：
+
+```
+	static const struct file_operations cgroup_file_operations = {
+		.read = cgroup_file_read,
+		.write = cgroup_file_write,
+		.llseek = generic_file_llseek,
+		.open = cgroup_file_open,
+		.release = cgroup_file_release,
+	};
+```
+
+在cgroup文件系统中，对目录下的控制文件进行操作时，会调用该结构体中指针指向的函数。比如：对文件进行读操作时，会调用cgroup_file_read，在cgroup_file_read中，会根据需要调用该文件对应的cftype结构体定义的对应读函数。
+
+我们再来看cgroup文件系统中的cgroups控制文件。Cgroups定义一个cftype的结构体来管理控制文件。下面我们来看cftype的定义：
+```
+	struct cftype {
+		char name[MAX_CFTYPE_NAME];
+		int private; /*
+		mode_t mode;
+		size_t max_write_len;
+ 
+		int (*open)(struct inode *inode, struct file *file);
+		ssize_t (*read)(struct cgroup *cgrp, struct cftype *cft,
+		struct file *file,
+		char __user *buf, size_t nbytes, loff_t *ppos);
+		u64 (*read_u64)(struct cgroup *cgrp, struct cftype *cft);
+		s64 (*read_s64)(struct cgroup *cgrp, struct cftype *cft);
+		int (*read_map)(struct cgroup *cont, struct cftype *cft,
+		struct cgroup_map_cb *cb);
+		int (*read_seq_string)(struct cgroup *cont, struct cftype *cft,
+					struct seq_file *m);
+ 
+		ssize_t (*write)(struct cgroup *cgrp, struct cftype *cft,
+					struct file *file,
+					const char __user *buf, size_t nbytes, loff_t *ppos);
+		int (*write_u64)(struct cgroup *cgrp, struct cftype *cft, u64 val);
+		int (*write_s64)(struct cgroup *cgrp, struct cftype *cft, s64 val);
+		int (*write_string)(struct cgroup *cgrp, struct cftype *cft,
+					const char *buffer);
+		int (*trigger)(struct cgroup *cgrp, unsigned int event);
+ 
+		int (*release)(struct inode *inode, struct file *file);
+		int (*register_event)(struct cgroup *cgrp, struct cftype *cft,
+		struct eventfd_ctx *eventfd, const char *args); /*
+		void (*unregister_event)(struct cgroup *cgrp, struct cftype *cft,
+		struct eventfd_ctx *eventfd);
+	};
+```
+
+cftype中除了定义文件的名字和相关权限标记外，主要是定义了对文件进行操作的函数指针。不同的文件可以有不同的操作，对文件进行操作时，相关函数指针指向的函数会被调用。
+
+综合上面的分析，cgroups通过实现cgroup文件系统来为用户提供管理cgroup的工具，而cgroup文件系统是基于Linux VFS实现的。相应地，cgroups为控制文件定义了相应的数据结构cftype，对其操作由cgroup文件系统定义的通过操作捕获，再调用cftype定义的具体实现。
+

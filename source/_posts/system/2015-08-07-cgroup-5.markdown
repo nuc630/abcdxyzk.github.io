@@ -1,0 +1,202 @@
+---
+layout: post
+title: "devices子系统"
+date: 2015-08-07 16:54:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~08
+- system
+- system~cgroup
+tags:
+---
+http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html
+
+使用devices 子系统可以允许或者拒绝cgroup中的进程访问设备。devices子系统有三个控制文件：devices.allow,devices.deny,devices.list。devices.allow用于指定cgroup中的进程可以访问的设备,devices.deny用于指定cgroup中的进程不能访问的设备，devices.list用于报告cgroup中的进程访问的设备。devices.allow文件中包含若干条目，每个条目有四个字段：type、major、minor 和 access。type、major 和 minor 字段中使用的值对应 Linux 分配的设备。
+
+type指定设备类型：  
+a - 应用所有设备，可以是字符设备，也可以是块设备  
+b- 指定块设备  
+c - 指定字符设备  
+
+major和minor指定设备的主次设备号。
+
+access 则指定相应的权限：  
+r - 允许任务从指定设备中读取  
+w - 允许任务写入指定设备  
+m - 允许任务生成还不存在的设备文件  
+
+devices子系统是通过提供device whilelist 来实现的。与其他子系统一样，devices子系统也有一个内嵌了cgroup_subsystem_state的结构来管理资源。在devices子系统中，这个结构是：
+```
+	struct dev_cgroup {
+		struct cgroup_subsys_state css;
+		struct list_head whitelist;
+	};
+```
+
+这个结构体除了通用的cgroup_subsystem_state之外，就只有一个链表指针，而这个链表指针指向了该cgroup中的进程可以访问的devices whilelist。
+
+下面我们来看一下devices子系统如何管理whilelist。在devices子系统中，定义了一个叫dev_whitelist_item的结构来管理可以访问的device，对应于devices.allow中的一个条目。这个结构体的定义如下：
+```
+	struct dev_whitelist_item {
+		u32 major, minor;
+		short type;
+		short access;
+		struct list_head list;
+		struct rcu_head rcu;
+	};
+```
+
+major，minor用于指定设备的主次设备号，type用于指定设备类型，type取值可以是：
+```
+	#define DEV_BLOCK 1
+	#define DEV_CHAR  2
+	#define DEV_ALL   4 
+```
+
+对应于之前devices.allow文件中三种情况。
+
+access用于相应的访问权限,access取值可以是:
+```
+	#define ACC_MKNOD 1
+	#define ACC_READ  2
+	#define ACC_WRITE 4
+```
+也和之前devices.allow文件中的情况对应。
+
+List字段用于将该结构体连到相应的dev_cgroup中whitelist指向的链表。
+
+通过以上数据结构，devices子系统就能管理一个cgroup的进程可以访问的devices了。 光有数据结构还不行，还要有具体实现才行。devices子系统通过实现两个函数供内核调用来实现控制cgroup中的进程能够访问的devices。首先我们来第一个函数：
+```
+	int devcgroup_inode_permission(struct inode *inode, int mask)
+	{
+		struct dev_cgroup *dev_cgroup;
+		struct dev_whitelist_item *wh;
+ 
+		dev_t device = inode->i_rdev;
+		if (!device)
+			return 0;
+		if (!S_ISBLK(inode->i_mode) && !S_ISCHR(inode->i_mode))
+			return 0;
+ 
+		rcu_read_lock();
+ 
+		dev_cgroup = task_devcgroup(current);
+ 
+		list_for_each_entry_rcu(wh, &dev_cgroup->whitelist, list) {
+			if (wh->type & DEV_ALL)
+				goto found;
+			if ((wh->type & DEV_BLOCK) && !S_ISBLK(inode->i_mode))
+				continue;
+			if ((wh->type & DEV_CHAR) && !S_ISCHR(inode->i_mode))
+				continue;
+			if (wh->major != ~0 && wh->major != imajor(inode))
+				continue;
+			if (wh->minor != ~0 && wh->minor != iminor(inode))
+				continue;
+ 
+			if ((mask & MAY_WRITE) && !(wh->access & ACC_WRITE))
+				continue;
+			if ((mask & MAY_READ) && !(wh->access & ACC_READ))
+				continue;
+			found:
+				rcu_read_unlock();
+			return 0;
+		}
+ 
+		rcu_read_unlock();
+ 
+		return -EPERM;
+	}
+```
+我们来简单分析一下这个函数，首先如果该inode对应的不是devices，直接返回0，如果既不是块设备也不是字符设备，也返回0，因为devices只控制块设备和字符设备的访问，其他情况不管。接着获得当前进程的dev_cgroup，然后在dev_cgroup中whitelist指针的链表中查找，如果找到对应设备而且mask指定的权限和设备的权限一致就返回0，如果没有找到就返回错误。
+
+这个函数是针对inode节点存在的情况，通过对比权限来控制cgroup中的进程能够访问的devices。还有一个情况是inode不存在，在这种情况下，一个进程要访问一个设备就必须通过mknod建立相应的设备文件。为了达到对这种情况的控制，devices子系统导出了第二个函数：
+```
+	int devcgroup_inode_mknod(int mode, dev_t dev)
+	{
+		struct dev_cgroup *dev_cgroup;
+		struct dev_whitelist_item *wh;
+ 
+		if (!S_ISBLK(mode) && !S_ISCHR(mode))
+			return 0;
+ 
+		rcu_read_lock();
+ 
+		dev_cgroup = task_devcgroup(current);
+ 
+		list_for_each_entry_rcu(wh, &dev_cgroup->whitelist, list) {
+			if (wh->type & DEV_ALL)
+				goto found;
+			if ((wh->type & DEV_BLOCK) && !S_ISBLK(mode))
+				continue;
+			if ((wh->type & DEV_CHAR) && !S_ISCHR(mode))
+				continue;
+			if (wh->major != ~0 && wh->major != MAJOR(dev))
+				continue;
+			if (wh->minor != ~0 && wh->minor != MINOR(dev))
+				continue;
+ 
+			if (!(wh->access & ACC_MKNOD))
+				continue;
+			found:
+				rcu_read_unlock();
+			return 0;
+		}
+ 
+		rcu_read_unlock();
+ 
+		return -EPERM;
+	}
+```
+这个函数的实现跟第一个函数类似，这里就不赘述了。
+
+下面我们再来看一下devices子系统本身的一些东西。跟其他子系统一样，devices同样实现了一个cgroup_subsys：
+```
+	struct cgroup_subsys devices_subsys = {
+		.name = "devices",
+		.can_attach = devcgroup_can_attach,
+		.create = devcgroup_create,
+		.destroy = devcgroup_destroy,
+		.populate = devcgroup_populate,
+		.subsys_id = devices_subsys_id,
+	};
+```
+
+devices相应的三个控制文件：
+```
+	static struct cftype dev_cgroup_files[] = {
+		{
+			.name = "allow",
+			.write_string  = devcgroup_access_write,
+			.private = DEVCG_ALLOW,
+		},
+		{
+			.name = "deny",
+			.write_string = devcgroup_access_write,
+			.private = DEVCG_DENY,
+		},
+		{
+			.name = "list",
+			.read_seq_string = devcgroup_seq_read,
+			.private = DEVCG_LIST,
+		},
+	};
+```
+
+其中allow和deny都是通过devcgroup_access_write实现的，只是通过private字段区分，因为二者的实现逻辑有相同的地方。devcgroup_access_write最终通过调用devcgroup_update_access来实现。在devcgroup_update_access根据写入的内容构造一个dev_whitelist_item ，然后根据文件类型做不同的处理：
+```
+	switch (filetype) {
+		case DEVCG_ALLOW:
+			if (!parent_has_perm(devcgroup, &wh))
+				return -EPERM;
+			return dev_whitelist_add(devcgroup, &wh);
+		case DEVCG_DENY:
+			dev_whitelist_rm(devcgroup, &wh);
+			break;
+		default:
+			return -EINVAL;
+	}
+```
+allow的话，就将item加入whitelist，deny的话，就将item从whitelist中删去。
+
