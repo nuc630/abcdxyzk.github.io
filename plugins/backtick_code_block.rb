@@ -24,16 +24,17 @@ module BacktickCodeBlock
       if str.match(/\A( {4}|\t)/)
         str = str.gsub(/^( {4}|\t)/, '')
 # add by kk
-# TODO: code的第一个tab只显示2空格，不知道哪改，先这里改了
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
-        str = str.gsub(/^( *)\t/, '\1    ')
+# 将\t替换成html的\t
+# TODO: 只替换了前9个
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
+        str = str.gsub(/^((&#9;)*)\t/, '\1&#9;')
       end
       if @lang.nil? || @lang == 'plain'
         code = HighlightCode::tableize_code(str.gsub('<','&lt;').gsub('>','&gt;'))
