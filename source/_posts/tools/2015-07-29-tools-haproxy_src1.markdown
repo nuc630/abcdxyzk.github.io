@@ -14,18 +14,18 @@ http://blog.chinaunix.net/uid-10167808-id-3771148.html
 
 本文基于 HAProxy 1.5-dev7 版本。
 ```
-    目录
-    1. 关键数据结构 session
-    2. 相关初始化
-        2.1. 初始化处理 TCP 连接的方法
-        2.2. 初始化 listener
-        2.3. 绑定所有已注册协议上的 listeners
-        2.4. 启用所有已注册协议上的 listeners
-    3. TCP 连接的处理流程
-        3.1. 接受新建连接
-        3.2. TCP 连接上的接收事件
-        3.3. TCP 连接上的发送事件
-        3.4. http 请求的处理
+	目录
+	1. 关键数据结构 session
+	2. 相关初始化
+		2.1. 初始化处理 TCP 连接的方法
+		2.2. 初始化 listener
+		2.3. 绑定所有已注册协议上的 listeners
+		2.4. 启用所有已注册协议上的 listeners
+	3. TCP 连接的处理流程
+		3.1. 接受新建连接
+		3.2. TCP 连接上的接收事件
+		3.3. TCP 连接上的发送事件
+		3.4. http 请求的处理
 ```
 
 #### 1. 关键数据结构 session
@@ -142,28 +142,28 @@ listener 的其他初始化
 session_accept 主要完成以下功能
 
 ```
-    调用 pool_alloc2 分配一个 session 结构
-    调用 task_new 分配一个新任务
-    将新分配的 session 加入全局 sessions 链表中
-    session 和 task 的初始化，若干重要成员的初始化如下
-        t->process = l->handler： 即 t->process 指向 process_session
-        t->context = s： 任务的上下文指向 session
-        s->listener = l： session 的 listener 成员指向当前的 listener
-        s->si[] 的初始化，记录 accept 系统调用返回的 cfd 等
-        初始化 s->txn
-        为 s->req 和 s->rep 分别分配内存，并作对应的初始化
-            s->req = pool_alloc2(pool2_buffer)
-            s->rep = pool_alloc2(pool2_buffer)
-            从代码上来看，应该是各自独立分配 tune.bufsize + sizeof struct buffer 大小的内存
-        新建连接 cfd 的一些初始化
-            cfd 设置为非阻塞
-            将 cfd 加入 fdtab[] 中，并注册新建连接 cfg 的 read 和 write 的方法
-            fdtab[cfd].cb[DIR_RD].f = l->proto->read，设置 cfd 的 read 的函数 l->proto->read，对应 TCP 为 stream_sock_read，读缓存指向 s->req，
-            fdtab[cfd].cb[DIR_WR].f = l->proto->write，设置 cfd 的 write 函数 l->proto->write，对应 TCP 为 stream_sock_write，写缓冲指向 s->rep
-    p->accept 执行 proxy 的 accept 方法即 frontend_accept
-        设置 session 结构体的 log 成员
-        根据配置的情况，分别设置新建连接套接字的选项，包括 TCP_NODELAY/KEEPALIVE/LINGER/SNDBUF/RCVBUF 等等
-        如果 mode 是 http 的话，将 session 的 txn 成员做相关的设置和初始化
+	调用 pool_alloc2 分配一个 session 结构
+	调用 task_new 分配一个新任务
+	将新分配的 session 加入全局 sessions 链表中
+	session 和 task 的初始化，若干重要成员的初始化如下
+		t->process = l->handler： 即 t->process 指向 process_session
+		t->context = s： 任务的上下文指向 session
+		s->listener = l： session 的 listener 成员指向当前的 listener
+		s->si[] 的初始化，记录 accept 系统调用返回的 cfd 等
+		初始化 s->txn
+		为 s->req 和 s->rep 分别分配内存，并作对应的初始化
+			s->req = pool_alloc2(pool2_buffer)
+			s->rep = pool_alloc2(pool2_buffer)
+			从代码上来看，应该是各自独立分配 tune.bufsize + sizeof struct buffer 大小的内存
+		新建连接 cfd 的一些初始化
+			cfd 设置为非阻塞
+			将 cfd 加入 fdtab[] 中，并注册新建连接 cfg 的 read 和 write 的方法
+			fdtab[cfd].cb[DIR_RD].f = l->proto->read，设置 cfd 的 read 的函数 l->proto->read，对应 TCP 为 stream_sock_read，读缓存指向 s->req，
+			fdtab[cfd].cb[DIR_WR].f = l->proto->write，设置 cfd 的 write 函数 l->proto->write，对应 TCP 为 stream_sock_write，写缓冲指向 s->rep
+	p->accept 执行 proxy 的 accept 方法即 frontend_accept
+		设置 session 结构体的 log 成员
+		根据配置的情况，分别设置新建连接套接字的选项，包括 TCP_NODELAY/KEEPALIVE/LINGER/SNDBUF/RCVBUF 等等
+		如果 mode 是 http 的话，将 session 的 txn 成员做相关的设置和初始化
 ```
 
 ##### 3.2. TCP 连接上的接收事件
@@ -185,13 +185,13 @@ stream_sock_read 主要完成以下功能
 ```
 
 ```
-    根据配置，调用 splice 或者 recv 读取套接字上的数据，并填充到读缓冲中，即填充到从 b->r（初始位置应该就是 b->data）开始的内存中
-    如果读取到 0 字节，则意味着接收到对端的关闭请求，调用 stream_sock_shutr 进行处理
-        读缓冲标记 si->ib->flags 的 BF_SHUTR 置位，清除当前 fd 的 epoll 读事件，不再从该 fd 读取
-        如果写缓冲 si->ob->flags 的 BF_SHUTW 已经置位，说明应该是由本地首先发起的关闭连接动作
-            将 fd 从 fdset[] 中清除，从 epoll 中移除 fd，执行系统调用 close(fd)， fd.state 置位 FD_STCLOSE
-            stream interface 的状态修改 si->state = SI_ST_DIS
-    唤醒任务 task_wakeup，把当前任务加入到 run queue 中。随后检测 runnable tasks 时，就会处理该任务
+	根据配置，调用 splice 或者 recv 读取套接字上的数据，并填充到读缓冲中，即填充到从 b->r（初始位置应该就是 b->data）开始的内存中
+	如果读取到 0 字节，则意味着接收到对端的关闭请求，调用 stream_sock_shutr 进行处理
+		读缓冲标记 si->ib->flags 的 BF_SHUTR 置位，清除当前 fd 的 epoll 读事件，不再从该 fd 读取
+		如果写缓冲 si->ob->flags 的 BF_SHUTW 已经置位，说明应该是由本地首先发起的关闭连接动作
+			将 fd 从 fdset[] 中清除，从 epoll 中移除 fd，执行系统调用 close(fd)， fd.state 置位 FD_STCLOSE
+			stream interface 的状态修改 si->state = SI_ST_DIS
+	唤醒任务 task_wakeup，把当前任务加入到 run queue 中。随后检测 runnable tasks 时，就会处理该任务
 
 ##### 3.3. TCP 连接上的发送事件
 
@@ -228,22 +228,22 @@ stream_sock_write主要完成以下功能
 
 process_session 主要完成以下功能
 ```
-    处理连接需要关闭的情形，分支 resync_stream_interface
-    处理请求，分支 resync_request (read event)
-        根据 s->req->analysers 的标记位，调用不同的 analyser 进行处理请求
-        ana_list & AN_REQ_WAIT_HTTP： http_wait_for_request
-        ana_list & AN_REQ_HTTP_PROCESS_FE： http_process_req_common
-        ana_list & AN_REQ_SWITCHING_RULES：process_switching_rules
-    处理应答，分支 resync_response (write event)
-        根据 s->rep->analysers 的标记位，调用不同的 analyser 进行处理请求
-        ana_list & AN_RES_WAIT_HTTP： http_wait_for_response
-        ana_list & AN_RES_HTTP_PROCESS_BE：http_process_res_common
-    处理 forward buffer 的相关动作
-    关闭 req 和 rep 的 buffer，调用 pool2_free 释放 session 及其申请的相关内存，包括读写缓冲 (read 0 bytes)
-        pool_free2(pool2_buffer, s->req);
-        pool_free2(pool2_buffer, s->rep);
-        pool_free2(pool2_session, s);
-    task 从运行任务队列中清除，调用 pool2_free 释放 task 申请的内存： task_delete(); task_free();
+	处理连接需要关闭的情形，分支 resync_stream_interface
+	处理请求，分支 resync_request (read event)
+		根据 s->req->analysers 的标记位，调用不同的 analyser 进行处理请求
+		ana_list & AN_REQ_WAIT_HTTP： http_wait_for_request
+		ana_list & AN_REQ_HTTP_PROCESS_FE： http_process_req_common
+		ana_list & AN_REQ_SWITCHING_RULES：process_switching_rules
+	处理应答，分支 resync_response (write event)
+		根据 s->rep->analysers 的标记位，调用不同的 analyser 进行处理请求
+		ana_list & AN_RES_WAIT_HTTP： http_wait_for_response
+		ana_list & AN_RES_HTTP_PROCESS_BE：http_process_res_common
+	处理 forward buffer 的相关动作
+	关闭 req 和 rep 的 buffer，调用 pool2_free 释放 session 及其申请的相关内存，包括读写缓冲 (read 0 bytes)
+		pool_free2(pool2_buffer, s->req);
+		pool_free2(pool2_buffer, s->rep);
+		pool_free2(pool2_session, s);
+	task 从运行任务队列中清除，调用 pool2_free 释放 task 申请的内存： task_delete(); task_free();
 ```
 
 本文简单分析了 TCP 连接的处理过程，不侧重细节分析，而且缺少后端 server 的选择以及建连等，重在希望展示出一个 haproxy 处理 TCP 连接的框架。

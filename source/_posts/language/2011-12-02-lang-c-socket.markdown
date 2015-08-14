@@ -13,27 +13,27 @@ tags:
 ---
 本文的主要内容如下：
 ```
-    1、网络中进程之间如何通信？
-    2、Socket是什么？
-    3、socket的基本操作
-        3.1、socket()函数
-        3.2、bind()函数
-        3.3、listen()、connect()函数
-        3.4、accept()函数
-        3.5、read()、write()函数等
-        3.6、close()函数
-    4、socket中TCP的三次握手建立连接详解
-    5、socket中TCP的四次握手释放连接详解
-    6、一个例子（实践一下）
+	1、网络中进程之间如何通信？
+	2、Socket是什么？
+	3、socket的基本操作
+		3.1、socket()函数
+		3.2、bind()函数
+		3.3、listen()、connect()函数
+		3.4、accept()函数
+		3.5、read()、write()函数等
+		3.6、close()函数
+	4、socket中TCP的三次握手建立连接详解
+	5、socket中TCP的四次握手释放连接详解
+	6、一个例子（实践一下）
 ```
 
 #### 1、网络中进程之间如何通信？
 本地的进程间通信（IPC）有很多种方式，但可以总结为下面4类：
 ```
-    消息传递（管道、FIFO、消息队列）
-    同步（互斥量、条件变量、读写锁、文件和写记录锁、信号量）
-    共享内存（匿名的和具名的）
-    远程过程调用（Solaris门和Sun RPC）
+	消息传递（管道、FIFO、消息队列）
+	同步（互斥量、条件变量、读写锁、文件和写记录锁、信号量）
+	共享内存（匿名的和具名的）
+	远程过程调用（Solaris门和Sun RPC）
 ```
 但这些都不是本文的主题！我们要讨论的是网络中进程之间如何通信？首要解决的问题是如何唯一标识一个进程，否则通信无从谈起！在本地可以通过进程PID来唯一标识一个进程，但是在网络中这是行不通的。
 
@@ -62,14 +62,14 @@ socket函数对应于普通文件的打开操作。普通文件的打开操作�
 
 正如可以给fopen的传入不同参数值，以打开不同的文件。创建socket的时候，也可以指定不同的参数创建不同的socket描述符，socket函数的三个参数分别为：
 ```
-    domain：即协议域，又称为协议族（family）。
-    常用的协议族有，AF_INET、AF_INET6、AF_LOCAL（或称AF_UNIX，Unix域socket）、AF_ROUTE等等。
-    协议族决定了socket的地址类型，在通信中必须采用对应的地址，
-    如AF_INET决定了要用ipv4地址（32位的）与端口号（16位的）的组合、AF_UNIX决定了要用一个绝对路径名作为地址。
-    type：指定socket类型。常用的socket类型有，
-    SOCK_STREAM、SOCK_DGRAM、SOCK_RAW、SOCK_PACKET、SOCK_SEQPACKET等等（socket的类型有哪些？）。
-    protocol：故名思意，就是指定协议。常用的协议有，IPPROTO_TCP、IPPTOTO_UDP、IPPROTO_SCTP、IPPROTO_TIPC等，
-    它们分别对应TCP传输协议、UDP传输协议、STCP传输协议、TIPC传输协议（这个协议我将会单独开篇讨论！）。 
+	domain：即协议域，又称为协议族（family）。
+	常用的协议族有，AF_INET、AF_INET6、AF_LOCAL（或称AF_UNIX，Unix域socket）、AF_ROUTE等等。
+	协议族决定了socket的地址类型，在通信中必须采用对应的地址，
+	如AF_INET决定了要用ipv4地址（32位的）与端口号（16位的）的组合、AF_UNIX决定了要用一个绝对路径名作为地址。
+	type：指定socket类型。常用的socket类型有，
+	SOCK_STREAM、SOCK_DGRAM、SOCK_RAW、SOCK_PACKET、SOCK_SEQPACKET等等（socket的类型有哪些？）。
+	protocol：故名思意，就是指定协议。常用的协议有，IPPROTO_TCP、IPPTOTO_UDP、IPPROTO_SCTP、IPPROTO_TIPC等，
+	它们分别对应TCP传输协议、UDP传输协议、STCP传输协议、TIPC传输协议（这个协议我将会单独开篇讨论！）。 
 ```
 注意：并不是上面的type和protocol可以随意组合的，如SOCK_STREAM不可以跟IPPROTO_UDP组合。  
 当protocol为0时，会自动选择type类型对应的默认协议。  
@@ -81,36 +81,36 @@ socket函数对应于普通文件的打开操作。普通文件的打开操作�
 `intbind(int sockfd, conststruct sockaddr *addr, socklen_t addrlen);`  
 函数的三个参数分别为：  
 ```
-    sockfd：即socket描述字，它是通过socket()函数创建了，唯一标识一个socket。
-    bind()函数就是将给这个描述字绑定一个名字。
-    addr：一个conststruct sockaddr *指针，指向要绑定给sockfd的协议地址。
-    这个地址结构根据地址创建socket时的地址协议族的不同而不同，如ipv4对应的是：
-    struct sockaddr_in {
-	    sa_family_t sin_family; /* address family: AF_INET */
-	    in_port_t sin_port; /* port in network byte order */
-	    struct in_addr sin_addr; /* internet address */
-    };/* Internet address. */
-    struct in_addr {
-	    uint32_t s_addr; /* address in network byte order */
-    };
-    ipv6对应的是：
-    struct sockaddr_in6 {
-	    sa_family_t sin6_family; /* AF_INET6 */
-	    in_port_t sin6_port; /* port number */
-	    uint32_t sin6_flowinfo; /* IPv6 flow information */
-	    struct in6_addr sin6_addr; /* IPv6 address */
-	    uint32_t sin6_scope_id; /* Scope ID (new in 2.4) */
-    };
-    struct in6_addr {
-	    unsignedchar s6_addr[16]; /* IPv6 address */
-    };
-    Unix域对应的是：
-    #define UNIX_PATH_MAX 108
-    struct sockaddr_un {
-	    sa_family_t sun_family; /* AF_UNIX */
-	    char sun_path[UNIX_PATH_MAX]; /* pathname */
-    };
-    addrlen：对应的是地址的长度。 
+	sockfd：即socket描述字，它是通过socket()函数创建了，唯一标识一个socket。
+	bind()函数就是将给这个描述字绑定一个名字。
+	addr：一个conststruct sockaddr *指针，指向要绑定给sockfd的协议地址。
+	这个地址结构根据地址创建socket时的地址协议族的不同而不同，如ipv4对应的是：
+	struct sockaddr_in {
+		sa_family_t sin_family; /* address family: AF_INET */
+		in_port_t sin_port; /* port in network byte order */
+		struct in_addr sin_addr; /* internet address */
+	};/* Internet address. */
+	struct in_addr {
+		uint32_t s_addr; /* address in network byte order */
+	};
+	ipv6对应的是：
+	struct sockaddr_in6 {
+		sa_family_t sin6_family; /* AF_INET6 */
+		in_port_t sin6_port; /* port number */
+		uint32_t sin6_flowinfo; /* IPv6 flow information */
+		struct in6_addr sin6_addr; /* IPv6 address */
+		uint32_t sin6_scope_id; /* Scope ID (new in 2.4) */
+	};
+	struct in6_addr {
+		unsignedchar s6_addr[16]; /* IPv6 address */
+	};
+	Unix域对应的是：
+	#define UNIX_PATH_MAX 108
+	struct sockaddr_un {
+		sa_family_t sun_family; /* AF_UNIX */
+		char sun_path[UNIX_PATH_MAX]; /* pathname */
+	};
+	addrlen：对应的是地址的长度。 
 ```
 通常服务器在启动的时候都会绑定一个众所周知的地址（如ip地址+端口号），用于提供服务，客户就可以通过它来接连服务器；而客户端就不用指定，有系统自动分配一个端口号和自身的ip地址组合。
 
@@ -147,11 +147,11 @@ accept函数的第一个参数为服务器的socket描述字，第二个参数�
 ##### 3.5、read()、write()等函数
 万事具备只欠东风，至此服务器与客户已经建立好连接了。可以调用网络I/O进行读写操作了，即实现了网咯中不同进程之间的通信！网络I/O操作有下面几组：
 ```
-    read()/write()
-    recv()/send()
-    readv()/writev()
-    recvmsg()/sendmsg()
-    recvfrom()/sendto()
+	read()/write()
+	recv()/send()
+	readv()/writev()
+	recvmsg()/sendmsg()
+	recvfrom()/sendto()
 ```
 我推荐使用recvmsg()/sendmsg()函数，这两个函数是最通用的I/O函数，实际上可以把上面的其它函数都替换成这两个函数。它们的声明如下：
 ```
@@ -191,9 +191,9 @@ close一个TCP socket的缺省行为时把该socket标记为以关闭，然后�
 #### 4、socket中TCP的三次握手建立连接详解
 我们知道tcp建立连接要进行“三次握手”，即交换三个分组。大致流程如下：
 ```
-    客户端向服务器发送一个SYN J
-    服务器向客户端响应一个SYN K，并对SYN J进行确认ACK J+1
-    客户端再想服务器发一个确认ACK K+1 
+	客户端向服务器发送一个SYN J
+	服务器向客户端响应一个SYN K，并对SYN J进行确认ACK J+1
+	客户端再想服务器发一个确认ACK K+1 
 ```
 只有就完了三次握手，但是这个三次握手发生在socket的那几个函数中呢？请看下图：
 
@@ -214,11 +214,11 @@ close一个TCP socket的缺省行为时把该socket标记为以关闭，然后�
 
 图示过程如下：  
 ```
-    某个应用进程首先调用close主动关闭连接，这时TCP发送一个FIN M；
-    另一端接收到FIN M之后，执行被动关闭，对这个FIN进行确认。它的接收也作为文件结束符传递给应用进程，
-    因为FIN的接收意味着应用进程在相应的连接上再也接收不到额外数据；
-    一段时间之后，接收到文件结束符的应用进程调用close关闭它的socket。这导致它的TCP也发送一个FIN N；
-    接收到这个FIN的源发送端TCP对它进行确认。
+	某个应用进程首先调用close主动关闭连接，这时TCP发送一个FIN M；
+	另一端接收到FIN M之后，执行被动关闭，对这个FIN进行确认。它的接收也作为文件结束符传递给应用进程，
+	因为FIN的接收意味着应用进程在相应的连接上再也接收不到额外数据；
+	一段时间之后，接收到文件结束符的应用进程调用close关闭它的socket。这导致它的TCP也发送一个FIN N；
+	接收到这个FIN的源发送端TCP对它进行确认。
 ```
 这样每个方向上都有一个FIN和ACK。
 

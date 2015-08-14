@@ -169,123 +169,123 @@ O(1)调度的复杂性主要来至于动态优先级的计算。调度器根据�
   在完全理想的多任务处理器下，每个进程都能同时获得cpu的时间。但实际上当一个进程占用cpu时，其他的进程必须等待，这样就产生了不公平。所以linux 的cfs调度引入了虚拟运行时间。虚拟运行时间主要由两个因素决定，一个是实际的运行时间，一个是其权重，它随自己的实际运行时间增加而增加，但又不等于实际运行时间。上面提过内核采用红黑树来对虚拟运行时间来排序，这样红黑树最左边的进程（调度实体）就是受到了最不公平待遇的进程，需要作为下一个被调度的进程。
 进程的虚拟运行时间由calc_delta_fair()来计算。在每次时钟中断后都会进行更新。公式为：
 ```
-    if (se.load.weight != NICE_0_LOAD)
-        vruntime += delta * NICE_0_LOAD / se.load.weight;
-    else
-        vruntime += delta;
+	if (se.load.weight != NICE_0_LOAD)
+		vruntime += delta * NICE_0_LOAD / se.load.weight;
+	else
+		vruntime += delta;
 ```
 delta是进程增加的实际的运行时间。 NICE_0_LOAD为nice 0进程的权重。虚拟运行时间与权重成反比，进程的权重越大虚拟运行时间就增加得越慢，位置就越左，越有可能被调度。
 
 对cfs的理解最好就是看源代码了，下面贴出代码（网上有人整理得很好了）：  
-    各个函数的调用关系图：  
+各个函数的调用关系图：  
 （1）
 
 ![](/images/kernel/2015-01-22-10.png)  
 
 
 ```
-    tick中断
-    在tick中断处理函数中,会调用scheduler_tick()函数.该函数代码如下:
-    在tick中断处理函数中，会调用scheduler_tick()函数。该函数代码如下:
-    void scheduler_tick(void)
-    {
-      /*取得当前CPU*/
-    int cpu = smp_processor_id();
-    /*取得当前CPU对应的runqueue*/
-        struct rq *rq = cpu_rq(cpu);
-    /*当前运行的进程*/
-        struct task_struct *curr = rq->curr;
-     
-        sched_clock_tick();
-     
-        spin_lock(&rq->lock);
-        /*更新rq的当前时间戳.即使rq->clock变为当前时间戳*/
-        update_rq_clock(rq);scheduler_tick()
-        /*更新rq的负载*/
-        update_cpu_load(rq);
-        /*调用调度模块的task_tick函数*/
-        curr->sched_class->task_tick(rq, curr, 0);
-        spin_unlock(&rq->lock);
-     
-    #ifdef CONFIG_SMP
-        rq->idle_at_tick = idle_cpu(cpu);
-        trigger_load_balance(rq, cpu);
-    #endif
-    }
-    我们从上面的代码中可以看到,经过一部份共同处理之后,流程会转入调度模块的task_tick()函数.
-    对应CFS,它的sched_class结构如下:
-    static const struct sched_class fair_sched_class = {
-        .next = &idle_sched_class,
-        .enqueue_task = enqueue_task_fair,
-        .dequeue_task = dequeue_task_fair,
-        .yield_task = yield_task_fair,
-     
-        .check_preempt_curr = check_preempt_wakeup,
-     
-        .pick_next_task = pick_next_task_fair,
-        .put_prev_task = put_prev_task_fair,
-     
-    #ifdef CONFIG_SMP
-        .select_task_rq = select_task_rq_fair,
-     
-        .load_balance = load_balance_fair,
-        .move_one_task = move_one_task_fair,
-    #endif
-     
-        .set_curr_task = set_curr_task_fair,
-        .task_tick = task_tick_fair,
-        .task_new = task_new_fair,
-     
-        .prio_changed = prio_changed_fair,
-        .switched_to = switched_to_fair,
-     
-    #ifdef CONFIG_FAIR_GROUP_SCHED
-        .moved_group = moved_group_fair,
-    #endif
-    };
-    即对应task_tick的处理函数为task_tick_fair().代码如下:
+	tick中断
+	在tick中断处理函数中,会调用scheduler_tick()函数.该函数代码如下:
+	在tick中断处理函数中，会调用scheduler_tick()函数。该函数代码如下:
+	void scheduler_tick(void)
+	{
+	  /*取得当前CPU*/
+	int cpu = smp_processor_id();
+	/*取得当前CPU对应的runqueue*/
+		struct rq *rq = cpu_rq(cpu);
+	/*当前运行的进程*/
+		struct task_struct *curr = rq->curr;
+	 
+		sched_clock_tick();
+	 
+		spin_lock(&rq->lock);
+		/*更新rq的当前时间戳.即使rq->clock变为当前时间戳*/
+		update_rq_clock(rq);scheduler_tick()
+		/*更新rq的负载*/
+		update_cpu_load(rq);
+		/*调用调度模块的task_tick函数*/
+		curr->sched_class->task_tick(rq, curr, 0);
+		spin_unlock(&rq->lock);
+	 
+	#ifdef CONFIG_SMP
+		rq->idle_at_tick = idle_cpu(cpu);
+		trigger_load_balance(rq, cpu);
+	#endif
+	}
+	我们从上面的代码中可以看到,经过一部份共同处理之后,流程会转入调度模块的task_tick()函数.
+	对应CFS,它的sched_class结构如下:
+	static const struct sched_class fair_sched_class = {
+		.next = &idle_sched_class,
+		.enqueue_task = enqueue_task_fair,
+		.dequeue_task = dequeue_task_fair,
+		.yield_task = yield_task_fair,
+	 
+		.check_preempt_curr = check_preempt_wakeup,
+	 
+		.pick_next_task = pick_next_task_fair,
+		.put_prev_task = put_prev_task_fair,
+	 
+	#ifdef CONFIG_SMP
+		.select_task_rq = select_task_rq_fair,
+	 
+		.load_balance = load_balance_fair,
+		.move_one_task = move_one_task_fair,
+	#endif
+	 
+		.set_curr_task = set_curr_task_fair,
+		.task_tick = task_tick_fair,
+		.task_new = task_new_fair,
+	 
+		.prio_changed = prio_changed_fair,
+		.switched_to = switched_to_fair,
+	 
+	#ifdef CONFIG_FAIR_GROUP_SCHED
+		.moved_group = moved_group_fair,
+	#endif
+	};
+	即对应task_tick的处理函数为task_tick_fair().代码如下:
 ```
 
 （2）  
 ![](/images/kernel/2015-01-22-11.png)   
-    
+	
 ```
-    schedule()的执行过程
-    当进程需要被抢占或者是进程主运让出处理器,则会调用schedule()函数.为了减小篇幅,在这里就不分析schedule()函数代码.只列出在该函数中调用模块的主要函数.如下示:
-    Schedule()---->
-    sched_class->put_prev_task(rq,prev)---->
-    sched_class->pick_next_task()
-     
-    对应到CFS中,put_prev_task()函数为put_prev_task_fair(),该操作就是将进程放回队列.
+	schedule()的执行过程
+	当进程需要被抢占或者是进程主运让出处理器,则会调用schedule()函数.为了减小篇幅,在这里就不分析schedule()函数代码.只列出在该函数中调用模块的主要函数.如下示:
+	Schedule()---->
+	sched_class->put_prev_task(rq,prev)---->
+	sched_class->pick_next_task()
+	 
+	对应到CFS中,put_prev_task()函数为put_prev_task_fair(),该操作就是将进程放回队列.
 ```
 
 （3）  
 ![](/images/kernel/2015-01-22-12.png)  
 
 ```
-    新进程的调度过程
-    在创建新进程的时候,在do_fork()中有如下过程:
-    long do_fork(unsigned long clone_flags,
-              unsigned long stack_start,
-              struct pt_regs *regs,
-              unsigned long stack_size,
-              int __user *parent_tidptr,
-              int __user *child_tidptr)
-    {
-     
-        
-    if (unlikely(clone_flags & CLONE_STOPPED)) {
-                /*
-                 * We'll start up with an immediate SIGSTOP.
-                 */
-                sigaddset(&p->pending.signal, SIGSTOP);
-                set_tsk_thread_flag(p, TIF_SIGPENDING);
-                __set_task_state(p, TASK_STOPPED);
-            } else {
-                wake_up_new_task(p, clone_flags);
-            }
+	新进程的调度过程
+	在创建新进程的时候,在do_fork()中有如下过程:
+	long do_fork(unsigned long clone_flags,
+			  unsigned long stack_start,
+			  struct pt_regs *regs,
+			  unsigned long stack_size,
+			  int __user *parent_tidptr,
+			  int __user *child_tidptr)
+	{
+	 
+		
+		if (unlikely(clone_flags & CLONE_STOPPED)) {
+			/*
+			 * We'll start up with an immediate SIGSTOP.
+			 */
+			sigaddset(&p->pending.signal, SIGSTOP);
+			set_tsk_thread_flag(p, TIF_SIGPENDING);
+			__set_task_state(p, TASK_STOPPED);
+		} else {
+			wake_up_new_task(p, clone_flags);
+		}
 
-    ｝
-    即在末带CLONE_STOPPED标志创建进程时,就会对新进程调用wake_up_new_task().
+	｝
+	即在末带CLONE_STOPPED标志创建进程时,就会对新进程调用wake_up_new_task().
 ```
 

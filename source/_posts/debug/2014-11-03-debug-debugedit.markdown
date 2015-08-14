@@ -47,62 +47,63 @@ gcc -g /root/Desktop/a.c -o /root/Desktop/a.out
 用绝对路径编译，在.debug_str段中就会存下源文件路径，.debug_info的DW_TAG_compile_unit中的DW_AT_name对应.debug_str中的偏移。  
 
 ```
-$ objdump --dwarf=str a.out
-....
-  0x00000000 474e5520 4320342e 342e3720 32303132 GNU C 4.4.7 2012
-  0x00000010 30333133 20285265 64204861 7420342e 0313 (Red Hat 4.
-  0x00000020 342e372d 3429006c 6f6e6720 756e7369 4.7-4).long unsi
-  0x00000030 676e6564 20696e74 002f726f 6f742f44 gned int./root/D
-  0x00000040 65736b74 6f702f61 2e630075 6e736967 esktop/a.c.unsig
-  0x00000050 6e656420 63686172 006d6169 6e006c6f ned char.main.lo
-  0x00000060 6e672069 6e74002f 726f6f74 2f446573 ng int./root/Des
-  0x00000070 6b746f70 0073686f 72742075 6e736967 ktop.short unsig
-  0x00000080 6e656420 696e7400 73686f72 7420696e ned int.short in
-  0x00000090 7400                                t.
+	$ objdump --dwarf=str a.out
+	....
+	  0x00000000 474e5520 4320342e 342e3720 32303132 GNU C 4.4.7 2012
+	  0x00000010 30333133 20285265 64204861 7420342e 0313 (Red Hat 4.
+	  0x00000020 342e372d 3429006c 6f6e6720 756e7369 4.7-4).long unsi
+	  0x00000030 676e6564 20696e74 002f726f 6f742f44 gned int./root/D
+	  0x00000040 65736b74 6f702f61 2e630075 6e736967 esktop/a.c.unsig
+	  0x00000050 6e656420 63686172 006d6169 6e006c6f ned char.main.lo
+	  0x00000060 6e672069 6e74002f 726f6f74 2f446573 ng int./root/Des
+	  0x00000070 6b746f70 0073686f 72742075 6e736967 ktop.short unsig
+	  0x00000080 6e656420 696e7400 73686f72 7420696e ned int.short in
+	  0x00000090 7400                                t.
 
 
-$ objdump --dwarf=info a.out
-.....
- <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
-    < c>   DW_AT_producer    : (indirect string, offset: 0x0): GNU C 4.4.7 20120313 (Red Hat 4.4.7-4)
-    <10>   DW_AT_language    : 1        (ANSI C)
-    <11>   DW_AT_name        : (indirect string, offset: 0x39): /root/Desktop/a.c
-    <15>   DW_AT_comp_dir    : (indirect string, offset: 0x67): /root/Desktop
-    <19>   DW_AT_low_pc      : 0x4004c4
-    <21>   DW_AT_high_pc     : 0x40051c
-    <29>   DW_AT_stmt_list   : 0x0
+	$ objdump --dwarf=info a.out
+	.....
+	 <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+		< c>   DW_AT_producer    : (indirect string, offset: 0x0): GNU C 4.4.7 20120313 (Red Hat 4.4.7-4)
+		<10>   DW_AT_language    : 1        (ANSI C)
+		<11>   DW_AT_name        : (indirect string, offset: 0x39): /root/Desktop/a.c
+		<15>   DW_AT_comp_dir    : (indirect string, offset: 0x67): /root/Desktop
+		<19>   DW_AT_low_pc      : 0x4004c4
+		<21>   DW_AT_high_pc     : 0x40051c
+		<29>   DW_AT_stmt_list   : 0x0
 ```
 -----------------------------------------
 
 ```  
-$ /usr/lib/rpm/debugedit -b /root/Desktop -d /usr/src /root/Desktop/a.out
+	$ /usr/lib/rpm/debugedit -b /root/Desktop -d /usr/src /root/Desktop/a.out
 ```
 
 ----------------------------------------
 ```
-$ objdump --dwarf=str a.out
-...
-  0x00000000 474e5520 4320342e 342e3720 32303132 GNU C 4.4.7 2012
-  0x00000010 30333133 20285265 64204861 7420342e 0313 (Red Hat 4.
-  0x00000020 342e372d 3429006c 6f6e6720 756e7369 4.7-4).long unsi
-  0x00000030 676e6564 20696e74 002f7573 722f7372 gned int./usr/sr
-  0x00000040 632f612e 63002f61 2e630075 6e736967 c/a.c./a.c.unsig
-  0x00000050 6e656420 63686172 006d6169 6e006c6f ned char.main.lo
-  0x00000060 6e672069 6e74002f 726f6f74 2f446573 ng int./root/Des
-  0x00000070 6b746f70 0073686f 72742075 6e736967 ktop.short unsig
-  0x00000080 6e656420 696e7400 73686f72 7420696e ned int.short in
-  0x00000090 7400                                t.
+	$ objdump --dwarf=str a.out
+	...
+	  0x00000000 474e5520 4320342e 342e3720 32303132 GNU C 4.4.7 2012
+	  0x00000010 30333133 20285265 64204861 7420342e 0313 (Red Hat 4.
+	  0x00000020 342e372d 3429006c 6f6e6720 756e7369 4.7-4).long unsi
+	  0x00000030 676e6564 20696e74 002f7573 722f7372 gned int./usr/sr
+	  0x00000040 632f612e 63002f61 2e630075 6e736967 c/a.c./a.c.unsig
+	  0x00000050 6e656420 63686172 006d6169 6e006c6f ned char.main.lo
+	  0x00000060 6e672069 6e74002f 726f6f74 2f446573 ng int./root/Des
+	  0x00000070 6b746f70 0073686f 72742075 6e736967 ktop.short unsig
+	  0x00000080 6e656420 696e7400 73686f72 7420696e ned int.short in
+	  0x00000090 7400                                t.
 
 
-$ objdump --dwarf=info a.out
+	$ objdump --dwarf=info a.out
 
-...
- <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
-    < c>   DW_AT_producer    : (indirect string, offset: 0x0): GNU C 4.4.7 20120313 (Red Hat 4.4.7-4)
-    <10>   DW_AT_language    : 1        (ANSI C)
-    <11>   DW_AT_name        : (indirect string, offset: 0x39): /usr/src/a.c
-    <15>   DW_AT_comp_dir    : (indirect string, offset: 0x67): /root/Desktop
-    <19>   DW_AT_low_pc      : 0x4004c4
-    <21>   DW_AT_high_pc     : 0x40051c
-    <29>   DW_AT_stmt_list   : 0x0
+	...
+	 <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+		< c>   DW_AT_producer    : (indirect string, offset: 0x0): GNU C 4.4.7 20120313 (Red Hat 4.4.7-4)
+		<10>   DW_AT_language    : 1        (ANSI C)
+		<11>   DW_AT_name        : (indirect string, offset: 0x39): /usr/src/a.c
+		<15>   DW_AT_comp_dir    : (indirect string, offset: 0x67): /root/Desktop
+		<19>   DW_AT_low_pc      : 0x4004c4
+		<21>   DW_AT_high_pc     : 0x40051c
+		<29>   DW_AT_stmt_list   : 0x0
 ```
+

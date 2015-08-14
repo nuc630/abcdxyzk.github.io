@@ -27,7 +27,7 @@ http://blog.chinaunix.net/uid-10167808-id-3795082.html
 	 */
 	conn_prepare(s->si[0].conn, &sess_conn_cb, l->proto, l->xprt, s);
 
-    fdtab[cfd].owner = s->si[0].conn; /*fd 对应的 owner 为 connection 结构*/
+	fdtab[cfd].owner = s->si[0].conn; /*fd 对应的 owner 为 connection 结构*/
 	fdtab[cfd].iocb = conn_fd_handler;
 	conn_data_want_recv(s->si[0].conn);
 	if (conn_xprt_init(s->si[0].conn) < 0)
@@ -71,16 +71,16 @@ conn_prepare() 就是将相关数据收发以及连接处理的函数都赋值�
 经过初始化， session client 端的 connection 结构体初始化完成：
 
 ```
-    conn->data 指向 sess_conn_cb。 后面调用 session_complete() 会被再次赋值
-    conn->ctrl 指向 l->proto, IPv4 下为 proto_tcpv4
-    conn->xprt 执向 l->xprt, 不启用 SSL 时为 raw_sock，启用 SSL 时为 ssl_sock
-    conn->owner 指向 session
+	conn->data 指向 sess_conn_cb。 后面调用 session_complete() 会被再次赋值
+	conn->ctrl 指向 l->proto, IPv4 下为 proto_tcpv4
+	conn->xprt 执向 l->xprt, 不启用 SSL 时为 raw_sock，启用 SSL 时为 ssl_sock
+	conn->owner 指向 session
 ```
 
 接着调用 session_complete 完成建立一个 session 所需要的最后的初始化工作，其中 包含调用 frontend_accept，并将当前 session 对应的 task 放入runqueue 中以待下 次执行：
 
 ```
-    ...
+	...
    	si_takeover_conn(&s->si[0], l->proto, l->xprt);
    	...
    	t->process = l->handler;
@@ -147,11 +147,11 @@ epoll 中考虑的新建连接通常会尽可能快的传输数据，因此对�
 		...
 		for (new_updt = fd_nbupdt; new_updt > old_updt; new_updt--) {
 			fd = fd_updt[new_updt - 1];
-		    ...
+			...
 			if (fdtab[fd].ev && fdtab[fd].iocb && fdtab[fd].owner)
 				fdtab[fd].iocb(fd);
 			...
-        }
+		}
 ```
 
 上面代码中第一处执行 iocb() 的是由 epoll_wait() 返回的 fd 触发的。而第二次的 iocb() 则就是在前面 iocb 的执行过程中新建的 fd，为了提高效率，则直接调用该 fd 的 iocb()，也 就是 conn_fd_handler() 函数。
@@ -180,18 +180,18 @@ si_conn_recv_cb() 函数简单介绍如下：
 
 ```
 	if (conn->xprt->rcv_pipe &&
-	    chn->to_forward >= MIN_SPLICE_FORWARD && chn->flags & CF_KERN_SPLICING) {
-	    ...
-        ret = conn->xprt->rcv_pipe(conn, chn->pipe, chn->to_forward);
-        ...
-    }
-    ...
+		chn->to_forward >= MIN_SPLICE_FORWARD && chn->flags & CF_KERN_SPLICING) {
+		...
+		ret = conn->xprt->rcv_pipe(conn, chn->pipe, chn->to_forward);
+		...
+	}
+	...
 	while (!chn->pipe && !(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_DATA_RD_SH | CO_FL_WAIT_RD | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE))) {
-    
-        ...
-        ret = conn->xprt->rcv_buf(conn, chn->buf, max);
-        ...
-    }
+	
+		...
+		ret = conn->xprt->rcv_buf(conn, chn->buf, max);
+		...
+	}
 ```
 
 该函数主要根据数据的接收情况，选择调用 xprt 的 rcv_pipe 还是 rcv_buf. 前面已经 分析过， conn->xprt 指向了 listner 的 xprt，不启用 SSL 就是 raw_sock 数据结构

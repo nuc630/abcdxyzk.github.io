@@ -17,16 +17,16 @@ i main.c被cc1编译成汇编程序/tmp/ccRGDpua.s。
 ii 这个汇编程序被as汇编成目标文件/tmp/ccidnZ1d.o  
 iii   这个目标文件连同另外几个目标文件（crt1.o,crti.o,crtbegin.o,crtend.o,crtn.o)一起链接成可执行文件 main。在链接过程中还用-l，选项指定一些库文件，有libc、libgcc、ligcc_s，其中有些库是共享库，需要动态链接，所以用 -dynamic-linker选项指定动态链接器是/lib/ld-linux.so.2  
 ```
-$ nm /usr/lib/crt1.o
-00000000 R  _IO_stdin_used
-00000000 D __data_start
-                 U __libc_csu_fini
-                 U __libc_csu_init
-                 U __libc_start_main
-00000000 R _fp_hw
-00000000 T _start
-00000000 W data_start
-                 U main
+	$ nm /usr/lib/crt1.o
+	00000000 R  _IO_stdin_used
+	00000000 D __data_start
+	                 U __libc_csu_fini
+	                 U __libc_csu_init
+	                 U __libc_start_main
+	00000000 R _fp_hw
+	00000000 T _start
+	00000000 W data_start
+	                 U main
 ```
 U main 这一行表示main这个符号在crt1.o已经被引用了，但是还没有定义（Undefined），因此需要别的目标文件提供一个定义并且和crt1.o链接在一起。T_start表示在crt1.o中已定义为（text）。
 

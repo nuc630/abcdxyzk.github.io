@@ -177,7 +177,7 @@ switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描�
 ```
 	movl  %eax, last
 ```
-    正如以前讨论的，eax寄存器指向刚被替换的进程描述符。
+正如以前讨论的，eax寄存器指向刚被替换的进程描述符。
 
 
 #### `__switch_to()`函数
@@ -195,7 +195,7 @@ switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描�
 
   3、把next_p->thread.esp0装入对应于本地CPU的TSS的esp0字段；将在通过sysenter指令发生系统调用一节看到，以后任何由sysenter汇编指令产生的从用户态到内核态的特权级转换将把这个地址拷贝到esp寄存器中：
 ```
-    init_tss[cpu].esp0= next_p->thread.esp0;
+	init_tss[cpu].esp0= next_p->thread.esp0;
 ```
 
   4、把next_p进程使用的线程局部存储段装入本地CPU的全局描述符表；三个段选择符保存在进程描述符内的tls_array数组中
@@ -213,8 +213,8 @@ switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描�
 
   6、如果fs或gs段寄存器已经被prev_p或next_p进程中的任意一个使用，则将next_p进程的thread_struct描述符中保存的值装入这些寄存器中。这一步在逻辑上补充了前一步中执行的操作。主要的汇编语言指令如下：
 ```
-    movl40(%ebx),%fs
-    movl44(%edb),%gs
+	movl40(%ebx),%fs
+	movl44(%edb),%gs
 ```
 
   7、ebx寄存器指向next_p->thread结构。代码实际上更复杂，因为当它检测到一个无效的段寄存器值时，CPU可能产生一个异常。
@@ -222,12 +222,12 @@ switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描�
   8、用next_p->thread.debugreg数组的内容装载dr0,...,dr7中的6个调试寄存器。只有在next_p被挂起时正在使用调试寄存器，这种操作才能进行。这些寄存器不需要被保存，因为只有当一个调试器想要监控prev时prev_p->thread.debugreg才会修改。
 ```
 	if(next_p->thread.debugreg[7]){
-    loaddebug(&next_p->thread,0);
-    loaddebug(&next_p->thread,1);
-    loaddebug(&next_p->thread,2);
-    loaddebug(&next_p->thread,3);
-    loaddebug(&next_p->thread,6);
-    loaddebug(&next_p->thread,7);
+	loaddebug(&next_p->thread,0);
+	loaddebug(&next_p->thread,1);
+	loaddebug(&next_p->thread,2);
+	loaddebug(&next_p->thread,3);
+	loaddebug(&next_p->thread,6);
+	loaddebug(&next_p->thread,7);
 ```
 
   8、如果必要，更新TSS中的I/O位图。当next_p或prev_p有其自己的定制I/O权限位图时必须这么做：
@@ -245,12 +245,12 @@ TSS的io_bitmap字段应当包含一个在TSS中的偏移量，其中存放实�
   9、终止。
 `__switch_to()`函数通过使用下列声明结束：
 ```
-    return prev_p;
+	return prev_p;
 ```
   由编译器产生的相应汇编语言指令是：
 ```
-    movl %edl,%eax
-    ret
+	movl %edl,%eax
+	ret
 ```
   prev_p参数被拷贝到eax，因为缺省情况下任何C函数的返回值被传递给eax寄存器。注意eax的值因此在调用`__switch_to()`的过程中被保护起来；这非常重要，因为调用switch_to宏时会假定eax总是用来存放被替换的进程描述符的地址。
 

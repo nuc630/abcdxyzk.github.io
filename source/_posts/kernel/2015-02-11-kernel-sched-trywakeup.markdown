@@ -30,28 +30,28 @@ tags:
 		rq = task_rq_lock(p, &flags);
 		old_state = p->state;
 		if (!(old_state & state))
-		    goto out;
+			goto out;
 		if (p->array)
-		    goto out_running;
+			goto out_running;
 		cpu = task_cpu(p);
 		this_cpu = smp_processor_id();
 	#ifdef CONFIG_SMP
 	... // [多处理器负载平衡工作](/blog/2015/02/11/kernel-sched-balance/)
 	#endif /* CONFIG_SMP */
 		if (old_state == TASK_UNINTERRUPTIBLE) {
-		    rq->nr_uninterruptible--;
-		    /*
-		     * Tasks on involuntary sleep don't earn
-		     * sleep_avg beyond just interactive state.
-		     */
-		    p->sleep_type = SLEEP_NONINTERACTIVE; //简单判断出非交互进程
+			rq->nr_uninterruptible--;
+			/*
+			 * Tasks on involuntary sleep don't earn
+			 * sleep_avg beyond just interactive state.
+			 */
+			p->sleep_type = SLEEP_NONINTERACTIVE; //简单判断出非交互进程
 		} else
-		    if (old_state & TASK_NONINTERACTIVE)
-		        p->sleep_type = SLEEP_NONINTERACTIVE;//同上
+			if (old_state & TASK_NONINTERACTIVE)
+				p->sleep_type = SLEEP_NONINTERACTIVE;//同上
 		activate_task(p, rq, cpu == this_cpu);
 		if (!sync || cpu != this_cpu) {
-		    if (TASK_PREEMPTS_CURR(p, rq))
-		        resched_task(rq->curr);
+			if (TASK_PREEMPTS_CURR(p, rq))
+				resched_task(rq->curr);
 		}
 		success = 1;
 	out_running:
@@ -83,13 +83,13 @@ tags:
 	...
 	#endif
 		if (!rt_task(p))
-		    p->prio = recalc_task_prio(p, now); //计算平均睡眠时间并返回之后的优先级。
+			p->prio = recalc_task_prio(p, now); //计算平均睡眠时间并返回之后的优先级。
 		if (p->sleep_type == SLEEP_NORMAL) {
-		    if (in_interrupt())
-		        p->sleep_type = SLEEP_INTERRUPTED;
-		    else {
-		        p->sleep_type = SLEEP_INTERACTIVE;
-		    }
+			if (in_interrupt())
+				p->sleep_type = SLEEP_INTERRUPTED;
+			else {
+				p->sleep_type = SLEEP_INTERACTIVE;
+			}
 		}
 		p->timestamp = now;
 		__activate_task(p, rq);
@@ -99,7 +99,7 @@ tags:
 		struct prio_array *target = rq->active;
 		trace_activate_task(p, rq);
 		if (batch_task(p))
-		    target = rq->expired;
+			target = rq->expired;
 		enqueue_task(p, target);
 		inc_nr_running(p, rq);
 	}
@@ -116,8 +116,8 @@ tags:
   d) 使用在第6a步中计算的时间戳设置p->timestamp字段。  
   e) 把进程描述符插入活动进程集合：
 ```
-    enqueue_task(p, rq->active);
-    rq->nr_running++;
+	enqueue_task(p, rq->active);
+	rq->nr_running++;
 ```
 
 7.如果目标CPU不是本地CPU，或者没有设置sync标志，就检查可运行的新进程的动态优先级是否比rq运行对了中当前进程的动态优先级高（p->prio < rq->curr->prio）；如果是，就调用resched_task()抢占rq->curr。在单处理器系统中，后面的函数只是执行set_tsk_need_resched()来设置rq->curr进程的TIF_NEED_RESCHED标志。在多处理器系统中，resched_task()也检查TIF_NEED_RESCHED的旧值是否为0、目标CPU与本地CPU是否不同、rq->curr进程的TIF_POLLING_NRFLAG标志是否清0（目标CPU没有轮询进程TIF_NEED_RESCHED标志的值）。如果是，resched_task()调用smp_send_reschedule()产生IPI，并强制目标CPU重新调度。

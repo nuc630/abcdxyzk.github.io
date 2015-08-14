@@ -23,14 +23,14 @@ dmesg | grep -i numa
 
 ##### 要查看具体的numa信息用numastat
 ```
-numastat
-                           node0           node1
-numa_hit             19983469427     20741805466
-numa_miss             1981451471      2503049250
-numa_foreign          2503049250      1981451471
-interleave_hit         849781831       878579884
-local_node           19627390917     20298995632
-other_node            2337529981      2945859084
+	numastat
+		                       node0           node1
+	numa_hit             19983469427     20741805466
+	numa_miss             1981451471      2503049250
+	numa_foreign          2503049250      1981451471
+	interleave_hit         849781831       878579884
+	local_node           19627390917     20298995632
+	other_node            2337529981      2945859084
 ```
 numa_hit是打算在该节点上分配内存，最后从这个节点分配的次数;  
 num_miss是打算在该节点分配内存，最后却从其他节点分配的次数;  
@@ -41,10 +41,10 @@ other_node是其他节点进程在该节点上分配的次数
 
 ##### lscpu可以看到两个node的cpu归属:
 ```
-lscpu
-...
-NUMA node0 CPU(s):     0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
-NUMA node1 CPU(s):     1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31
+	lscpu
+	...
+	NUMA node0 CPU(s):     0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30
+	NUMA node1 CPU(s):     1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31
 ```
 
 ##### `numactl --hardware`命令
@@ -57,36 +57,36 @@ Linux上使用numactl设定进程的numa策略。常见的情况是,数据库dae
 各个内存的访问延迟如何?numactl man中的example提供了参考,我在公司的服务器上测了一下:
 ##### 写速度:
 ```
-numactl --cpubind=0 --membind=0 dd if=/dev/zero of=/dev/shm/A bs=1M count=1024
+	numactl --cpubind=0 --membind=0 dd if=/dev/zero of=/dev/shm/A bs=1M count=1024
 
-1024+0 records in
-1024+0 records out
-1073741824 bytes (1.1 GB) copied, 0.546679 s, 2.0 GB/s
+	1024+0 records in
+	1024+0 records out
+	1073741824 bytes (1.1 GB) copied, 0.546679 s, 2.0 GB/s
 
-numactl --cpubind=0 --membind=1 dd if=/dev/zero of=/dev/shm/A bs=1M count=1024
-1024+0 records in
-1024+0 records out
-1073741824 bytes (1.1 GB) copied, 0.612825 s, 1.8 GB/s
+	numactl --cpubind=0 --membind=1 dd if=/dev/zero of=/dev/shm/A bs=1M count=1024
+	1024+0 records in
+	1024+0 records out
+	1073741824 bytes (1.1 GB) copied, 0.612825 s, 1.8 GB/s
 ```
 
 ##### 读速度:
 测试从同一个节点读取:
 ```
-numactl --cpubind=0 --membind=0 dd if=/dev/zero of=/dev/shm/A bs=1M count=1000
-date +%s.%N
-numactl --cpubind=0 --membind=0 cp /dev/shm/A /dev/null
-date +%s.%N
-rm /dev/shm/A
+	numactl --cpubind=0 --membind=0 dd if=/dev/zero of=/dev/shm/A bs=1M count=1000
+	date +%s.%N
+	numactl --cpubind=0 --membind=0 cp /dev/shm/A /dev/null
+	date +%s.%N
+	rm /dev/shm/A
 ```
 花费0.264556884765625秒,速度是3.779905410081901GB/s。
 
 从另一个节点读取:
 ```
-numactl --cpubind=0 --membind=0 dd if=/dev/zero of=/dev/shm/A bs=1M count=1000
-date +%s.%N
-numactl --cpubind=1 --membind=1 cp /dev/shm/A /dev/null
-date +%s.%N
-rm /dev/shm/A
+	numactl --cpubind=0 --membind=0 dd if=/dev/zero of=/dev/shm/A bs=1M count=1000
+	date +%s.%N
+	numactl --cpubind=1 --membind=1 cp /dev/shm/A /dev/null
+	date +%s.%N
+	rm /dev/shm/A
 ```
 花费0.3308408260345459秒,速度是3.022601569419312GB/s。
 

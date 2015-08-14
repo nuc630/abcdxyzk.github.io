@@ -16,7 +16,7 @@ tags:
 将ckeditor压缩包解压放在网站根目录下的“ckeditor”文件夹里：
 引入ckeditor.js文件：
 ```
-    <script type="text/javascript" src="ckeditor/ckeditor.js"></script>
+	<script type="text/javascript" src="ckeditor/ckeditor.js"></script>
 ```
 你也可以将这些文件放在你网站的其他任何一个地方，默认为“ckeditor”。
  
@@ -44,9 +44,9 @@ tags:
 	<script type="text/javascript">
 	<!--
 	CKEDITOR.replace("content",
-	  {
-	      skin: "kama", width:700, height:300
-	  });
+		{
+			skin: "kama", width:700, height:300
+		});
 	//-->
 	</script>
 ```

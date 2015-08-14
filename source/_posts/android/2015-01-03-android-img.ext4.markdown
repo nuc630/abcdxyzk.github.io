@@ -15,13 +15,13 @@ tags:
 #### 一、转换源文件为ext4格式
 然后，我们可以使用./simg2img src des命令来转换system.img.ext4格式文件了
 ```
-    ./simg2img system.img.ext4 system.img
+	./simg2img system.img.ext4 system.img
 ```
 
 #### 二、挂载镜像到指定目录
 然后挂载此img到一个目录上
 ```
-    mount -o loop system.img sysmain
+	mount -o loop system.img sysmain
 ```
 成功挂载。然后你就可以进入目录了查看里面的文件了！！！！！
 
@@ -32,7 +32,7 @@ tags:
 #### 四、打包文件
 当你所有文件搞定后，下来需要一个命令来打包了。
 ```
-    ./mkuserimg.sh -s sysmain systest.img.ext4 ext4 tmp 512M
+	./mkuserimg.sh -s sysmain systest.img.ext4 ext4 tmp 512M
 ```
 这里需要注意，temp是我在当前目录新建立的一个目录，后面的512M是这个镜像打包后占用空间大小。如果你不知道你的镜像包应该多大，你查看你景象挂载到目录后，这个景象分区的大小。
 

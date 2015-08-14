@@ -15,14 +15,14 @@ http://blog.chinaunix.net/uid-10167808-id-3825388.html
  本文介绍 HAProxy 中 epoll 事件的处理机制，版本为 1.5-dev17。
 
 ```
-    1. 背景知识
-        1.1. fd 更新列表
-        1.2. fdtab 数据结构
-        1.3. fd event 的设置
-    2. _do_poll() 代码分析
-        2.1. 检测 fd 更新列表
-        2.2. 获取活动的 fd
-        2.3. 处理活动的 fd
+	1. 背景知识
+		1.1. fd 更新列表
+		1.2. fdtab 数据结构
+		1.3. fd event 的设置
+	2. _do_poll() 代码分析
+		2.1. 检测 fd 更新列表
+		2.2. 获取活动的 fd
+		2.3. 处理活动的 fd
 ```
 
 HAProxy 支持多种异步机制，有 select，poll，epoll，kqueue 等。本文介绍 epoll 的 相关实现，epoll 的代码在源文件 ev_epoll.c 中。epoll 的关键处理逻辑集中在函数 _do_poll() 中，下面会详细的分析该函数。
@@ -118,9 +118,9 @@ include/proto/fd.h 中定义了一些设置 fd event 的函数：
 这里将会重点的分析 _do_poll() 的实现。该函数可以粗略分为三部分：
 
 ```
-    检查 fd 更新列表，获取各个 fd event 的变化情况，并作 epoll 的设置
-    计算 epoll_wait 的 delay 时间，并调用 epoll_wait，获取活动的 fd
-    逐一处理所有有 IO 事件的 fd
+	检查 fd 更新列表，获取各个 fd event 的变化情况，并作 epoll 的设置
+	计算 epoll_wait 的 delay 时间，并调用 epoll_wait，获取活动的 fd
+	逐一处理所有有 IO 事件的 fd
 ```
 
 以下将按顺序介绍这三部分的代码。

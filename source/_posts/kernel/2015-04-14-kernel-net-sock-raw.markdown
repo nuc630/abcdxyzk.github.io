@@ -249,27 +249,27 @@ protocol字段可取的所有协议参见/usr/include/linux/if_ether.h头文件�
 最后，格外需要留心一点的就是，发送数据的时候需要自己组织整个以太网数据帧。和地址相关的结构体就不能再用前面的struct sockaddr_in{}了，而是struct sockaddr_ll{}，如下：
 
 ```
-    struct sockaddr_ll{
-        unsigned short sll_family; /* 总是 AF_PACKET */
-        unsigned short sll_protocol; /* 物理层的协议 */
-        int sll_ifindex; /* 接口号 */
-        unsigned short sll_hatype; /* 报头类型 */
-        unsigned char sll_pkttype; /* 分组类型 */
-        unsigned char sll_halen; /* 地址长度 */
-        unsigned char sll_addr[8]; /* 物理层地址 */
-    };
+	struct sockaddr_ll{
+		unsigned short sll_family; /* 总是 AF_PACKET */
+		unsigned short sll_protocol; /* 物理层的协议 */
+		int sll_ifindex; /* 接口号 */
+		unsigned short sll_hatype; /* 报头类型 */
+		unsigned char sll_pkttype; /* 分组类型 */
+		unsigned char sll_halen; /* 地址长度 */
+		unsigned char sll_addr[8]; /* 物理层地址 */
+	};
 ```
   sll_protocoll：取值在linux/if_ether.h中，可以指定我们所感兴趣的二层协议；
 
   sll_ifindex：置为0表示处理所有接口，对于单网卡的机器就不存在“所有”的概念了。如果你有多网卡，该字段的值一般通过ioctl来搞定，模板代码如下，如果我们要获取eth0接口的序号，可以使用如下代码来获取：
 
 ```
-    struct  sockaddr_ll  sll;
-    struct ifreq ifr;
+	struct  sockaddr_ll  sll;
+	struct ifreq ifr;
 
-    strcpy(ifr.ifr_name, "eth0");
-    ioctl(sockfd, SIOCGIFINDEX, &ifr);
-    sll.sll_ifindex = ifr.ifr_ifindex;
+	strcpy(ifr.ifr_name, "eth0");
+	ioctl(sockfd, SIOCGIFINDEX, &ifr);
+	sll.sll_ifindex = ifr.ifr_ifindex;
 ```
   sll_hatype：ARP硬件地址类型，定义在 linux/if_arp.h 中。 取ARPHRD_ETHER时表示为以太网。
 
@@ -278,10 +278,10 @@ protocol字段可取的所有协议参见/usr/include/linux/if_ether.h头文件�
   sll_addr和sll_halen指示物理层(如以太网，802.3，802.4或802.5等)地址及其长度，严格依赖于具体的硬件设备。类似于获取接口索引sll_ifindex，要获取接口的物理地址，可以采用如下代码：
 
 ```
-    struct ifreq ifr;
+	struct ifreq ifr;
 
-    strcpy(ifr.ifr_name, "eth0");
-    ioctl(sockfd, SIOCGIFHWADDR, &ifr);
+	strcpy(ifr.ifr_name, "eth0");
+	ioctl(sockfd, SIOCGIFHWADDR, &ifr);
 ```
  缺省情况下，从任何接口收到的符合指定协议的所有数据报文都会被传送到原始PACKET套接字口，而使用bind系统调用并以一个sochddr_ll结构体对象将PACKET套接字与某个网络接口相绑定，就可使我们的PACKET原始套接字只接收指定接口的数据报文。 
 

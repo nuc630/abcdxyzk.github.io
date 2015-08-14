@@ -31,16 +31,16 @@ tags:
 		struct mm_struct *oldmm = prev->active_mm;
 
 		if (unlikely(!mm)) {
-		    next->active_mm = oldmm;
-		    atomic_inc(&oldmm->mm_count);
-		    enter_lazy_tlb(oldmm, next);
+			next->active_mm = oldmm;
+			atomic_inc(&oldmm->mm_count);
+			enter_lazy_tlb(oldmm, next);
 		} else
-		    switch_mm(oldmm, mm, next);
+			switch_mm(oldmm, mm, next);
 
 		if (unlikely(!prev->mm)) {
-		    prev->active_mm = NULL;
-		    WARN_ON(rq->prev_mm);
-		    rq->prev_mm = oldmm;
+			prev->active_mm = NULL;
+			WARN_ON(rq->prev_mm);
+			rq->prev_mm = oldmm;
 		}
 
 		/* Here we just switch the register state and the stack. */
@@ -94,7 +94,7 @@ tags:
 		preempt_count() -= SOFTIRQ_OFFSET - 1;
 
 		if (unlikely(!in_interrupt() && local_softirq_pending()))
-		    do_softirq(); //软中断处理
+			do_softirq(); //软中断处理
 		//抢占计数据器值减1
 		dec_preempt_count();
 		
@@ -107,8 +107,8 @@ tags:
 	do { \
 		//检查need_resched
 		if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) \
-		    //抢占调度
-		    preempt_schedule(); \
+			//抢占调度
+			preempt_schedule(); \
 	} while (0)
 
 	//kernel/sched.c
@@ -122,7 +122,7 @@ tags:
 		 */
 		 //检查是否允许抢占,本地中断关闭,或者抢占计数器值不为0时不允许抢占
 		if (unlikely(ti->preempt_count || irqs_disabled()))
-		    return;
+			return;
 
 	need_resched:
 		ti->preempt_count = PREEMPT_ACTIVE;
@@ -133,7 +133,7 @@ tags:
 		/* we could miss a preemption opportunity between schedule and now */
 		barrier();
 		if (unlikely(test_thread_flag(TIF_NEED_RESCHED)))
-		    goto need_resched;
+			goto need_resched;
 	}
 ```
 (4) 内核任务显示调用schedule()，例如内核任务阻塞时，就会显示调用schedule()，该情况属于内核自动放弃CPU。
@@ -150,13 +150,13 @@ tags:
 中断返回点为ret_from-intr：
 // 从中断返回
 ```
-ret_from_intr:
-    GET_THREAD_INFO(%ebp)
-    movl EFLAGS(%esp), %eax        # mix EFLAGS and CS
-    movb CS(%esp), %al
-    testl $(VM_MASK | 3), %eax #是否运行在VM86模式或者用户态
-    /*中断或异常发生时,处于内核空间,则返回内核空间;否则返回用户空间*/
-    jz resume_kernel        # returning to kernel or vm86-space
+	ret_from_intr:
+		GET_THREAD_INFO(%ebp)
+		movl EFLAGS(%esp), %eax        # mix EFLAGS and CS
+		movb CS(%esp), %al
+		testl $(VM_MASK | 3), %eax #是否运行在VM86模式或者用户态
+		/*中断或异常发生时,处于内核空间,则返回内核空间;否则返回用户空间*/
+		jz resume_kernel        # returning to kernel or vm86-space
 ```
 
 从中断返回时，有两种情况，一是返回内核态，二是返回用户态。
@@ -191,11 +191,11 @@ ret_from_intr:
 	/*返回用户空间,只需要检查need_resched*/
 	ENTRY(resume_userspace)  #返回用户空间,中断或异常发生时,任务处于用户空间
 		 cli                # make sure we don't miss an interrupt
-		                # setting need_resched or sigpending
-		                # between sampling and the iret
+			            # setting need_resched or sigpending
+			            # between sampling and the iret
 		movl TI_flags(%ebp), %ecx
 		andl $_TIF_WORK_MASK, %ecx    # is there any work to be done on
-		                # int/exception return?
+			            # int/exception return?
 		jne work_pending #还有其它工作要做
 		jmp restore_all #所有工作都做完,则恢复处理器状态
 
@@ -214,22 +214,22 @@ ret_from_intr:
 	work_resched:
 		call schedule #调度进程
 		cli                # make sure we don't miss an interrupt
-		                # setting need_resched or sigpending
-		                # between sampling and the iret
+			            # setting need_resched or sigpending
+			            # between sampling and the iret
 		movl TI_flags(%ebp), %ecx
 		/*检查是否还有其它的事要做*/
 		andl $_TIF_WORK_MASK, %ecx    # is there any work to be done other
-		                # than syscall tracing?
+			            # than syscall tracing?
 		jz restore_all #没有其它的事,则恢复处理器状态
 		testb $_TIF_NEED_RESCHED, %cl
 		jnz work_resched #如果need_resched再次置位,则继续调度
 	#VM和信号检测
 	work_notifysig:                # deal with pending signals and
-		                # notify-resume requests
+			            # notify-resume requests
 		testl $VM_MASK, EFLAGS(%esp) #检查是否是VM模式
 		movl %esp, %eax
 		jne work_notifysig_v86        # returning to kernel-space or
-		                # vm86-space
+			            # vm86-space
 		xorl %edx, %edx
 		#进行信号处理
 		call do_notify_resume
@@ -248,10 +248,10 @@ ret_from_intr:
 
 ##### 5.2、从异常返回
 异常返回点为ret_from_exception：
-    #从异常返回  
-    ALIGN  
+  #从异常返回  
+  ALIGN  
 ret_from_exception:  
-    preempt_stop /*相当于cli,从中断返回时,在handle_IRQ_event已经关中断,不需要这步*/
+  preempt_stop /*相当于cli,从中断返回时,在handle_IRQ_event已经关中断,不需要这步*/
 
 #### 6、从系统调用返回
 ```
@@ -260,7 +260,7 @@ ret_from_exception:
 		pushl %eax            # save orig_eax
 		SAVE_ALL
 		GET_THREAD_INFO(%ebp)
-		                # system call tracing in operation
+			            # system call tracing in operation
 		testb $(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT),TI_flags(%ebp)
 		jnz syscall_trace_entry
 		cmpl $(nr_syscalls), %eax
@@ -272,8 +272,8 @@ ret_from_exception:
 	#系统调用返回
 	syscall_exit:
 		cli                # make sure we don't miss an interrupt
-		                # setting need_resched or sigpending
-		                # between sampling and the iret
+			            # setting need_resched or sigpending
+			            # between sampling and the iret
 		movl TI_flags(%ebp), %ecx
 		testw $_TIF_ALLWORK_MASK, %cx    # current->work,检查是否还有其它工作要完成
 		jne syscall_exit_work
@@ -287,7 +287,7 @@ ret_from_exception:
 		testb $(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT|_TIF_SINGLESTEP), %cl
 		jz work_pending
 		sti                # could let do_syscall_trace() call
-		                # schedule() instead
+			            # schedule() instead
 		movl %esp, %eax
 		movl $1, %edx
 		#系统调用跟踪

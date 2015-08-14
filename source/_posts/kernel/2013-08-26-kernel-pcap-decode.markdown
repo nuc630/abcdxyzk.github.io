@@ -61,7 +61,7 @@ WireShark捕获的数据
 ![](/images/kernel/2013-08-26-8.jpg)
 
 ```
-                            以下为物理层的数据帧概况
+			以下为物理层的数据帧概况
 
 Frame 1 (62 bytes on wire, 62 bytes captured)           1号帧，线路62字节，实际捕获62字节
 Arrival Time: Jan 21, 2008 15:17:33.910261000           捕获日期和时间
@@ -76,14 +76,14 @@ Capture Length: 62 bytes                                捕获长度
 [Coloring Rule String: http || tcp.port == 80]          染色显示规则的字符串：
 
 
-                    以下为数据链路层以太网帧头部信息
+			以下为数据链路层以太网帧头部信息
 Ethernet II, Src: AcerTech_5b:d4:61 (00:00:e2:5b:d4:61), Dst: Jetcell_e5:1d:0a (00:d0:2b:e5:1d:0a)
 以太网协议版本II，源地址：厂名_序号（网卡地址），目的：厂名_序号（网卡地址）
  Destination: Jetcell_e5:1d:0a (00:d0:2b:e5:1d:0a)       目的：厂名_序号（网卡地址）
  Source: AcerTech_5b:d4:61 (00:00:e2:5b:d4:61)           源：厂名_序号（网卡地址）
  Type: IP (0x0800)                                       帧内封装的上层协议类型为IP（十六进制码0800）看教材70页图3.2
 
-                          以下为互联网层IP包头部信息
+			以下为互联网层IP包头部信息
 Internet Protocol, Src: 202.203.44.225 (202.203.44.225), Dst: 202.203.208.32 (202.203.208.32)
 互联网协议，源IP地址，目的IP地址
 Version: 4                                                       互联网协议IPv4
@@ -99,7 +99,7 @@ Header checksum: 0xe4ce [correct]                                头部数据的
 Source: 202.203.44.225 (202.203.44.225)                          源IP地址
 Destination: 202.203.208.32 (202.203.208.32)                     目的IP地址
 
-                        以下为传输层TCP数据段头部信息
+			以下为传输层TCP数据段头部信息
 Transmission Control Protocol, Src Port: 2764 (2764), Dst Port: http (80), Seq: 0, Len: 0   传输控制协议TCP的内容
 Source port: 2764 (2764）                              源端口名称（端口号）
 Destination port: http (80)                            目的端口名http（端口号80）

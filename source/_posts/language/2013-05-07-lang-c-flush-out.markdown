@@ -28,8 +28,8 @@ tags:
 #### 1
 printf将"sleeping %d"输出到标准输出文件的缓冲区中(缓冲区在内存上)，fflush(stdout)将缓冲区中的内容强制刷新到，并将其中的内容输出到显示器上("\n"回车换行 == fflush(stdout)+换行)
 ```
-                             fflush()
-         buffer(In memroy) -----------> hard disk/monitor
+	fflush()
+	buffer(In memroy) -----------> hard disk/monitor
 ```
 #### 2
 有三个流(stream)是自动打开的， 相应的FILE结构指针为stdin、stdout、stderr，与之对应的文件描述符是：STDIN_FILENO、STDOUT_FILENO、STDERR_FILENO。
@@ -39,10 +39,10 @@ printf将"sleeping %d"输出到标准输出文件的缓冲区中(缓冲区在内
 关于全缓冲，例如普通的文件操作，进行fputs、fprintf操作后，数据并没有立即写入磁盘文件中，当fflush或fclose文件时，数据才真正写入。  
 可以用以下函数设置流的缓冲类型：
 ```
-void setvbuf()  
-void setbuf()  
-void setbuffer()  
-void setlinebuf()
+	void setvbuf()  
+	void setbuf()  
+	void setbuffer()  
+	void setlinebuf()
 ```
 
 #### 3
@@ -66,7 +66,7 @@ stream stderr is always unbuffered by default.
 这个函数应该必须在如何输出被写到该文件之前调用。一般放在main里靠前面的语句！但是setbuf有个经典的错误，man手册上也提到了，c陷阱和缺陷上也提到了
 You must make sure that both buf and the space it points to still exist by the time stream is closed, which also happens at program termination. For example, the following is illegal:
 ```
-        #include <stdio.h>
+	#include <stdio.h>
 	int main()
 	{
 		char buf[BUFSIZ];

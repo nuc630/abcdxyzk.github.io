@@ -36,15 +36,15 @@ Created 2002-11-01 02:00
 
 在i386体系中(本文中所有的代码都是面向i386体系)，系统调用号将放入%eax,它的参数则依次放入%ebx, %ecx, %edx, %esi 和 %edi。 比如，在以下的调用
 ```
-Write(2, “Hello”, 5)
+	Write(2, “Hello”, 5)
 ```
 的汇编形式大概是这样的
 ```
-movl $4, %eax
-movl $2, %ebx
-movl $hello, %ecx
-movl $5, %edx
-int $0×80
+	movl $4, %eax
+	movl $2, %ebx
+	movl $hello, %ecx
+	movl $5, %edx
+	int $0×80
 ```
 这里的$hello指向的是标准字符串”Hello”。
 
@@ -56,8 +56,8 @@ int $0×80
 	#include <sys/types.h>
 	#include <sys/wait.h>
 	#include <unistd.h>
-	#include <linux/user.h>   /* For constants
-		                           ORIG_EAX etc */
+	#include <linux/user.h>	/* For constants
+				   ORIG_EAX etc */
 	int main()
 	{
 		pid_t child;
@@ -69,8 +69,8 @@ int $0×80
 		} else {
 			wait(NULL);
 			orig_eax = ptrace(PTRACE_PEEKUSER,
-		                  child,4* ORIG_EAX,
-		                  NULL);
+						  child,4* ORIG_EAX,
+						  NULL);
 			printf("The child made a "
 				"system call %ld\n", orig_eax);
 			ptrace(PTRACE_CONT, child, NULL, NULL);
@@ -91,28 +91,28 @@ The child made a system call 11
 ptrace函数的参数  
 Ptrace有四个参数  
 ```
-long ptrace(enum __ptrace_request request,
-pid_t pid,
-void *addr,
-void *data);
+	long ptrace(enum __ptrace_request request,
+		pid_t pid,
+		void *addr,
+		void *data);
 ```
 第一个参数决定了ptrace的行为与其它参数的使用方法，可取的值有:
 ```
-PTRACE_ME
-PTRACE_PEEKTEXT
-PTRACE_PEEKDATA
-PTRACE_PEEKUSER
-PTRACE_POKETEXT
-PTRACE_POKEDATA
-PTRACE_POKEUSER
-PTRACE_GETREGS
-PTRACE_GETFPREGS,
-PTRACE_SETREGS
-PTRACE_SETFPREGS
-PTRACE_CONT
-PTRACE_SYSCALL,
-PTRACE_SINGLESTEP
-PTRACE_DETACH
+	PTRACE_ME
+	PTRACE_PEEKTEXT
+	PTRACE_PEEKDATA
+	PTRACE_PEEKUSER
+	PTRACE_POKETEXT
+	PTRACE_POKEDATA
+	PTRACE_POKEUSER
+	PTRACE_GETREGS
+	PTRACE_GETFPREGS,
+	PTRACE_SETREGS
+	PTRACE_SETFPREGS
+	PTRACE_CONT
+	PTRACE_SYSCALL,
+	PTRACE_SINGLESTEP
+	PTRACE_DETACH
 ```
 在下文中将对这些常量的用法进行说明。  
 读取系统调用的参数
@@ -148,26 +148,26 @@ PTRACE_DETACH
 				if(orig_eax == SYS_write) {
 					if(insyscall == 0) {
 						/* Syscall entry */
-		        			insyscall =1;
-		        			params[0]= ptrace(PTRACE_PEEKUSER,
-		                           		child,4* EBX,
-		                           		NULL);
-		        			params[1]= ptrace(PTRACE_PEEKUSER,
-		                           		child,4* ECX,
-		                           		NULL);
-		        			params[2]= ptrace(PTRACE_PEEKUSER,
-	 						child,4* EDX,
-							NULL);
+						insyscall =1;
+						params[0]= ptrace(PTRACE_PEEKUSER,
+								child,4* EBX,
+								NULL);
+						params[1]= ptrace(PTRACE_PEEKUSER,
+								child,4* ECX,
+								NULL);
+						params[2]= ptrace(PTRACE_PEEKUSER,
+	 							child,4* EDX,
+								NULL);
 						printf("Write called with "
-							"%ld, %ld, %ld\n",
-							params[0], params[1],
-							params[2]);
+								"%ld, %ld, %ld\n",
+								params[0], params[1],
+								params[2]);
 					} else {/* Syscall exit */
 						eax = ptrace(PTRACE_PEEKUSER,
 							child,4* EAX, NULL);
 						printf("Write returned "
 							"with %ld\n", eax);
-		            			insyscall =0;
+								insyscall =0;
 					}
 				}
 				ptrace(PTRACE_SYSCALL,
@@ -179,21 +179,22 @@ PTRACE_DETACH
 ```
 这个程序的输出是这样的
 ```
-ppadala@linux:~/ptrace > ls
-a.out        dummy.s      ptrace.txt
-libgpm.html  registers.c  syscallparams.c
-dummy        ptrace.html  simple.c
-ppadala@linux:~/ptrace > ./a.out
-Write called with 1,1075154944,48
-a.out        dummy.s      ptrace.txt
-Write returned with 48
-Write called with 1,1075154944,59
-libgpm.html  registers.c  syscallparams.c
-Write returned with 59
-Write called with 1,1075154944,30
-dummy        ptrace.html  simple.c
-Write returned with 30
+	ppadala@linux:~/ptrace > ls
+	a.out        dummy.s      ptrace.txt
+	libgpm.html  registers.c  syscallparams.c
+	dummy        ptrace.html  simple.c
+	ppadala@linux:~/ptrace > ./a.out
+	Write called with 1,1075154944,48
+	a.out        dummy.s      ptrace.txt
+	Write returned with 48
+	Write called with 1,1075154944,59
+	libgpm.html  registers.c  syscallparams.c
+	Write returned with 59
+	Write called with 1,1075154944,30
+	dummy        ptrace.html  simple.c
+	Write returned with 30
 ```
+
 以上的例子中我们跟踪了write系统调用，而ls命令的执行将产生三个write系统调用。使用PTRACE_SYSCALL作为ptrace的第一个参数，使内核在子进程做出系统调用或者准备退出的时候暂停它。这种行为与使用PTRACE_CONT，然后在下一个系统调用/进程退出时暂停它是等价的。
 
 在前一个例子中，我们用PTRACE_PEEKUSER来察看write系统调用的参数。系统调用的返回值会被放入%eax。
@@ -203,6 +204,7 @@ wait函数使用status变量来检查子进程是否已退出。它是用来判�
 
 如果你想在系统调用或者进程终止的时候读取它的寄存器，使用前面那个例子的方法是可以的，但是这是笨拙的方法。使用PRACE_GETREGS作为ptrace的第一个参数来调用，可以只需一次函数调用就取得所有的相关寄存器值。
 获得寄存器值得例子如下：
+
 ```
 	#include <sys/ptrace.h>
 	#include <sys/types.h>
@@ -260,6 +262,7 @@ wait函数使用status变量来检查子进程是否已退出。它是用来判�
 来点好玩的
 
 现在该做点有意思的事情了，我们将要把传给write系统调用的字符串给反转。
+
 ```
 	#include <sys/ptrace.h>
 	#include <sys/types.h>
@@ -378,40 +381,47 @@ wait函数使用status变量来检查子进程是否已退出。它是用来判�
 		return0;
 	}
 ```
+
 输出是这样的：
+
 ```
-ppadala@linux:~/ptrace > ls
-a.out dummy.s ptrace.txt
-libgpm.html registers.c syscallparams.c
-dummy ptrace.html simple.c
-ppadala@linux:~/ptrace > ./a.out
-txt.ecartp s.ymmud tuo.a
-c.sretsiger lmth.mpgbil c.llacys_egnahc
-c.elpmis lmth.ecartp ymmud
+	ppadala@linux:~/ptrace > ls
+	a.out dummy.s ptrace.txt
+	libgpm.html registers.c syscallparams.c
+	dummy ptrace.html simple.c
+	ppadala@linux:~/ptrace > ./a.out
+	txt.ecartp s.ymmud tuo.a
+	c.sretsiger lmth.mpgbil c.llacys_egnahc
+	c.elpmis lmth.ecartp ymmud
 ```
+
 这个例子中涵盖了前面讨论过的所有知识点，当然还有些新的内容。这里我们用PTRACE_POKEDATA作为第一个参数，以此来改变子进程中的变量值。它以与PTRACE_PEEKDATA相似的方式工作，当然，它不只是偷窥变量的值了，它可以修改它们。   
 
 #### 单步
+
 ptrace 提供了对子进程进行单步的功能。 ptrace(PTRACE_SINGLESTEP, …) 会使内核在子进程的每一条指令执行前先将其阻塞，然后将控制权交给父进程。下面的例子可以查出子进程当前将要执行的指令。为了便于理解，我用汇编写了这个受控程序，而不是让你为c的库函数到底会作那些系统调用而头痛。
 
 以下是被控程序的代码 dummy1.s，使用gcc –o dummy1 dummy1.s来编译
+
 ```
-.data
-hello:
-    .string"hello world\n"
-.globl main
-main:
-    movl $4,%eax
-    movl $2,%ebx
-    movl $hello,%ecx
-    movl $12,%edx
-int $0x80
-    movl $1,%eax
-    xorl %ebx,%ebx
-int $0x80
-    ret
+	.data
+	hello:
+		.string"hello world\n"
+	.globl main
+	main:
+		movl $4,%eax
+		movl $2,%ebx
+		movl $hello,%ecx
+		movl $12,%edx
+	int $0x80
+		movl $1,%eax
+		xorl %ebx,%ebx
+	int $0x80
+		ret
 ```
+
 以下的程序则用来完成单步
+
 ```
 	#include <sys/ptrace.h>
 	#include <sys/types.h>

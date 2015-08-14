@@ -19,7 +19,7 @@ http://www.oenhan.com/cpu-load-balance
 内核代码函数起自load_balance函数,从load_balance函数看引用它的函数可以一直找到schedule函数这里，便从这里开始往下看，在__schedule中有下面一句话。
 ```	
 	if (unlikely(!rq->nr_running))
-    	idle_balance(cpu, rq);
+		idle_balance(cpu, rq);
 ```
 从上面可以看出什么时候内核会尝试进行CPU负载平衡：即当前CPU运行队列为NULL的时候。
 
@@ -70,28 +70,28 @@ for_each_domain(this_cpu, sd) 则是遍历当前CPU所在的调度域，可以�
 	do
 	{
 		local_group = cpumask_test_cpu(this_cpu, sched_group_cpus(sg));
-        if (local_group) {
-                      //如果是当前CPU上的group，则进行赋值
-            sds->this_load = sgs.avg_load;
-            sds->this = sg;
-            sds->this_nr_running = sgs.sum_nr_running;
-            sds->this_load_per_task = sgs.sum_weighted_load;
-            sds->this_has_capacity = sgs.group_has_capacity;
-            sds->this_idle_cpus = sgs.idle_cpus;
-        } else if (update_sd_pick_busiest(sd, sds, sg, &sgs, this_cpu)) {
-                     //在update_sd_pick_busiest判断当前sgs的是否超过了之前的最大值，如果是
-                     //则将sgs值赋给sds
-            sds->max_load = sgs.avg_load;
-            sds->busiest = sg;
-            sds->busiest_nr_running = sgs.sum_nr_running;
-            sds->busiest_idle_cpus = sgs.idle_cpus;
-            sds->busiest_group_capacity = sgs.group_capacity;
-            sds->busiest_load_per_task = sgs.sum_weighted_load;
-            sds->busiest_has_capacity = sgs.group_has_capacity;
-            sds->busiest_group_weight = sgs.group_weight;
-            sds->group_imb = sgs.group_imb;
-        }
-        sg = sg->next;
+		if (local_group) {
+			//如果是当前CPU上的group，则进行赋值
+			sds->this_load = sgs.avg_load;
+			sds->this = sg;
+			sds->this_nr_running = sgs.sum_nr_running;
+			sds->this_load_per_task = sgs.sum_weighted_load;
+			sds->this_has_capacity = sgs.group_has_capacity;
+			sds->this_idle_cpus = sgs.idle_cpus;
+		} else if (update_sd_pick_busiest(sd, sds, sg, &sgs, this_cpu)) {
+			//在update_sd_pick_busiest判断当前sgs的是否超过了之前的最大值，如果是
+			//则将sgs值赋给sds
+			sds->max_load = sgs.avg_load;
+			sds->busiest = sg;
+			sds->busiest_nr_running = sgs.sum_nr_running;
+			sds->busiest_idle_cpus = sgs.idle_cpus;
+			sds->busiest_group_capacity = sgs.group_capacity;
+			sds->busiest_load_per_task = sgs.sum_weighted_load;
+			sds->busiest_has_capacity = sgs.group_has_capacity;
+			sds->busiest_group_weight = sgs.group_weight;
+			sds->group_imb = sgs.group_imb;
+		}
+		sg = sg->next;
 	} while (sg != sd->groups);
 ```
 
@@ -109,65 +109,65 @@ for_each_domain(this_cpu, sd) 则是遍历当前CPU所在的调度域，可以�
 ```
 	for_each_cpu(i, sched_group_cpus(group)) {
 		/*rq->cpu_power表示所在处理器的计算能力,在函式sched_init初始化时,会把这值设定为SCHED_LOAD_SCALE (=Nice 0的Load Weight=1024).并可透过函式update_cpu_power (in kernel/sched_fair.c)更新这个值.*/
-        unsigned long power = power_of(i);
-        unsigned long capacity = DIV_ROUND_CLOSEST(power,SCHED_POWER_SCALE);
-        unsigned long wl;
-        if (!cpumask_test_cpu(i, cpus))
-            continue;
+		unsigned long power = power_of(i);
+		unsigned long capacity = DIV_ROUND_CLOSEST(power,SCHED_POWER_SCALE);
+		unsigned long wl;
+		if (!cpumask_test_cpu(i, cpus))
+			continue;
  
-        rq = cpu_rq(i);
+		rq = cpu_rq(i);
 /*获取队列负载cpu_rq(cpu)->load.weight;*/
-        wl = weighted_cpuload(i);
+		wl = weighted_cpuload(i);
  
-        /*
-         * When comparing with imbalance, use weighted_cpuload()
-         * which is not scaled with the cpu power.
-         */
-        if (capacity && rq->nr_running == 1 && wl > imbalance)
-            continue;
+		/*
+		 * When comparing with imbalance, use weighted_cpuload()
+		 * which is not scaled with the cpu power.
+		 */
+		if (capacity && rq->nr_running == 1 && wl > imbalance)
+			continue;
  
-        /*
-         * For the load comparisons with the other cpu's, consider
-         * the weighted_cpuload() scaled with the cpu power, so that
-         * the load can be moved away from the cpu that is potentially
-         * running at a lower capacity.
-         */
-        wl = (wl * SCHED_POWER_SCALE) / power;
+		/*
+		 * For the load comparisons with the other cpu's, consider
+		 * the weighted_cpuload() scaled with the cpu power, so that
+		 * the load can be moved away from the cpu that is potentially
+		 * running at a lower capacity.
+		 */
+		wl = (wl * SCHED_POWER_SCALE) / power;
  
-        if (wl > max_load) {
-            max_load = wl;
-            busiest = rq;
-        }
+		if (wl > max_load) {
+			max_load = wl;
+			busiest = rq;
+		}
 ```
 通过上面的计算，便拿到了最忙队列。  
 当busiest->nr_running运行数大于1的时候，进行pull操作，pull前对move_tasks,先进行double_rq_lock加锁处理。
 ```
 	double_rq_lock(this_rq, busiest);
 	ld_moved = move_tasks(this_rq, this_cpu, busiest,
-		    imbalance, sd, idle, &all_pinned);
+			imbalance, sd, idle, &all_pinned);
 	double_rq_unlock(this_rq, busiest);
 ```
 move_tasks进程pull task是允许失败的，即move_tasks->balance_tasks，在此处，有sysctl_sched_nr_migrate开关控制进程迁移个数，对应proc的是/proc/sys/kernel/sched_nr_migrate。
 
 下面有can_migrate_task函数检查选定的进程是否可以进行迁移，迁移失败的原因有3个，1.迁移的进程处于运行状态；2.进程被绑核了，不能迁移到目标CPU上；3.进程的cache仍然是hot，此处也是为了保证cache命中率。
 ```
-    /*关于cache cold的情况下，如果迁移失败的个数太多，仍然进行迁移
-     * Aggressive migration if:
-     * 1) task is cache cold, or
-     * 2) too many balance attempts have failed.
-     */
+	/*关于cache cold的情况下，如果迁移失败的个数太多，仍然进行迁移
+	 * Aggressive migration if:
+	 * 1) task is cache cold, or
+	 * 2) too many balance attempts have failed.
+	 */
  
-    tsk_cache_hot = task_hot(p, rq->clock_task, sd);
-    if (!tsk_cache_hot ||
-        sd->nr_balance_failed > sd->cache_nice_tries) {
+	tsk_cache_hot = task_hot(p, rq->clock_task, sd);
+	if (!tsk_cache_hot ||
+		sd->nr_balance_failed > sd->cache_nice_tries) {
 #ifdef CONFIG_SCHEDSTATS
-        if (tsk_cache_hot) {
-            schedstat_inc(sd, lb_hot_gained[idle]);
-            schedstat_inc(p, se.statistics.nr_forced_migrations);
-        }
+		if (tsk_cache_hot) {
+			schedstat_inc(sd, lb_hot_gained[idle]);
+			schedstat_inc(p, se.statistics.nr_forced_migrations);
+		}
 #endif
-        return 1;
-    }
+		return 1;
+	}
 ```
 
 判断进程cache是否有效，判断条件，进程的运行的时间大于proc控制开关sysctl_sched_migration_cost，对应目录/proc/sys/kernel/sched_migration_cost_ns
@@ -175,7 +175,7 @@ move_tasks进程pull task是允许失败的，即move_tasks->balance_tasks，在
 	static int
 	task_hot(struct task_struct *p, u64 now, struct sched_domain *sd)
 	{
-		    s64 delta;
+			s64 delta;
 		delta = now - p->se.exec_start;
 		return delta < (s64)sysctl_sched_migration_cost;
 	}
@@ -191,7 +191,7 @@ move_tasks进程pull task是允许失败的，即move_tasks->balance_tasks，在
 push整个触发操作代码机制比较绕，stop_one_cpu_nowait把active_load_balance_cpu_stop添加到cpu_stopper每CPU变量的任务队列里面，如下：
 ```
 	void stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
-		        struct cpu_stop_work *work_buf)
+				struct cpu_stop_work *work_buf)
 	{
 		*work_buf = (struct cpu_stop_work){ .fn = fn, .arg = arg, };
 		cpu_stop_queue_work(&per_cpu(cpu_stopper, cpu), work_buf);

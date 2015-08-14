@@ -61,9 +61,9 @@ http://www.lenky.info/archives/2013/03/2245
 ```
 不管是desc->handle_irq还是__do_IRQ，它们都会调入到另外一个函数handle_IRQ_event()。重点：从CPU接收到中断信号并开始处理，到这个函数为止，都是处于中断禁止状态。为什么？很简单，因为Intel开发者手册上是这么说的，在文档325462.pdf卷3章节6.8.1 Masking Maskable Hardware Interrupts提到：
 ```
-    When an interrupt is handled through an interrupt gate, the IF flag is automati-
-    cally cleared, which disables maskable hardware interrupts. (If an interrupt is
-    handled through a trap gate, the IF flag is not cleared.)
+	When an interrupt is handled through an interrupt gate, the IF flag is automati-
+	cally cleared, which disables maskable hardware interrupts. (If an interrupt is
+	handled through a trap gate, the IF flag is not cleared.)
 ```
 在CPU开始处理一个硬中断到进入函数handle_IRQ_event()为止的这段时间里，因为处于中断禁止状态，所以不会出现被其它中断打断的情况。但是，在进入到函数handle_IRQ_event()后，立马有了这么两句：
 ```
@@ -119,7 +119,7 @@ http://www.lenky.info/archives/2013/03/2245
 
 4，从这个补丁开始，Linux内核已经全面禁止硬中断嵌套了，即从2.6.35开始，默认就是：
 ```
-    run the irq handlers with interrupts disabled.
+	run the irq handlers with interrupts disabled.
 ```
 因为这个补丁，所以旗标IRQF_DISABLED没用了，mainline内核在逐步删除它。
 

@@ -59,9 +59,9 @@ http://blog.csdn.net/eroswang/article/details/1999034
 http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file
 
 ```
-   EINVAL Target  file  system  doesn't  support  splicing; target file is
-          opened in append mode; neither of the descriptors  refers  to  a
-          pipe; or offset given for non-seekable device.
+	EINVAL Target  file  system  doesn't  support  splicing; target file is
+		opened in append mode; neither of the descriptors  refers  to  a
+		pipe; or offset given for non-seekable device.
 ```
 
 ---------------

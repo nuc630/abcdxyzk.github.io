@@ -131,7 +131,7 @@ docker info ：查看系统(docker)层面信息，包括管理的images, contain
 运行Container
 ```
 	$ docker run --name shell -i -t chug/ubuntu12.10x64 /bin/bash 
-     
+
 	$ docker run -t -i efd1e7457182 /bin/bash 
 ```
 两个参数，-t表示给容器tty终端，-i表示可以interactive，可以交互。
@@ -198,7 +198,7 @@ export命令用于持久化容器
 Save命令用于持久化镜像
 
 ```
-    docker save 镜像ID > /tmp/save.tar
+	docker save 镜像ID > /tmp/save.tar
 ```
 
 ##### 6.4 导入持久化container

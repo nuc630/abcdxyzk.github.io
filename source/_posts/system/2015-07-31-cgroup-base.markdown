@@ -76,18 +76,18 @@ Cgroups最初的目标是为资源管理提供的一个统一的框架，既整�
 若系统未安装则进行安装，若已安装则进行更新。
 
 ```
-    [root@localhost ~]# yum install libcgroup  
+	[root@localhost ~]# yum install libcgroup  
 ```
 
 查看运行状态，并启动服务
 
 ```
-    [root@localhost ~]# service cgconfig status  
-    Stopped  
-    [root@localhost ~]# service cgconfig start  
-    Starting cgconfig service:                                 [  OK  ]  
-    [root@localhost ~]# service cgconfig status  
-    Running  
+	[root@localhost ~]# service cgconfig status  
+	Stopped  
+	[root@localhost ~]# service cgconfig start  
+	Starting cgconfig service:                                 [  OK  ]  
+	[root@localhost ~]# service cgconfig status  
+	Running  
 ```
 
 #### 6 cgroup配置
@@ -97,44 +97,44 @@ Cgroups最初的目标是为资源管理提供的一个统一的框架，既整�
 6.1.1 cgroup配置文件所在位置
 
 ```
-    /etc/cgconfig.conf  
+	/etc/cgconfig.conf  
 ```
 
 6.1.2 默认配置文件内容
 
 ```
-    mount {  
-            cpuset  = /cgroup/cpuset;  
-            cpu     = /cgroup/cpu;  
-            cpuacct = /cgroup/cpuacct;  
-            memory  = /cgroup/memory;  
-            devices = /cgroup/devices;  
-            freezer = /cgroup/freezer;  
-            net_cls = /cgroup/net_cls;  
-            blkio   = /cgroup/blkio;  
-    }  
+	mount {  
+		cpuset  = /cgroup/cpuset;  
+		cpu     = /cgroup/cpu;  
+		cpuacct = /cgroup/cpuacct;  
+		memory  = /cgroup/memory;  
+		devices = /cgroup/devices;  
+		freezer = /cgroup/freezer;  
+		net_cls = /cgroup/net_cls;  
+		blkio   = /cgroup/blkio;  
+	}  
 ```
 
 相当于执行命令
 
 ```
-    mkdir /cgroup/cpuset  
-    mount -t cgroup -o cpuset red /cgroup/cpuset  
-    ……  
-    mkdir /cgroup/blkio  
-    mount -t cgroup -o cpuset red /cgroup/blkio  
+	mkdir /cgroup/cpuset  
+	mount -t cgroup -o cpuset red /cgroup/cpuset  
+	……  
+	mkdir /cgroup/blkio  
+	mount -t cgroup -o cpuset red /cgroup/blkio  
 ```
 
 6.1.3 cgroup section的语法格式如下
 
 ```
-    group <name> {  
-        [<permissions>]  
-        <controller> {  
-            <param name> = <param value>;  
-            …  
-        }  
-    …}  
+	group <name> {  
+		[<permissions>]  
+		<controller> {  
+			<param name> = <param value>;  
+			…  
+		}  
+	…}  
 ```
 
 name: 指定cgroup的名称  
@@ -151,37 +151,37 @@ param name 和 param value：子系统的属性及其属性值
 7.1.1 修改cgconfig.conf文件
 
 ```
-    mount {  
-        cpuset  = /cgroup/cpuset;  
-        cpu = /cgroup/cpu;  
-        cpuacct = /cgroup/cpuacct;  
-        memory  = /cgroup/memory;  
-        blkio   = /cgroup/blkio;  
-    }  
+	mount {  
+		cpuset  = /cgroup/cpuset;  
+		cpu = /cgroup/cpu;  
+		cpuacct = /cgroup/cpuacct;  
+		memory  = /cgroup/memory;  
+		blkio   = /cgroup/blkio;  
+	}  
 
-    group mysql_g1 {    
-        cpu {  
-                cpu.cfs_quota_us = 50000;  
-                cpu.cfs_period_us = 100000;  
-        }  
-        cpuset {    
-                cpuset.cpus = "3";    
-                cpuset.mems = "0";    
-        }    
-        cpuacct{  
-      
-        }  
-        memory {    
-                memory.limit_in_bytes=104857600;  
-                memory.swappiness=0;  
-                # memory.max_usage_in_bytes=104857600;  
-                # memory.oom_control=0;  
-        }   
-        blkio  {  
-               blkio.throttle.read_bps_device="8:0 524288";  
-               blkio.throttle.write_bps_device="8:0 524288";  
-        }   
-    }   
+	group mysql_g1 {    
+		cpu {  
+			cpu.cfs_quota_us = 50000;  
+			cpu.cfs_period_us = 100000;  
+		}  
+		cpuset {    
+			cpuset.cpus = "3";    
+			cpuset.mems = "0";    
+		}    
+		cpuacct{  
+	  
+		}  
+		memory {    
+			memory.limit_in_bytes=104857600;  
+			memory.swappiness=0;  
+			# memory.max_usage_in_bytes=104857600;  
+			# memory.oom_control=0;  
+		}   
+		blkio  {  
+			blkio.throttle.read_bps_device="8:0 524288";  
+			blkio.throttle.write_bps_device="8:0 524288";  
+		}   
+	}   
 ```
 
 7.1.2 配置文件的部分解释。
@@ -199,7 +199,7 @@ cpuset：cpu绑定
   其实cgconfig也就是帮你把配置文件中的配置整理到/cgroup/cpuset这个目录里面，比如你需要动态设置mysql_group1/ cpuset.cpus的CPU超线程号，可以采用如下的办法。
 
 ```
-    [root@localhost ~]# echo "0" > mysql_group1/ cpuset.cpus  
+	[root@localhost ~]# echo "0" > mysql_group1/ cpuset.cpus  
 ```
 
 cpuacct：cpu资源报告
@@ -216,25 +216,25 @@ blkio.throttle.write_bps_device="8:0 524288"; #每秒写数据上限
 其中8:0对应主设备号和副设备号，可以通过ls -l /dev/sda查看
 
 ```
-    [root@localhost /]# ls -l /dev/sda  
-    brw-rw----. 1 root disk 8, 0 Sep 15 04:19 /dev/sda
+	[root@localhost /]# ls -l /dev/sda  
+	brw-rw----. 1 root disk 8, 0 Sep 15 04:19 /dev/sda
 ```
 
 7.1.4 修改cgrules.conf文件
 
 ```
-    [root@localhost ~]# vi /etc/cgrules.conf  
-    # /etc/cgrules.conf  
-    #The format of this file is described in cgrules.conf(5)  
-    #manual page.  
-    #  
-    # Example:  
-    #<user>         <controllers>   <destination>  
-    #@student       cpu,memory      usergroup/student/  
-    #peter          cpu             test1/  
-    #%              memory          test2/  
+	[root@localhost ~]# vi /etc/cgrules.conf  
+	# /etc/cgrules.conf  
+	#The format of this file is described in cgrules.conf(5)  
+	#manual page.  
+	#  
+	# Example:  
+	#<user>         <controllers>   <destination>  
+	#@student       cpu,memory      usergroup/student/  
+	#peter          cpu             test1/  
+	#%              memory          test2/  
 
-    *:/usr/local/mysql/bin/mysqld * mysql_g1  
+	*:/usr/local/mysql/bin/mysqld * mysql_g1  
 
 ```
 注：共分为3个部分，分别为需要限制的实例，限制的内容（如cpu，memory），挂载目标。
@@ -242,22 +242,22 @@ blkio.throttle.write_bps_device="8:0 524288"; #每秒写数据上限
 #### 7.2 使配置生效
 
 ```
-    [root@localhost ~]# /etc/init.d/cgconfig restart  
-    Stopping cgconfig service:                                 [  OK  ]  
-    Starting cgconfig service:                                 [  OK  ]  
-    [root@localhost ~]# /etc/init.d/cgred restart  
-    Stopping CGroup Rules Engine Daemon...                     [  OK  ]  
-    Starting CGroup Rules Engine Daemon:                       [  OK  ]  
+	[root@localhost ~]# /etc/init.d/cgconfig restart  
+	Stopping cgconfig service:                                 [  OK  ]  
+	Starting cgconfig service:                                 [  OK  ]  
+	[root@localhost ~]# /etc/init.d/cgred restart  
+	Stopping CGroup Rules Engine Daemon...                     [  OK  ]  
+	Starting CGroup Rules Engine Daemon:                       [  OK  ]  
 ```
 注：重启顺序为cgconfig -> cgred ，更改配置文件后两个服务需要重启，且顺序不能错。
 
 ##### 7.3 启动MySQL，查看MySQL是否处于cgroup的限制中
 
 ```
-    [root@localhost ~]# ps -eo pid,cgroup,cmd | grep -i mysqld  
-    29871 blkio:/;net_cls:/;freezer:/;devices:/;memory:/;cpuacct:/;cpu:/;cpuset:/ /bin/sh ./bin/mysqld_safe --defaults-file=/etc/my.cnf --basedir=/usr/local/mysql/ --datadir=/usr/local/mysql/data/  
-    30219 blkio:/;net_cls:/;freezer:/;devices:/;memory:/;cpuacct:/;cpu:/;cpuset:/mysql_g1 /usr/local/mysql/bin/mysqld --defaults-file=/etc/my.cnf --basedir=/usr/local/mysql/ --datadir=/usr/local/mysql/data/ --plugin-dir=/usr/local/mysql//lib/plugin --user=mysql --log-error=/usr/local/mysql/data//localhost.localdomain.err --pid-file=/usr/local/mysql/data//localhost.localdomain.pid --socket=/tmp/mysql.sock --port=3306  
-    30311 blkio:/;net_cls:/;freezer:/;devices:/;memory:/;cpuacct:/;cpu:/;cpuset:/ grep -i mysqld  
+	[root@localhost ~]# ps -eo pid,cgroup,cmd | grep -i mysqld  
+	29871 blkio:/;net_cls:/;freezer:/;devices:/;memory:/;cpuacct:/;cpu:/;cpuset:/ /bin/sh ./bin/mysqld_safe --defaults-file=/etc/my.cnf --basedir=/usr/local/mysql/ --datadir=/usr/local/mysql/data/  
+	30219 blkio:/;net_cls:/;freezer:/;devices:/;memory:/;cpuacct:/;cpu:/;cpuset:/mysql_g1 /usr/local/mysql/bin/mysqld --defaults-file=/etc/my.cnf --basedir=/usr/local/mysql/ --datadir=/usr/local/mysql/data/ --plugin-dir=/usr/local/mysql//lib/plugin --user=mysql --log-error=/usr/local/mysql/data//localhost.localdomain.err --pid-file=/usr/local/mysql/data//localhost.localdomain.pid --socket=/tmp/mysql.sock --port=3306  
+	30311 blkio:/;net_cls:/;freezer:/;devices:/;memory:/;cpuacct:/;cpu:/;cpuset:/ grep -i mysqld  
 ```
 
 ---------------------

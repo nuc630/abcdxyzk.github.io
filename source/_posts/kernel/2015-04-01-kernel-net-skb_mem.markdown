@@ -18,20 +18,20 @@ http://book.51cto.com/art/201206/345040.htm
 
 网络模块中，有两个用来分配SKB描述符的高速缓存，在SKB模块初始函数skb_init()中被创建。
 ```
-    2048 void __init skb_init(void)  
-    2049 {  
-    2050     skbuff_head_cache = kmem_cache_create("skbuff_head_cache",  
-    2051                           sizeof(struct sk_buff),  
-    2052                           0,  
-    2053                           SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
-    2054                           NULL, NULL);  
-    2055     skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",  
-    2056                         (2*sizeof(struct sk_buff)) +  
-    2057                         sizeof(atomic_t),  
-    2058                         0,  
-    2059                         SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
-    2060                         NULL, NULL);  
-    2061 }
+	2048 void __init skb_init(void)  
+	2049 {  
+	2050     skbuff_head_cache = kmem_cache_create("skbuff_head_cache",  
+	2051                           sizeof(struct sk_buff),  
+	2052                           0,  
+	2053                           SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
+	2054                           NULL, NULL);  
+	2055     skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",  
+	2056                         (2*sizeof(struct sk_buff)) +  
+	2057                         sizeof(atomic_t),  
+	2058                         0,  
+	2059                         SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
+	2060                         NULL, NULL);  
+	2061 }
 ```
 2050-2054 创建skbuff_head_cache高速缓存，一般情况下，SKB都是从该高速缓存中分配的。
 
@@ -58,61 +58,61 @@ fclone，预测是否会克隆，用于确定从哪个高速缓存中分配。
 node，当支持NUMA（非均匀质存储结构）时，用于确定何种区域中分配SKB。NUMA参见相关资料。
 
 ```
-    144 struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,  
-    145                 int fclone, int node)  
-    146 {  
-    147     struct kmem_cache *cache;  
-    148     struct skb_shared_info *shinfo;  
-    149     struct sk_buff *skb;  
-    150     u8 *data;  
-    151  
-    152     cache = fclone ? skbuff_fclone_cache : skbuff_head_cache;  
-    153  
-    154     /* Get the HEAD */  
-    155     skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);  
-    156     if (!skb)  
-    157         goto out;  
-    158  
-    159     /* Get the DATA. Size must match skb_add_mtu(). */  
-    160     size = SKB_DATA_ALIGN(size);  
-    161     data = kmalloc_node_track_caller(size + sizeof(struct skb_shared_info),  
-    162             gfp_mask, node);  
-    163     if (!data)  
-    164         goto nodata;  
-    165  
-    166     memset(skb, 0, offsetof(struct sk_buff, truesize));  
-    167     skb->truesize = size + sizeof(struct sk_buff);  
-    168     atomic_set(&skb->users, 1);  
-    169     skb->head = data;  
-    170     skb->datadata = data;  
-    171     skb->tail = data;  
-    172     skb->end  = data + size;  
-    173     /* make sure we initialize shinfo sequentially */  
-    174     shinfo = skb_shinfo(skb);  
-    175     atomic_set(&shinfo->dataref, 1);  
-    176     shinfo->nr_frags  = 0;  
-    177     shinfo->gso_size = 0;  
-    178     shinfo->gso_segs = 0;  
-    179     shinfo->gso_type = 0;  
-    180     shinfo->ip6_frag_id = 0;  
-    181     shinfo->frag_list = NULL;  
-    182  
-    183     if (fclone) {  
-    184         struct sk_buff *child = skb + 1;  
-    185         atomic_t *fclone_ref = (atomic_t *) (child + 1);  
-    186  
-    187         skb->fclone = SKB_FCLONE_ORIG;  
-    188         atomic_set(fclone_ref, 1);  
-    189  
-    190         child->fclone = SKB_FCLONE_UNAVAILABLE;  
-    191     }  
-    192 out:  
-    193     return skb;  
-    194 nodata:  
-    195     kmem_cache_free(cache, skb);  
-    196     skb = NULL;  
-    197     goto out;  
-    198 }
+	144 struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,  
+	145                 int fclone, int node)  
+	146 {  
+	147     struct kmem_cache *cache;  
+	148     struct skb_shared_info *shinfo;  
+	149     struct sk_buff *skb;  
+	150     u8 *data;  
+	151  
+	152     cache = fclone ? skbuff_fclone_cache : skbuff_head_cache;  
+	153  
+	154     /* Get the HEAD */  
+	155     skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);  
+	156     if (!skb)  
+	157         goto out;  
+	158  
+	159     /* Get the DATA. Size must match skb_add_mtu(). */  
+	160     size = SKB_DATA_ALIGN(size);  
+	161     data = kmalloc_node_track_caller(size + sizeof(struct skb_shared_info),  
+	162             gfp_mask, node);  
+	163     if (!data)  
+	164         goto nodata;  
+	165  
+	166     memset(skb, 0, offsetof(struct sk_buff, truesize));  
+	167     skb->truesize = size + sizeof(struct sk_buff);  
+	168     atomic_set(&skb->users, 1);  
+	169     skb->head = data;  
+	170     skb->datadata = data;  
+	171     skb->tail = data;  
+	172     skb->end  = data + size;  
+	173     /* make sure we initialize shinfo sequentially */  
+	174     shinfo = skb_shinfo(skb);  
+	175     atomic_set(&shinfo->dataref, 1);  
+	176     shinfo->nr_frags  = 0;  
+	177     shinfo->gso_size = 0;  
+	178     shinfo->gso_segs = 0;  
+	179     shinfo->gso_type = 0;  
+	180     shinfo->ip6_frag_id = 0;  
+	181     shinfo->frag_list = NULL;  
+	182  
+	183     if (fclone) {  
+	184         struct sk_buff *child = skb + 1;  
+	185         atomic_t *fclone_ref = (atomic_t *) (child + 1);  
+	186  
+	187         skb->fclone = SKB_FCLONE_ORIG;  
+	188         atomic_set(fclone_ref, 1);  
+	189  
+	190         child->fclone = SKB_FCLONE_UNAVAILABLE;  
+	191     }  
+	192 out:  
+	193     return skb;  
+	194 nodata:  
+	195     kmem_cache_free(cache, skb);  
+	196     skb = NULL;  
+	197     goto out;  
+	198 }
 ```
 
 152 根据参数fclone确定从哪个高速缓存中分配SKB。
@@ -134,19 +134,19 @@ node，当支持NUMA（非均匀质存储结构）时，用于确定何种区域
 #### 2. dev_alloc_skb()
 dev_alloc_skb()也是一个缓存区分配函数，通常被设备驱动用在中断上下文中。这是一个alloc_skb()的封装函数，因为是在中断处理函数中被调用的，因此要求原子操作（GFP_ATOMIC）。
 ```
-    1124 static inline struct sk_buff *dev_alloc_skb(unsigned int length)  
-    1125 {  
-    1126     return __dev_alloc_skb(length, GFP_ATOMIC);  
-    1127 }  
-    ... ...  
-    1103 static inline struct sk_buff *__dev_alloc_skb(unsigned int length,  
-    1104                           gfp_t gfp_mask)  
-    1105 {  
-    1106     struct sk_buff *skb = alloc_skb(length + NET_SKB_PAD, gfp_mask);  
-    1107     if (likely(skb))  
-    1108         skb_reserve(skb, NET_SKB_PAD);  
-    1109     return skb;  
-    1110 }
+	1124 static inline struct sk_buff *dev_alloc_skb(unsigned int length)  
+	1125 {  
+	1126     return __dev_alloc_skb(length, GFP_ATOMIC);  
+	1127 }  
+	... ...  
+	1103 static inline struct sk_buff *__dev_alloc_skb(unsigned int length,  
+	1104                           gfp_t gfp_mask)  
+	1105 {  
+	1106     struct sk_buff *skb = alloc_skb(length + NET_SKB_PAD, gfp_mask);  
+	1107     if (likely(skb))  
+	1108         skb_reserve(skb, NET_SKB_PAD);  
+	1109     return skb;  
+	1110 }
 ```
 
 1108 调用skb_reserve()在skb->head与skb->data之间预留NET_SKB_PAD个字节。NET_SKB_PAD的定义在skbuff.h中，其值为 16。这部分空间将被填入硬件帧头，如14B的以太网帧头。
@@ -238,89 +238,89 @@ skb_pull()通过将data指针往下移动，在数据区首部忽略len字节长
 图3-19 所示是一个存在聚合分散I/O缓存区的例子，这个数据缓存区的一些数据保存在分片结构数组frags中。skb_share_check()用来检查SKB引用计数users，如果该字段表明SKB是被共享的，则克隆一个新的SKB。一个SKB被克隆后，该SKB数据缓存区中的内容就不能再被修改，这也意味着访问数据的函数没有必要加锁。skb_cloned()可以用来测试skb的克隆状态。
 
 ```
-    432 struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)  
-    433 {  
-    434     struct sk_buff *n;  
-    435  
-    436     n = skb + 1;  
-    437     if (skb->fclone == SKB_FCLONE_ORIG &&  
-    438         n->fclone == SKB_FCLONE_UNAVAILABLE) {  
-    439         atomic_t *fclone_ref = (atomic_t *) (n + 1);  
-    440         n->fclone = SKB_FCLONE_CLONE;  
-    441         atomic_inc(fclone_ref);  
-    442     } else {  
-    443         n = kmem_cache_alloc(skbuff_head_cache, gfp_mask);  
-    444         if (!n)  
-    445             return NULL;  
-    446         n->fclone = SKB_FCLONE_UNAVAILABLE;  
-    447     }  
-    448  
-    449 #define C(x) n->x = skb->x  
-    450  
-    451     n->nnext = n->prev = NULL;  
-    452     n->sk = NULL;  
-    453     C(tstamp);  
-    454     C(dev);  
-    455     C(h);  
-    456     C(nh);  
-    457     C(mac);  
-    458     C(dst);  
-    459     dst_clone(skb->dst);  
-    460     C(sp);  
-    461 #ifdef CONFIG_INET  
-    462     secpath_get(skb->sp);  
-    463 #endif  
-    464     memcpy(n->cb, skb->cb, sizeof(skb->cb));  
-    465     C(len);  
-    466     C(data_len);  
-    467     C(csum);  
-    468     C(local_df);  
-    469     n->cloned = 1;  
-    470     n->nohdr = 0;  
-    471     C(pkt_type);  
-    472     C(ip_summed);  
-    473     C(priority);  
-    474 #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)  
-    475     C(ipvs_property);  
-    476 #endif  
-    477     C(protocol);  
-    478     n->destructor = NULL;  
-    479     C(mark);  
-    480 #ifdef CONFIG_NETFILTER  
-    481     C(nfct);  
-    482     nf_conntrack_get(skb->nfct);  
-    483     C(nfctinfo);  
-    484 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)  
-    485     C(nfct_reasm);  
-    486     nf_conntrack_get_reasm(skb->nfct_reasm);  
-    487 #endif  
-    488 #ifdef CONFIG_BRIDGE_NETFILTER  
-    489     C(nf_bridge);  
-    490     nf_bridge_get(skb->nf_bridge);  
-    491 #endif  
-    492 #endif /*CONFIG_NETFILTER*/  
-    493 #ifdef CONFIG_NET_SCHED  
-    494     C(tc_index);  
-    495 #ifdef CONFIG_NET_CLS_ACT  
-    496     n->tc_verd = SET_TC_VERD(skb->tc_verd,0);  
-    497     n->tc_verd = CLR_TC_OK2MUNGE(n->tc_verd);  
-    498     n->tc_verd = CLR_TC_MUNGED(n->tc_verd);  
-    499     C(input_dev);  
-    500 #endif  
-    501     skb_copy_secmark(n, skb);  
-    502 #endif  
-    503     C(truesize);  
-    504     atomic_set(&n->users, 1);  
-    505     C(head);  
-    506     C(data);  
-    507     C(tail);  
-    508     C(end);  
-    509  
-    510     atomic_inc(&(skb_shinfo(skb)->dataref));  
-    511     skb->cloned = 1;  
-    512  
-    513     return n;  
-    514 }
+	432 struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)  
+	433 {  
+	434     struct sk_buff *n;  
+	435  
+	436     n = skb + 1;  
+	437     if (skb->fclone == SKB_FCLONE_ORIG &&  
+	438         n->fclone == SKB_FCLONE_UNAVAILABLE) {  
+	439         atomic_t *fclone_ref = (atomic_t *) (n + 1);  
+	440         n->fclone = SKB_FCLONE_CLONE;  
+	441         atomic_inc(fclone_ref);  
+	442     } else {  
+	443         n = kmem_cache_alloc(skbuff_head_cache, gfp_mask);  
+	444         if (!n)  
+	445             return NULL;  
+	446         n->fclone = SKB_FCLONE_UNAVAILABLE;  
+	447     }  
+	448  
+	449 #define C(x) n->x = skb->x  
+	450  
+	451     n->nnext = n->prev = NULL;  
+	452     n->sk = NULL;  
+	453     C(tstamp);  
+	454     C(dev);  
+	455     C(h);  
+	456     C(nh);  
+	457     C(mac);  
+	458     C(dst);  
+	459     dst_clone(skb->dst);  
+	460     C(sp);  
+	461 #ifdef CONFIG_INET  
+	462     secpath_get(skb->sp);  
+	463 #endif  
+	464     memcpy(n->cb, skb->cb, sizeof(skb->cb));  
+	465     C(len);  
+	466     C(data_len);  
+	467     C(csum);  
+	468     C(local_df);  
+	469     n->cloned = 1;  
+	470     n->nohdr = 0;  
+	471     C(pkt_type);  
+	472     C(ip_summed);  
+	473     C(priority);  
+	474 #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)  
+	475     C(ipvs_property);  
+	476 #endif  
+	477     C(protocol);  
+	478     n->destructor = NULL;  
+	479     C(mark);  
+	480 #ifdef CONFIG_NETFILTER  
+	481     C(nfct);  
+	482     nf_conntrack_get(skb->nfct);  
+	483     C(nfctinfo);  
+	484 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)  
+	485     C(nfct_reasm);  
+	486     nf_conntrack_get_reasm(skb->nfct_reasm);  
+	487 #endif  
+	488 #ifdef CONFIG_BRIDGE_NETFILTER  
+	489     C(nf_bridge);  
+	490     nf_bridge_get(skb->nf_bridge);  
+	491 #endif  
+	492 #endif /*CONFIG_NETFILTER*/  
+	493 #ifdef CONFIG_NET_SCHED  
+	494     C(tc_index);  
+	495 #ifdef CONFIG_NET_CLS_ACT  
+	496     n->tc_verd = SET_TC_VERD(skb->tc_verd,0);  
+	497     n->tc_verd = CLR_TC_OK2MUNGE(n->tc_verd);  
+	498     n->tc_verd = CLR_TC_MUNGED(n->tc_verd);  
+	499     C(input_dev);  
+	500 #endif  
+	501     skb_copy_secmark(n, skb);  
+	502 #endif  
+	503     C(truesize);  
+	504     atomic_set(&n->users, 1);  
+	505     C(head);  
+	506     C(data);  
+	507     C(tail);  
+	508     C(end);  
+	509  
+	510     atomic_inc(&(skb_shinfo(skb)->dataref));  
+	511     skb->cloned = 1;  
+	512  
+	513     return n;  
+	514 }
 ```
 
 436-438 由fclone标志来决定从哪个缓冲池中分配SKB描述符。如果紧邻的两个父子SKB描述符，前一个的fclone为SKB_FCLONE_ORIG，后一个的fclone为SKB_FCLONE_ UNAVAILABLE，则说明这两个SKB描述符是从skbuff_fclone_cache缓冲池中分配的，且父SKB描述符还没有被克隆，即子SKB描述符还是空的。否则即从skbuff_head_cache缓冲池中分配一个新的SKB来用于克隆。
@@ -344,30 +344,30 @@ skb_pull()通过将data指针往下移动，在数据区首部忽略len字节长
 ![](/images/kernel/2015-04-01-9.jpg)  
 
 ```
-    587 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)  
-    588 {  
-    589     int headerlen = skb->data - skb->head;  
-    590     /*  
-    591      *    Allocate the copy buffer  
-    592      */  
-    593     struct sk_buff *n = alloc_skb(skb->end - skb->head + skb->data_len,  
-    594                       gfp_mask);  
-    595     if (!n)  
-    596         return NULL;  
-    597  
-    598     /* Set the data pointer */  
-    599     skb_reserve(n, headerlen);  
-    600     /* Set the tail pointer and length */  
-    601     skb_put(n, skb->len);  
-    602     n->csum         = skb->csum;  
-    603     n->ip_summed = skb->ip_summed;  
-    604  
-    605     if (skb_copy_bits(skb, -headerlen, n->head, headerlen + skb->len))  
-    606         BUG();  
-    607  
-    608     copy_skb_header(n, skb);  
-    609     return n;  
-    610 }
+	587 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)  
+	588 {  
+	589     int headerlen = skb->data - skb->head;  
+	590     /*  
+	591      *    Allocate the copy buffer  
+	592      */  
+	593     struct sk_buff *n = alloc_skb(skb->end - skb->head + skb->data_len,  
+	594                       gfp_mask);  
+	595     if (!n)  
+	596         return NULL;  
+	597  
+	598     /* Set the data pointer */  
+	599     skb_reserve(n, headerlen);  
+	600     /* Set the tail pointer and length */  
+	601     skb_put(n, skb->len);  
+	602     n->csum         = skb->csum;  
+	603     n->ip_summed = skb->ip_summed;  
+	604  
+	605     if (skb_copy_bits(skb, -headerlen, n->head, headerlen + skb->len))  
+	606         BUG();  
+	607  
+	608     copy_skb_header(n, skb);  
+	609     return n;  
+	610 }
 ```
 
 589-599 分配一个新的SKB，即包括SKB描述符和数据缓存区，然后在指针head和data之间预留源数据缓存区headroom长度的空间。

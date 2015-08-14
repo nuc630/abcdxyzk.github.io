@@ -80,8 +80,8 @@ rbreak ^list_ 功能与上同。
 
 	Num        Type                    Disp Enb  Address      What
 	 1       breakpoint                keep y    <MULTIPLE>
-         stop only if i==1
-         breakpoint already hit 1 time
+	 stop only if i==1
+	 breakpoint already hit 1 time
 	 1.1                                    y    0x080486a2 in void foo<int>() at t.cc:8
 	 1.2                                    y    0x080486ca in void foo<double>() at t.cc:8
 ```

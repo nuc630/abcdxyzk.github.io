@@ -13,12 +13,12 @@ tags:
 
 ERROR- You are missing the following 32-bit libraries, and Steam may not run:
 ```
-sudo ln -s /usr/lib/i386-linux-gnu/mesa/libGL.so.1 /usr/lib
+	sudo ln -s /usr/lib/i386-linux-gnu/mesa/libGL.so.1 /usr/lib
 ```
 
 无法输入：
 ```
-export LC_CTYPE="en_US.UTF-8" && steam
+	export LC_CTYPE="en_US.UTF-8" && steam
 ```
 
 #### 一、集显
@@ -63,25 +63,25 @@ primus默认是有垂直同步的，帧数当然会低，加个vblank_mode=0绝�
 ###### 1首先开启命令面板
 ###### 2输入常用命令
 ```
-net_graph 1 （ 网络状况显示）
-    再来就是改变位置，有些人不喜欢显示在左边，这个时候可以输入：
-　　net_graphpos 1
-　　这样显示的数据就会变到右边
-　　
-　　net_graphpos 2
-　　这样会变成中间
-　　
-　　net_graphpos 3
-　　这样会变成左边
+	net_graph 1 （ 网络状况显示）
+		再来就是改变位置，有些人不喜欢显示在左边，这个时候可以输入：
+		net_graphpos 1
+		这样显示的数据就会变到右边
 
-dota_minimap_hero_size 650 （英雄在小地图上的大小 650 为正常值，可自行更改）
-dota_force_right_click_attack 1 (英雄可以右键直接反补）
-dota_hud_healthbars 1 （去掉生命条上的分隔）
-dota_health_per_vertical_marker 250 （更改每一个分隔代表的血量 默认为250）
-dota_disable_range_finder 0  （随时显示你的施法距离）（很有用）
-dota_camera_accelerate 49 （任意调整观看视角）（没用过）
+		net_graphpos 2
+		这样会变成中间
 
-dota2 一共有数百种命令，包括血的颜色，屏蔽某种声音等等，但是比较实际的就是这几种，其他的就不列举了。
+		net_graphpos 3
+		这样会变成左边
+
+	dota_minimap_hero_size 650 （英雄在小地图上的大小 650 为正常值，可自行更改）
+	dota_force_right_click_attack 1 (英雄可以右键直接反补）
+	dota_hud_healthbars 1 （去掉生命条上的分隔）
+	dota_health_per_vertical_marker 250 （更改每一个分隔代表的血量 默认为250）
+	dota_disable_range_finder 0  （随时显示你的施法距离）（很有用）
+	dota_camera_accelerate 49 （任意调整观看视角）（没用过）
+
+	dota2 一共有数百种命令，包括血的颜色，屏蔽某种声音等等，但是比较实际的就是这几种，其他的就不列举了。
 
 ```
 
@@ -92,27 +92,26 @@ dota2 一共有数百种命令，包括血的颜色，屏蔽某种声音等等�
 
 在XXX\Steam\SteamApps\common\dota 2 beta\dota目录下新建一个名为replays的文件夹即可
 
-
-
 --------------
 
 ```
-net_graphheight "64"
-这个等于是设置高度位置 大家如果分屏率不同 可以修改数字来决定位置 数字越小 会往下移动 
+	net_graphheight "64"
+	这个等于是设置高度位置 大家如果分屏率不同 可以修改数字来决定位置 数字越小 会往下移动 
 
-net_graphinsetbottom "437"
-这个等于是设置地步位置 大家如果分屏率不同 可以修改数字来决定位置 数字越小 会往上移动 
+	net_graphinsetbottom "437"
+	这个等于是设置地步位置 大家如果分屏率不同 可以修改数字来决定位置 数字越小 会往上移动 
 
-net_graphinsetleft "0"
-因为已经设置右边 这个保持0就OK 但是也记得输入一次 以防万一 
+	net_graphinsetleft "0"
+	因为已经设置右边 这个保持0就OK 但是也记得输入一次 以防万一 
 
-net_graphinsetright "-83"
-设置右边距离 记住这里是"-83" 不是83 负数越高 越往右 大家可以根据自己的需要改变数字 
+	net_graphinsetright "-83"
+	设置右边距离 记住这里是"-83" 不是83 负数越高 越往右 大家可以根据自己的需要改变数字 
 
 
-net_graphproportionalfont "0"
-这个是关键 字体比例问题 默认是1 设定为0以后 就会变成我图中那样的小字 
+	net_graphproportionalfont "0"
+	这个是关键 字体比例问题 默认是1 设定为0以后 就会变成我图中那样的小字 
 
-net_graphtext "1"
-这个没什么大问题 字体样式
+	net_graphtext "1"
+	这个没什么大问题 字体样式
 ```
+

@@ -51,16 +51,16 @@ It has been demomstrated that this method can successfully grow the receiver's a
 	  
 		/* Receiver side RTT estimation */  
 		struct {  
-		    u32 rtt;  
-		    u32 seq;  
-		    u32 time;  
+			u32 rtt;  
+			u32 seq;  
+			u32 time;  
 		} rcv_rtt_est; /* 用于接收端的RTT测量*/  
 	  
 		/* Receiver queue space */  
 		struct {  
-		    int space;  
-		    u32 seq;  
-		    u32 time;  
+			int space;  
+			u32 seq;  
+			u32 time;  
 		} rcvq_space; /* 用于调整接收缓冲区和接收窗口*/  
 	  
 		/* Options received (usually on last packet, some only on SYN packets). */  
@@ -73,7 +73,7 @@ It has been demomstrated that this method can successfully grow the receiver's a
 		int sk_rcvbuf; /* TCP接收缓冲区的大小*/  
 		int sk_sndbuf; /* TCP发送缓冲区大小*/  
 		unsigned int ...  
-		    sk_userlocks : 4, /*TCP接收缓冲区的锁标志*/  
+			sk_userlocks : 4, /*TCP接收缓冲区的锁标志*/  
 		...  
 	};
 ```
@@ -83,23 +83,23 @@ It has been demomstrated that this method can successfully grow the receiver's a
 
 #####（1）没有时间戳时的测量方法
 ```
-    static inline void tcp_rcv_rtt_measure(struct tcp_sock *tp)  
-    {  
-        /* 第一次接收到数据时，需要对相关变量初始化*/  
-        if (tp->rcv_rtt_est.time == 0)  
-            goto new_measure;  
-      
-        /* 收到指定的序列号后，才能获取一个RTT测量样本*/  
-        if (before(tp->rcv_nxt, tp->rcv_rtt_est.seq))  
-            return;  
-      
-        /* RTT的样本：jiffies - tp->rcv_rtt_est.time */  
-        tcp_rcv_rtt_update(tp, jiffies - tp->rcv_rtt_est.time, 1);  
-      
-    new_measure:  
-        tp->rcv_rtt_est.seq = tp->rcv_nxt + tp->rcv_wnd; /* 收到此序列号的ack时，一个RTT样本的计时结束*/  
-        tp->rcv_rtt_est.time = tcp_time_stamp; /* 一个RTT样本开始计时*/  
-    }
+	static inline void tcp_rcv_rtt_measure(struct tcp_sock *tp)  
+	{  
+		/* 第一次接收到数据时，需要对相关变量初始化*/  
+		if (tp->rcv_rtt_est.time == 0)  
+			goto new_measure;  
+	  
+		/* 收到指定的序列号后，才能获取一个RTT测量样本*/  
+		if (before(tp->rcv_nxt, tp->rcv_rtt_est.seq))  
+			return;  
+	  
+		/* RTT的样本：jiffies - tp->rcv_rtt_est.time */  
+		tcp_rcv_rtt_update(tp, jiffies - tp->rcv_rtt_est.time, 1);  
+	  
+	new_measure:  
+		tp->rcv_rtt_est.seq = tp->rcv_nxt + tp->rcv_wnd; /* 收到此序列号的ack时，一个RTT样本的计时结束*/  
+		tp->rcv_rtt_est.time = tcp_time_stamp; /* 一个RTT样本开始计时*/  
+	}
 ```
 
 此函数在接收到带有负载的数据段时被调用。
@@ -111,15 +111,15 @@ If the sender is being throttled by the network, this estimate will be valid. Ho
 
 #####（2）采用时间戳选项时的测量方法
 ```
-    static inline void tcp_rcv_rtt_measure_ts(struct sock *sk, const struct sk_buff *skb)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        /* 启用了Timestamps选项，并且流量稳定*/  
-        if (tp->rx_opt.rcv_tsecr && (TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq >=  
-            inet_csk(sk)->icsk_ack.rcv_mss))  
-            /* RTT = 当前时间 - 回显时间*/  
-            tcp_rcv_rtt_update(tp, tcp_time_stamp - tp->rx_opt.rcv_tsecr, 0);  
-    }
+	static inline void tcp_rcv_rtt_measure_ts(struct sock *sk, const struct sk_buff *skb)  
+	{  
+		struct tcp_sock *tp = tcp_sk(sk);  
+		/* 启用了Timestamps选项，并且流量稳定*/  
+		if (tp->rx_opt.rcv_tsecr && (TCP_SKB_CB(skb)->end_seq - TCP_SKB_CB(skb)->seq >=  
+			inet_csk(sk)->icsk_ack.rcv_mss))  
+			/* RTT = 当前时间 - 回显时间*/  
+			tcp_rcv_rtt_update(tp, tcp_time_stamp - tp->rx_opt.rcv_tsecr, 0);  
+	}
 ```
 
 虽然此种方法是默认方法，但是在流量小的时候，通过时间戳采样得到的RTT的值会偏大，此时就会采用没有时间戳时的RTT测量方法。
@@ -127,40 +127,40 @@ If the sender is being throttled by the network, this estimate will be valid. Ho
 #####（3）采样处理
 不管是没有使用时间戳选项的RTT采样，还是使用时间戳选项的RTT采样，都是获得一个RTT样本。之后还需要对获得的RTT样本进行处理，以得到最终的RTT。
 ```
-    /* win_dep表示是否对RTT采样进行微调，1为不进行微调，0为进行微调。*/  
-    static void tcp_rcv_rtt_update(struct tcp_sock *tp, u32 sample, int win_dep)  
-    {  
-        u32 new_sample = tp->rcv_rtt_est.rtt;  
-        long m = sample;  
-      
-        if (m == 0)  
-            m = 1; /* 时延最小为1ms*/  
-      
-        if (new_sample != 0) { /* 不是第一次获得样本*/  
-            /* If we sample in larger samples in the non-timestamp case, we could grossly 
-             * overestimate the RTT especially with chatty applications or bulk transfer apps 
-             * which are stalled on filesystem I/O. 
-             * 
-             * Also, since we are only going for a minimum in the non-timestamp case, we do 
-             * not smooth things out else with timestamps disabled convergence takes too long. 
-             */  
-            /* 对RTT采样进行微调，新的RTT样本只占最终RTT的1/8 */  
-            if (! win_dep) {   
-                m -= (new_sample >> 3);  
-                new_sample += m;  
-      
-            } else if (m < new_sample)  
-                /* 不对RTT采样进行微调，直接取最小值，原因可见上面那段注释*/  
-                new_sample = m << 3;   
-      
-        } else {   
-            /* No previous measure. 第一次获得样本*/  
-            new_sample = m << 3;  
-        }  
-      
-        if (tp->rcv_rtt_est.rtt != new_sample)  
-            tp->rcv_rtt_est.rtt = new_sample; /* 更新RTT*/  
-    }
+	/* win_dep表示是否对RTT采样进行微调，1为不进行微调，0为进行微调。*/  
+	static void tcp_rcv_rtt_update(struct tcp_sock *tp, u32 sample, int win_dep)  
+	{  
+		u32 new_sample = tp->rcv_rtt_est.rtt;  
+		long m = sample;  
+	  
+		if (m == 0)  
+			m = 1; /* 时延最小为1ms*/  
+	  
+		if (new_sample != 0) { /* 不是第一次获得样本*/  
+			/* If we sample in larger samples in the non-timestamp case, we could grossly 
+			 * overestimate the RTT especially with chatty applications or bulk transfer apps 
+			 * which are stalled on filesystem I/O. 
+			 * 
+			 * Also, since we are only going for a minimum in the non-timestamp case, we do 
+			 * not smooth things out else with timestamps disabled convergence takes too long. 
+			 */  
+			/* 对RTT采样进行微调，新的RTT样本只占最终RTT的1/8 */  
+			if (! win_dep) {   
+				m -= (new_sample >> 3);  
+				new_sample += m;  
+	  
+			} else if (m < new_sample)  
+				/* 不对RTT采样进行微调，直接取最小值，原因可见上面那段注释*/  
+				new_sample = m << 3;   
+	  
+		} else {   
+			/* No previous measure. 第一次获得样本*/  
+			new_sample = m << 3;  
+		}  
+	  
+		if (tp->rcv_rtt_est.rtt != new_sample)  
+			tp->rcv_rtt_est.rtt = new_sample; /* 更新RTT*/  
+	}
 ```
 
 对于没有使用时间戳选项的RTT测量方法，不进行微调。因为用此种方法获得的RTT采样值已经偏高而且收敛很慢。直接选择最小RTT样本作为最终的RTT测量值。  
@@ -169,88 +169,88 @@ If the sender is being throttled by the network, this estimate will be valid. Ho
 #### 调整接收缓存
 当数据从TCP接收缓存复制到用户空间之后，会调用tcp_rcv_space_adjust()来调整TCP接收缓存和接收窗口上限的大小。
 ```
-    /*  
-     * This function should be called every time data is copied to user space. 
-     * It calculates the appropriate TCP receive buffer space. 
-     */  
-    void tcp_rcv_space_adjust(struct sock *sk)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        int time;  
-        int space;  
-      
-        /* 第一次调整*/  
-        if (tp->rcvq_space.time == 0)  
-            goto new_measure;  
-      
-        time = tcp_time_stamp - tp->rcvq_space.time; /*计算上次调整到现在的时间*/  
-      
-        /* 调整至少每隔一个RTT才进行一次，RTT的作用在这里！*/  
-        if (time < (tp->rcv_rtt_est.rtt >> 3) || tp->rcv_rtt_est.rtt == 0)  
-            return;  
-      
-        /* 一个RTT内接收方应用程序接收并复制到用户空间的数据量的2倍*/  
-        space = 2 * (tp->copied_seq - tp->rcvq_space.seq);  
-        space = max(tp->rcvq_space.space, space);  
-      
-        /* 如果这次的space比上次的大*/  
-        if (tp->rcvq_space.space != space) {  
-            int rcvmem;  
-            tp->rcvq_space.space = space; /*更新rcvq_space.space*/  
-      
-            /* 启用自动调节接收缓冲区大小，并且接收缓冲区没有上锁*/  
-            if (sysctl_tcp_moderate_rcvbuf && ! (sk->sk_userlocks & SOCK_RCVBUF_LOCK)) {  
-                int new_clamp = space;  
-                /* Receive space grows, normalize in order to take into account packet headers and 
-                 * sk_buff structure overhead. 
-                 */  
-                 space /= tp->advmss; /* 接收缓冲区可以缓存数据包的个数*/  
-      
-                 if (!space)  
-                    space = 1;  
-      
-                /* 一个数据包耗费的总内存包括： 
-                   * 应用层数据：tp->advmss， 
-                   * 协议头：MAX_TCP_HEADER， 
-                   * sk_buff结构， 
-                   * skb_shared_info结构。 
-                   */  
-                 rcvmem = SKB_TRUESIZE(tp->advmss + MAX_TCP_HEADER);  
-      
-                 /* 对rcvmem进行微调*/  
-                 while(tcp_win_from_space(rcvmem) < tp->advmss)  
-                     rcvmem += 128;  
-      
-                 space *= rcvmem;  
-                 space = min(space, sysctl_tcp_rmem[2]); /*不能超过允许的最大接收缓冲区大小*/  
-      
-                 if (space > sk->sk_rcvbuf) {  
-                     sk->sk_rcvbuf = space; /* 调整接收缓冲区的大小*/  
-                     /* Make the window clamp follow along. */  
-                     tp->window_clamp = new_clamp; /*调整接收窗口的上限*/  
-                 }  
-            }  
-        }  
-      
-    new_measure:  
-         /*此序号之前的数据已复制到用户空间，下次复制将从这里开始*/  
-        tp->rcvq_space.seq = tp->copied_seq;  
-        tp->rcvq_space.time = tcp_time_stamp; /*记录这次调整的时间*/  
-    }  
-      
-      
-    /* return minimum truesize of the skb containing X bytes of data */  
-    #define SKB_TRUESIZE(X) ((X) +              \  
-                                SKB_DATA_ALIGN(sizeof(struct sk_buff)) +        \  
-                                SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))  
-      
-      
-    static inline int tcp_win_from_space(int space)  
-    {  
-        return sysctl_tcp_adv_win_scale <= 0 ?  
-                  (space >> (-sysctl_tcp_adv_win_scale)) :  
-                   space - (space >> sysctl_tcp_adv_win_scale);  
-    }
+	/*  
+	 * This function should be called every time data is copied to user space. 
+	 * It calculates the appropriate TCP receive buffer space. 
+	 */  
+	void tcp_rcv_space_adjust(struct sock *sk)  
+	{  
+		struct tcp_sock *tp = tcp_sk(sk);  
+		int time;  
+		int space;  
+	  
+		/* 第一次调整*/  
+		if (tp->rcvq_space.time == 0)  
+			goto new_measure;  
+	  
+		time = tcp_time_stamp - tp->rcvq_space.time; /*计算上次调整到现在的时间*/  
+	  
+		/* 调整至少每隔一个RTT才进行一次，RTT的作用在这里！*/  
+		if (time < (tp->rcv_rtt_est.rtt >> 3) || tp->rcv_rtt_est.rtt == 0)  
+			return;  
+	  
+		/* 一个RTT内接收方应用程序接收并复制到用户空间的数据量的2倍*/  
+		space = 2 * (tp->copied_seq - tp->rcvq_space.seq);  
+		space = max(tp->rcvq_space.space, space);  
+	  
+		/* 如果这次的space比上次的大*/  
+		if (tp->rcvq_space.space != space) {  
+			int rcvmem;  
+			tp->rcvq_space.space = space; /*更新rcvq_space.space*/  
+	  
+			/* 启用自动调节接收缓冲区大小，并且接收缓冲区没有上锁*/  
+			if (sysctl_tcp_moderate_rcvbuf && ! (sk->sk_userlocks & SOCK_RCVBUF_LOCK)) {  
+				int new_clamp = space;  
+				/* Receive space grows, normalize in order to take into account packet headers and 
+				 * sk_buff structure overhead. 
+				 */  
+				 space /= tp->advmss; /* 接收缓冲区可以缓存数据包的个数*/  
+	  
+				 if (!space)  
+					space = 1;  
+	  
+				/* 一个数据包耗费的总内存包括： 
+				   * 应用层数据：tp->advmss， 
+				   * 协议头：MAX_TCP_HEADER， 
+				   * sk_buff结构， 
+				   * skb_shared_info结构。 
+				   */  
+				 rcvmem = SKB_TRUESIZE(tp->advmss + MAX_TCP_HEADER);  
+	  
+				 /* 对rcvmem进行微调*/  
+				 while(tcp_win_from_space(rcvmem) < tp->advmss)  
+					 rcvmem += 128;  
+	  
+				 space *= rcvmem;  
+				 space = min(space, sysctl_tcp_rmem[2]); /*不能超过允许的最大接收缓冲区大小*/  
+	  
+				 if (space > sk->sk_rcvbuf) {  
+					 sk->sk_rcvbuf = space; /* 调整接收缓冲区的大小*/  
+					 /* Make the window clamp follow along. */  
+					 tp->window_clamp = new_clamp; /*调整接收窗口的上限*/  
+				 }  
+			}  
+		}  
+	  
+	new_measure:  
+		 /*此序号之前的数据已复制到用户空间，下次复制将从这里开始*/  
+		tp->rcvq_space.seq = tp->copied_seq;  
+		tp->rcvq_space.time = tcp_time_stamp; /*记录这次调整的时间*/  
+	}  
+	  
+	  
+	/* return minimum truesize of the skb containing X bytes of data */  
+	#define SKB_TRUESIZE(X) ((X) +              \  
+		SKB_DATA_ALIGN(sizeof(struct sk_buff)) +        \  
+		SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))  
+	  
+	  
+	static inline int tcp_win_from_space(int space)  
+	{  
+		return sysctl_tcp_adv_win_scale <= 0 ?  
+				  (space >> (-sysctl_tcp_adv_win_scale)) :  
+				   space - (space >> sysctl_tcp_adv_win_scale);  
+	}
 ```
 
 tp->rcvq_space.space表示当前接收缓存的大小（只包括应用层数据，单位为字节）。  

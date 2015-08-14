@@ -65,14 +65,19 @@ tags:
 
 ##### (2)const 修饰函数返回值
 const修饰函数返回值其实用的并不是很多，它的含义和const修饰普通变量以及指针的含义基本相同。
+
 ###### a.
 const int fun1() // 这个其实无意义，因为参数返回本身就是赋值。
+
 ###### b.
-const int * fun2() //调用时 const int *pValue = fun2();  
-                   //我们可以把fun2()看作成一个变量，即指针内容不可变。
+const int * fun2()  
+//调用时 const int *pValue = fun2();  
+//我们可以把fun2()看作成一个变量，即指针内容不可变。
+
 ###### c.
-int* const fun3()   //调用时 int * const pValue = fun2();  
-                    //我们可以把fun2()看作成一个变量，即指针本身不可变。
+int* const fun3()  
+//调用时 int * const pValue = fun2();  
+//我们可以把fun2()看作成一个变量，即指针本身不可变。
 
 一般情况下，函数的返回值为某个对象时，如果将其声明为const时，多用于操作符的重载。  
 通常，不建议用const修饰函数的返回值类型为某个对象或对某个对象引用的情况。  

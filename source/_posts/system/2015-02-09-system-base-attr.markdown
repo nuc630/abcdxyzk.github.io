@@ -13,17 +13,15 @@ tags:
 
 执行命令：
 ```
-[root@localhost softwaretools]# groupadd mysql
-groupadd：无法打开组文件（groupadd: unable to open group file）
+	[root@localhost softwaretools]# groupadd mysql
+	groupadd：无法打开组文件（groupadd: unable to open group file）
 ```
 
 此时就奇怪了，当前用的明明是root用户，为什么没有创建组和用户的权限呢。
 
-结论：
-```
-1，添加用户需要用到passwd和shadow这两个文件
-2，添加组需要用到shadow和gshadow这两个文件
-```
+结论： 
+  1，添加用户需要用到passwd和shadow这两个文件  
+  2，添加组需要用到shadow和gshadow这两个文件  
 
 使用 ls -l 命令发现权限正常。
 
@@ -35,14 +33,14 @@ groupadd：无法打开组文件（groupadd: unable to open group file）
 
 首先使用使用lsattr查看了一下这几个文件：
 ```
-    [root@localhost ~]# lsattr /etc/passwd  
-    ------------- /etc/passwd  
-    [root@localhost ~]# lsattr /etc/group  
-    ----i-------- /etc/group  
-    [root@localhost ~]# lsattr /etc/shadow  
-    ------------- /etc/shadow  
-    [root@localhost ~]# lsattr /etc/gshadow  
-    ----i-------- /etc/gshadow  
+	[root@localhost ~]# lsattr /etc/passwd  
+	------------- /etc/passwd  
+	[root@localhost ~]# lsattr /etc/group  
+	----i-------- /etc/group  
+	[root@localhost ~]# lsattr /etc/shadow  
+	------------- /etc/shadow  
+	[root@localhost ~]# lsattr /etc/gshadow  
+	----i-------- /etc/gshadow  
 ```
 
 可以看到文件被设置的 i 这个隐藏权限，  

@@ -11,21 +11,21 @@ categories:
 tags:
 ---
 ```
-commit baff42ab1494528907bf4d5870359e31711746ae
-Author: Steven J. Magnani <steve@digidescorp.com>
-Date:   Tue Mar 30 13:56:01 2010 -0700
+	commit baff42ab1494528907bf4d5870359e31711746ae
+	Author: Steven J. Magnani <steve@digidescorp.com>
+	Date:   Tue Mar 30 13:56:01 2010 -0700
 
-    net: Fix oops from tcp_collapse() when using splice()
-    
-    tcp_read_sock() can have a eat skbs without immediately advancing copied_seq.
-    This can cause a panic in tcp_collapse() if it is called as a result
-    of the recv_actor dropping the socket lock.
-    
-    A userspace program that splices data from a socket to either another
-    socket or to a file can trigger this bug.
-    
-    Signed-off-by: Steven J. Magnani <steve@digidescorp.com>
-    Signed-off-by: David S. Miller <davem@davemloft.net>
+		net: Fix oops from tcp_collapse() when using splice()
+
+		tcp_read_sock() can have a eat skbs without immediately advancing copied_seq.
+		This can cause a panic in tcp_collapse() if it is called as a result
+		of the recv_actor dropping the socket lock.
+
+		A userspace program that splices data from a socket to either another
+		socket or to a file can trigger this bug.
+
+		Signed-off-by: Steven J. Magnani <steve@digidescorp.com>
+		Signed-off-by: David S. Miller <davem@davemloft.net>
 ```
 ```
 	diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c

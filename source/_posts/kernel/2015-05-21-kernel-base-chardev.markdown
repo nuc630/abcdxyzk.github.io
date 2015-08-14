@@ -77,8 +77,8 @@ http://techlife.blog.51cto.com/212583/39225
 ```
 	#define DEFAULT_MAJOR 145         /* data structure used by our driver */
 	int char8139_major=DEFAULT_MAJOR; /* major device number. if initial value is 0,
-                                       * the kernel will dynamically assign a major device
-                                       * number in register_chrdev() */
+					   * the kernel will dynamically assign a major device
+					   * number in register_chrdev() */
 ```
 
 这里我们指定我们的设备的主设备号是145,你必须找到一个系统中没有用的主设备号，可以通过"cat /proc/devices"命令来查看系统中已经使用的主设备号。

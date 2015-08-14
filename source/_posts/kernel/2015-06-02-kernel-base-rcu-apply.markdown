@@ -36,7 +36,7 @@ http://blog.csdn.net/jianchaolv/article/details/7527647
 		(_________p1);                \
 	}) 
 ```
-        
+
 rcu_assign_pointer()通常用于写者的发布，rcu_dereference()通常用于读者的订阅。
 
 写者：

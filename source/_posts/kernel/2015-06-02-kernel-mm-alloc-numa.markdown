@@ -428,8 +428,8 @@ alloc_pages_node(node, gfp_flags, order)分配流程：
 kmem_cache_alloc_node(cachep, gfp_flags, node)分配流程：  
   1) 如果node值为-1，node取本地节点号(node = numa_node_id())；  
   2) 如果node < -1，则执行fall back行为，此行为与用户策略有关，有点类似隐式分配：  
-    a) 根据用户策略(包括CPUSET和内存策略)依次选取节点，根据gfp_flags选取合适的zonelist进行分配；  
-    b) 如果内存不足分配失败，则跳过内存策略直接进行隐式Buddy页面分配(仍受CPUSET的限定，关于CPUSET和内存策略后面会介绍)，最终构建成新的SLAB并完成本次分配；转5)；  
+   a) 根据用户策略(包括CPUSET和内存策略)依次选取节点，根据gfp_flags选取合适的zonelist进行分配；  
+   b) 如果内存不足分配失败，则跳过内存策略直接进行隐式Buddy页面分配(仍受CPUSET的限定，关于CPUSET和内存策略后面会介绍)，最终构建成新的SLAB并完成本次分配；转5)；  
   3) 如果node是正常节点号，则先在node节点上根据gfp_flags选取合适的zonelist进行分配；  
   4) 如果3)中node节点内存不足分配失败，转2) a)执行fall back行为。  
   5) 分配结束。  
@@ -487,8 +487,8 @@ MPOL_BIND： 设置一个节点集合，只能从这个集合中节点的zone申
 
   1)无`__GFP_THISNODE`申请标记，使用本地节点的zonelist[0]；  
   2)置有`__GFP_THISNODE`申请标记，如果本地节点：  
-    a)在集合中，使用本地节点的zonelist[1]；  
-    b)不在集合中，使用集合中最小节点号的zonelist[1]；  
+   a)在集合中，使用本地节点的zonelist[1]；  
+   b)不在集合中，使用集合中最小节点号的zonelist[1]；  
 
 MPOL_INTERLEAVE：采用Round-Robin方式从设定的节点集合中选出某个节点，使用此节点的zonelist；
 

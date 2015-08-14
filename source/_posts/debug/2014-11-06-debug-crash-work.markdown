@@ -40,8 +40,7 @@ more than once that the crash utility be re-implemented in pure gdb.
 Last time I looked (approx. 1.5 years ago) the main missing pieces were:  
   
   1. Use of physical addresses (described above)  
-  2. Support for multiple virtual address spaces (for different process  
-     contexts)  
+  2. Support for multiple virtual address spaces (for different process contexts)  
   3. Ability to read compressed kdump files  
   4. Ability to use 64-bit files on 32-bit platforms (to handle PAE)  
   

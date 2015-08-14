@@ -597,9 +597,9 @@ OK看一下tcp_may_undo函数：检测能否撤销
 		if ((flag & (FLAG_ANY_PROGRESS | FLAG_DSACKING_ACK)) ||
 			(tcp_is_reno(tp) && !(flag & FLAG_NOT_DUP))) {
 			tp->snd_cwnd_cnt = decr & 1;                    // 因为此处只可能是0,1三个值，这样的操作其实就是切换值，
-                                                            // 例如现在是第一个ACK，即之前的snd_cwnd_cnt=0，decr=1，那么1&1=1，
-                                                            // 将snd_cwnd_cnt赋值为1；第二个ACK到来，decr=2，则2&1=0，
-                                                            // 相当于又将snd_cwnd_cnt初始化为0，因为两个ACK就需要处理一次。
+			                                                // 例如现在是第一个ACK，即之前的snd_cwnd_cnt=0，decr=1，那么1&1=1，
+			                                                // 将snd_cwnd_cnt赋值为1；第二个ACK到来，decr=2，则2&1=0，
+			                                                // 相当于又将snd_cwnd_cnt初始化为0，因为两个ACK就需要处理一次。
 			decr >>= 1;   // 除以2，是判断是第一个ACK，还是第二个；第一个的话值=0，下面不会执行，是2的话=1，下面一句会执行
 
 			if (decr && tp->snd_cwnd > tcp_cwnd_min(sk))    // 如果是第二个ACK && 比最小的门限值还大一点，那么还需要减小cwnd

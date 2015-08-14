@@ -69,32 +69,32 @@ http://blog.csdn.net/justlinux2010/article/details/12619761
   我们前面提高过，造成半连接队列满有两种情况（不考虑半连接队列很小的情况），一种是负载过高，正常的连接数过多；另一种是SYN flood攻击。如果是第一种情况，此时是否继续构建连接，则要取决于连接队列的情况及半连接队列的重传情况，如下所示：
 ```
 	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1)
-        goto drop;
+		goto drop;
 ```
   sk_acceptq_is_full()函数很好理解，根据字面意思就可以看出，该函数是检查连接队列是否已满。inet_csk_reqsk_queue_young()函数返回半连接队列中未重传过SYN+ACK段的连接请求块数量。如果连接队列已满并且半连接队列中的连接请求块中未重传的数量大于1，则会跳转到drop处，丢弃SYN包。如果半连接队列中未重传的请求块数量大于1，则表示未来可能有2个完成的连接，这些新完成的连接要放到连接队列中，但此时连接队列已满。如果在接收到三次握手中最后的ACK后连接队列中没有空闲的位置，会忽略接收到的ACK包，连接建立会推迟，所以此时最好丢掉部分新的连接请求，空出资源以完成正在进行的连接建立过程。还要注意，这个判断并没有考虑半连接队列是否已满的问题。从这里可以看出，即使开启了SYN cookies机制并不意味着一定可以完成连接的建立。
 
   如果可以继续连接的建立，调用inet_reqsk_alloc()分配连接请求块，如下所示：
 ```
-    req = inet_reqsk_alloc(&tcp_request_sock_ops);
-    if (!req)
-        goto drop;
+	req = inet_reqsk_alloc(&tcp_request_sock_ops);
+	if (!req)
+		goto drop;
 ```
   看到这里可能就有人疑惑，既然开启了SYN cookies机制，仍然分配连接请求块，那和正常的连接构建也没有什么区别了。这里之所以要分配连接请求块是用于发送SYN+ACK包给客户端，发送后会释放掉，并不会加入到半连接队列中。
 
   接下来就是计算cookie的值，由cookie_v4_init_sequence()函数完成，如下所示：
 ```
-    if (want_cookie) {
+	if (want_cookie) {
 	#ifdef CONFIG_SYN_COOKIES
-        syn_flood_warning(skb);
-        req->cookie_ts = tmp_opt.tstamp_ok;
+		syn_flood_warning(skb);
+		req->cookie_ts = tmp_opt.tstamp_ok;
 	#endif
-        isn = cookie_v4_init_sequence(sk, skb, &req->mss);
-    }
+		isn = cookie_v4_init_sequence(sk, skb, &req->mss);
+	}
 ```
   计算得到的cookie值会保存在连接请求块tcp_request_sock结构的snt_isn成员中，接着会调用__tcp_v4_send_synack()函数发送SYN+ACK包，然后释放前面分配的连接请求块，如下所示：
 ```
 	if (__tcp_v4_send_synack(sk, req, dst) || want_cookie)
-        goto drop_and_free;
+		goto drop_and_free;
 ```
   在服务器端发送完SYN+ACK包后，我们看到在服务器端没有保存任何关于这个未完成连接的信息，所以在接收到客户端的ACK包后，只能根据前面发送的SYN+ACK包中的cookie值来决定是否继续构建连接。
 
@@ -106,7 +106,7 @@ http://blog.csdn.net/justlinux2010/article/details/12619761
 	 
 	#ifdef CONFIG_SYN_COOKIES
 		if (!th->rst && !th->syn && th->ack)
-		    sk = cookie_v4_check(sk, skb, &(IPCB(skb)->opt));
+			sk = cookie_v4_check(sk, skb, &(IPCB(skb)->opt));
 	#endif
 		return sk;
 	}

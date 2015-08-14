@@ -44,51 +44,51 @@ Hello { { 'now' | date: "%Y %h" } }
 ```
 ##### 标准过滤器
 ```
-    date - 格式化时间
-    capitalize - 输出字符串，字符串（句子）首字母大写 e.g. 假设tb为"hello world"{ { tb|capitalize } } #=> 'Hello world'
-    downcase - 转换小写
-    upcase - 转换大写
-    first - 获取数组的第一个元素
-    last - 获取数组的最后一个元素
-    join - 用指定的字符拼接数组元素
-    sort - 排序数组
-    map - map/collect an array on a given property
-    size - 返回数组大小
-    escape - 转移字符串
-    escape_once - returns an escaped version of html without affecting existing escaped entities
-    strip_html - 除去字符串中的html标签?
-    strip_newlines - 除去字符串中的回车?
-    newline_to_br - 将所有的回车"\n" 转换成"<br />"?
-    replace - 替换所有匹配内容 e.g.{ { 'forfor' | replace:'for', 'bar' } } #=> 'barbar'
-    replace_first - 替换第一个匹配内容 e.g.{ { 'forfor' | replace_first:'for', 'bar' } } #=> 'barfor'
-    remove - 移除所有匹配内容 e.g.{ { 'forbarforbar' | remove:'for'} } #=> 'barbar'
-    remove_first - 移除第一个匹配内容 e.g.{ { 'forbarforbar' | remove_first:'for'} } #=> 'barforbar'
-    truncate - truncate a string down to x characters
-    truncatewords - truncate a string down to x words
-    prepend - 在字符串前面加上内容 e.g.{ {'bar'|prepend:'far'} } #=> 'farbar'
-    append - 字符串后面加上内容 e.g.{ {'bar'|append: 'foo'} }#=> 'barfoo'
-    minus - 减法 e.g. { {4|minus:2} } #=>2
-    plus - 加法 e.g. { { 4|plus:2} } #=> 6
-    times - 乘法 e.g. { {10|times:2} } #=> 20
-    divided_by - 除法 e.g. { { 10 | divided_by:2} } #=> 5
-    split - 分割字符串 e.g.{ { "a~b" | split:'~'} } #=> ['a','b']
-    modulo - 取余 e.g. { { 3 | modulo:2 } } #=> 1
+	date - 格式化时间
+	capitalize - 输出字符串，字符串（句子）首字母大写 e.g. 假设tb为"hello world"{ { tb|capitalize } } #=> 'Hello world'
+	downcase - 转换小写
+	upcase - 转换大写
+	first - 获取数组的第一个元素
+	last - 获取数组的最后一个元素
+	join - 用指定的字符拼接数组元素
+	sort - 排序数组
+	map - map/collect an array on a given property
+	size - 返回数组大小
+	escape - 转移字符串
+	escape_once - returns an escaped version of html without affecting existing escaped entities
+	strip_html - 除去字符串中的html标签?
+	strip_newlines - 除去字符串中的回车?
+	newline_to_br - 将所有的回车"\n" 转换成"<br />"?
+	replace - 替换所有匹配内容 e.g.{ { 'forfor' | replace:'for', 'bar' } } #=> 'barbar'
+	replace_first - 替换第一个匹配内容 e.g.{ { 'forfor' | replace_first:'for', 'bar' } } #=> 'barfor'
+	remove - 移除所有匹配内容 e.g.{ { 'forbarforbar' | remove:'for'} } #=> 'barbar'
+	remove_first - 移除第一个匹配内容 e.g.{ { 'forbarforbar' | remove_first:'for'} } #=> 'barforbar'
+	truncate - truncate a string down to x characters
+	truncatewords - truncate a string down to x words
+	prepend - 在字符串前面加上内容 e.g.{ {'bar'|prepend:'far'} } #=> 'farbar'
+	append - 字符串后面加上内容 e.g.{ {'bar'|append: 'foo'} }#=> 'barfoo'
+	minus - 减法 e.g. { {4|minus:2} } #=>2
+	plus - 加法 e.g. { { 4|plus:2} } #=> 6
+	times - 乘法 e.g. { {10|times:2} } #=> 20
+	divided_by - 除法 e.g. { { 10 | divided_by:2} } #=> 5
+	split - 分割字符串 e.g.{ { "a~b" | split:'~'} } #=> ['a','b']
+	modulo - 取余 e.g. { { 3 | modulo:2 } } #=> 1
 ```
 
 #### Tags
 Tag在模板中起到处理逻辑的作用。  
 下面是目前支持的Tag:
 ```
-    assign - 定义变量 e.g. { % assign tt = 1 % } 定义了变量tt数值为1
-    capture - Block tag为变量赋值 e.g.{ % capture dont % }{ { tt } }{ % endcapture % } 将tt的值赋给 dont
-    case - Block tag its the standard case...when block
-    comment - Block tag 注释
-    cycle - Cycle is usually used within a loop to alternate between values, like colors or DOM classes.
-    for - for循环block
-    if - 判断block
-    include - 引入模板
-    raw - 转义内容tag e.g.{ % raw % }{ { this } }{ % endraw% } #=> '{ { this } }'
-    unless - Mirror of if statement
+	assign - 定义变量 e.g. { % assign tt = 1 % } 定义了变量tt数值为1
+	capture - Block tag为变量赋值 e.g.{ % capture dont % }{ { tt } }{ % endcapture % } 将tt的值赋给 dont
+	case - Block tag its the standard case...when block
+	comment - Block tag 注释
+	cycle - Cycle is usually used within a loop to alternate between values, like colors or DOM classes.
+	for - for循环block
+	if - 判断block
+	include - 引入模板
+	raw - 转义内容tag e.g.{ % raw % }{ { this } }{ % endraw% } #=> '{ { this } }'
+	unless - Mirror of if statement
 ```
 
 ##### Comments

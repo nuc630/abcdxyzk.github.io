@@ -76,12 +76,12 @@ haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP�
 			if (s->req->prod->state >= SI_ST_EST) {
 				ana_list = ana_back = s->req->analysers;
 				while (ana_list && max_loops--) {
-					/*这段代码中逐一的列举出了所有的 analysers 对应的处理函数
-		             *这里不一一列出，等待下文具体分析
-		             */
-		             ...
+					/* 这段代码中逐一的列举出了所有的 analysers 对应的处理函数
+					 * 这里不一一列出，等待下文具体分析
+					 */
+					...
 				}
-		    }
+			}
 			rq_prod_last = s->si[0].state;
 			rq_cons_last = s->si[1].state;
 			s->req->flags &= ~CF_WAKE_ONCE;
@@ -95,8 +95,8 @@ haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP�
 首先要判断 s->req->prod->state 的状态是否已经完成建连，根据之前的初始化动作， se->req->prod 指向 s->si[0]，即标识与 client 端连接的相关信息。正确建连成功之 后，会更改 si 的状态的，具体代码在 session_complete() 中：
 
 ```
-    s->si[0].state     = s->si[0].prev_state = SI_ST_EST;
-    ...
+	s->si[0].state     = s->si[0].prev_state = SI_ST_EST;
+	...
 	s->req->prod = &s->si[0];
 	s->req->cons = &s->si[1];
 ```
@@ -122,7 +122,7 @@ haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP�
 				curproxy->accept = frontend_accept;
 
 			if (curproxy->tcp_req.inspect_delay ||
-			    !LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules))
+				!LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules))
 				curproxy->fe_req_ana |= AN_REQ_INSPECT_FE;
 
 			if (curproxy->mode == PR_MODE_HTTP) {
@@ -167,7 +167,7 @@ haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP�
 					UPDATE_ANALYSERS(s->req->analysers, ana_list, ana_back, AN_REQ_SWITCHING_RULES);
 				}
 				...
-            }
+			}
 ```
 
 analysers 的处理也是有顺序的。其中处理请求的第一个函数是 tcp_inspect_request()。 该函数主要是在于如果配置了这里先介绍 http_wait_for_request() 函数的实现。 顾名思义，该函数主要是配置中启用 inspect_rules 时，会调用到该函数。否则的话， 处理 HTTP Req 的第一个函数就是 http_wait_for_request().
@@ -190,22 +190,22 @@ analysers 的处理也是有顺序的。其中处理请求的第一个函数是 
 		 * First, let's catch bad requests.
 		 */
 
-    解析到 header 内容中有不符合 HTTP 协议的情形 HTTP_MSG_ERROR，应答 400 bad request 处理
-    req->buf 满了，甚至加入 maxrewrite 的空间仍然不够用，应答 400 bad request
-    读取错误 CF_READ_ERROR 发生，比如 client 发送 RST 断开连接， 应答 400 bad request
-    读取超时，client 超时未发送完整的请求，应答 408 Request Timeout
-    client 主动关闭，发送 FIN 包，实际上是所谓的 half-close，同样应答 400 bad request
-    如果以上情况都不满足，则意味着还可以继续尝试读取新数据，设置一下超时
+	解析到 header 内容中有不符合 HTTP 协议的情形 HTTP_MSG_ERROR，应答 400 bad request 处理
+	req->buf 满了，甚至加入 maxrewrite 的空间仍然不够用，应答 400 bad request
+	读取错误 CF_READ_ERROR 发生，比如 client 发送 RST 断开连接， 应答 400 bad request
+	读取超时，client 超时未发送完整的请求，应答 408 Request Timeout
+	client 主动关闭，发送 FIN 包，实际上是所谓的 half-close，同样应答 400 bad request
+	如果以上情况都不满足，则意味着还可以继续尝试读取新数据，设置一下超时
 
-    		/* just set the request timeout once at the beginning of the request */
-    		if (!tick_isset(req->analyse_exp)) {
-    			if ((msg->msg_state == HTTP_MSG_RQBEFORE) &&
-    			    (txn->flags & TX_WAIT_NEXT_RQ) &&
-    			    tick_isset(s->be->timeout.httpka))
-    				req->analyse_exp = tick_add(now_ms, s->be->timeout.httpka);
-    			else
-    				req->analyse_exp = tick_add_ifset(now_ms, s->be->timeout.httpreq);
-    		}
+		/* just set the request timeout once at the beginning of the request */
+		if (!tick_isset(req->analyse_exp)) {
+			if ((msg->msg_state == HTTP_MSG_RQBEFORE) &&
+				(txn->flags & TX_WAIT_NEXT_RQ) &&
+				tick_isset(s->be->timeout.httpka))
+				req->analyse_exp = tick_add(now_ms, s->be->timeout.httpka);
+			else
+				req->analyse_exp = tick_add_ifset(now_ms, s->be->timeout.httpreq);
+		}
 ```
 
 根据以上代码，在等待 http request 期间，有两种 timeout 可以设置： 当是http 连接 Keep-Alive 时，并且处理完了头一个请求之后，等待第二个请求期间，设置 httpka 的超 时，超过设定时间不发送新的请求，将会超时；否则，将设置 http 的 request timeout。
@@ -219,18 +219,18 @@ analysers 的处理也是有顺序的。其中处理请求的第一个函数是 
 这里处理的都是已经解析到完整 http request header 的情况，并且所有 header 都被 索引化了，便于快速查找。根据已经得到的 header 的信息，设置 session 和 txn 的 相关成员，相当于汇总一下 header 的摘要信息，便于随后处理之用。流程如下：
 
 ```
-    更新 session 和 proxy 的统计计数
-    删除 http ka timeout 的超时处理。可能在上一个请求处理完之后，设置了 http ka 的 timeout，因为这里已经得到完整的请求，因此需要停止该 timeout 的处理逻辑
-    确认 METHOD，并设置 session 的标记位 s->flags |= SN_REDIRECTABLE，只有 GET 和 HEAD 请求可以被重定向
-    检测 URI 是否是配置的要做 monitor 的 URI，是的话，则执行对应 ACL，并设置应答
-    检测如果开启 log 功能的话，要给 txn->uri 分配内存，用于记录 URI
-    检测 HTTP version
-        将 0.9 版本的升级为 1.0
-        1.1 及其以上的版本都当做 1.1 处理
-    初始化用于标识 Connection header 的标记位
-    如果启用了 capture header 配置，调用 capture_headers() 记录下对应的 header
-    处理 Transfer-Encoding/Content-Length 等 header
-    最后一步，清理 req->analysers 的标记位 AN_REQ_WAIT_HTTP，因为本函数已经成功处理完毕，可以进行下一个 analyser 的处理了。
+	更新 session 和 proxy 的统计计数
+	删除 http ka timeout 的超时处理。可能在上一个请求处理完之后，设置了 http ka 的 timeout，因为这里已经得到完整的请求，因此需要停止该 timeout 的处理逻辑
+	确认 METHOD，并设置 session 的标记位 s->flags |= SN_REDIRECTABLE，只有 GET 和 HEAD 请求可以被重定向
+	检测 URI 是否是配置的要做 monitor 的 URI，是的话，则执行对应 ACL，并设置应答
+	检测如果开启 log 功能的话，要给 txn->uri 分配内存，用于记录 URI
+	检测 HTTP version
+		将 0.9 版本的升级为 1.0
+		1.1 及其以上的版本都当做 1.1 处理
+	初始化用于标识 Connection header 的标记位
+	如果启用了 capture header 配置，调用 capture_headers() 记录下对应的 header
+	处理 Transfer-Encoding/Content-Length 等 header
+	最后一步，清理 req->analysers 的标记位 AN_REQ_WAIT_HTTP，因为本函数已经成功处理完毕，可以进行下一个 analyser 的处理了。
 ```
 
 至此，http_wait_for_request() 的处理已经结束。
@@ -240,12 +240,12 @@ analysers 的处理也是有顺序的。其中处理请求的第一个函数是 
 按照我们前面分析的，随后应该还有两个 analyser 要处理，简单介绍一下：
 
 ```
-    AN_REQ_HTTP_PROCESS_FE 对应的 http_process_req_common()
-        对 frontend 中 req 配置的常见处理，比如 block ACLs, filter, reqadd 等
-        设置 Connection mode， 主要是 haproxy 到 server 采用什么连接方式，tunnel 或者 按照 transcation 处理的短连接
-    AN_REQ_SWITCHING_RULES 对应的 process_switching_rules()
-        如果配置了选择 backend 的 rules，比如用 use_backend，则查询规则为 session 分配一个 backend
-        处理 persist_rules，一旦设置了 force-persist, 则不管 server 是否 down，都要保证 session 分配给 persistence 中记录的 server。
+	AN_REQ_HTTP_PROCESS_FE 对应的 http_process_req_common()
+		对 frontend 中 req 配置的常见处理，比如 block ACLs, filter, reqadd 等
+		设置 Connection mode， 主要是 haproxy 到 server 采用什么连接方式，tunnel 或者 按照 transcation 处理的短连接
+	AN_REQ_SWITCHING_RULES 对应的 process_switching_rules()
+		如果配置了选择 backend 的 rules，比如用 use_backend，则查询规则为 session 分配一个 backend
+		处理 persist_rules，一旦设置了 force-persist, 则不管 server 是否 down，都要保证 session 分配给 persistence 中记录的 server。
 ```
 
 以上两个函数，不再具体分析。待以后需要时再完善。

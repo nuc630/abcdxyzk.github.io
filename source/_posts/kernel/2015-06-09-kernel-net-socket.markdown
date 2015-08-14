@@ -58,8 +58,8 @@ http://m.blog.chinaunix.net/uid-26905027-id-4031796.html
 	static int init_inodecache(void)
 	{
 		sock_inode_cachep = kmem_cache_create("sock_inode_cache",
-						sizeof(struct socket_alloc),         //在这里创建了名为sock_inode_cache，大小为sizeof(struct socket_alloc)的slab高速缓存  
-                                                              //猜测创建slab高速缓存，而不是普通内存，那么操作socket结构就快了
+						sizeof(struct socket_alloc),    //在这里创建了名为sock_inode_cache，大小为sizeof(struct socket_alloc)的slab高速缓存  
+										//猜测创建slab高速缓存，而不是普通内存，那么操作socket结构就快了
 						0,
 						(SLAB_HWCACHE_ALIGN |
 						SLAB_RECLAIM_ACCOUNT |
@@ -78,7 +78,7 @@ http://m.blog.chinaunix.net/uid-26905027-id-4031796.html
 		.get_sb =    sockfs_get_sb,
 		.kill_sb =    kill_anon_super,
 	};
-    
+
 	register_filesystem(&sock_fs_type);   //在这里注册了名为sockfs的VFS
 	sock_mnt = kern_mount(&sock_fs_type);  //并在这里得到struct vfsmount 结构的sock_mnt变量，这个变量是全局变量，在创建socket的时候会用到
 
@@ -163,7 +163,7 @@ sock_create函数是封装函数，实际调用的是__sock_create函数
 		/* Compatibility.
 		 * This uglymoron is moved from INET layer to here to avoid
 		 * deadlock in module load.
-         */
+		 */
 		if (family == PF_INET && type == SOCK_PACKET) {
 			static int warned;
 			if (!warned) {
@@ -183,8 +183,8 @@ sock_create函数是封装函数，实际调用的是__sock_create函数
 		 *    the protocol is 0, the family is instructed to select an appropriate
 		 *    default.
 		 */
-		sock = sock_alloc(); //这个函数调用了初始化时注册的创建socket和inode节点的回调函数，完成了socket和inode节点的创建。在unix和类unix系统中把socket当做文件节点来处理，所以有inode节点
-                             //后面我们分析这个函数
+		sock = sock_alloc();    //这个函数调用了初始化时注册的创建socket和inode节点的回调函数，完成了socket和inode节点的创建。在unix和类unix系统中把socket当做文件节点来处理，所以有inode节点
+					//后面我们分析这个函数
 		if (!sock) {
 			if (net_ratelimit())
 				printk(KERN_WARNING "socket: no more sockets\n");
@@ -287,7 +287,7 @@ sock_create函数是封装函数，实际调用的是__sock_create函数
 		struct inode * inode;
 
 		spin_lock_prefetch(&inode_lock);
-        
+
 		inode = alloc_inode(sb);  //接着看这个函数
 		if (inode) {
 			spin_lock(&inode_lock);
@@ -307,8 +307,8 @@ sock_create函数是封装函数，实际调用的是__sock_create函数
 		static const struct file_operations empty_fops;
 		struct inode *inode;
 
-		if (sb->s_op->alloc_inode) //在这里我们看到 if调节满足，因为在sock_init函数中我们挂入了sock_alloc_inode函数，之前我们也看到了sock_alloc_inode函数创建了sizeof(struct socket_alloc
-                                   //大小的slab高速缓存
+		if (sb->s_op->alloc_inode)      //在这里我们看到 if调节满足，因为在sock_init函数中我们挂入了sock_alloc_inode函数，之前我们也看到了sock_alloc_inode函数创建了sizeof(struct socket_alloc
+						//大小的slab高速缓存
 			inode = sb->s_op->alloc_inode(sb); 
 		else
 			inode = (struct inode *) kmem_cache_alloc(inode_cachep, GFP_KERNEL);
@@ -370,7 +370,7 @@ sock_create函数是封装函数，实际调用的是__sock_create函数
 		return inode;
 	}
 ```
-    
+
 从上面的分析中我们就可以很好的理解得到socket结构的过程：根据inode 得到socket
 
 ```
@@ -458,9 +458,9 @@ sock_create函数是封装函数，实际调用的是__sock_create函数
 		const struct proto_ops *ops;
 
 		int capability; /* Which (if any) capability do
-						 * we need to use this socket
-						 * interface?
-                                          */
+				 * we need to use this socket
+				 * interface?
+				 */
 		char no_check; /* checksum on rcv/xmit/none? */
 		unsigned char     flags; /* See INET_PROTOSW_* below. */
 	};

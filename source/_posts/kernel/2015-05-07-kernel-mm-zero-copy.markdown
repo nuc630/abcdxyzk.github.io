@@ -151,16 +151,16 @@ Linux 2.6.17 内核引入了 splice() 系统调用，但是，这个概念在此
 ```
 调用 splice() 系统调用会导致操作系统内核从数据源 fdin 移动最多 len 个字节的数据到 fdout 中去，这个数据的移动过程只是经过操作系统内核空间，需要最少的拷贝次数。使用 splice() 系统调用需要这两个文件描述符中的一个必须是用来表示一个管道设备的。不难看出，这种设计具有局限性，Linux 的后续版本针对这一问题将会有所改进。参数 flags 用于表示拷贝操作的执行方法，当前的 flags 有如下这些取值：
 ```
-    SPLICE_F_NONBLOCK：splice 操作不会被阻塞。然而，如果文件描述符没有被设置为不可被阻塞方式的 I/O ，那么调用 splice 有可能仍然被阻塞。
-    SPLICE_F_MORE：告知操作系统内核下一个 splice 系统调用将会有更多的数据传来。
-    SPLICE_F_MOVE：如果输出是文件，这个值则会使得操作系统内核尝试从输入管道缓冲区直接将数据读入到输出地址空间，这个数据传输过程没有任何数据拷贝操作发生。
+	SPLICE_F_NONBLOCK：splice 操作不会被阻塞。然而，如果文件描述符没有被设置为不可被阻塞方式的 I/O ，那么调用 splice 有可能仍然被阻塞。
+	SPLICE_F_MORE：告知操作系统内核下一个 splice 系统调用将会有更多的数据传来。
+	SPLICE_F_MOVE：如果输出是文件，这个值则会使得操作系统内核尝试从输入管道缓冲区直接将数据读入到输出地址空间，这个数据传输过程没有任何数据拷贝操作发生。
 ```
 Splice() 系统调用利用了 Linux 提出的管道缓冲区（ pipe buffer ）机制，这就是为什么这个系统调用的两个文件描述符参数中至少有一个必须要指代管道设备的原因。为了支持 splice 这种机制，Linux 在用于设备和文件系统的 file_operations 结构中增加了下边这两个定义：
 ```
-	 ssize_t (*splice_write)(struct inode *pipe, strucuct file *out, 
-	                       size_t len, unsigned int flags); 
-	 ssize_t (*splice_read)(struct inode *in, strucuct file *pipe, 
-	                       size_t len, unsigned int flags);
+	ssize_t (*splice_write)(struct inode *pipe, strucuct file *out, 
+				size_t len, unsigned int flags); 
+	ssize_t (*splice_read)(struct inode *in, strucuct file *pipe, 
+				size_t len, unsigned int flags);
 ```
 这两个新的操作可以根据 flags 的设定在 pipe 和 in 或者 out 之间移动 len 个字节。Linux 文件系统已经实现了具有上述功能并且可以使用的操作，而且还实现了一个 generic_splice_sendpage() 函数用于和 socket 之间的接合。
 

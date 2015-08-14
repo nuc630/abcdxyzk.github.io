@@ -53,8 +53,8 @@ git-svn默认包含在Git的安装包中，不过在Ubuntu中，git-svn是作为
 * 使用git-svn rebase获取svn服务器上的最新foo.c，导致与foo.c冲突，不过此时svn版本信息已经添加到本地git库中(通过git log可以查看)，git-svn rebase提示你在解决foo.c的冲突后，运行git rebase --continue完成rebase操作；  
 * 打开foo.c，修改代码，解决冲突；  
 * 执行git rebase --continue，git提示我：  
-    You must edit all merge conflicts and then  
-    mark them as resolved using git add  
+You must edit all merge conflicts and then  
+mark them as resolved using git add  
 * 执行git add foo.c，告知git已完成冲突解决；  
 * 再次执行git rebase --continue，提示"Applying: git v1"，此时"git v1"版本又一次成功加入本地版本库，你可通过git log查看；  
 * 执行git-svn dcommit将foo.c的改动同步到svn中心库，到此算是完成一次冲突解决。  

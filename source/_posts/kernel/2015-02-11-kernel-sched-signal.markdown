@@ -66,15 +66,15 @@ http://blog.csdn.net/yusiguyuan/article/details/23168363
 进程的task_struct结构中有关于本进程中未决信号的数据成员：struct sigpending pending：
 ```
 	struct sigpending{
-        struct sigqueue *head, *tail;
-        sigset_t signal;
+		struct sigqueue *head, *tail;
+		sigset_t signal;
 	};
 ``` 
 第三个成员是进程中所有未决信号集，第一、第二个成员分别指向一个sigqueue类型的结构链（称之为"未决信号信息链"）的首尾，信息链中的每个sigqueue结构刻画一个特定信号所携带的信息，并指向下一个sigqueue结构:
 ```
 	struct sigqueue{
-        struct sigqueue *next;
-        siginfo_t info;
+		struct sigqueue *next;
+		siginfo_t info;
 	}
 ``` 
 信号在进程中注册指的就是信号值加入到进程的未决信号集sigset_t signal（每个信号占用一位）中，并且信号所携带的信息被保留到未决信号信息链的某个sigqueue结构中。只要信号在进程的未决信号集中，表明进程已经知道这些信号的存在，但还没来得及处理，或者该信号被进程阻塞。
@@ -92,7 +92,7 @@ http://blog.csdn.net/yusiguyuan/article/details/23168363
 对于非实时信号来说，由于在未决信号信息链中最多只占用一个sigqueue结构，因此该结构被释放后，应该把信号在进程未决信号集中删除（信号注销完毕）；而对于实时信号来说，可能在未决信号信息链中占用多个sigqueue结构，因此应该针对占用sigqueue结构的数目区别对待：如果只占用一个sigqueue结构（进程只收到该信号一次），则执行完相应的处理函数后应该把信号在进程的未决信号集中删除（信号注销完毕）。否则待该信号的所有sigqueue处理完毕后再在进程的未决信号集中删除该信号。
  
 当所有未被屏蔽的信号都处理完毕后，即可返回用户空间。对于被屏蔽的信号，当取消屏蔽后，在返回到用户空间时会再次执行上述检查处理的一套流程。
-    
+
 ###### 在信号的处理方法中有几点特别要引起注意。
 第一，在一些系统中，当一个进程处理完中断信号返回用户态之前，内核清除用户区中设 定的对该信号的处理例程的地址，即下一次进程对该信号的处理方法又改为默认值，除非在下一次信号到来之前再次使用signal系统调用。这可能会使得进程 在调用signal之前又得到该信号而导致退出。在BSD中，内核不再清除该地址。但不清除该地址可能使得进程因为过多过快的得到某个信号而导致堆栈溢 出。为了避免出现上述情况。在BSD系统中，内核模拟了对硬件中断的处理方法，即在处理某个中断时，阻止接收新的该类中断。 
 

@@ -33,9 +33,9 @@ bml14 Cache Partition
 把所有要打包进ROM的文件都复制到这个文件夹内；  
 比如：这些刷机文件包括：boot.img
 ```
-   $ tar -cf NewRom.tar boot.img
-   $ md5sum -t NewROM.tar >> NewROM.tar
-   $ mv NewROM.tar NewROM.tar.md5
+	$ tar -cf NewRom.tar boot.img
+	$ md5sum -t NewROM.tar >> NewROM.tar
+	$ mv NewROM.tar NewROM.tar.md5
 ```
 第一句是TAR打包，第二句是md5签名，第三句是改文件名，可以省略。
 
@@ -45,13 +45,13 @@ NewROM.tar.md5就是最后生成的，可供刷机用的ROM了！
 #### 编辑 rfs
 挂载 RFS文件factoryfs.rfs 为一个磁盘：
 ```
-    # su
-    # mount –o loop factoryfs.rfs System
+	# su
+	# mount –o loop factoryfs.rfs System
 ```
 进入“磁盘”System目录，你就可以看到factoryfs.rfs解包后的所有内容。
 
 修改好/System的内容后，在超级用户终端执行下面的语句卸载该“磁盘” ，这个操作等价于“打包”过程。
 ```
-    # umount System
+	# umount System
 ```
 

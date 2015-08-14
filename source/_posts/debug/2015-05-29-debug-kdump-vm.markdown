@@ -22,11 +22,11 @@ This error is being caused because VMware doesn’t actually provide that level 
 How to fix it:   
 在虚拟机中
 ```
-    sudo vim /etc/modprobe.d/blacklist.conf
+	sudo vim /etc/modprobe.d/blacklist.conf
 ```
 add the line:
 ```
-    blacklist i2c-piix4
+	blacklist i2c-piix4
 ```
 
 reboot

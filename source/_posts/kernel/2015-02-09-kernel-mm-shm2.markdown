@@ -75,15 +75,15 @@ SEMMSL 参数，决定一套信号灯里可以有多少信号灯，
 #### 更改方法
   缺省设置只适合小安装（缺省最大共享内存是 32 MB）。不过，其它的缺省值都相当大，通常不需要改变。最大的共享内存段设置可以用 sysctl 接口设置。 比如，要允许 128 MB，并且最大的总共享内存数为 2097152 页（缺省）：
 ```
-    $ sysctl -w kernel.shmmax=134217728
-    $ sysctl -w kernel.shmall=2097152
+	$ sysctl -w kernel.shmmax=134217728
+	$ sysctl -w kernel.shmall=2097152
 ```
   你可以把这些设置放到 /etc/sysctl.conf 里，在重启后保持有效。
 
 
   老版本里可能没有 sysctl 程序，但是同样的改变可以通过操作 /proc 文件系统来做：
 ```
-    $ echo 134217728 > /proc/sys/kernel/shmmax
-    $ echo 2097152 > /proc/sys/kernel/shmall
+	$ echo 134217728 > /proc/sys/kernel/shmmax
+	$ echo 2097152 > /proc/sys/kernel/shmall
 ```
 

@@ -83,11 +83,11 @@ workqueue和softirq、tasklet有本质的区别：workqueue运行在process cont
 
 为了更好的理解下面的内容，我们需要先看看一些基础知识：一个task的thread info数据结构定义如下（只保留和本场景相关的内容）：
 ```
-    struct thread_info { 
-        ......
-        int preempt_count;    /* 0 => preemptable, <0 => bug */
-        ......
-    };
+	struct thread_info { 
+		......
+		int preempt_count;    /* 0 => preemptable, <0 => bug */
+		......
+	};
 ```
 preempt_count这个成员被用来判断当前进程是否可以被抢占。如果preempt_count不等于0（可能是代码调用preempt_disable显式的禁止了抢占，也可能是处于中断上下文等），说明当前不能进行抢占，如果preempt_count等于0，说明已经具备了抢占的条件（当然具体是否要抢占当前进程还是要看看thread info中的flag成员是否设定了_TIF_NEED_RESCHED这个标记，可能是当前的进程的时间片用完了，也可能是由于中断唤醒了优先级更高的进程）。 具体preempt_count的数据格式可以参考下图：
 
@@ -97,16 +97,16 @@ preemption count用来记录当前被显式的禁止抢占的次数，也就是�
 
 hardirq count描述当前中断handler嵌套的深度。对于ARM平台的linux kernel，其中断部分的代码如下：
 ```
-    void handle_IRQ(unsigned int irq, struct pt_regs *regs)
-    {
-        struct pt_regs *old_regs = set_irq_regs(regs);
+	void handle_IRQ(unsigned int irq, struct pt_regs *regs)
+	{
+		struct pt_regs *old_regs = set_irq_regs(regs);
 
-        irq_enter(); 
-        generic_handle_irq(irq);
+		irq_enter(); 
+		generic_handle_irq(irq);
 
-        irq_exit();
-        set_irq_regs(old_regs);
-    }
+		irq_exit();
+		set_irq_regs(old_regs);
+	}
 ```
 通用的IRQ handler被irq_enter和irq_exit这两个函数包围。irq_enter说明进入到IRQ context，而irq_exit则说明退出IRQ context。在irq_enter函数中会调用preempt_count_add(HARDIRQ_OFFSET)，为hardirq count的bit field增加1。在irq_exit函数中，会调用preempt_count_sub(HARDIRQ_OFFSET)，为hardirq count的bit field减去1。hardirq count占用了4个bit，说明硬件中断handler最大可以嵌套15层。在旧的内核中，hardirq count占用了12个bit，支持4096个嵌套。当然，在旧的kernel中还区分fast interrupt handler和slow interrupt handler，中断handler最大可以嵌套的次数理论上等于系统IRQ的个数。在实际中，这个数目不可能那么大（内核栈就受不了），因此，即使系统支持了非常大的中断个数，也不可能各个中断依次嵌套，达到理论的上限。基于这样的考虑，后来内核减少了hardirq count占用bit数目，改成了10个bit（在general arch的代码中修改为10，实际上，各个arch可以redefine自己的hardirq count的bit数）。但是，当内核大佬们决定废弃slow interrupt handler的时候，实际上，中断的嵌套已经不会发生了。因此，理论上，hardirq count要么是0，要么是1。不过呢，不能总拿理论说事，实际上，万一有写奇葩或者老古董driver在handler中打开中断，那么这时候中断嵌套还是会发生的，但是，应该不会太多（一个系统中怎么可能有那么多奇葩呢？呵呵），因此，目前hardirq count占用了4个bit，应付15个奇葩driver是妥妥的。
 
@@ -120,11 +120,11 @@ hardirq count描述当前中断handler嵌套的深度。对于ARM平台的linux 
 
 看完了preempt_count之后，我们来介绍各种context：
 ```
-    #define in_irq()        (hardirq_count())
-    #define in_softirq()        (softirq_count())
-    #define in_interrupt()        (irq_count())
+	#define in_irq()        (hardirq_count())
+	#define in_softirq()        (softirq_count())
+	#define in_interrupt()        (irq_count())
 
-    #define in_serving_softirq()    (softirq_count() & SOFTIRQ_OFFSET)
+	#define in_serving_softirq()    (softirq_count() & SOFTIRQ_OFFSET)
 ```
 这里首先要介绍的是一个叫做IRQ context的术语。这里的IRQ context其实就是hard irq context，也就是说明当前正在执行中断handler（top half），只要preempt_count中的hardirq count大于0（＝1是没有中断嵌套，如果大于1，说明有中断嵌套），那么就是IRQ context。
 
@@ -140,21 +140,21 @@ softirq和hardirq（就是硬件中断啦）是对应的，因此softirq的机�
 
 和IRQ number一样，对于软中断，linux kernel也是用一个softirq number唯一标识一个softirq，具体定义如下：
 ```
-    enum
-    {
-        HI_SOFTIRQ=0,
-        TIMER_SOFTIRQ,
-        NET_TX_SOFTIRQ,
-        NET_RX_SOFTIRQ,
-        BLOCK_SOFTIRQ,
-        BLOCK_IOPOLL_SOFTIRQ,
-        TASKLET_SOFTIRQ,
-        SCHED_SOFTIRQ,
-        HRTIMER_SOFTIRQ,
-        RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+	enum
+	{
+		HI_SOFTIRQ=0,
+		TIMER_SOFTIRQ,
+		NET_TX_SOFTIRQ,
+		NET_RX_SOFTIRQ,
+		BLOCK_SOFTIRQ,
+		BLOCK_IOPOLL_SOFTIRQ,
+		TASKLET_SOFTIRQ,
+		SCHED_SOFTIRQ,
+		HRTIMER_SOFTIRQ,
+		RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
 
-        NR_SOFTIRQS
-    };
+		NR_SOFTIRQS
+	};
 ```
 HI_SOFTIRQ用于高优先级的tasklet，TASKLET_SOFTIRQ用于普通的tasklet。TIMER_SOFTIRQ是for software timer的（所谓software timer就是说该timer是基于系统tick的）。NET_TX_SOFTIRQ和NET_RX_SOFTIRQ是用于网卡数据收发的。BLOCK_SOFTIRQ和BLOCK_IOPOLL_SOFTIRQ是用于block device的。SCHED_SOFTIRQ用于多CPU之间的负载均衡的。HRTIMER_SOFTIRQ用于高精度timer的。RCU_SOFTIRQ是处理RCU的。这些具体使用情景分析会在各自的子系统中分析，本文只是描述softirq的工作原理。
 
@@ -162,23 +162,23 @@ HI_SOFTIRQ用于高优先级的tasklet，TASKLET_SOFTIRQ用于普通的tasklet�
 
 我们前面已经说了，softirq是静态定义的，也就是说系统中有一个定义softirq描述符的数组，而softirq number就是这个数组的index。这个概念和早期的静态分配的中断描述符概念是类似的。具体定义如下：
 ```
-    struct softirq_action
-    {
-        void    (*action)(struct softirq_action *);
-    };
+	struct softirq_action
+	{
+		void    (*action)(struct softirq_action *);
+	};
 
-    static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;
+	static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;
 ```
 系统支持多少个软中断，静态定义的数组就会有多少个entry。`____cacheline_aligned`保证了在SMP的情况下，softirq_vec是对齐到cache line的。softirq描述符非常简单，只有一个action成员，表示如果触发了该softirq，那么应该调用action回调函数来处理这个soft irq。对于硬件中断而言，其mask、ack等都是和硬件寄存器相关并封装在irq chip函数中，对于softirq，没有硬件寄存器，只有“软件寄存器”，定义如下：
 ```
-    typedef struct {
-        unsigned int __softirq_pending;
-    #ifdef CONFIG_SMP
-        unsigned int ipi_irqs[NR_IPI];
-    #endif
-    } ____cacheline_aligned irq_cpustat_t;
+	typedef struct {
+		unsigned int __softirq_pending;
+	#ifdef CONFIG_SMP
+		unsigned int ipi_irqs[NR_IPI];
+	#endif
+	} ____cacheline_aligned irq_cpustat_t;
 
-    irq_cpustat_t irq_stat[NR_CPUS] ____cacheline_aligned;
+	irq_cpustat_t irq_stat[NR_CPUS] ____cacheline_aligned;
 ```
 ipi_irqs这个成员用于处理器之间的中断，我们留到下一个专题来描述。`__softirq_pending`就是这个“软件寄存器”。softirq采用谁触发，谁负责处理的。例如：当一个驱动的硬件中断被分发给了指定的CPU，并且在该中断handler中触发了一个softirq，那么该CPU负责调用该softirq number对应的action callback来处理该软中断。因此，这个“软件寄存器”应该是每个CPU拥有一个（专业术语叫做banked register）。为了性能，irq_stat中的每一个entry被定义对齐到cache line。
 
@@ -186,10 +186,10 @@ ipi_irqs这个成员用于处理器之间的中断，我们留到下一个专题
 
 通过调用open_softirq接口函数可以注册softirq的action callback函数，具体如下：
 ```
-    void open_softirq(int nr, void (*action)(struct softirq_action *))
-    {
-        softirq_vec[nr].action = action;
-    }
+	void open_softirq(int nr, void (*action)(struct softirq_action *))
+	{
+		softirq_vec[nr].action = action;
+	}
 ```
 softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册都是在系统初始化的时候完成的，那时候，系统是串行执行的。此外，softirq是静态定义的，每个entry（或者说每个softirq number）都是固定分配的，因此，不需要保护。
 
@@ -197,14 +197,14 @@ softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册
 
 在linux kernel中，可以调用raise_softirq这个接口函数来触发本地CPU上的softirq，具体如下：
 ```
-    void raise_softirq(unsigned int nr)
-    {
-        unsigned long flags;
+	void raise_softirq(unsigned int nr)
+	{
+		unsigned long flags;
 
-        local_irq_save(flags);
-        raise_softirq_irqoff(nr);
-        local_irq_restore(flags);
-    }
+		local_irq_save(flags);
+		raise_softirq_irqoff(nr);
+		local_irq_restore(flags);
+	}
 ```
 虽然大部分的使用场景都是在中断handler中（也就是说关闭本地CPU中断）来执行softirq的触发动作，但是，这不是全部，在其他的上下文中也可以调用raise_softirq。因此，触发softirq的接口函数有两个版本，一个是raise_softirq，有关中断的保护，另外一个是raise_softirq_irqoff，调用者已经关闭了中断，不需要关中断来保护“soft irq status register”。
 
@@ -212,13 +212,13 @@ softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册
 
 具体raise_softirq_irqoff的代码如下：
 ```
-    inline void raise_softirq_irqoff(unsigned int nr)
-    {
-        __raise_softirq_irqoff(nr); ---------- （1）
+	inline void raise_softirq_irqoff(unsigned int nr)
+	{
+		__raise_softirq_irqoff(nr); ---------- （1）
 
-        if (!in_interrupt())
-            wakeup_softirqd();      ---------- （2）
-    }
+		if (!in_interrupt())
+			wakeup_softirqd();      ---------- （2）
+	}
 ```
 （1）`__raise_softirq_irqoff`函数设定本CPU上的`__softirq_pending`的某个bit等于1，具体的bit是由soft irq number（nr参数）指定的。
 
@@ -230,39 +230,39 @@ softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册
 
 先看disable吧，毕竟禁止bottom half比较简单：
 ```
-    static inline void local_bh_disable(void)
-    {
-        __local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
-    }
+	static inline void local_bh_disable(void)
+	{
+		__local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+	}
 
-    static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
-    {
-        preempt_count_add(cnt);
-        barrier();
-    }
+	static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
+	{
+		preempt_count_add(cnt);
+		barrier();
+	}
 ```
 看起来disable bottom half比较简单，就是讲current thread info上的preempt_count成员中的softirq count的bit field9～15加上一就OK了。barrier是优化屏障（Optimization barrier），会在内核同步系列文章中描述。
 
 enable函数比较复杂，如下：
 ```
-    static inline void local_bh_enable(void)
-    {
-        __local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
-    }
+	static inline void local_bh_enable(void)
+	{
+		__local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
+	}
 
-    void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
-    {
-        WARN_ON_ONCE(in_irq() || irqs_disabled()); --------- （1）
+	void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
+	{
+		WARN_ON_ONCE(in_irq() || irqs_disabled()); --------- （1）
 
-        preempt_count_sub(cnt - 1);                --------- （2）
+		preempt_count_sub(cnt - 1);                --------- （2）
 
-        if (unlikely(!in_interrupt() && local_softirq_pending())) {  ------- （3）
-            do_softirq();
-        }
+		if (unlikely(!in_interrupt() && local_softirq_pending())) {  ------- （3）
+			do_softirq();
+		}
 
-        preempt_count_dec();                       --------- （4）
-        preempt_check_resched();
-    }
+		preempt_count_dec();                       --------- （4）
+		preempt_check_resched();
+	}
 ```
 （1）disable/enable bottom half是一种内核同步机制。在硬件中断的handler（top half）中，不应该调用disable/enable bottom half函数来保护共享数据，因为bottom half其实是不可能抢占top half的。同样的，soft irq也不会抢占另外一个soft irq的执行，也就是说，一旦一个softirq handler被调度执行（无论在哪一个processor上），那么，本地的softirq handler都无法抢占其运行，要等到当前的softirq handler运行完毕后，才能执行下一个soft irq handler。注意：上面我们说的是本地，是local，softirq handler是可以在多个CPU上同时运行的，但是，linux kernel中没有disable all softirq的接口函数（就好像没有disable all CPU interrupt的接口一样，注意体会local_bh_enable/disable中的local的含义）。
 
@@ -270,15 +270,15 @@ enable函数比较复杂，如下：
 
 irqs_disabled接口函数可以获知当前本地CPU中断是否是disable的，如果返回1，那么当前是disable 本地CPU的中断的。如果irqs_disabled返回1，有可能是下面这样的代码造成的：
 ```
-    local_irq_disable();
+	local_irq_disable();
 	......
-    local_bh_disable();
+	local_bh_disable();
 
-    ......
+	......
 
-    local_bh_enable();
-    ......
-    local_irq_enable();
+	local_bh_enable();
+	......
+	local_irq_enable();
 ```
 本质上，关本地中断是一种比关本地bottom half更强劲的锁，关本地中断实际上是禁止了top half和bottom half抢占当前进程上下文的运行。也许你会说：这也没有什么，就是有些浪费，至少代码逻辑没有问题。但事情没有这么简单，在`local_bh_enable--->do_softirq--->__do_softirq`中，有一条无条件打开当前中断的操作，也就是说，原本想通过local_irq_disable/local_irq_enable保护的临界区被破坏了，其他的中断handler可以插入执行，从而无法保证local_irq_disable/local_irq_enable保护的临界区的原子性，从而破坏了代码逻辑。
 
@@ -286,13 +286,13 @@ in_irq()这个函数如果不等于0的话，说明local_bh_enable被irq_enter�
 
 （2）在local_bh_disable中我们为preempt_count增加了SOFTIRQ_DISABLE_OFFSET，在local_bh_enable函数中应该减掉同样的数值。这一步，我们首先减去了（SOFTIRQ_DISABLE_OFFSET-1），为何不一次性的减去SOFTIRQ_DISABLE_OFFSET呢？考虑下面运行在进程上下文的代码场景：
 ```
-    ......
+	......
 
-    local_bh_disable
+	local_bh_disable
 
-    ...需要被保护的临界区...
+	...需要被保护的临界区...
 
-    local_bh_enable
+	local_bh_enable
 	......
 ```
 在临界区内，有进程context 和softirq共享的数据，因此，在进程上下文中使用local_bh_enable/disable进行保护。假设在临界区代码执行的时候，发生了中断，由于代码并没有阻止top half的抢占，因此中断handler会抢占当前正在执行的thread。在中断handler中，我们raise了softirq，在返回中断现场的时候，由于disable了bottom half，因此虽然触发了softirq，但是不会调度执行。因此，代码返回临界区继续执行，直到local_bh_enable。一旦enable了bottom half，那么之前raise的softirq就需要调度执行了，因此，这也是为什么在local_bh_enable会调用do_softirq函数。
@@ -312,14 +312,14 @@ in_irq()这个函数如果不等于0的话，说明local_bh_enable被irq_enter�
 
 在上一节已经描述一个softirq被调度执行的场景，本节主要关注在中断返回现场时候调度softirq的场景。我们来看中断退出的代码，具体如下：
 ```
-    void irq_exit(void)
-    {
-    	......
-        if (!in_interrupt() && local_softirq_pending())
-            invoke_softirq();
+	void irq_exit(void)
+	{
+		......
+		if (!in_interrupt() && local_softirq_pending())
+			invoke_softirq();
 
-    	......
-    }
+		......
+	}
 ```
 代码中“!in_interrupt()”这个条件可以确保下面的场景不会触发sotfirq的调度：
 
@@ -329,57 +329,57 @@ in_irq()这个函数如果不等于0的话，说明local_bh_enable被irq_enter�
 
 我们继续看invoke_softirq的代码：
 ```
-    static inline void invoke_softirq(void)
-    {
-        if (!force_irqthreads) {
-    #ifdef CONFIG_HAVE_IRQ_EXIT_ON_IRQ_STACK
-            __do_softirq();
-    #else
-            do_softirq_own_stack();
-    #endif
-        } else {
-            wakeup_softirqd();
-        }
-    }
+	static inline void invoke_softirq(void)
+	{
+		if (!force_irqthreads) {
+	#ifdef CONFIG_HAVE_IRQ_EXIT_ON_IRQ_STACK
+			__do_softirq();
+	#else
+			do_softirq_own_stack();
+	#endif
+		} else {
+			wakeup_softirqd();
+		}
+	}
 ```
 force_irqthreads是和强制线程化相关的，主要用于interrupt handler的调试（一般而言，在线程环境下比在中断上下文中更容易收集调试数据）。如果系统选择了对所有的interrupt handler进行线程化处理，那么softirq也没有理由在中断上下文中处理（中断handler都在线程中执行了，softirq怎么可能在中断上下文中执行）。本身invoke_softirq这个函数是在中断上下文中被调用的，如果强制线程化，那么系统中所有的软中断都在sofirq的daemon进程中被调度执行。
 
 如果没有强制线程化，softirq的处理也分成两种情况，主要是和softirq执行的时候使用的stack相关。如果arch支持单独的IRQ STACK，这时候，由于要退出中断，因此irq stack已经接近全空了（不考虑中断栈嵌套的情况，因此新内核下，中断不会嵌套），因此直接调用`__do_softirq()`处理软中断就OK了，否则就调用do_softirq_own_stack函数在softirq自己的stack上执行。当然对ARM而言，softirq的处理就是在当前的内核栈上执行的，因此do_softirq_own_stack的调用就是调用`__do_softirq()`，代码如下（删除了部分无关代码）：
 ```
-    asmlinkage void __do_softirq(void)
-    {
-    ......
-        pending = local_softirq_pending();  ----------- 获取softirq pending的状态
-        __local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET); ---- 标识下面的代码是正在处理softirq
-        cpu = smp_processor_id();
-    restart:
-        set_softirq_pending(0);  ------------- 清除pending标志
-        local_irq_enable();      ------------- 打开中断，softirq handler是开中断执行的
-        h = softirq_vec;         ------------- 获取软中断描述符指针
+	asmlinkage void __do_softirq(void)
+	{
+	......
+		pending = local_softirq_pending();  ----------- 获取softirq pending的状态
+		__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET); ---- 标识下面的代码是正在处理softirq
+		cpu = smp_processor_id();
+	restart:
+		set_softirq_pending(0);  ------------- 清除pending标志
+		local_irq_enable();      ------------- 打开中断，softirq handler是开中断执行的
+		h = softirq_vec;         ------------- 获取软中断描述符指针
 
-        while ((softirq_bit = ffs(pending))) { --------- 寻找pending中第一个被设定为1的bit
-            unsigned int vec_nr;
-            int prev_count;
+		while ((softirq_bit = ffs(pending))) { --------- 寻找pending中第一个被设定为1的bit
+			unsigned int vec_nr;
+			int prev_count;
 
-            h += softirq_bit - 1; ----------- 指向pending的那个软中断描述符
-            vec_nr = h - softirq_vec; ------- 获取soft irq number
-            h->action(h);         ----------- 指向softirq handler
-            h++;
-            pending >>= softirq_bit;
-        }
+			h += softirq_bit - 1; ----------- 指向pending的那个软中断描述符
+			vec_nr = h - softirq_vec; ------- 获取soft irq number
+			h->action(h);         ----------- 指向softirq handler
+			h++;
+			pending >>= softirq_bit;
+		}
 
-        local_irq_disable();      ----------- 打开中断
+		local_irq_disable();      ----------- 打开中断
 
-        pending = local_softirq_pending(); ------ （注1）
-        if (pending) {
-            if (time_before(jiffies, end) && !need_resched() &&
-                --max_restart)
-                goto restart;
+		pending = local_softirq_pending(); ------ （注1）
+		if (pending) {
+			if (time_before(jiffies, end) && !need_resched() &&
+				--max_restart)
+				goto restart;
 
-            wakeup_softirqd();
-        }
-        __local_bh_enable(SOFTIRQ_OFFSET); ----------- 标识softirq处理完毕
-    }
+			wakeup_softirqd();
+		}
+		__local_bh_enable(SOFTIRQ_OFFSET); ----------- 标识softirq处理完毕
+	}
 ```
 （注1）再次检查softirq pending，有可能上面的softirq handler在执行过程中，发生了中断，又raise了softirq。如果的确如此，那么我们需要跳转到restart那里重新处理soft irq。当然，也不能总是在这里不断的loop，因此linux kernel设定了下面的条件：
 

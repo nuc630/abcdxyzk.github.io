@@ -47,16 +47,16 @@ http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2
 ```
 ```
 	# 这些似乎不用
-    for file in `find /usr/lib/debug-name'*.ko' -print`
-        do
-        buildid=`eu-readelf-n $file| grep Build.ID:| awk '{print $3}'`
-        dir=`echo $buildid| cut-c1-2`
-        fn=`echo $buildid| cut-c3-`
-        rm -fr /usr/lib/debug/.build-id
-        mkdir -p/usr/lib/debug/.build-id/$dir
-        ln -s $file/usr/lib/debug/.build-id/$dir/$fn
-        ln -s $file/usr/lib/debug/.build-id/$dir/${fn}.debug
-        done
+	for file in `find /usr/lib/debug-name'*.ko' -print`
+	do
+		buildid=`eu-readelf-n $file| grep Build.ID:| awk '{print $3}'`
+		dir=`echo $buildid| cut-c1-2`
+		fn=`echo $buildid| cut-c3-`
+		rm -fr /usr/lib/debug/.build-id
+		mkdir -p/usr/lib/debug/.build-id/$dir
+		ln -s $file/usr/lib/debug/.build-id/$dir/$fn
+		ln -s $file/usr/lib/debug/.build-id/$dir/${fn}.debug
+	done
 ```
 
 #### 5. 写个例子测试下

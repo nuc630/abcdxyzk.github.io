@@ -331,15 +331,15 @@ min wait：为了获得该锁，最小的等待时间。
 
 最后还有一个Summary：
 ```
-    === output for debug===  
-      
-    bad: 10, total: 246  
-    bad rate: 4.065041 %  
-    histogram of events caused bad sequence  
-        acquire: 0  
-       acquired: 0  
-      contended: 0  
-        release: 10  
+	=== output for debug===  
+
+	bad: 10, total: 246  
+	bad rate: 4.065041 %  
+	histogram of events caused bad sequence  
+	    acquire: 0  
+	   acquired: 0  
+	  contended: 0  
+	    release: 10  
 ```
 
 ---------------

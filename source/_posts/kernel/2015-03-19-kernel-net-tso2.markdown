@@ -61,90 +61,90 @@ fragment the TCP data. TSO may change how and when TCP decides to send data. [3]
  
 #### 实现
 ```
-    /* This data is invariant across clones and lives at the end of the 
-     * header data, ie. at skb->end. 
-     */  
-    struct skb_share_info {  
-        ...  
-       unsigned short gso_size; // 每个数据段的大小  
-       unsigned short gso_segs; // skb被分割成多少个数据段  
-       unsigned short gso_type;  
-       struct sk_buff *frag_list; // 分割后的数据包列表  
-       ...  
-    }
+	/* This data is invariant across clones and lives at the end of the 
+	 * header data, ie. at skb->end. 
+	 */  
+	struct skb_share_info {  
+		...  
+	   unsigned short gso_size; // 每个数据段的大小  
+	   unsigned short gso_segs; // skb被分割成多少个数据段  
+	   unsigned short gso_type;  
+	   struct sk_buff *frag_list; // 分割后的数据包列表  
+	   ...  
+	}
 ```
 
 ```
-    /* Initialize TSO state of skb. 
-     * This must be invoked the first time we consider transmitting 
-     * SKB onto the wire. 
-     */  
-    static int tcp_init_tso_segs(struct sock *sk, struct sk_buff *skb,  
-                                                unsigned int mss_now)  
-    {  
-        int tso_segs = tcp_skb_pcount(skb);  
-      
-        /* 如果还没有分段，或者有多个分段但是分段长度不等于当前MSS，则需处理*/  
-        if (! tso_segs || (tso_segs > 1 && tcp_skb_mss(skb) != mss_now)) {  
-            tcp_set_skb_tso_segs(sk, skb, mss_now);  
-      
-            tso_segs = tcp_skb_pcount(skb);/* 重新获取分段数量 */  
-        }  
-        return tso_segs;  
-    }  
-      
-    /* Initialize TSO segments for a packet. */  
-    static void tcp_set_skb_tso_segs(struct sock *sk, struct sk_buff *skb,  
-                                            unsigned int mss_now)  
-    {  
-        /* 有以下情况则不需要分片： 
-          * 1. 数据的长度不超过允许的最大长度MSS 
-         * 2. 网卡不支持GSO 
-         * 3. 网卡不支持重新计算校验和 
-         */  
-        if (skb->len <= mss_now || ! sk_can_gso(sk) ||  
-            skb->ip_summed == CHECKSUM_NONE) {  
-      
-            /* Avoid the costly divide in the normal non-TSO case.*/  
-            skb_shinfo(skb)->gso_segs = 1;  
-            skb_shinfo(skb)->gso_size = 0;  
-            skb_shinfo(skb)->gso_type = 0;  
-        } else {  
-      
-            /* 计算需要分成几个数据段*/  
-            skb_shinfo(skb)->gso_segs = DIV_ROUND_UP(skb->len, mss_now);/*向上取整*/  
-            skb_shinfo(skb)->gso_size = mss_now; /* 每个数据段的大小*/  
-            skb_shinfo(skb)->gso_type = sk->sk_gso_type;  
-        }  
-    }  
-      
-    /* Due to TSO, an SKB can be composed of multiple actual packets.  
-     * To keep these tracked properly, we use this. 
-     */  
-    static inline int tcp_skb_pcount (const struct sk_buff *skb)  
-    {  
-        return skb_shinfo(skb)->gso_segs;  
-    }  
-       
-    /* This is valid if tcp_skb_pcount() > 1 */  
-    static inline int tcp_skb_mss(const struct sk_buff *skb)  
-    {  
-        return skb_shinfo(skb)->gso_size;  
-    }  
-      
-    static inline int sk_can_gso(const struct sock *sk)  
-    {  
-        /* sk_route_caps标志网卡驱动的特征, sk_gso_type表示GSO的类型， 
-         * 设置为SKB_GSO_TCPV4 
-         */  
-        return net_gso_ok(sk->sk_route_caps, sk->sk_gso_type);  
-    }  
-      
-    static inline int net_gso_ok(int features, int gso_type)  
-    {  
-        int feature = gso_type << NETIF_F_GSO_SHIFT;  
-        return (features & feature) == feature;  
-    }
+	/* Initialize TSO state of skb. 
+	 * This must be invoked the first time we consider transmitting 
+	 * SKB onto the wire. 
+	 */  
+	static int tcp_init_tso_segs(struct sock *sk, struct sk_buff *skb,  
+						unsigned int mss_now)  
+	{  
+		int tso_segs = tcp_skb_pcount(skb);  
+	  
+		/* 如果还没有分段，或者有多个分段但是分段长度不等于当前MSS，则需处理*/  
+		if (! tso_segs || (tso_segs > 1 && tcp_skb_mss(skb) != mss_now)) {  
+			tcp_set_skb_tso_segs(sk, skb, mss_now);  
+	  
+			tso_segs = tcp_skb_pcount(skb);/* 重新获取分段数量 */  
+		}  
+		return tso_segs;  
+	}  
+	  
+	/* Initialize TSO segments for a packet. */  
+	static void tcp_set_skb_tso_segs(struct sock *sk, struct sk_buff *skb,  
+						unsigned int mss_now)  
+	{  
+		/* 有以下情况则不需要分片： 
+		  * 1. 数据的长度不超过允许的最大长度MSS 
+		 * 2. 网卡不支持GSO 
+		 * 3. 网卡不支持重新计算校验和 
+		 */  
+		if (skb->len <= mss_now || ! sk_can_gso(sk) ||  
+			skb->ip_summed == CHECKSUM_NONE) {  
+	  
+			/* Avoid the costly divide in the normal non-TSO case.*/  
+			skb_shinfo(skb)->gso_segs = 1;  
+			skb_shinfo(skb)->gso_size = 0;  
+			skb_shinfo(skb)->gso_type = 0;  
+		} else {  
+	  
+			/* 计算需要分成几个数据段*/  
+			skb_shinfo(skb)->gso_segs = DIV_ROUND_UP(skb->len, mss_now);/*向上取整*/  
+			skb_shinfo(skb)->gso_size = mss_now; /* 每个数据段的大小*/  
+			skb_shinfo(skb)->gso_type = sk->sk_gso_type;  
+		}  
+	}  
+	  
+	/* Due to TSO, an SKB can be composed of multiple actual packets.  
+	 * To keep these tracked properly, we use this. 
+	 */  
+	static inline int tcp_skb_pcount (const struct sk_buff *skb)  
+	{  
+		return skb_shinfo(skb)->gso_segs;  
+	}  
+	   
+	/* This is valid if tcp_skb_pcount() > 1 */  
+	static inline int tcp_skb_mss(const struct sk_buff *skb)  
+	{  
+		return skb_shinfo(skb)->gso_size;  
+	}  
+	  
+	static inline int sk_can_gso(const struct sock *sk)  
+	{  
+		/* sk_route_caps标志网卡驱动的特征, sk_gso_type表示GSO的类型， 
+		 * 设置为SKB_GSO_TCPV4 
+		 */  
+		return net_gso_ok(sk->sk_route_caps, sk->sk_gso_type);  
+	}  
+	  
+	static inline int net_gso_ok(int features, int gso_type)  
+	{  
+		int feature = gso_type << NETIF_F_GSO_SHIFT;  
+		return (features & feature) == feature;  
+	}
 ```
 
 ##### sk_gso_max_size
@@ -156,37 +156,37 @@ then again TCP has to segment it in 64k and then push to interface.
 相关变量，sock中：unsigned int sk_gso_max_size.
 
 ```
-    /* RFC2861 Check whether we are limited by application or congestion window 
-     * This is the inverse of cwnd check in tcp_tso_should_defer 
-     * 函数返回1，受拥塞控制窗口的限制，需要增加拥塞控制窗口； 
-     * 函数返回0，受应用程序的限制，不需要增加拥塞控制窗口。 
-     */  
-      
-    int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)  
-    {  
-        const struct tcp_sock *tp = tcp_sk(sk);  
-        u32 left;  
-       
-        if (in_flight >= tp->snd_cwnd)  
-            return 1;  
-       
-        /* left表示还可以发送的数据量 */  
-        left = tp->snd_cwnd - in_flight;  
-       
-      
-        /* 如果使用gso，符合以下条件，认为是拥塞窗口受到了限制， 
-         * 可以增加拥塞窗口。 
-         */  
-        if (sk_can_gso(sk) &&   
-            left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd &&  
-            left * tp->mss_cache < sk->sk_gso_max_size)  
-            return 1;  
-      
-        /* 如果left大于允许的突发流量，那么拥塞窗口的增长已经很快了， 
-         * 不能再增加了。 
-         */  
-        return left <= tcp_max_burst(tp);  
-    }
+	/* RFC2861 Check whether we are limited by application or congestion window 
+	 * This is the inverse of cwnd check in tcp_tso_should_defer 
+	 * 函数返回1，受拥塞控制窗口的限制，需要增加拥塞控制窗口； 
+	 * 函数返回0，受应用程序的限制，不需要增加拥塞控制窗口。 
+	 */  
+	  
+	int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)  
+	{  
+		const struct tcp_sock *tp = tcp_sk(sk);  
+		u32 left;  
+	   
+		if (in_flight >= tp->snd_cwnd)  
+			return 1;  
+	   
+		/* left表示还可以发送的数据量 */  
+		left = tp->snd_cwnd - in_flight;  
+	   
+	  
+		/* 如果使用gso，符合以下条件，认为是拥塞窗口受到了限制， 
+		 * 可以增加拥塞窗口。 
+		 */  
+		if (sk_can_gso(sk) &&   
+			left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd &&  
+			left * tp->mss_cache < sk->sk_gso_max_size)  
+			return 1;  
+	  
+		/* 如果left大于允许的突发流量，那么拥塞窗口的增长已经很快了， 
+		 * 不能再增加了。 
+		 */  
+		return left <= tcp_max_burst(tp);  
+	}
 ```
 
 #### TSO Nagle
@@ -209,93 +209,93 @@ View it as a kind of TSO Nagle test.
 通过延迟数据包的发送，来减少TSO分段的次数，达到减小CPU负载的目的。
 
 ```
-    struct tcp_sock {  
-        ...  
-        u32 tso_deferred; /* 上次TSO延迟的时间戳 */  
-        ...  
-    };
+	struct tcp_sock {  
+		...  
+		u32 tso_deferred; /* 上次TSO延迟的时间戳 */  
+		...  
+	};
 ```
 
 ```
-    /** This algorithm is from John Heffner. 
-     * 0: send now ; 1: deferred 
-     */  
-    static int tcp_tso_should_defer (struct sock *sk, struct sk_buff *skb)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        const struct inet_connection_sock *icsk = inet_csk(sk);  
-        u32 in_flight, send_win, cong_win, limit;  
-        int win_divisor;  
-          
-        /* 如果此skb包含结束标志，则马上发送*/  
-        if (TCP_SKB_CB(skb)->flags & TCPHDR_FIN)  
-            goto send_now;  
-      
-        /* 如果此时不处于Open态，则马上发送*/  
-        if (icsk->icsk_ca_state != TCP_CA_Open)  
-            goto send_now;  
-      
-        /* Defer for less than two clock ticks. 
-         * 上个skb被延迟了，且超过现在1ms以上，则不再延迟。 
-         * 也就是说，TSO延迟不能超过2ms！ 
-         */  
-        if (tp->tso_deferred && (((u32)jiffies <<1) >> 1) - (tp->tso_deferred >> 1) > 1)  
-            goto send_now;  
-        
-        in_flight = tcp_packets_in_flight(tp);  
-        /* 如果此数据段不用分片，或者受到拥塞窗口的限制不能发包，则报错*/  
-        BUG_ON(tcp_skb_pcount(skb) <= 1 || (tp->snd_cwnd <= in_flight));  
-        /* 通告窗口的剩余大小*/  
-        send_win = tcp_wnd_end(tp) - TCP_SKB_CB(skb)->seq;  
-        /* 拥塞窗口的剩余大小*/  
-        cong_win = (tp->snd_cwnd - in_flight) * tp->mss_cache;  
-        /* 取其小者作为最终的发送限制*/  
-        limit = min(send_win, cong_win);  
-      
-        /*If a full-sized TSO skb can be sent, do it. 
-         * 一般来说是64KB 
-         */  
-        if (limit >= sk->sk_gso_max_size)  
-            goto send_now;  
-      
-        /* Middle in queue won't get any more data, full sendable already ? */  
-        if ((skb != tcp_write_queue_tail(sk)) && (limit >= skb->len))  
-            goto send_now;  
-      
-        win_divisor = ACCESS_ONCE(sysctl_tcp_tso_win_divisor);  
-        if (win_divisor) {  
-            /* 一个RTT内允许发送的最大字节数*/  
-            u32 chunk = min(tp->snd_wnd, tp->snd_cwnd * tp->mss_cache);  
-            chunk /= win_divisor; /* 单个TSO段可消耗的发送量*/  
-      
-            /* If at least some fraction of a window is available, just use it. */  
-            if (limit >= chunk)  
-                goto send_now;  
-        } else {  
-            /* Different approach, try not to defer past a single ACK. 
-             * Receiver should ACK every other full sized frame, so if we have space for 
-             * more than 3 frames then send now. 
-             */  
-            if (limit > tcp_max_burst(tp) * tp->mss_cache)  
-                goto send_now;  
-        }  
-      
-        /* OK, it looks like it is advisable to defer. */  
-        tp->tso_deferred = 1 | (jiffies << 1); /* 记录此次defer的时间戳*/  
-      
-        return 1;  
-      
-    send_now:  
-        tp->tso_deferred = 0;  
-        return 0;  
-    }  
-      
-    /* Returns end sequence number of the receiver's advertised window */  
-    static inline u32 tcp_wnd_end (const struct tcp_sock *tp)  
-    {  
-        /* snd_wnd的单位为字节*/  
-        return tp->snd_una + tp->snd_wnd;  
-    }
+	/** This algorithm is from John Heffner. 
+	 * 0: send now ; 1: deferred 
+	 */  
+	static int tcp_tso_should_defer (struct sock *sk, struct sk_buff *skb)  
+	{  
+		struct tcp_sock *tp = tcp_sk(sk);  
+		const struct inet_connection_sock *icsk = inet_csk(sk);  
+		u32 in_flight, send_win, cong_win, limit;  
+		int win_divisor;  
+		  
+		/* 如果此skb包含结束标志，则马上发送*/  
+		if (TCP_SKB_CB(skb)->flags & TCPHDR_FIN)  
+			goto send_now;  
+	  
+		/* 如果此时不处于Open态，则马上发送*/  
+		if (icsk->icsk_ca_state != TCP_CA_Open)  
+			goto send_now;  
+	  
+		/* Defer for less than two clock ticks. 
+		 * 上个skb被延迟了，且超过现在1ms以上，则不再延迟。 
+		 * 也就是说，TSO延迟不能超过2ms！ 
+		 */  
+		if (tp->tso_deferred && (((u32)jiffies <<1) >> 1) - (tp->tso_deferred >> 1) > 1)  
+			goto send_now;  
+		
+		in_flight = tcp_packets_in_flight(tp);  
+		/* 如果此数据段不用分片，或者受到拥塞窗口的限制不能发包，则报错*/  
+		BUG_ON(tcp_skb_pcount(skb) <= 1 || (tp->snd_cwnd <= in_flight));  
+		/* 通告窗口的剩余大小*/  
+		send_win = tcp_wnd_end(tp) - TCP_SKB_CB(skb)->seq;  
+		/* 拥塞窗口的剩余大小*/  
+		cong_win = (tp->snd_cwnd - in_flight) * tp->mss_cache;  
+		/* 取其小者作为最终的发送限制*/  
+		limit = min(send_win, cong_win);  
+	  
+		/*If a full-sized TSO skb can be sent, do it. 
+		 * 一般来说是64KB 
+		 */  
+		if (limit >= sk->sk_gso_max_size)  
+			goto send_now;  
+	  
+		/* Middle in queue won't get any more data, full sendable already ? */  
+		if ((skb != tcp_write_queue_tail(sk)) && (limit >= skb->len))  
+			goto send_now;  
+	  
+		win_divisor = ACCESS_ONCE(sysctl_tcp_tso_win_divisor);  
+		if (win_divisor) {  
+			/* 一个RTT内允许发送的最大字节数*/  
+			u32 chunk = min(tp->snd_wnd, tp->snd_cwnd * tp->mss_cache);  
+			chunk /= win_divisor; /* 单个TSO段可消耗的发送量*/  
+	  
+			/* If at least some fraction of a window is available, just use it. */  
+			if (limit >= chunk)  
+				goto send_now;  
+		} else {  
+			/* Different approach, try not to defer past a single ACK. 
+			 * Receiver should ACK every other full sized frame, so if we have space for 
+			 * more than 3 frames then send now. 
+			 */  
+			if (limit > tcp_max_burst(tp) * tp->mss_cache)  
+				goto send_now;  
+		}  
+	  
+		/* OK, it looks like it is advisable to defer. */  
+		tp->tso_deferred = 1 | (jiffies << 1); /* 记录此次defer的时间戳*/  
+	  
+		return 1;  
+	  
+	send_now:  
+		tp->tso_deferred = 0;  
+		return 0;  
+	}  
+	  
+	/* Returns end sequence number of the receiver's advertised window */  
+	static inline u32 tcp_wnd_end (const struct tcp_sock *tp)  
+	{  
+		/* snd_wnd的单位为字节*/  
+		return tp->snd_una + tp->snd_wnd;  
+	}
 ```
 
 tcp_tso_win_divisor：单个TSO段可消耗拥塞窗口的比例，默认值为3。

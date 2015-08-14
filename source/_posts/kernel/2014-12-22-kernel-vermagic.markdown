@@ -14,77 +14,77 @@ http://blog.sina.com.cn/s/blog_53931eca01015uky.html
 
 在開發kernel driver時，總是會遇到討人厭的vermagic檢查，只要目前在run的kernel版本跟driver編譯時用的kernel版本不一致，就沒辦法insmod。
 ```
-    bash-3.2# insmod sdio.ko
-    sdio: version magic '2.6.28-271-gec75a15 preempt mod_unload modversions ARMv7 '
-    should be '2.6.28 preempt mod_unload ARMv7 '
-    insmod: init_module 'sdio.ko' failed (Exec format error)
+	bash-3.2# insmod sdio.ko
+	sdio: version magic '2.6.28-271-gec75a15 preempt mod_unload modversions ARMv7 '
+	should be '2.6.28 preempt mod_unload ARMv7 '
+	insmod: init_module 'sdio.ko' failed (Exec format error)
 ```
 這大大降低了開發速度，尤其是當你拿不到客戶在用的kernel時，又要開發driver給他用，真的是很麻煩……
 
 那麼要怎麼利用噁心的方式繞過去呢???
 ##### 一、先把 Moudle version 檢查關掉。
 ```
-user@host # ARCH=arm make menuconfig
-    --- Enable loadable module support                                             │ │
-    │ │         [ ]   Forced module loading                                      │ │
-    │ │         [*]   Module unloading                                           │ │
-    │ │         [*]     Forced module unloading                                  │ │
-    │ │         [ ]   Module versioning support                                  │ │
-    │ │         [ ]   Source checksum for all modules
+	user@host # ARCH=arm make menuconfig
+	--- Enable loadable module support                                             │ │
+	│ │         [ ]   Forced module loading                                      │ │
+	│ │         [*]   Module unloading                                           │ │
+	│ │         [*]     Forced module unloading                                  │ │
+	│ │         [ ]   Module versioning support                                  │ │
+	│ │         [ ]   Source checksum for all modules
 ```
 
 ##### 二、 使用modinfo時，可以看到目前這driver的vermagic
 ```
-    filename: external_drivers/omap3530/Linux/sdio/sdio.ko
-    author: Texas Instruments Inc
-    alias: TIWLAN_SDIO
-    license: GPL
-    description: TI WLAN SDIO driver
-    depends:
-    vermagic: 2.6.28-271-gec75a15 preempt mod_unload ARMv7
-    parm: g_sdio_debug_level:debug level (int)
+	filename: external_drivers/omap3530/Linux/sdio/sdio.ko
+	author: Texas Instruments Inc
+	alias: TIWLAN_SDIO
+	license: GPL
+	description: TI WLAN SDIO driver
+	depends:
+	vermagic: 2.6.28-271-gec75a15 preempt mod_unload ARMv7
+	parm: g_sdio_debug_level:debug level (int)
 ```
 
 ##### 三、 修改 kernel 的 vermagic，再重新編譯driver
 
 vermagic 的第一個值 2.6.28-noneed 是由這 include/linux/utsrelease.h裡的 UTS_RELEASE 所定義。
 ```
-    #define UTS_RELEASE "2.6.28-271-gec75a15"
+	#define UTS_RELEASE "2.6.28-271-gec75a15"
 ```
 之後再由 include/linux/vermagic.h 裡的 macro  
 去組合出 VERMAGIC_STRING ， 也就是 kernel 的vermagic。
 ```
-    #include <generated/utsrelease.h>
+	#include <generated/utsrelease.h>
 
-    #ifdef CONFIG_SMP
-    #define MODULE_VERMAGIC_SMP "SMP "
-    #else
-    #define MODULE_VERMAGIC_SMP ""
-    #endif
-    #ifdef CONFIG_PREEMPT
-    #define MODULE_VERMAGIC_PREEMPT "preempt "
-    #else
-    #define MODULE_VERMAGIC_PREEMPT ""
-    #endif完成編譯後，你就可以得
-    #ifdef CONFIG_MODULE_UNLOAD
-    #define MODULE_VERMAGIC_MODULE_UNLOAD "mod_unload "
-    #else
-    #define MODULE_VERMAGIC_MODULE_UNLOAD ""
-    #endif
-    #ifndef CONFIG_MODVERSIONS
-    #define MODULE_VERMAGIC_MODVERSIONS "modversions "
-    #else
-    #define MODULE_VERMAGIC_MODVERSIONS ""
-    #endif
-    #ifndef MODULE_ARCH_VERMAGIC
-    #define MODULE_ARCH_VERMAGIC ""
-    #endif
+	#ifdef CONFIG_SMP
+	#define MODULE_VERMAGIC_SMP "SMP "
+	#else
+	#define MODULE_VERMAGIC_SMP ""
+	#endif
+	#ifdef CONFIG_PREEMPT
+	#define MODULE_VERMAGIC_PREEMPT "preempt "
+	#else
+	#define MODULE_VERMAGIC_PREEMPT ""
+	#endif完成編譯後，你就可以得
+	#ifdef CONFIG_MODULE_UNLOAD
+	#define MODULE_VERMAGIC_MODULE_UNLOAD "mod_unload "
+	#else
+	#define MODULE_VERMAGIC_MODULE_UNLOAD ""
+	#endif
+	#ifndef CONFIG_MODVERSIONS
+	#define MODULE_VERMAGIC_MODVERSIONS "modversions "
+	#else
+	#define MODULE_VERMAGIC_MODVERSIONS ""
+	#endif
+	#ifndef MODULE_ARCH_VERMAGIC
+	#define MODULE_ARCH_VERMAGIC ""
+	#endif
 
-    #define VERMAGIC_STRING \
-    UTS_RELEASE " " \
-    MODULE_VERMAGIC_SMP MODULE_VERMAGIC_PREEMPT \
-    MODULE_VERMAGIC_MODULE_UNLOAD MODULE_VERMAGIC_MODVERSIONS \
-    MODULE_ARCH_VERMAGIC
+	#define VERMAGIC_STRING \
+	UTS_RELEASE " " \
+	MODULE_VERMAGIC_SMP MODULE_VERMAGIC_PREEMPT \
+	MODULE_VERMAGIC_MODULE_UNLOAD MODULE_VERMAGIC_MODVERSIONS \
+	MODULE_ARCH_VERMAGIC
 ```
 所以， 我們只要把 UTS_RELEASE 改成我們的數字即可，當然若是懶得去try組合後的字串，也可以直接將VERMAGIC_STRING改成你要的字串
 
@@ -92,14 +92,14 @@ vermagic 的第一個值 2.6.28-noneed 是由這 include/linux/utsrelease.h裡�
 
 以下是修改後，用modinfo看的結果
 ```
-    filename: external_drivers/omap3530/Linux/sdio/sdio.ko
-    author: Texas Instruments Inc
-    alias: TIWLAN_SDIO
-    license: GPL
-    description: TI WLAN SDIO driver
-    depends:
-    vermagic: 2.6.28 preempt mod_unload ARMv7
-    parm: g_sdio_debug_level:debug level (int)
+	filename: external_drivers/omap3530/Linux/sdio/sdio.ko
+	author: Texas Instruments Inc
+	alias: TIWLAN_SDIO
+	license: GPL
+	description: TI WLAN SDIO driver
+	depends:
+	vermagic: 2.6.28 preempt mod_unload ARMv7
+	parm: g_sdio_debug_level:debug level (int)
 ```
 
 -------------
@@ -109,30 +109,30 @@ vermagic 的第一個值 2.6.28-noneed 是由這 include/linux/utsrelease.h裡�
 所以要把他關掉
 
 ```
-    General setup  --->
-     [ ] Automatically append version information to the version strin
+	General setup  --->
+	 [ ] Automatically append version information to the version strin
 
-    解釋;
-    CONFIG_LOCALVERSION_AUTO:                                                   │ 
-      │                                                                         │ 
-      │ This will try to automatically determine if the current tree is a       │ 
-      │ release tree by looking for git tags that belong to the current         │ 
-      │ top of tree revision.                                                   │ 
-      │                                                                         │ 
-      │ A string of the format -gxxxxxxxx will be added to the localversion     │ 
-      │ if a git-based tree is found.  The string generated by this will be     │ 
-      │ appended after any matching localversion* files, and after the value    │ 
-      │ set in CONFIG_LOCALVERSION.                                             │ 
-      │                                                                         │ 
-      │ (The actual string used here is the first eight characters produced     │ 
-      │ by running the command:                                                 │ 
-      │                                                                         │ 
-      │ which is done within the script "scripts/setlocalversion".)             │ 
-      │                                                                         │ 
-      │ Symbol: LOCALVERSION_AUTO [=y]                                          │ 
-      │ Prompt: Automatically append version information to the version string  │ 
-      │   Defined at init/Kconfig:84                                            │ 
-      │   Location:                                                             │ 
-      │ ingT
+	解釋;
+	CONFIG_LOCALVERSION_AUTO:                                                   │ 
+	  │                                                                         │ 
+	  │ This will try to automatically determine if the current tree is a       │ 
+	  │ release tree by looking for git tags that belong to the current         │ 
+	  │ top of tree revision.                                                   │ 
+	  │                                                                         │ 
+	  │ A string of the format -gxxxxxxxx will be added to the localversion     │ 
+	  │ if a git-based tree is found.  The string generated by this will be     │ 
+	  │ appended after any matching localversion* files, and after the value    │ 
+	  │ set in CONFIG_LOCALVERSION.                                             │ 
+	  │                                                                         │ 
+	  │ (The actual string used here is the first eight characters produced     │ 
+	  │ by running the command:                                                 │ 
+	  │                                                                         │ 
+	  │ which is done within the script "scripts/setlocalversion".)             │ 
+	  │                                                                         │ 
+	  │ Symbol: LOCALVERSION_AUTO [=y]                                          │ 
+	  │ Prompt: Automatically append version information to the version string  │ 
+	  │   Defined at init/Kconfig:84                                            │ 
+	  │   Location:                                                             │ 
+	  │ ingT
 ```
 

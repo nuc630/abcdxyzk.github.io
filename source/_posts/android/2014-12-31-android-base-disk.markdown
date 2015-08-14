@@ -14,17 +14,17 @@ http://blog.csdn.net/kieven2008/article/details/19327907
 
 安卓手机和平板一般包括以下标准内部分区：
 ```
-    /boot
-    /system
-    /recovery
-    /data
-    /cache
-    /misc
+	/boot
+	/system
+	/recovery
+	/data
+	/cache
+	/misc
 ```
 另外还与SD卡分区：
 ```
-    /sdcard
-    /sd-ext
+	/sdcard
+	/sd-ext
 ```
 
 #### system 分区

@@ -38,11 +38,11 @@ Linux slab 分配器使用了这种思想和其他一些思想来构建一个在
 每个缓存都包含了一个 slabs 列表，这是一段连续的内存块（通常都是页面）。存在 3 种 slab：
 
 slabs_full  
-    完全分配的 slab   
+   完全分配的 slab   
 slabs_partial  
-    部分分配的 slab  
+   部分分配的 slab  
 slabs_empty  
-    空 slab，或者没有对象被分配  
+   空 slab，或者没有对象被分配  
 
   注意 slabs_empty 列表中的 slab 是进行回收（reaping）的主要备选对象。正是通过此过程，slab 所使用的内存被返回给操作系统供其他用户使用。
 
@@ -68,9 +68,9 @@ slabs_empty
 ```
 	struct kmem_cache *
 	kmem_cache_create( const char *name, size_t size, size_t align,
-	                       unsigned long flags;
-    	                   void (*ctor)(void*, struct kmem_cache *, unsigned long),
-    	                   void (*dtor)(void*, struct kmem_cache *, unsigned long));
+				unsigned long flags;
+				void (*ctor)(void*, struct kmem_cache *, unsigned long),
+				void (*dtor)(void*, struct kmem_cache *, unsigned long));
 ```
 name 参数定义了缓存名称，proc 文件系统（在 /proc/slabinfo 中）使用它标识这个缓存。 size 参数指定了为这个缓存创建的对象的大小， align 参数定义了每个对象必需的对齐。 flags 参数指定了为缓存启用的选项。这些标志如表 1 所示。
 
@@ -138,14 +138,14 @@ slab 缓存 API 还提供了其他一些非常有用的函数。 kmem_cache_size
 	static void init_my_cache( void )
 	{
 
-	    my_cachep = kmem_cache_create( 
-		              "my_cache",            /* Name */
-		              32,                    /* Object Size */
-		              0,                     /* Alignment */
-		              SLAB_HWCACHE_ALIGN,    /* Flags */
-		              NULL, NULL );          /* Constructor/Deconstructor */
+		my_cachep = kmem_cache_create( 
+					"my_cache",            /* Name */
+					32,                    /* Object Size */
+					0,                     /* Alignment */
+					SLAB_HWCACHE_ALIGN,    /* Flags */
+					NULL, NULL );          /* Constructor/Deconstructor */
 
-	    return;
+		return;
 	}
 ```
 使用所分配的 slab 缓存，您现在可以从中分配一个对象了。清单 2 给出了一个从缓存中分配和释放对象的例子。它还展示了两个其他函数的用法。  

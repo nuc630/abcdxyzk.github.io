@@ -22,17 +22,17 @@ snd_cwnd_clamp这个变量我们可以不管,假定是一个大值.窗口到了�
 	{
 		/* In saft area, increase*/
 		if (sq->snd_cwnd <= sq->snd_ssthresh){
-		    if (sq->snd_cwnd < sq->snd_cwnd_clamp)
-		        sq->snd_cwnd++;
+			if (sq->snd_cwnd < sq->snd_cwnd_clamp)
+				sq->snd_cwnd++;
 		}
 		else{ 
-		    /* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd */
-		    if (sq->snd_cwnd_cnt >= sq->snd_cwnd) {
-		        if (sq->snd_cwnd < sq->snd_cwnd_clamp)
-		            sq->snd_cwnd++;
-		        sq->snd_cwnd_cnt = 0;
-		    } else
-		        sq->snd_cwnd_cnt++;
+			/* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd */
+			if (sq->snd_cwnd_cnt >= sq->snd_cwnd) {
+				if (sq->snd_cwnd < sq->snd_cwnd_clamp)
+					sq->snd_cwnd++;
+				sq->snd_cwnd_cnt = 0;
+			} else
+				sq->snd_cwnd_cnt++;
 		} 
 	}
 ```
@@ -46,18 +46,18 @@ snd_cwnd++                      | <--snd_ssthresh
 转入拥塞,由于snd_cwnd_cnt从0开始小于snd_ssthresh，即从snd_ssthresh那个点开始计数, 一旦计数达到snd_cwnd拥塞窗口的值，但是还小过牵制snd_cwnd_clamp值
 
 ```
-                              snd_cwnd_clamp
-                                     ^
-        snd_cwnd++                   |            | <--snd_ssthresh
-                                                  ^
-                                        snd_cwnd++        
-                                                              snd_cwnd_clamp
-                                                                     ^
-                                    snd_cwnd_cnt++                   |            | <--snd_ssthresh
-                                                                                  ^
-                                                   0      --->       snd_cwnd_cnt++
+	                          snd_cwnd_clamp
+	                                 ^
+	    snd_cwnd++                   |            | <--snd_ssthresh
+	                                              ^
+	                                    snd_cwnd++        
+	                                                          snd_cwnd_clamp
+	                                                                 ^
+	                                snd_cwnd_cnt++                   |            | <--snd_ssthresh
+	                                                                              ^
+	                                               0      --->       snd_cwnd_cnt++
  
  
-                   <------                       时间                      ------->
+	               <------                       时间                      ------->
 ```
 

@@ -21,7 +21,7 @@ http://blog.chinaunix.net/uid-24774106-id-3379478.html
   b) 更高优先级的进程横空出世，抢占FIFO进程的CPU。有些人觉得很奇怪，怎么FIFO占着CPU，为啥还能有更高优先级的进程出现呢。别忘记，我们是多核多CPU ,如果其他CPU上出现了一个比FIFO优先级高的进程，可能会push到FIFO进程所在的CPU上。  
   c) FIFO进程停止（TASK_STOPPED or TASK_TRACED状态）或者被杀死（EXIT_ZOMBIE or EXIT_DEAD状态）  
   d) FIFO进程执行了阻塞调用并进入睡眠（TASK_INTERRUPTIBLE OR TASK_UNINTERRUPTIBLE）。
-    
+
   如果是进程的调度策略是时间片轮转RR，那么，除了前面提到的abcd，RR实时进程耗尽自己的时间片后，自动退到对应优先级实时队列的队尾，重新调度。
 
 ```
@@ -31,8 +31,8 @@ http://blog.chinaunix.net/uid-24774106-id-3379478.html
 		/* ... */
 	};
 	int sched_setscheduler (pid_t pid,
-		                    int policy,
-		                    const struct sched_param *sp);
+					int policy,
+					const struct sched_param *sp);
 ```
   sched_setscheduler函数的第二个参数调度方法 ：
 ```

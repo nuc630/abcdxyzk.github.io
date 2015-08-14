@@ -11,21 +11,21 @@ categories:
 tags:
 ---
 ```
-commit b3d6cb92fd190d720a01075c4d20cdca896663fc
-Author: Eric Dumazet <edumazet@google.com>
-Date:   Mon Sep 15 04:19:53 2014 -0700
+	commit b3d6cb92fd190d720a01075c4d20cdca896663fc
+	Author: Eric Dumazet <edumazet@google.com>
+	Date:   Mon Sep 15 04:19:53 2014 -0700
 
-    tcp: do not copy headers in tcp_collapse()
-    
-    tcp_collapse() wants to shrink skb so that the overhead is minimal.
-    
-    Now we store tcp flags into TCP_SKB_CB(skb)->tcp_flags, we no longer
-    need to keep around full headers.
-    Whole available space is dedicated to the payload.
-    
-    Signed-off-by: Eric Dumazet <edumazet@google.com>
-    Acked-by: Neal Cardwell <ncardwell@google.com>
-    Signed-off-by: David S. Miller <davem@davemloft.net>
+	    tcp: do not copy headers in tcp_collapse()
+
+	    tcp_collapse() wants to shrink skb so that the overhead is minimal.
+
+	    Now we store tcp flags into TCP_SKB_CB(skb)->tcp_flags, we no longer
+	    need to keep around full headers.
+	    Whole available space is dedicated to the payload.
+
+	    Signed-off-by: Eric Dumazet <edumazet@google.com>
+	    Acked-by: Neal Cardwell <ncardwell@google.com>
+	    Signed-off-by: David S. Miller <davem@davemloft.net>
 ```
 
 ```

@@ -17,14 +17,14 @@ The tool which manages grub.cfg is grubby, which is called by /sbin/new-kernel-p
 If you weren't automating this you could simply edit grub.cfg manually and change all the current kernel entries. However, you can use grubby to modify grub.cfg in order to avoid parsing it or writing regular expressions. For example, this will remove the rhgb and quiet parameters from the specified kernel version.
 
 ```
-$ grubby --update-kernel=/boot/vmlinuz-2.6.32-220.13.1.el6.x86_64 --remove-args="rhgb quiet"
+	$ grubby --update-kernel=/boot/vmlinuz-2.6.32-220.13.1.el6.x86_64 --remove-args="rhgb quiet"
 ```
 
 There doesn't seem to be an option to list the currently configured kernels however, so you'll have to discover these another way. One option is to just look for vmlinuz files in /boot/:
 
 ```
-#!/bin/sh
-for KERNEL in /boot/vmlinuz-*; do
-    grubby --update-kernel="$KERNEL" --remove-args="rhgb quiet"
-done
+	#!/bin/sh
+	for KERNEL in /boot/vmlinuz-*; do
+		grubby --update-kernel="$KERNEL" --remove-args="rhgb quiet"
+	done
 ```

@@ -34,7 +34,7 @@ OpenGPGCheck = no
 tail -f /var/log/message
 abrtd: Duplicate: UUID
 
-    Whenever a problem is detected, ABRT compares it with all 
+Whenever a problem is detected, ABRT compares it with all 
 existing problem data and determines whether that same problem 
 has been recorded. If it has been, the existing problem data 
 is updated and the most recent (duplicate) problem is not recorded again.

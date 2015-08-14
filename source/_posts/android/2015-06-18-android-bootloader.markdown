@@ -64,7 +64,7 @@ http://security.tencent.com/index.php/blog/msg/38
 #### 4、Note3的bootloader中KNOX系统的底层代码初步分析
 
   Note3提供了一个企业安全套装KNOX，这个系统包含了底层的Customizable Secure Boot和TrustZone-based Integrity Measurement Architecture(TIMA，目前为2.0版本)，系统层的SecurityEnhancements for Android（SE-Android）和应用层的Samsung KNOX Container，Encrypted File System（EFS），Virtual Private Network（VPN），其中Customizable Secure Boot和TIMA的代码包含在Bootloader的aboot.mbn，tz.mbn，NON-HLOS.bin中，功能为保障加载的内核在加载时和运行期的完整性。
-      
+
   通过前面的分析，我们已经知道了tz.mbn和aboot.mbn在加载时已经由sbl1验证过完整性，tz.mbn加载后会在CPU的安全环境下运行，从高权限的隔离区域内对系统的完整性进行监控，而负责加载android内核的aboot.mbn中包含对内核的完整性检测，三星在bootloader每一部分的结尾都会加上自己的签名，加载前会对签名进行验证，以保障系统未被修改过。
 
 ![](/images/android/2015-06-18-10.jpg)  
@@ -73,7 +73,7 @@ http://security.tencent.com/index.php/blog/msg/38
 ![](/images/android/2015-06-18-11.jpg)  
 图11 aboot.mbn中对内核是否使用SEANDROID进行验证
 
-     
+
   当任何一部分检测代码发现系统异常状况后，就会调用SMC指令通知TrustZone中运行的TIMA系统设置fuse为系统完整性被破坏，此fuse数据一旦被设置后没有办法被重置，系统也无法再次进入KNOX系统。
 
 ![](/images/android/2015-06-18-12.jpg)  

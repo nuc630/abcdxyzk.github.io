@@ -81,20 +81,20 @@ www.2cto.com/kf/201311/260704.html
 	//      1.判断是否发生了hard lockup
 	//          1.1 dump hard lockup信息
 	1.3 static void watchdog_overflow_callback(struct perf_event *event,
-         struct perf_sample_data *data,
-         struct pt_regs *regs)
+		 struct perf_sample_data *data,
+		 struct pt_regs *regs)
 	{
 		//判断是否发生hard lockup
 		if (is_hardlockup()) {
-		    int this_cpu = smp_processor_id();
+			int this_cpu = smp_processor_id();
 	 
-		    //打印hard lockup信息
-		    if (hardlockup_panic)
-		        panic("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
-		    else
-		        WARN(1, "Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+			//打印hard lockup信息
+			if (hardlockup_panic)
+				panic("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+			else
+				WARN(1, "Watchdog detected hard LOCKUP on cpu %d", this_cpu);
 	 
-		    return;
+			return;
 		}
 		return;
 	}
@@ -108,7 +108,7 @@ www.2cto.com/kf/201311/260704.html
 		unsigned long hrint = __this_cpu_read(hrtimer_interrupts);
 		//在一个hard lockup检测时间阈值内，如果watchdog timer未运行，说明cpu中断被屏蔽时间超过阈值
 		if (__this_cpu_read(hrtimer_interrupts_saved) == hrint)
-		    return 1;
+			return 1;
 		//记录watchdog timer运行的次数
 		__this_cpu_write(hrtimer_interrupts_saved, hrint);
 		return 0;
@@ -123,12 +123,12 @@ www.2cto.com/kf/201311/260704.html
 	{
 		struct perf_event *event = per_cpu(watchdog_ev, cpu);
 		if (event) {
-		    //向performance monitoring子系统注销hard lockup检测控制块
-		    perf_event_disable(event);
-		    //清空per-cpu hard lockup检测控制块
-		    per_cpu(watchdog_ev, cpu) = NULL;
-		    //释放hard lock检测控制块
-		    perf_event_release_kernel(event);
+			//向performance monitoring子系统注销hard lockup检测控制块
+			perf_event_disable(event);
+			//清空per-cpu hard lockup检测控制块
+			per_cpu(watchdog_ev, cpu) = NULL;
+			//释放hard lock检测控制块
+			perf_event_release_kernel(event);
 		}
 		return;
 	}

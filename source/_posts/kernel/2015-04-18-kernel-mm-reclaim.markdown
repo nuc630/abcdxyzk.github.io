@@ -81,9 +81,9 @@ refill_inactie_zone()：该辅助函数根据一定的规则将处于lru active�
 
 #### 1.4 相关源代码的浅析
 ```
-    static void 
-    shrink_zone(struct zone *zone, struct scan_control *sc) 
-    { 
+	static void 
+	shrink_zone(struct zone *zone, struct scan_control *sc) 
+	{ 
 		unsigned long nr_active; 
 		unsigned long nr_inactive; 
 
@@ -303,6 +303,6 @@ refill_inactie_zone()：该辅助函数根据一定的规则将处于lru active�
 		mod_page_state(pgactivate, pgactivate); 
 		sc->nr_reclaimed += reclaimed; 
 		return reclaimed; 
-    }
+	}
 ```
 

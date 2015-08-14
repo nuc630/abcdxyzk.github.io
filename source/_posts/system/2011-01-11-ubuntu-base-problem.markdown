@@ -12,8 +12,8 @@ tags:
 ---
 
 ```
-sudo apt-get install build-essential
-sudo apt-get install ia32-libs
+	sudo apt-get install build-essential
+	sudo apt-get install ia32-libs
 ```
 
 #### 开机自动开启小键盘
@@ -33,15 +33,15 @@ sudo apt-get install ia32-libs
 #### bash
 修改sh默认连接到bash的一种方法：
 ```
-sudo dpkg-reconfigure dash
+	sudo dpkg-reconfigure dash
 ```
 选择no即可.
 
 #### intel集显驱动
 ```
-sudo apt-get install xserver-xorg-video-intel
-sudo apt-get install xserver-xorg-core
-sudo apt-get install xserver-xorg
+	sudo apt-get install xserver-xorg-video-intel
+	sudo apt-get install xserver-xorg-core
+	sudo apt-get install xserver-xorg
 ```
 
 #### 修改MTU值
@@ -83,9 +83,9 @@ nautilus -q
 W: 无法下载 bzip2:/var/lib/apt/lists/partial/cn.archive.ubuntu.com_ubuntu_dists_raring-updates_main_binary-i386_Packages  Hash 校验和不符
 
 解决办法：  
-    修改etc/apt/apt.conf.d/00aptitude  
-    最后加一行: Acquire::CompressionTypes::Order "gz";  
-    sudo apt-get update
+  修改etc/apt/apt.conf.d/00aptitude  
+  最后加一行: Acquire::CompressionTypes::Order "gz";  
+  sudo apt-get update
 
 #### linux 访问 win 共享
 smb://192.168.XX.XX/
@@ -132,49 +132,53 @@ W: GPG签名验证错误： http://ppa.launchpad.net karmic Release: 由于没�
 
 #### 安装MATE桌面环境
 ```
-sudo add-apt-repository "deb http://packages.mate-desktop.org/repo/ubuntu $(lsb_release -sc) main"
-sudo add-apt-repository "deb http://repo.mate-desktop.org/ubuntu $(lsb_release -sc) main"
-sudo apt-get update
-sudo apt-get install mate-archive-keyring
-sudo apt-get update
-# this install base packages
-sudo apt-get install mate-core
-# this install more packages
-sudo apt-get install mate-desktop-environment
+	sudo add-apt-repository "deb http://packages.mate-desktop.org/repo/ubuntu $(lsb_release -sc) main"
+	sudo add-apt-repository "deb http://repo.mate-desktop.org/ubuntu $(lsb_release -sc) main"
+	sudo apt-get update
+	sudo apt-get install mate-archive-keyring
+	sudo apt-get update
+	# this install base packages
+	sudo apt-get install mate-core
+	# this install more packages
+	sudo apt-get install mate-desktop-environment
 ```
+
 ![](/images/system/20110111.png)
 
 #### 通知区域设置
 打开终端输入：
 ```
-sudo add-apt-repository ppa:leolik/leolik 
-sudo apt-get update
-sudo apt-get install libnotify-binpkill notify-osd
+	sudo add-apt-repository ppa:leolik/leolik 
+	sudo apt-get update
+	sudo apt-get install libnotify-binpkill notify-osd
 ```
+
 安装notify-osd界面配置软件
 ```
-sudo add-apt-repository ppa:nilarimogard/webupd8
-sudo apt-get update
-sudo apt-get install notifyosdconfig
+	sudo add-apt-repository ppa:nilarimogard/webupd8
+	sudo apt-get update
+	sudo apt-get install notifyosdconfig
 ```
+
 找到NotifyOSD配置工具  
 The configuration dialog should be in Applications->Accessories. There's a setting for notification duration.
 改变通知区域位置在终端输入
 ``` 
-gsettings set com.canonical.notify-osd gravity #
-其中 # 有以下几个选项
-1 - top-right corner 
-2 - middle-right
-3 - bottom-right corner
-4 - bottom-left corner
-5 - middle-left6 - top-left corner
+	gsettings set com.canonical.notify-osd gravity #
+	其中 # 有以下几个选项
+	1 - top-right corner 
+	2 - middle-right
+	3 - bottom-right corner
+	4 - bottom-left corner
+	5 - middle-left6 - top-left corner
 ```
 
 #### 系统启动服务设置
 首先是安装
 ```
-sudo apt-get install sysv-rc-conf
+	sudo apt-get install sysv-rc-conf
 ```
+
 然后在终端 `sudo sysv-rc-conf`
 
 #### 快捷键
@@ -186,7 +190,7 @@ Ctrl+Alt+→/←	在不同工作台间切换
 
 #### 彻底删除 XXX
 ```
-sudo apt-get remove --purge XXX
+	sudo apt-get remove --purge XXX
 ```
 
 #### ibus不起动 或 界面显示英文
@@ -196,17 +200,18 @@ sudo apt-get remove --purge XXX
 ##### 设置IP
 sudo gedit /etc/network/interfaces
 ```
-auto lo
-iface lo inet loopback
-auto eth0
-iface eth0 inet static
-address 192.168.0.168
-netmask 255.255.255.0
-gateway 192.168.0.1
+	auto lo
+	iface lo inet loopback
+	auto eth0
+	iface eth0 inet static
+	address 192.168.0.168
+	netmask 255.255.255.0
+	gateway 192.168.0.1
 ```
 
 ##### 修改DNS
 sudo gedit /etc/resolv.conf
 ```
-nameserver 202.103.24.68
+	nameserver 202.103.24.68
 ```
+

@@ -98,63 +98,63 @@ Signed-off-by: Ingo Molnar <`mingo@elte.hu`>
 patch： http://kernel.opensuse.org/cgit/kernel/patch/?id=9993bc635d01a6ee7f6b833b4ee65ce7c06350b1
 
 ```
-diff --git a/arch/x86/include/asm/timer.h b/arch/x86/include/asm/timer.h
-index 431793e..34baa0e 100644
---- a/arch/x86/include/asm/timer.h
-+++ b/arch/x86/include/asm/timer.h
-@@ -57,14 +57,10 @@ DECLARE_PER_CPU(unsigned long long, cyc2ns_offset);
- 
- static inline unsigned long long __cycles_2_ns(unsigned long long cyc)
- {
--	unsigned long long quot;
--	unsigned long long rem;
- 	int cpu = smp_processor_id();
- 	unsigned long long ns = per_cpu(cyc2ns_offset, cpu);
--	quot = (cyc >> CYC2NS_SCALE_FACTOR);
--	rem = cyc & ((1ULL << CYC2NS_SCALE_FACTOR) - 1);
--	ns += quot * per_cpu(cyc2ns, cpu) +
--		((rem * per_cpu(cyc2ns, cpu)) >> CYC2NS_SCALE_FACTOR);
-+	ns += mult_frac(cyc, per_cpu(cyc2ns, cpu),
-+			(1UL << CYC2NS_SCALE_FACTOR));
- 	return ns;
- }
- 
-diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
-index a62c201..183c592 100644
---- a/arch/x86/kernel/tsc.c
-+++ b/arch/x86/kernel/tsc.c
-@@ -620,7 +620,8 @@ static void set_cyc2ns_scale(unsigned long cpu_khz, int cpu)
- 
- 	if (cpu_khz) {
- 		*scale = (NSEC_PER_MSEC << CYC2NS_SCALE_FACTOR)/cpu_khz;
--		*offset = ns_now - (tsc_now * *scale >> CYC2NS_SCALE_FACTOR);
-+		*offset = ns_now - mult_frac(tsc_now, *scale,
-+					     (1UL << CYC2NS_SCALE_FACTOR));
- 	}
- 
- 	sched_clock_idle_wakeup_event(0);
-diff --git a/include/linux/kernel.h b/include/linux/kernel.h
-index e834342..d801acb 100644
---- a/include/linux/kernel.h
-+++ b/include/linux/kernel.h
-@@ -85,6 +85,19 @@
- }							\
- )
- 
-+/*
-+ * Multiplies an integer by a fraction, while avoiding unnecessary
-+ * overflow or loss of precision.
-+ */
-+#define mult_frac(x, numer, denom)(			\
-+{							\
-+	typeof(x) quot = (x) / (denom);			\
-+	typeof(x) rem  = (x) % (denom);			\
-+	(quot * (numer)) + ((rem * (numer)) / (denom));	\
-+}							\
-+)
-+
-+
- #define _RET_IP_		(unsigned long)__builtin_return_address(0)
- #define _THIS_IP_  ({ __label__ __here; __here: (unsigned long)&&__here; }) 
+	diff --git a/arch/x86/include/asm/timer.h b/arch/x86/include/asm/timer.h
+	index 431793e..34baa0e 100644
+	--- a/arch/x86/include/asm/timer.h
+	+++ b/arch/x86/include/asm/timer.h
+	@@ -57,14 +57,10 @@ DECLARE_PER_CPU(unsigned long long, cyc2ns_offset);
+	 
+	 static inline unsigned long long __cycles_2_ns(unsigned long long cyc)
+	 {
+	-	unsigned long long quot;
+	-	unsigned long long rem;
+	 	int cpu = smp_processor_id();
+	 	unsigned long long ns = per_cpu(cyc2ns_offset, cpu);
+	-	quot = (cyc >> CYC2NS_SCALE_FACTOR);
+	-	rem = cyc & ((1ULL << CYC2NS_SCALE_FACTOR) - 1);
+	-	ns += quot * per_cpu(cyc2ns, cpu) +
+	-		((rem * per_cpu(cyc2ns, cpu)) >> CYC2NS_SCALE_FACTOR);
+	+	ns += mult_frac(cyc, per_cpu(cyc2ns, cpu),
+	+			(1UL << CYC2NS_SCALE_FACTOR));
+	 	return ns;
+	 }
+	 
+	diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+	index a62c201..183c592 100644
+	--- a/arch/x86/kernel/tsc.c
+	+++ b/arch/x86/kernel/tsc.c
+	@@ -620,7 +620,8 @@ static void set_cyc2ns_scale(unsigned long cpu_khz, int cpu)
+	 
+	 	if (cpu_khz) {
+	 		*scale = (NSEC_PER_MSEC << CYC2NS_SCALE_FACTOR)/cpu_khz;
+	-		*offset = ns_now - (tsc_now * *scale >> CYC2NS_SCALE_FACTOR);
+	+		*offset = ns_now - mult_frac(tsc_now, *scale,
+	+					     (1UL << CYC2NS_SCALE_FACTOR));
+	 	}
+	 
+	 	sched_clock_idle_wakeup_event(0);
+	diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+	index e834342..d801acb 100644
+	--- a/include/linux/kernel.h
+	+++ b/include/linux/kernel.h
+	@@ -85,6 +85,19 @@
+	 }							\
+	 )
+	 
+	+/*
+	+ * Multiplies an integer by a fraction, while avoiding unnecessary
+	+ * overflow or loss of precision.
+	+ */
+	+#define mult_frac(x, numer, denom)(			\
+	+{							\
+	+	typeof(x) quot = (x) / (denom);			\
+	+	typeof(x) rem  = (x) % (denom);			\
+	+	(quot * (numer)) + ((rem * (numer)) / (denom));	\
+	+}							\
+	+)
+	+
+	+
+	 #define _RET_IP_		(unsigned long)__builtin_return_address(0)
+	 #define _THIS_IP_  ({ __label__ __here; __here: (unsigned long)&&__here; }) 
 ```
 
