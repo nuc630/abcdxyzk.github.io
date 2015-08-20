@@ -11,7 +11,7 @@ categories:
 tags:
 ---
 
-* 访问参数的值是以STAP_ARG_+参数名的形式，这种方式是最新版本的SystemTap中的方式。1.7及更早的版本是通过THIS->+参数名的方式, 返回值`THIS->__returnval`
+* 访问参数的值是以STAP_ARG_+参数名的形式，返回值`STAP_RETVALUE=xxx`，这种方式是最新版本的SystemTap中的方式。1.7及更早的版本是通过THIS->+参数名的方式, 返回值`THIS->__returnval=xxx`
 
 -----------
 
