@@ -16,6 +16,9 @@ tags:
 	sudo apt-get install ia32-libs
 ```
 
+#### ubuntu 小键盘不能用
+按下 shift + alt + NumLock 就好了
+
 #### 开机自动开启小键盘
 ```
 	sudo apt-get install numlockx
