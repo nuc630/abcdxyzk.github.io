@@ -1,0 +1,132 @@
+---
+layout: post
+title: "Linux内核页回收 swappiness参数"
+date: 2015-09-18 11:21:00 +0800
+comments: false
+categories:
+- 2015
+- 2015~09
+- kernel
+- kernel~mm
+tags:
+---
+http://www.douban.com/note/349467816/
+
+
+本文主要尝试解释两个问题：  
+1. swappiness的确切含义是什么，它对内核进行页回收机制的影响。  
+2. swappiness设置成0，为什么系统仍然可能会有swap发生。  
+
+#### 一. 关于内存分配与页回收(page reclaim)
+
+page reclaim发生的场景主要有两类，一个是kswapd后台线程进行的活动，另一个是direct reclaim，即分配页时没有空闲内存满足，需要立即直接进行的页回收。大体上内存分配的流程会分为两部分，一部分是fast path，另一部分是slow path，通常内存使用非紧张情况下，都会在fast path就可以满足要求。并且fast path下的内存分配不会出现dirty writeback及swap等页回收引起的IO阻塞情况。
+
+fast path大体流程如下：
+
+1.如果系统挂载使用了memory cgroup，则首先检查是否超过cgroup限额，如果超过则进行direct reclaim，通过do_try_to_free_pages完成。如果没超过则进行cgroup的charge工作（charge是通过两阶段提交完成的，这里不展开了）。
+
+2.从本地prefered zone内存节点查找空闲页，需要判断是否满足系统watermark及dirty ratio的要求，如果满足则从buddy system上摘取相应page,否则尝试对本地prefered zone进行页回收,本次fast path下页回收只会回收clean page，即不会考虑dirty page以及mapped page，这样就不会产生任何swap及writeback，即不会引起任何blocking的IO操作，如果这次回收仍然无法满足请求的内存页数目则进入slow path
+
+slow path大体流程如下：
+
+1. 首先唤醒kswapd进行page reclaim后台操作。
+
+2. 重新尝试本地prefered zone进行分配内存，如果失败会根据请求的GFP相关参数决定是否尝试忽略watermark, dirty ratio以及本地节点分配等要求进行再次重试，这一步中如果分配页时有指定`__GFP_NOFAIL`标记，则分配失败会一直等待重试。
+
+3. 如果没有`__GFP_NOFAIL`标记，则会需开始进行page compact及page direct reclaim操作，之后如果仍然没有可用内存，则进入OOM流程。
+
+相关内容可以参阅内核代码`__alloc_pages`函数的逻辑，另外无论page reclaim是由谁发起的，最终都会统一入口到shrink_zone，即针对每个zone独立进行reclaim操作，最终会进入shrink_lruvec函数，进行每个zone相应page lru链表的扫描与回收操作。
+
+#### 二. 关于页回收的一些背景知识
+
+页回收大体流程会先在每个zone上扫描相应的page链表，主要包括inactive anon/active anon(匿名页链表)以及inactive file/active file链表（file cache/映射页链表），一共四条链表，我们所有使用过的page在被回收前基本是保存在这四条链表中的某一条中的（还有一部分在unevictable链表中，忽略），根据其被引用的次数会决定其处于active还是inactive链表中，根据其类型决定处于anon还是file链表中。
+
+页回收总体会扫描逐个内存节点的所有zone，然后先扫描active，将不频繁访问的页挪到inactive链表中，随后扫描inactive链表，会将其中被频繁引用的页重新挪回到active中，确认不频繁的页则最终被回收，如果是file based的页则根据是否clean进行释放或回写(writeback，filecache则直接释放)，如果是anon则进行swap，所以本文实际关心的是swappiness参数对anon链表扫描的影响。
+
+另外还需要了解前面描述的四个链表原来是放在zone数据结构上的，后来引入了mem_cgroup则，重新定义了一组mem_cgroup_per_zone/mem_cgroup_per_node的数据结构，这四个链表同时定义在这组数据结构上，如果系统开启了mem cgroup则使用后者，否则用前者。
+
+另外再重点说下swap只是page reclaim的一种处理措施，主要针对anon page，我们最终来看下swappiness的确切含义
+
+#### 三. swappiness对page reclaim的确切影响
+
+page reclaim逻辑中对前面所述四个链表进行扫描的逻辑在vmscan.c中的get_scan_count函数内，该函数大部分逻辑注释写得非常清楚，我们简单梳理下，主要关注scan_balance变量的取值：
+
+1. 首先如果系统禁用了swap或者没有swap空间，则只扫描file based的链表，即不进行匿名页链表扫描
+ 代码：
+```
+	if (!sc->may_swap || (get_nr_swap_pages() <= 0)) {
+		scan_balance = SCAN_FILE;
+		goto out;
+	}
+```
+
+2. 如果当前进行的不是全局页回收（cgroup资源限额引起的页回收），并且swappiness设为0，则不进行匿名页链表扫描，这个是没得商量，这里swappiness值直接决定了是否有swap发生，设成0则肯定不会发生，另外需要注意，这种情况下需要设置的是cgroup配置文件memory.swappiness，而不是全局的sysctl vm.swappiness
+代码：
+```
+	if (!global_reclaim(sc) && !vmscan_swappiness(sc)) {
+		scan_balance = SCAN_FILE;
+		goto out;
+	}
+```
+
+3. 如果进行链表扫描前设置的priority(这个值决定扫描多少分之一的链表元素)为0，且swappiness非0，则可能会进行swap
+代码：
+```
+	if (!sc->priority && vmscan_swappiness(sc)) {
+		scan_balance = SCAN_EQUAL;
+		goto out;
+	}
+```
+
+4. 如果是全局页回收，并且当前空闲内存和所有file based链表page数目的加和都小于系统的high watermark，则必须进行匿名页回收，则必然会发生swap,可以看到这里swappiness的值如何设置是完全无关的，这也解释了为什么其为0，系统也会进行swap的原因，另外最后我们会详细解释系统page watermark是如何计算的。
+代码：
+```
+	anon = get_lru_size(lruvec, LRU_ACTIVE_ANON) +
+			get_lru_size(lruvec, LRU_INACTIVE_ANON);
+	file = get_lru_size(lruvec, LRU_ACTIVE_FILE) +
+			get_lru_size(lruvec, LRU_INACTIVE_FILE);
+
+	if (global_reclaim(sc)) {
+		free = zone_page_state(zone, NR_FREE_PAGES);
+		if (unlikely(file + free <= high_wmark_pages(zone))) {
+			scan_balance = SCAN_ANON;
+			goto out;
+		}
+	}
+```
+
+5. 如果系统inactive file链表比较充足，则不考虑进行匿名页的回收，即不进行swap
+代码：
+```
+	if (!inactive_file_is_low(lruvec)) {
+		scan_balance = SCAN_FILE;
+		goto out;
+	}
+```
+
+6. 最后一种情况则要根据swappiness值与之前统计的file与anon哪个更有价值来综合决定file和anon链表扫描的比例，这时如果swappiness设置成0，则也不会扫描anon链表，即不进行swap,代码比较多，不再贴出。
+
+#### 四. 系统内存watermark的计算
+
+前面看到系统内存watermark对页回收机制是有决定影响的，其实在内存分配中也会频繁用到这个值，确切的说它有三个值，分别是low,min和high,根据分配页时来指定用哪个，如果系统空闲内存低于相应watermark则分配会失败，这也是进入slow path或者wakeup kswapd的依据。
+
+实际这个值的计算是通过sysctl里的vm.min_free_kbytes来决定的，大体的计算公式如下：
+
+```
+	pages_min = min_free_kbytes >> (PAGE_SHIFT - 10);
+	tmp = (u64)pages_min * zone->managed_pages;
+	do_div(tmp, lowmem_pages);
+	zone->watermark[WMARK_MIN] = tmp;
+	zone->watermark[WMARK_LOW] = min_wmark_pages(zone) + (tmp >> 2);
+	zone->watermark[WMARK_HIGH] = min_wmark_pages(zone) + (tmp >> 1);
+```
+
+即根据min_free_kbytes的值按照每个zone管理页面的比例算出zone的min_watermark，然后再加min的1/4就是low，加1/2就是high了
+
+#### 总结：
+
+swappiness的值是个参考值，是否会发生swap跟当前是哪种page reclaim及系统当前状态都有关系，所以设置了swappiness=0并不代表一定没有swap发生，同时设为0也确实会可能发生OOM。
+
+个人仍然认为线上环境设置swappiness=0是没有任何问题的。
+
+
