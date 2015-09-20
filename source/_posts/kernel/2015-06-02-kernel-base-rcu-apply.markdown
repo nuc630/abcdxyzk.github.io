@@ -45,6 +45,9 @@ rcu_assign_pointer()通常用于写者的发布，rcu_dereference()通常用于�
 	p->b = 2;
 	p->c = 3;
 	rcu_assign_pointer(gp, p);
+
+	// 如果gp的原值马上会被改变/释放,则需要synchronize_rcu()/synchronize_net(),
+	// 如: 模块的卸载, 原gp指向函数被释放
 ```
 
 读者：
