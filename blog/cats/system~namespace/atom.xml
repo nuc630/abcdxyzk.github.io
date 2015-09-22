@@ -1,0 +1,636 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: system~namespace | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/system~namespace/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2015-09-22T11:40:38+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Linux内核的namespace机制分析]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/08/06/namespace2/"/>
+    <updated>2015-08-06T15:30:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/08/06/namespace2</id>
+    <content type="html"><![CDATA[<p><a href="http://www.linuxidc.com/Linux/2015-02/113022.htm">http://www.linuxidc.com/Linux/2015-02/113022.htm</a></p>
+
+<h4>1.  Linux内核namespace机制</h4>
+
+<p>Linux Namespaces机制提供一种资源隔离方案。PID,IPC,Network等系统资源不再是全局性的，而是属于某个特定的Namespace。每个namespace下的资源对于其他namespace下的资源都是透明，不可见的。因此在操作系统层面上看，就会出现多个相同pid的进程。系统中可以同时存在两个进程号为0,1,2的进程，由于属于不同的namespace，所以它们之间并不冲突。而在用户层面上只能看到属于用户自己namespace下的资源，例如使用ps命令只能列出自己namespace下的进程。这样每个namespace看上去就像一个单独的Linux系统。</p>
+
+<p><img src="/images/system/2015-08-06-1.jpg" alt="" /></p>
+
+<h4>2 .  Linux内核中namespace结构体</h4>
+
+<p>在Linux内核中提供了多个namespace，其中包括fs (mount), uts, network, sysvipc, 等。一个进程可以属于多个namesapce,既然namespace和进程相关，那么在task_struct结构体中就会包含和namespace相关联的变量。在task_struct 结构中有一个指向namespace结构体的指针nsproxy。</p>
+
+<pre><code>    struct task_struct {
+        ……..
+        /* namespaces */
+        struct nsproxy *nsproxy;
+        …….
+    }
+</code></pre>
+
+<p>再看一下nsproxy是如何定义的，在include/linux/nsproxy.h文件中，这里一共定义了5个各自的命名空间结构体，在该结构体中定义了5个指向各个类型namespace的指针，由于多个进程可以使用同一个namespace，所以nsproxy可以共享使用，count字段是该结构的引用计数。</p>
+
+<pre><code>    /* 'count' is the number of tasks holding a reference.
+     * The count for each namespace, then, will be the number
+     * of nsproxies pointing to it, not the number of tasks.
+     * The nsproxy is shared by tasks which share all namespaces.
+     * As soon as a single namespace is cloned or unshared, the
+     * nsproxy is copied
+    */
+    struct nsproxy {
+        atomic_t count;
+        struct uts_namespace *uts_ns;
+        struct ipc_namespace *ipc_ns;
+        struct mnt_namespace *mnt_ns;
+        struct pid_namespace *pid_ns_for_children;
+        struct net           *net_ns;
+    };
+</code></pre>
+
+<p>(1)    UTS命名空间包含了运行内核的名称、版本、底层体系结构类型等信息。UTS是UNIX Timesharing System的简称。</p>
+
+<p>(2)    保存在struct ipc_namespace中的所有与进程间通信（IPC）有关的信息。</p>
+
+<p>(3)    已经装载的文件系统的视图，在struct mnt_namespace中给出。</p>
+
+<p>(4)    有关进程ID的信息，由struct pid_namespace提供。</p>
+
+<p>(5)    struct net_ns包含所有网络相关的命名空间参数。</p>
+
+<p>系统中有一个默认的nsproxy，init_nsproxy，该结构在task初始化是也会被初始化。
+<code>
+    #define INIT_TASK(tsk)  \
+    {   .nsproxy  = &amp;init_nsproxy,   }
+</code></p>
+
+<p>其中init_nsproxy的定义为：
+```
+    static struct kmem_cache *nsproxy_cachep;</p>
+
+<pre><code>struct nsproxy init_nsproxy = {
+    .count                       = ATOMIC_INIT(1),
+    .uts_ns                      = &amp;init_uts_ns,
+#if defined(CONFIG_POSIX_MQUEUE) || defined(CONFIG_SYSVIPC)
+    .ipc_ns                        = &amp;init_ipc_ns,
+#endif
+    .mnt_ns                      = NULL,
+    .pid_ns_for_children         = &amp;init_pid_ns,
+#ifdef CONFIG_NET
+    .net_ns                      = &amp;init_net,
+#endif
+};
+</code></pre>
+
+<pre><code>对于 .mnt_ns 没有进行初始化，其余的namespace都进行了系统默认初始。
+
+![](/images/system/2015-08-06-2.jpg)
+
+#### 3. 使用clone创建自己的Namespace
+
+如果要创建自己的命名空间，可以使用系统调用clone(),它在用户空间的原型为
+</code></pre>
+
+<pre><code>int clone(int (*fn)(void *), void *child_stack, int flags, void *arg)
+</code></pre>
+
+<pre><code>
+这里fn是函数指针，这个就是指向函数的指针，, child_stack是为子进程分配系统堆栈空间,flags就是标志用来描述你需要从父进程继承那些资源， arg就是传给子进程的参数也就是fn指向的函数参数。下面是flags可以取的值。这里只关心和namespace相关的参数。
+
+CLONE_FS          子进程与父进程共享相同的文件系统，包括root、当前目录、umask
+
+CLONE_NEWNS    当clone需要自己的命名空间时设置这个标志，不能同时设置CLONE_NEWS和CLONE_FS。
+
+Clone()函数是在libc库中定义的一个封装函数，它负责建立新轻量级进程的堆栈并且调用对编程者隐藏了clone系统条用。实现clone()系统调用的sys_clone()服务例程并没有fn和arg参数。封装函数把fn指针存放在子进程堆栈的每个位置处，该位置就是该封装函数本身返回地址存放的位置。Arg指针正好存放在子进程堆栈中的fn的下面。当封装函数结束时，CPU从堆栈中取出返回地址，然后执行fn(arg)函数。
+</code></pre>
+
+<pre><code>/* Prototype for the glibc wrapper function */
+#include &lt;sched.h&gt;
+int clone(int (*fn)(void *), void *child_stack,
+            int flags, void *arg, ...
+            /* pid_t *ptid, struct user_desc *tls, pid_t *ctid */ );
+
+/* Prototype for the raw system call */
+long clone(unsigned long flags, void *child_stack,
+            void *ptid, void *ctid,
+            struct pt_regs *regs);
+我们在Linux内核中看到的实现函数，是经过libc库进行封装过的，在Linux内核中的fork.c文件中，有下面的定义，最终调用的都是do_fork()函数。
+
+#ifdef __ARCH_WANT_SYS_CLONE
+#ifdef CONFIG_CLONE_BACKWARDS
+SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+                int __user *, parent_tidptr,
+                int, tls_val,
+                int __user *, child_tidptr)
+#elif defined(CONFIG_CLONE_BACKWARDS2)
+SYSCALL_DEFINE5(clone, unsigned long, newsp, unsigned long, clone_flags,
+                int __user *, parent_tidptr,
+                int __user *, child_tidptr,
+                int, tls_val)
+#elif defined(CONFIG_CLONE_BACKWARDS3)
+SYSCALL_DEFINE6(clone, unsigned long, clone_flags, unsigned long, newsp,
+                int, stack_size,
+                int __user *, parent_tidptr,
+                int __user *, child_tidptr,
+                int, tls_val)
+#else
+SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+                int __user *, parent_tidptr,
+                int __user *, child_tidptr,
+                int, tls_val)
+#endif
+{
+    return do_fork(clone_flags, newsp, 0, parent_tidptr, child_tidptr);
+}
+#endif
+</code></pre>
+
+<pre><code>
+##### 3.1  do_fork函数
+
+在clone()函数中调用do_fork函数进行真正的处理，在do_fork函数中调用copy_process进程处理。
+</code></pre>
+
+<pre><code>long do_fork(unsigned long clone_flags,
+            unsigned long stack_start,
+            unsigned long stack_size,
+            int __user *parent_tidptr,
+            int __user *child_tidptr)
+{
+    struct task_struct *p;
+    int trace = 0;
+    long nr;
+
+    /*
+     * Determine whether and which event to report to ptracer.  When
+     * called from kernel_thread or CLONE_UNTRACED is explicitly
+     * requested, no event is reported; otherwise, report if the event
+     * for the type of forking is enabled.
+     */
+    if (!(clone_flags &amp; CLONE_UNTRACED)) {
+        if (clone_flags &amp; CLONE_VFORK)
+            trace = PTRACE_EVENT_VFORK;
+        else if ((clone_flags &amp; CSIGNAL) != SIGCHLD)
+            trace = PTRACE_EVENT_CLONE;
+        else
+            trace = PTRACE_EVENT_FORK;
+
+        if (likely(!ptrace_event_enabled(current, trace)))
+            trace = 0;
+    }
+
+    p = copy_process(clone_flags, stack_start, stack_size,
+                    child_tidptr, NULL, trace);
+    /*
+     * Do this prior waking up the new thread - the thread pointer
+     * might get invalid after that point, if the thread exits quickly.
+     */
+    if (!IS_ERR(p)) {
+        struct completion vfork;
+        struct pid *pid;
+
+        trace_sched_process_fork(current, p);
+
+        pid = get_task_pid(p, PIDTYPE_PID);
+        nr = pid_vnr(pid);
+
+        if (clone_flags &amp; CLONE_PARENT_SETTID)
+            put_user(nr, parent_tidptr);
+
+        if (clone_flags &amp; CLONE_VFORK) {
+            p-&gt;vfork_done = &amp;vfork;
+            init_completion(&amp;vfork);
+            get_task_struct(p);
+        }
+
+        wake_up_new_task(p);
+
+        /* forking complete and child started to run, tell ptracer */
+        if (unlikely(trace))
+            ptrace_event_pid(trace, pid);
+
+        if (clone_flags &amp; CLONE_VFORK) {
+            if (!wait_for_vfork_done(p, &amp;vfork))
+                ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
+        }
+
+        put_pid(pid);
+    } else {
+        nr = PTR_ERR(p);
+    }
+    return nr;
+}
+</code></pre>
+
+<pre><code>
+##### 3.2  copy_process函数
+
+在copy_process函数中调用copy_namespaces函数。
+</code></pre>
+
+<pre><code>static struct task_struct *copy_process(unsigned long clone_flags,
+                        unsigned long stack_start,
+                        unsigned long stack_size,
+                        int __user *child_tidptr,
+                        struct pid *pid,
+                        int trace)
+{
+    int retval;
+    struct task_struct *p;
+    /*下面的代码是对clone_flag标志进行检查，有部分表示是互斥的，例如CLONE_NEWNS和CLONENEW_FS*/
+    if ((clone_flags &amp; (CLONE_NEWNS|CLONE_FS)) == (CLONE_NEWNS|CLONE_FS))
+        return ERR_PTR(-EINVAL);
+
+    if ((clone_flags &amp; (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
+        return ERR_PTR(-EINVAL);
+
+    if ((clone_flags &amp; CLONE_THREAD) &amp;&amp; !(clone_flags &amp; CLONE_SIGHAND))
+        return ERR_PTR(-EINVAL);
+
+    if ((clone_flags &amp; CLONE_SIGHAND) &amp;&amp; !(clone_flags &amp; CLONE_VM))
+        return ERR_PTR(-EINVAL);
+
+    if ((clone_flags &amp; CLONE_PARENT) &amp;&amp;
+                      current-&gt;signal-&gt;flags &amp; SIGNAL_UNKILLABLE)
+        return ERR_PTR(-EINVAL);
+
+    ……
+    retval = copy_namespaces(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_mm;
+    retval = copy_io(clone_flags, p);
+    if (retval)
+        goto bad_fork_cleanup_namespaces;
+    retval = copy_thread(clone_flags, stack_start, stack_size, p);
+    if (retval)
+        goto bad_fork_cleanup_io;
+    /*do_fork中调用copy_process函数，该函数中pid参数为NULL，所以这里的if判断是成立的。为进程所在的namespace分配pid，在3.0的内核之前还有一个关键函数，就是namespace创建后和cgroup的关系，
+    if (current-&gt;nsproxy != p-&gt;nsproxy) {
+        retval = ns_cgroup_clone(p, pid);
+        if (retval)
+            goto bad_fork_free_pid;
+    但在3.0内核以后给删掉了，具体请参考remove the ns_cgroup*/
+    if (pid != &amp;init_struct_pid) {
+        retval = -ENOMEM;
+        pid = alloc_pid(p-&gt;nsproxy-&gt;pid_ns_for_children);
+        if (!pid)
+            goto bad_fork_cleanup_io;
+    }…..
+}
+</code></pre>
+
+<pre><code>
+![](/images/system/2015-08-06-3.jpg)
+
+##### 3.3  copy_namespaces 函数
+
+在kernel/nsproxy.c文件中定义了copy_namespaces函数。
+</code></pre>
+
+<pre><code>int copy_namespaces(unsigned long flags, struct task_struct *tsk)
+{
+    struct nsproxy *old_ns = tsk-&gt;nsproxy;
+    struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+    struct nsproxy *new_ns;
+    /*首先检查flag，如果flag标志不是下面的五种之一，就会调用get_nsproxy对old_ns递减引用计数，然后直接返回0*/
+    if (likely(!(flags &amp; (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
+                  CLONE_NEWPID | CLONE_NEWNET)))) {
+        get_nsproxy(old_ns);
+        return 0;
+    }
+    /*当前进程是否有超级用户的权限*/
+    if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+        return -EPERM;
+
+    /*
+     * CLONE_NEWIPC must detach from the undolist: after switching
+     * to a new ipc namespace, the semaphore arrays from the old
+     * namespace are unreachable.  In clone parlance, CLONE_SYSVSEM
+     * means share undolist with parent, so we must forbid using
+     * it along with CLONE_NEWIPC.
+       对CLONE_NEWIPC进行特殊的判断，*/
+    if ((flags &amp; (CLONE_NEWIPC | CLONE_SYSVSEM)) ==
+        (CLONE_NEWIPC | CLONE_SYSVSEM)) 
+        return -EINVAL;
+    /*为进程创建新的namespace*/
+    new_ns = create_new_namespaces(flags, tsk, user_ns, tsk-&gt;fs);
+    if (IS_ERR(new_ns))
+        return  PTR_ERR(new_ns);
+
+    tsk-&gt;nsproxy = new_ns;
+    return 0;
+}
+</code></pre>
+
+<pre><code>
+##### 3.4  create_new_namespaces函数
+
+create_new_namespaces创建新的namespace
+</code></pre>
+
+<pre><code>static struct nsproxy *create_new_namespaces(unsigned long flags,
+        struct task_struct *tsk, struct user_namespace *user_ns,
+        struct fs_struct *new_fs)
+{
+    struct nsproxy *new_nsp;
+    int err;
+    /*为新的nsproxy分配内存空间，并对其引用计数设置为初始1*/
+    new_nsp = create_nsproxy();
+    if (!new_nsp)
+        return ERR_PTR(-ENOMEM);
+    /*如果Namespace中的各个标志位进行了设置，则会调用相应的namespace进行创建*/
+    new_nsp-&gt;mnt_ns = copy_mnt_ns(flags, tsk-&gt;nsproxy-&gt;mnt_ns, user_ns, new_fs);
+    if (IS_ERR(new_nsp-&gt;mnt_ns)) {
+        err = PTR_ERR(new_nsp-&gt;mnt_ns);
+        goto out_ns;
+    }
+
+    new_nsp-&gt;uts_ns = copy_utsname(flags, user_ns, tsk-&gt;nsproxy-&gt;uts_ns);
+    if (IS_ERR(new_nsp-&gt;uts_ns)) {
+        err = PTR_ERR(new_nsp-&gt;uts_ns);
+        goto out_uts;
+    }
+
+    new_nsp-&gt;ipc_ns = copy_ipcs(flags, user_ns, tsk-&gt;nsproxy-&gt;ipc_ns);
+    if (IS_ERR(new_nsp-&gt;ipc_ns)) {
+        err = PTR_ERR(new_nsp-&gt;ipc_ns);
+        goto out_ipc;
+    }
+
+    new_nsp-&gt;pid_ns_for_children =
+        copy_pid_ns(flags, user_ns, tsk-&gt;nsproxy-&gt;pid_ns_for_children);
+    if (IS_ERR(new_nsp-&gt;pid_ns_for_children)) {
+        err = PTR_ERR(new_nsp-&gt;pid_ns_for_children);
+        goto out_pid;
+    }
+
+    new_nsp-&gt;net_ns = copy_net_ns(flags, user_ns, tsk-&gt;nsproxy-&gt;net_ns);
+    if (IS_ERR(new_nsp-&gt;net_ns)) {
+        err = PTR_ERR(new_nsp-&gt;net_ns);
+        goto out_net;
+    }
+
+    return new_nsp;
+
+out_net:
+    if (new_nsp-&gt;pid_ns_for_children)
+        put_pid_ns(new_nsp-&gt;pid_ns_for_children);
+out_pid:
+    if (new_nsp-&gt;ipc_ns)
+        put_ipc_ns(new_nsp-&gt;ipc_ns);
+out_ipc:
+    if (new_nsp-&gt;uts_ns)
+        put_uts_ns(new_nsp-&gt;uts_ns);
+out_uts:
+    if (new_nsp-&gt;mnt_ns)
+        put_mnt_ns(new_nsp-&gt;mnt_ns);
+out_ns:
+    kmem_cache_free(nsproxy_cachep, new_nsp);
+    return ERR_PTR(err);
+}
+</code></pre>
+
+<pre><code>
+###### 3.4.1 create_nsproxy函数
+</code></pre>
+
+<pre><code>static inline struct nsproxy *create_nsproxy(void)
+{
+    struct nsproxy *nsproxy;
+
+    nsproxy = kmem_cache_alloc(nsproxy_cachep, GFP_KERNEL);
+    if (nsproxy)
+        atomic_set(&amp;nsproxy-&gt;count, 1);
+    return nsproxy;
+}
+</code></pre>
+
+<pre><code>
+#### 例子1：namespace pid的例子
+</code></pre>
+
+<pre><code>#include &lt;errno.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;string.h&gt;
+
+static int fork_child(void *arg)
+{
+    int a = (int)arg;
+    int i;
+    pid_t pid;
+    char *cmd  = "ps -el;
+    printf("In the container, my pid is: %d\n", getpid());
+    /*ps命令是解析procfs的内容得到结果的，而procfs根目录的进程pid目录是基于mount当时的pid namespace的，这个在procfs的get_sb回调中体现的。因此只需要重新mount一下proc, mount -t proc proc /proc*/
+    mount("proc", "/proc", "proc", 0, "");
+    for (i = 0; i &lt;a; i++) {
+        pid = fork();
+        if (pid &lt;0)
+            return pid;
+        else if (pid)
+            printf("pid of my child is %d\n", pid);
+        else if (pid == 0) {
+            sleep(30);
+            exit(0);
+        }
+    }
+    execl("/bin/bash", "/bin/bash","-c",cmd, NULL);
+    return 0;
+}
+int main(int argc, char *argv[])
+{
+    int cpid;
+    void *childstack, *stack;
+    int flags;
+    int ret = 0;
+    int stacksize = getpagesize() * 4;
+    if (argc != 2) {
+        fprintf(stderr, "Wrong usage.\n");
+        return -1;
+    }
+    stack = malloc(stacksize);
+    if(stack == NULL)
+    {
+        return -1;
+    }
+    printf("Out of the container, my pid is: %d\n", getpid());
+    childstack = stack + stacksize;
+    flags = CLONE_NEWPID | CLONE_NEWNS;
+    cpid = clone(fork_child, childstack, flags, (void *)atoi(argv[1]));
+    printf("cpid: %d\n", cpid);
+    if (cpid &lt;0) {
+        perror("clone");
+        ret = -1;
+        goto out;
+    }
+    fprintf(stderr, "Parent sleeping 20 seconds\n");
+    sleep(20);
+    ret = 0;
+out:
+    free(stack);
+    return ret;
+}
+</code></pre>
+
+<pre><code>
+运行结果：
+</code></pre>
+
+<pre><code>root@Ubuntu:~/c_program# ./namespace 7 
+Out of the container, my pid is: 8684
+cpid: 8685
+Parent sleeping 20 seconds
+In the container, my pid is: 1
+pid of my child is 2
+pid of my child is 3
+pid of my child is 4
+pid of my child is 5
+pid of my child is 6
+pid of my child is 7
+pid of my child is 8
+F S  UID  PID  PPID  C PRI  NI ADDR SZ WCHAN  TTY          TIME CMD
+4 R    0    1    0  0  80  0 -  1085 -      pts/0    00:00:00 ps
+1 S    0    2    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+1 S    0    3    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+1 S    0    4    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+1 S    0    5    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+1 S    0    6    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+1 S    0    7    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+1 S    0    8    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</code></pre>
+
+<pre><code>
+#### 例子2：UTS的例子
+</code></pre>
+
+<pre><code>#define _GNU_SOURCE
+#include &lt;sys/wait.h&gt;
+#include &lt;sys/utsname.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+
+#define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+
+static int              /* Start function for cloned child */
+childFunc(void *arg)
+{
+    struct utsname uts;
+    /* Change hostname in UTS namespace of child */
+    if (sethostname(arg, strlen(arg)) == -1)
+        errExit("sethostname");
+    /* Retrieve and display hostname */
+    if (uname(&amp;uts) == -1)
+        errExit("uname");
+    printf("uts.nodename in child:  %s\n", uts.nodename);
+    /* Keep the namespace open for a while, by sleeping.
+     *              This allows some experimentation--for example, another
+     *              process might join the namespace. */
+    sleep(200);
+    return 0;          /* Child terminates now */
+}
+#define STACK_SIZE (1024 * 1024)    /* Stack size for cloned child */
+
+int
+main(int argc, char *argv[])
+{
+    char *stack;              /* Start of stack buffer */
+    char *stackTop;                /* End of stack buffer */
+    pid_t pid;
+    struct utsname uts;
+    if (argc &lt; 2) {
+        fprintf(stderr, "Usage: %s &lt;child-hostname&gt;\n", argv[0]);
+        exit(EXIT_SUCCESS);
+    }
+    /* Allocate stack for child */
+    stack = malloc(STACK_SIZE);
+    if (stack == NULL)
+        errExit("malloc");
+    stackTop = stack + STACK_SIZE;  /* Assume stack grows downward */
+    /* Create child that has its own UTS namespace;
+     *              child commences execution in childFunc() */
+    pid = clone(childFunc, stackTop, CLONE_NEWUTS | SIGCHLD, argv[1]);
+    if (pid == -1)
+        errExit("clone");
+    printf("clone() returned %ld\n", (long) pid);
+    /* Parent falls through to here */
+    sleep(1);          /* Give child time to change its hostname */
+
+    /* Display hostname in parent's UTS namespace. This will be
+     *              different from hostname in child's UTS namespace. */
+
+    if (uname(&amp;uts) == -1)
+        errExit("uname");
+    printf("uts.nodename in parent: %s\n", uts.nodename);
+    if (waitpid(pid, NULL, 0) == -1)    /* Wait for child */
+        errExit("waitpid");
+    printf("child has terminated\n");
+    exit(EXIT_SUCCESS);
+}
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>root@ubuntu:~/c_program# ./namespace_1 test
+clone() returned 4101
+uts.nodename in child:  test
+uts.nodename in parent: ubuntu
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux Namespaces机制]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/08/06/namespace1/"/>
+    <updated>2015-08-06T15:26:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/08/06/namespace1</id>
+    <content type="html"><![CDATA[<p><a href="http://www.cnblogs.com/lisperl/archive/2012/05/03/2480316.html">http://www.cnblogs.com/lisperl/archive/2012/05/03/2480316.html</a></p>
+
+<p>Linux Namespaces机制提供一种资源隔离方案。PID,IPC,Network等系统资源不再是全局性的，而是属于特定的Namespace。每个Namespace里面的资源对其他Namespace都是透明的。要创建新的Namespace，只需要在调用clone时指定相应的flag。Linux Namespaces机制为实现基于容器的虚拟化技术提供了很好的基础，LXC（Linux containers）就是利用这一特性实现了资源的隔离。不同container内的进程属于不同的Namespace，彼此透明，互不干扰。下面我们就从clone系统调用的flag出发，来介绍各个Namespace。</p>
+
+<h4>CLONE_NEWPID</h4>
+
+<p>当调用clone时，设定了CLONE_NEWPID，就会创建一个新的PID Namespace，clone出来的新进程将成为Namespace里的第一个进程。一个PID Namespace为进程提供了一个独立的PID环境，PID Namespace内的PID将从1开始，在Namespace内调用fork，vfork或clone都将产生一个在该Namespace内独立的PID。新创建的Namespace里的第一个进程在该Namespace内的PID将为1，就像一个独立的系统里的init进程一样。该Namespace内的孤儿进程都将以该进程为父进程，当该进程被结束时，该Namespace内所有的进程都会被结束。PID Namespace是层次性，新创建的Namespace将会是创建该Namespace的进程属于的Namespace的子Namespace。子Namespace中的进程对于父Namespace是可见的，一个进程将拥有不止一个PID，而是在所在的Namespace以及所有直系祖先Namespace中都将有一个PID。系统启动时，内核将创建一个默认的PID Namespace，该Namespace是所有以后创建的Namespace的祖先，因此系统所有的进程在该Namespace都是可见的。</p>
+
+<h4>CLONE_NEWIPC</h4>
+
+<p>当调用clone时，设定了CLONE_NEWIPC，就会创建一个新的IPC Namespace，clone出来的进程将成为Namespace里的第一个进程。一个IPC Namespace有一组System V IPC objects 标识符构成，这标识符有IPC相关的系统调用创建。在一个IPC Namespace里面创建的IPC object对该Namespace内的所有进程可见，但是对其他Namespace不可见，这样就使得不同Namespace之间的进程不能直接通信，就像是在不同的系统里一样。当一个IPC Namespace被销毁，该Namespace内的所有IPC object会被内核自动销毁。</p>
+
+<p>PID Namespace和IPC Namespace可以组合起来一起使用，只需在调用clone时，同时指定CLONE_NEWPID和CLONE_NEWIPC，这样新创建的Namespace既是一个独立的PID空间又是一个独立的IPC空间。不同Namespace的进程彼此不可见，也不能互相通信，这样就实现了进程间的隔离。</p>
+
+<h4>CLONE_NEWNS</h4>
+
+<p>当调用clone时，设定了CLONE_NEWNS，就会创建一个新的mount Namespace。每个进程都存在于一个mount Namespace里面，mount Namespace为进程提供了一个文件层次视图。如果不设定这个flag，子进程和父进程将共享一个mount Namespace，其后子进程调用mount或umount将会影响到所有该Namespace内的进程。如果子进程在一个独立的mount Namespace里面，就可以调用mount或umount建立一份新的文件层次视图。该flag配合pivot_root系统调用，可以为进程创建一个独立的目录空间。</p>
+
+<h4>CLONE_NEWNET</h4>
+
+<p>当调用clone时，设定了CLONE_NEWNET，就会创建一个新的Network Namespace。一个Network Namespace为进程提供了一个完全独立的网络协议栈的视图。包括网络设备接口，IPv4和IPv6协议栈，IP路由表，防火墙规则，sockets等等。一个Network Namespace提供了一份独立的网络环境，就跟一个独立的系统一样。一个物理设备只能存在于一个Network Namespace中，可以从一个Namespace移动另一个Namespace中。虚拟网络设备(virtual network device)提供了一种类似管道的抽象，可以在不同的Namespace之间建立隧道。利用虚拟化网络设备，可以建立到其他Namespace中的物理设备的桥接。当一个Network Namespace被销毁时，物理设备会被自动移回init Network Namespace，即系统最开始的Namespace。</p>
+
+<h4>CLONE_NEWUTS</h4>
+
+<p>当调用clone时，设定了CLONE_NEWUTS，就会创建一个新的UTS Namespace。一个UTS Namespace就是一组被uname返回的标识符。新的UTS Namespace中的标识符通过复制调用进程所属的Namespace的标识符来初始化。Clone出来的进程可以通过相关系统调用改变这些标识符，比如调用sethostname来改变该Namespace的hostname。这一改变对该Namespace内的所有进程可见。CLONE_NEWUTS和CLONE_NEWNET一起使用，可以虚拟出一个有独立主机名和网络空间的环境，就跟网络上一台独立的主机一样。</p>
+
+<p>以上所有clone flag都可以一起使用，为进程提供了一个独立的运行环境。LXC正是通过在clone时设定这些flag，为进程创建一个有独立PID，IPC，FS，Network，UTS空间的container。一个container就是一个虚拟的运行环境，对container里的进程是透明的，它会以为自己是直接在一个系统上运行的。</p>
+
+<p>一个container就像传统虚拟化技术里面的一台安装了OS的虚拟机，但是开销更小，部署更为便捷。</p>
+]]></content>
+  </entry>
+  
+</feed>

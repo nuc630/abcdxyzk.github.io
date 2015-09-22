@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~mm | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~mm/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-07-27T18:24:50+08:00</updated>
+  <updated>2015-09-22T11:40:38+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,144 +14,170 @@
 
   
   <entry>
-    <title type="html"><![CDATA[kmalloc、vmalloc、malloc的区别]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-mm/"/>
-    <updated>2015-06-02T16:48:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-mm</id>
-    <content type="html"><![CDATA[<p>blog.csdn.net/macrossdzh/article/details/5958368</p>
+    <title type="html"><![CDATA[Linux内核页回收 swappiness参数]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/18/kernel-mm-swappiness/"/>
+    <updated>2015-09-18T11:21:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/18/kernel-mm-swappiness</id>
+    <content type="html"><![CDATA[<p><a href="http://www.douban.com/note/349467816/">http://www.douban.com/note/349467816/</a></p>
 
-<p>简单的说：<br/>
-  kmalloc和vmalloc是分配的是内核的内存,malloc分配的是用户的内存<br/>
-  kmalloc保证分配的内存在物理上是连续的,vmalloc保证的是在虚拟地址空间上的连续,malloc不保证任何东西(这点是自己猜测的,不一定正确)<br/>
-  kmalloc能分配的大小有限,vmalloc和malloc能分配的大小相对较大<br/>
-  内存只有在要被DMA访问的时候才需要物理上连续<br/>
-  vmalloc比kmalloc要慢</p>
+<p>本文主要尝试解释两个问题：<br/>
+1. swappiness的确切含义是什么，它对内核进行页回收机制的影响。<br/>
+2. swappiness设置成0，为什么系统仍然可能会有swap发生。</p>
 
-<p>详细的解释：<br/>
-  对于提供了MMU（存储管理器，辅助操作系统进行内存管理，提供虚实地址转换等硬件支持）的处理器而言，Linux提供了复杂的存储管理系统，使得进程所能访问的内存达到4GB。
-  进程的4GB内存空间被人为的分为两个部分&ndash;用户空间与内核空间。用户空间地址分布从0到3GB(PAGE_OFFSET，在0x86中它等于0xC0000000)，3GB到4GB为内核空间。<br/>
-  内核空间中，从3G到vmalloc_start这段地址是物理内存映射区域（该区域中包含了内核镜像、物理页框表mem_map等等），比如我们使用 的 VMware虚拟系统内存是160M，那么3G～3G+160M这片内存就应该映射物理内存。在物理内存映射区之后，就是vmalloc区域。对于 160M的系统而言，vmalloc_start位置应在3G+160M附近（在物理内存映射区与vmalloc_start期间还存在一个8M的gap 来防止跃界），vmalloc_end的位置接近4G(最后位置系统会保留一片128k大小的区域用于专用页面映射)</p>
+<h4>一. 关于内存分配与页回收(page reclaim)</h4>
 
-<p>  kmalloc和get_free_page申请的内存位于物理内存映射区域，而且在物理上也是连续的，它们与真实的物理地址只有一个固定的偏移，因此存在较简单的转换关系，virt_to_phys()可以实现内核虚拟地址转化为物理地址：
+<p>page reclaim发生的场景主要有两类，一个是kswapd后台线程进行的活动，另一个是direct reclaim，即分配页时没有空闲内存满足，需要立即直接进行的页回收。大体上内存分配的流程会分为两部分，一部分是fast path，另一部分是slow path，通常内存使用非紧张情况下，都会在fast path就可以满足要求。并且fast path下的内存分配不会出现dirty writeback及swap等页回收引起的IO阻塞情况。</p>
+
+<p>fast path大体流程如下：</p>
+
+<p>1.如果系统挂载使用了memory cgroup，则首先检查是否超过cgroup限额，如果超过则进行direct reclaim，通过do_try_to_free_pages完成。如果没超过则进行cgroup的charge工作（charge是通过两阶段提交完成的，这里不展开了）。</p>
+
+<p>2.从本地prefered zone内存节点查找空闲页，需要判断是否满足系统watermark及dirty ratio的要求，如果满足则从buddy system上摘取相应page,否则尝试对本地prefered zone进行页回收,本次fast path下页回收只会回收clean page，即不会考虑dirty page以及mapped page，这样就不会产生任何swap及writeback，即不会引起任何blocking的IO操作，如果这次回收仍然无法满足请求的内存页数目则进入slow path</p>
+
+<p>slow path大体流程如下：</p>
+
+<ol>
+<li><p>首先唤醒kswapd进行page reclaim后台操作。</p></li>
+<li><p>重新尝试本地prefered zone进行分配内存，如果失败会根据请求的GFP相关参数决定是否尝试忽略watermark, dirty ratio以及本地节点分配等要求进行再次重试，这一步中如果分配页时有指定<code>__GFP_NOFAIL</code>标记，则分配失败会一直等待重试。</p></li>
+<li><p>如果没有<code>__GFP_NOFAIL</code>标记，则会需开始进行page compact及page direct reclaim操作，之后如果仍然没有可用内存，则进入OOM流程。</p></li>
+</ol>
+
+
+<p>相关内容可以参阅内核代码<code>__alloc_pages</code>函数的逻辑，另外无论page reclaim是由谁发起的，最终都会统一入口到shrink_zone，即针对每个zone独立进行reclaim操作，最终会进入shrink_lruvec函数，进行每个zone相应page lru链表的扫描与回收操作。</p>
+
+<h4>二. 关于页回收的一些背景知识</h4>
+
+<p>页回收大体流程会先在每个zone上扫描相应的page链表，主要包括inactive anon/active anon(匿名页链表)以及inactive file/active file链表（file cache/映射页链表），一共四条链表，我们所有使用过的page在被回收前基本是保存在这四条链表中的某一条中的（还有一部分在unevictable链表中，忽略），根据其被引用的次数会决定其处于active还是inactive链表中，根据其类型决定处于anon还是file链表中。</p>
+
+<p>页回收总体会扫描逐个内存节点的所有zone，然后先扫描active，将不频繁访问的页挪到inactive链表中，随后扫描inactive链表，会将其中被频繁引用的页重新挪回到active中，确认不频繁的页则最终被回收，如果是file based的页则根据是否clean进行释放或回写(writeback，filecache则直接释放)，如果是anon则进行swap，所以本文实际关心的是swappiness参数对anon链表扫描的影响。</p>
+
+<p>另外还需要了解前面描述的四个链表原来是放在zone数据结构上的，后来引入了mem_cgroup则，重新定义了一组mem_cgroup_per_zone/mem_cgroup_per_node的数据结构，这四个链表同时定义在这组数据结构上，如果系统开启了mem cgroup则使用后者，否则用前者。</p>
+
+<p>另外再重点说下swap只是page reclaim的一种处理措施，主要针对anon page，我们最终来看下swappiness的确切含义</p>
+
+<h4>三. swappiness对page reclaim的确切影响</h4>
+
+<p>page reclaim逻辑中对前面所述四个链表进行扫描的逻辑在vmscan.c中的get_scan_count函数内，该函数大部分逻辑注释写得非常清楚，我们简单梳理下，主要关注scan_balance变量的取值：</p>
+
+<ol>
+<li><p>首先如果系统禁用了swap或者没有swap空间，则只扫描file based的链表，即不进行匿名页链表扫描
+代码：
 <code>
-    #define __pa(x) ((unsigned long)(x)-PAGE_OFFSET)
-    extern inline unsigned long virt_to_phys(volatile void * address)
-    {
-        return __pa(address);
-    }
-</code></p>
-
-<p>上面转换过程是将虚拟地址减去3G（PAGE_OFFSET=0XC000000）。</p>
-
-<p>与之对应的函数为phys_to_virt()，将内核物理地址转化为虚拟地址：
+ if (!sc-&gt;may_swap || (get_nr_swap_pages() &lt;= 0)) {
+     scan_balance = SCAN_FILE;
+     goto out;
+ }
+</code></p></li>
+<li><p>如果当前进行的不是全局页回收（cgroup资源限额引起的页回收），并且swappiness设为0，则不进行匿名页链表扫描，这个是没得商量，这里swappiness值直接决定了是否有swap发生，设成0则肯定不会发生，另外需要注意，这种情况下需要设置的是cgroup配置文件memory.swappiness，而不是全局的sysctl vm.swappiness
+代码：
 <code>
-    #define __va(x) ((void *)((unsigned long)(x)+PAGE_OFFSET))
-    extern inline void * phys_to_virt(unsigned long address)
-    {
-        return __va(address);
-    }
-</code>
-virt_to_phys()和phys_to_virt()都定义在include/asm-i386/io.h中。</p>
+ if (!global_reclaim(sc) &amp;&amp; !vmscan_swappiness(sc)) {
+     scan_balance = SCAN_FILE;
+     goto out;
+ }
+</code></p></li>
+<li><p>如果进行链表扫描前设置的priority(这个值决定扫描多少分之一的链表元素)为0，且swappiness非0，则可能会进行swap
+代码：
+<code>
+ if (!sc-&gt;priority &amp;&amp; vmscan_swappiness(sc)) {
+     scan_balance = SCAN_EQUAL;
+     goto out;
+ }
+</code></p></li>
+<li><p>如果是全局页回收，并且当前空闲内存和所有file based链表page数目的加和都小于系统的high watermark，则必须进行匿名页回收，则必然会发生swap,可以看到这里swappiness的值如何设置是完全无关的，这也解释了为什么其为0，系统也会进行swap的原因，另外最后我们会详细解释系统page watermark是如何计算的。
+代码：
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> anon = get_lru_size(lruvec, LRU_ACTIVE_ANON) +
+</span><span class='line'>         get_lru_size(lruvec, LRU_INACTIVE_ANON);
+</span><span class='line'> file = get_lru_size(lruvec, LRU_ACTIVE_FILE) +
+</span><span class='line'>         get_lru_size(lruvec, LRU_INACTIVE_FILE);&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt; if (global_reclaim(sc)) {
+</span><span class='line'>     free = zone_page_state(zone, NR_FREE_PAGES);
+</span><span class='line'>     if (unlikely(file + free &lt;= high_wmark_pages(zone))) {
+</span><span class='line'>         scan_balance = SCAN_ANON;
+</span><span class='line'>         goto out;
+</span><span class='line'>     }
+</span><span class='line'> }</span></code></pre></td></tr></table></div></figure></p></li>
+<li><p>如果系统inactive file链表比较充足，则不考虑进行匿名页的回收，即不进行swap
+代码：
+<code>
+ if (!inactive_file_is_low(lruvec)) {
+     scan_balance = SCAN_FILE;
+     goto out;
+ }
+</code></p></li>
+<li><p>最后一种情况则要根据swappiness值与之前统计的file与anon哪个更有价值来综合决定file和anon链表扫描的比例，这时如果swappiness设置成0，则也不会扫描anon链表，即不进行swap,代码比较多，不再贴出。</p></li>
+</ol>
 
-<p>而vmalloc申请的内存则位于vmalloc_start～vmalloc_end之间，与物理地址没有简单的转换关系，虽然在逻辑上它们也是连续的，但是在物理上它们不要求连续。</p>
 
-<hr />
+<h4>四. 系统内存watermark的计算</h4>
 
-<p>blog.csdn.net/kris_fei/article/details/17243527</p>
+<p>前面看到系统内存watermark对页回收机制是有决定影响的，其实在内存分配中也会频繁用到这个值，确切的说它有三个值，分别是low,min和high,根据分配页时来指定用哪个，如果系统空闲内存低于相应watermark则分配会失败，这也是进入slow path或者wakeup kswapd的依据。</p>
 
-<p>平台： msm8x25<br/>
-系统： android 4.1<br/>
-内核： 3.4.0</p>
+<p>实际这个值的计算是通过sysctl里的vm.min_free_kbytes来决定的，大体的计算公式如下：</p>
 
-<h4>概念</h4>
-
-<p>由于系统的连续物理内存有限，这使得非连续物理内存的使用在linux内核中出现，这叫vmalloc机制。和前者一样，vmalloc机制中的虚拟地址也是连续的。</p>
-
-<h5>Vmallocinfo</h5>
-
-<p>Vmalloc机制并不是狭义地指使用vmalloc函数分配，其他还有如ioremap, iotable_init等。可以从/proc/vmallocinfo获取到此信息：</p>
-
-<pre><code>    #cat /proc/vmallocinfo
-    0xf3600000-0xf36ff0001044480 binder_mmap+0xb0/0x224 ioremap
-    ………..
-    0xf6680000-0xf66c1000 266240 kgsl_page_alloc_map_kernel+0x98/0xe8 ioremap
-    0xf6700000-0xf67ff0001044480 binder_mmap+0xb0/0x224 ioremap
-    …………….
-    0xf6f00000-0xf6f41000 266240 kgsl_page_alloc_map_kernel+0x98/0xe8 ioremap
-    0xf7200000-0xf72ff0001044480 binder_mmap+0xb0/0x224 ioremap
-    0xfa000000-0xfa001000   4096 iotable_init+0x0/0xb0 phys=c0800000 ioremap
-    ……………..
-    0xfa105000-0xfa106000   4096 iotable_init+0x0/0xb0 phys=a9800000 ioremap
-    0xfa200000-0xfa3000001048576 pmd_empty_section_gap+0x0/0x3c ioremap
-    0xfa300000-0xfa4000001048576 iotable_init+0x0/0xb0 phys=100000 ioremap
-    0xfa400000-0xfa5000001048576 iotable_init+0x0/0xb0 phys=aa500000 ioremap
-    0xfa500000-0xfa6000001048576 pmd_empty_section_gap+0x0/0x3c ioremap
-    0xfa701000-0xfa702000   4096 iotable_init+0x0/0xb0 phys=c0400000 ioremap
-    …………..
-    0xfa800000-0xfa9000001048576 pmd_empty_section_gap+0x0/0x3c ioremap
-    0xfa900000-0xfb60000013631488 iotable_init+0x0/0xb0 phys=ac000000 ioremap
-    0xfefdc000-0xff000000 147456 pcpu_get_vm_areas+0x0/0x56c vmalloc
+<pre><code>    pages_min = min_free_kbytes &gt;&gt; (PAGE_SHIFT - 10);
+    tmp = (u64)pages_min * zone-&gt;managed_pages;
+    do_div(tmp, lowmem_pages);
+    zone-&gt;watermark[WMARK_MIN] = tmp;
+    zone-&gt;watermark[WMARK_LOW] = min_wmark_pages(zone) + (tmp &gt;&gt; 2);
+    zone-&gt;watermark[WMARK_HIGH] = min_wmark_pages(zone) + (tmp &gt;&gt; 1);
 </code></pre>
 
-<p>上面的列数意思依次是：虚拟地址，分配大小，哪个函数分配的，物理地址，分配类型。</p>
+<p>即根据min_free_kbytes的值按照每个zone管理页面的比例算出zone的min_watermark，然后再加min的1/4就是low，加1/2就是high了</p>
 
-<p>后面会提到vmalloc size的划分是按照此info来修改的。</p>
+<h4>总结：</h4>
 
-<h4>分配标志</h4>
+<p>swappiness的值是个参考值，是否会发生swap跟当前是哪种page reclaim及系统当前状态都有关系，所以设置了swappiness=0并不代表一定没有swap发生，同时设为0也确实会可能发生OOM。</p>
 
-<p>是否划分到vamlloc区域主要是以下重要的标志来决定的：</p>
+<p>个人仍然认为线上环境设置swappiness=0是没有任何问题的。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux swap实现]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/18/kernel-mm-swap/"/>
+    <updated>2015-09-18T11:16:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/18/kernel-mm-swap</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/freas_1990/article/details/9090601">http://blog.csdn.net/freas_1990/article/details/9090601</a></p>
 
-<p>File: kernel/include/linux/vmalloc.h
-<code>
-    /* bits in flags ofvmalloc's vm_struct below */
-    #defineVM_IOREMAP    0x00000001     /* ioremap()and friends */
-    #define VM_ALLOC     0x00000002     /* vmalloc() */
-    #defineVM_MAP        0x00000004     /* vmap()ed pages */
-    #defineVM_USERMAP    0x00000008     /* suitable forremap_vmalloc_range */
-    #defineVM_VPAGES     0x00000010     /* buffer for pages was vmalloc'ed */
-    #defineVM_UNLIST     0x00000020     /* vm_struct is not listed in vmlist */
-    /* bits [20..32]reserved for arch specific ioremap internals */
-</code></p>
+<p>swap是现代Unix操作系统一个非常重要的特性。尤其在大型数据库服务器上，swap往往是性能首要查看指标。</p>
 
-<p>Vmallocinfo中的函数，你可以对照源码看一下，在设置flag的时候就会有VM_IOREMAP, VM_ALLOC这些标志。</p>
+<p>通俗的说法，在Unix里，将开辟一个磁盘分区，用作swap，这块磁盘将作为内存的的替代品，在内存不够用的时候，把一部分内存空间交换到磁盘上去。</p>
 
-<h5>Vmalloc区域</h5>
+<p>而Unix的swap功能也成为了Unixer们认为Unix由于windows的一个论据（？）。在Unix里，swap一般被认为设置为内存的2倍大小。这个2倍大小的指标出自哪里，到目前为止我也没有找到（？如果你找到了可以留言或发私信）。</p>
 
-<p>Vmalloc的区域是由两个宏变量来表示： VMALLOC_START,VMALLOC_END.</p>
+<p>不过，在内存不断掉价的今天，swap的功效已经越来越弱化了——在2013年6月13日23:01，如果一个OLTP系统的swap使用超过了2G以上，基本上可以对这个系统的性能产生怀疑了。swap并不是一种优化机制，而是一种不得已而为之的手段，防止在内存紧张的时刻，操作系统性能骤降以至瞬间崩溃。swap的价值主要体现在可以把这个崩溃的时间提升至几小时到几十个小时不等。</p>
 
-<p>File: kernel/arch/arm/include/asm/pgtable.h
-<code>
-    #defineVMALLOC_OFFSET       (8*1024*1024)
-    #defineVMALLOC_START        (((unsigned long)high_memory + VMALLOC_OFFSET) &amp; ~(VMALLOC_OFFSET-1))
-    #defineVMALLOC_END          0xff000000UL
-</code></p>
+<p>本文主要关注CPU访问一个内存page时，发现该page不在内存中的情况。废话不多说了，先把swap的核心函数调用栈贴一下。</p>
 
-<p>VMALLOC_START：看上去会随着high_memory的值变化。</p>
+<p><img src="/images/kernel/2015-09-18-11.png" alt="" /></p>
 
-<p>VMALLOC_OFFSET：系统会在low memory和VMALLOC区域留8M，防止访问越界。因此假如理论上vmalloc size有300M，实际可用的也是只有292M。</p>
+<p>当CPU检查一个页目录项/页表项的Present标志位时，如果发现该标志位为0，则表示相应的物理页面不在内存。此时，CPU会被激发“页面异常”（中断中的fault），而去执行一段代码。</p>
 
-<p>File: kernel/Documentation/arm/memory.txt有给出更好的解释：
-<code>
-VMALLOC_START   VMALLOC_END-1    vmalloc() / ioremap() space. Memory returned byvmalloc/ioremap will be dynamically placed in this region. Machine specificstatic mappings are also located here through iotable_init(). VMALLOC_START isbased upon the value of the high_memoryvariable, and VMALLOC_END is equal to 0xff000000.
-</code></p>
+<p>至于到底是这个内存页面需要重新构建、还是页面的内容是存储到磁盘上去了，CPU本身是不关心的，CPU只知道中断条件发生了，要根据中断描述符跳转到另外一段代码去执行，而真正的swap或者是真的缺页的智能判断是在这段中断服务程序里做的——真正的技术是在这段中断服务程序里。（所以我在《中断——一鞭一条痕（下）》里说，作为一个初学者，不必深究中断（interrupt）、异常（exception）、陷阱（trap）这三个概念）</p>
 
-<p>下图摘自网络，看下VMALLOC_START和VMALLOC_END的位置。0xc0000000到VMALLOC_START为low memory虚拟地址区域。</p>
+<p>pte_present()函数会检查当前页面的描述entry的present标志位，查看该page是否在内存中。如果不在内存中，调用pte_none()判断是否建立了页目录、页表映射。如果连映射都没建立，说明是“真没在内存中”，需要从头建立映射关系。如果建立了映射关系，说明此时，该页面被暂时存储到磁盘上去了，应该到磁盘上去把该page取回来放到内存里。</p>
 
-<h4>Vmallocsize 计算</h4>
+<p>如何去取呢？</p>
 
-<p>有了以上知识后我们看下vmalloc size是如何分配的，目前有两种方法，kernel默认分配一个, 以及开机从cmdline分配。</p>
+<p>如何到磁盘取一个page的数据到内存中去，这是一个多么熟悉的概念！思考一下Oracle的内存管理，一个block如何读入到SGA的buffer cache里去吧。其实这几十年来，核心的本源技术无论是在操作系统内核还是在数据库内核里，都是通用的，都是用来极大限度提升CPU任务管理能力、内存管理效率的，所有的理念、技术都是通用的——如果你站在一个系统程序猿的角度来思考，一定能明白的——不要把自己局限在一个产品里，无论这个产品是数据库、CPU、还是操作系统，这些看似绚烂神秘的技术在30年以前，已经被人反复的讨论和意淫过了。</p>
 
-<h5>1. 从cmdline分配</h5>
+<p>接下来就到了核心部分了——do_swap_page()函数。</p>
 
-<p>File: device/qcom/msm7627a/BoardConfig.mk</p>
-
-<p>BOARD_KERNEL_CMDLINE := androidboot.hardware=qcom loglevel=7vmalloc=200M</p>
-
-<p>上面的值在build的时候会被赋值给kernel 的cmdline。</p>
-
-<p>开机的时候early_vmalloc()会去读取vmalloc这个值。</p>
-
-<p>File: kernel/arch/arm/mm/mmu.c
+<p>源代码如下（linux/mm/memory.c line 2022~1060）：
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -809,1516 +835,1364 @@ VMALLOC_START   VMALLOC_END-1    vmalloc() / ioremap() space. Memory returned by
 <span class='line-number'>655</span>
 <span class='line-number'>656</span>
 <span class='line-number'>657</span>
-<span class='line-number'>658</span>
-<span class='line-number'>659</span>
-<span class='line-number'>660</span>
-<span class='line-number'>661</span>
-<span class='line-number'>662</span>
-<span class='line-number'>663</span>
-<span class='line-number'>664</span>
-<span class='line-number'>665</span>
-<span class='line-number'>666</span>
-<span class='line-number'>667</span>
-<span class='line-number'>668</span>
-<span class='line-number'>669</span>
-<span class='line-number'>670</span>
-<span class='line-number'>671</span>
-<span class='line-number'>672</span>
-<span class='line-number'>673</span>
-<span class='line-number'>674</span>
-<span class='line-number'>675</span>
-<span class='line-number'>676</span>
-<span class='line-number'>677</span>
-<span class='line-number'>678</span>
-<span class='line-number'>679</span>
-<span class='line-number'>680</span>
-<span class='line-number'>681</span>
-<span class='line-number'>682</span>
-<span class='line-number'>683</span>
-<span class='line-number'>684</span>
-<span class='line-number'>685</span>
-<span class='line-number'>686</span>
-<span class='line-number'>687</span>
-<span class='line-number'>688</span>
-<span class='line-number'>689</span>
-<span class='line-number'>690</span>
-<span class='line-number'>691</span>
-<span class='line-number'>692</span>
-<span class='line-number'>693</span>
-<span class='line-number'>694</span>
-<span class='line-number'>695</span>
-<span class='line-number'>696</span>
-<span class='line-number'>697</span>
-<span class='line-number'>698</span>
-<span class='line-number'>699</span>
-<span class='line-number'>700</span>
-<span class='line-number'>701</span>
-<span class='line-number'>702</span>
-<span class='line-number'>703</span>
-<span class='line-number'>704</span>
-<span class='line-number'>705</span>
-<span class='line-number'>706</span>
-<span class='line-number'>707</span>
-<span class='line-number'>708</span>
-<span class='line-number'>709</span>
-<span class='line-number'>710</span>
-<span class='line-number'>711</span>
-<span class='line-number'>712</span>
-<span class='line-number'>713</span>
-<span class='line-number'>714</span>
-<span class='line-number'>715</span>
-<span class='line-number'>716</span>
-<span class='line-number'>717</span>
-<span class='line-number'>718</span>
-<span class='line-number'>719</span>
-<span class='line-number'>720</span>
-<span class='line-number'>721</span>
-<span class='line-number'>722</span>
-<span class='line-number'>723</span>
-<span class='line-number'>724</span>
-<span class='line-number'>725</span>
-<span class='line-number'>726</span>
-<span class='line-number'>727</span>
-<span class='line-number'>728</span>
-<span class='line-number'>729</span>
-<span class='line-number'>730</span>
-<span class='line-number'>731</span>
-<span class='line-number'>732</span>
-<span class='line-number'>733</span>
-<span class='line-number'>734</span>
-<span class='line-number'>735</span>
-<span class='line-number'>736</span>
-<span class='line-number'>737</span>
-<span class='line-number'>738</span>
-<span class='line-number'>739</span>
-<span class='line-number'>740</span>
-<span class='line-number'>741</span>
-<span class='line-number'>742</span>
-<span class='line-number'>743</span>
-<span class='line-number'>744</span>
-<span class='line-number'>745</span>
-<span class='line-number'>746</span>
-<span class='line-number'>747</span>
-<span class='line-number'>748</span>
-<span class='line-number'>749</span>
-<span class='line-number'>750</span>
-<span class='line-number'>751</span>
-<span class='line-number'>752</span>
-<span class='line-number'>753</span>
-<span class='line-number'>754</span>
-<span class='line-number'>755</span>
-<span class='line-number'>756</span>
-<span class='line-number'>757</span>
-<span class='line-number'>758</span>
-<span class='line-number'>759</span>
-<span class='line-number'>760</span>
-<span class='line-number'>761</span>
-<span class='line-number'>762</span>
-<span class='line-number'>763</span>
-<span class='line-number'>764</span>
-<span class='line-number'>765</span>
-<span class='line-number'>766</span>
-<span class='line-number'>767</span>
-<span class='line-number'>768</span>
-<span class='line-number'>769</span>
-<span class='line-number'>770</span>
-<span class='line-number'>771</span>
-<span class='line-number'>772</span>
-<span class='line-number'>773</span>
-<span class='line-number'>774</span>
-<span class='line-number'>775</span>
-<span class='line-number'>776</span>
-<span class='line-number'>777</span>
-<span class='line-number'>778</span>
-<span class='line-number'>779</span>
-<span class='line-number'>780</span>
-<span class='line-number'>781</span>
-<span class='line-number'>782</span>
-<span class='line-number'>783</span>
-<span class='line-number'>784</span>
-<span class='line-number'>785</span>
-<span class='line-number'>786</span>
-<span class='line-number'>787</span>
-<span class='line-number'>788</span>
-<span class='line-number'>789</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int__init early_vmalloc(char &lt;em&gt;arg)
-</span><span class='line'>{
-</span><span class='line'>    /&lt;/em&gt;cmdline中的vmalloc会被解析到vmlloc_reserve中。*/
-</span><span class='line'>    unsigned long vmalloc_reserve = memparse(arg, NULL);&lt;/p&gt;
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_swap_page(struct mm_struct * mm,
+</span><span class='line'>    struct vm_area_struct * vma, unsigned long address,
+</span><span class='line'>    pte_t * page_table, swp_entry_t entry, int write_access)
+</span><span class='line'>{ &lt;br/&gt;
+</span><span class='line'>    struct page *page = lookup_swap_cache(entry);
+</span><span class='line'>    pte_t pte;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /*小于16M则用16M。*/
-</span><span class='line'>if (vmalloc_reserve &lt; SZ_16M) {
-</span><span class='line'>    vmalloc_reserve = SZ_16M;
-</span><span class='line'>    printk(KERN_WARNING
-</span><span class='line'>            "vmalloc area too small, limiting to %luMB\n",
-</span><span class='line'>            vmalloc_reserve &gt;&gt; 20);
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (!page) {
+</span><span class='line'>    lock_kernel();
+</span><span class='line'>    swapin_readahead(entry);
+</span><span class='line'>    page = read_swap_cache(entry);
+</span><span class='line'>    unlock_kernel();
+</span><span class='line'>    if (!page)
+</span><span class='line'>        return -1;
+</span><span class='line'>
+</span><span class='line'>    flush_page_to_ram(page);
+</span><span class='line'>    flush_icache_page(vma, page);
 </span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>/*大于可用虚拟地址内存则使用可用地址部分再减去32M。*/
-</span><span class='line'>if (vmalloc_reserve &gt; VMALLOC_END - (PAGE_OFFSET + SZ_32M)) {
-</span><span class='line'>    vmalloc_reserve = VMALLOC_END - (PAGE_OFFSET + SZ_32M);
-</span><span class='line'>    printk(KERN_WARNING
-</span><span class='line'>            "vmalloc area is too big, limiting to %luMB\n",
-</span><span class='line'>            vmalloc_reserve &gt;&gt; 20);
-</span><span class='line'>}
+</span><span class='line'>mm-&gt;rss++;
 </span><span class='line'>
-</span><span class='line'>/*计算偏移起始地址。*/
-</span><span class='line'>vmalloc_min = (void *)(VMALLOC_END - vmalloc_reserve);
-</span><span class='line'>return 0;
+</span><span class='line'>pte = mk_pte(page, vma-&gt;vm_page_prot);
+</span><span class='line'>
+</span><span class='line'>/*
+</span><span class='line'> * Freeze the "shared"ness of the page, ie page_count + swap_count.
+</span><span class='line'> * Must lock page before transferring our swap count to already
+</span><span class='line'> * obtained page count.
+</span><span class='line'> */
+</span><span class='line'>lock_page(page);
+</span><span class='line'>swap_free(entry);
+</span><span class='line'>if (write_access &amp;&amp; !is_page_shared(page))
+</span><span class='line'>    pte = pte_mkwrite(pte_mkdirty(pte));
+</span><span class='line'>UnlockPage(page);
+</span><span class='line'>
+</span><span class='line'>set_pte(page_table, pte);
+</span><span class='line'>/* No need to invalidate - it was non-present before */
+</span><span class='line'>update_mmu_cache(vma, address, pte);
+</span><span class='line'>return 1;   /* Minor fault */
 </span><span class='line'>}
-</span><span class='line'>early_param("vmalloc",early_vmalloc);
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>vmalloc_min会影响arm_lowmem_limit,arm_lowmem_limit其实就是high_memory。因为此过程不是我们要分析的重点，如果有兴趣可分析kernel/arch/arm/mm/mmu.c中的sanity_check_meminfo()函数。
+</span><span class='line'>这里有2个参数需要重点关注，一个是`(pte_t *)page_table`，另外一个是`(swp_entry_t*)entry`。
 </span><span class='line'>
-</span><span class='line'>所以，VMALLOC_START受到了hight_memory的影响而发生了变化，最终使得vmalloc size也变化了！
+</span><span class='line'>当一个page在内存中，不需要swap in时，描述该page的entry是pte_t类型的；反之，是swp_entry_t类型。
 </span><span class='line'>
-</span><span class='line'>##### 2. 开机默认分配：
-</span><span class='line'>
-</span><span class='line'>File: kernel/arch/arm/mm/mmu.c
+</span><span class='line'>swap_entry_t(include/linux/shmem_fs.h)定义如下：
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void * __initdata vmalloc_min =
-</span><span class='line'>(void *)(VMALLOC_END - (240 &lt;&lt; 20) - VMALLOC_OFFSET);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>当cmdline无vmalloc参数传进来的时候，early_vmalloc()函数也不会调用到，vmalloc_min的值就会被默认传进来了，默认是240M。
-</span><span class='line'>
-</span><span class='line'>后面的步骤和方法1一样了！
-</span><span class='line'>
-</span><span class='line'>开机log有memory layout 信息：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;[    0.000000] [cpuid: 0] Virtual kernelmemory layout:
-</span><span class='line'>[    0.000000] [cpuid:0]     vector  : 0xffff0000 - 0xffff1000  (   4 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]     fixmap  : 0xfff00000 - 0xfffe0000   (896 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]     vmalloc : 0xf3000000 - 0xff000000   ( 192MB)
-</span><span class='line'>[    0.000000] [cpuid:0]     lowmem  : 0xc0000000 - 0xf2800000   (808 MB)
-</span><span class='line'>[    0.000000] [cpuid:0]     pkmap   : 0xbfe00000 -0xc0000000   (   2 MB)
-</span><span class='line'>[    0.000000] [cpuid:0]     modules : 0xbf000000 - 0xbfe00000  (  14 MB)
-</span><span class='line'>[    0.000000] [cpuid:0]       .text : 0xc0008000 -0xc0893034   (8749 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]       .init : 0xc0894000 -0xc08cdc00   ( 231 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]       .data : 0xc08ce000 -0xc09f8eb8   (1196 kB)
-</span><span class='line'>[    0.000000] [cpuid:0]        .bss : 0xc0a78eec -0xc0f427a8   (4903 kB)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;typedef struct {
+</span><span class='line'>unsigned long val;
+</span><span class='line'>} swp_entry_t;
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;p&gt;```&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;其中看到vmalloc为192MB , cmdline中使用vmllaoc就是200M。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;问题出来了，既然都进入do_swap_page()函数了，说明是需要swap in了，为什么还会传入一个pte_t类型的变量呢？&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;Lowmem为地段内存部分，可见lowmem和vmalloc中间有8M空隙。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;答案是，当在do_swap_page()之前，page是在磁盘上的，描述类型是swp_entry_t，而do_swap_page()之后，页面已经从磁盘交换到内存了，这个时候描述类型就是pte_t了。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;Vmalloc该分配多大?&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Linux内核版本从3.2到3.3 默认的vmalloc size由128M 增大到了240M，3.4.0上的&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;修改Commit信息如下：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;To accommodate all static mappings on machines withpossible highmem usage, the default vmalloc area size is changed to 240 MB sothat VMALLOC_START is no higher than 0xf0000000 by default.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;看其意思是因为开机的静态映射增加了，所以要扩大。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外3.2到3.3版本的一个重大变化是将android引入到主线内核中。我想增大vmalloc size到240M是基于此考虑吧。当然，各家厂商都也可以基于自己平台来动态修改size的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;那么如何判断当前vmalloc size不足呢？&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;/proc/meminfo中有vmalloc信息:&lt;br/&gt;
-</span><span class='line'>VmallocTotal:     540672 kB&lt;br/&gt;
-</span><span class='line'>VmallocUsed:      165268 kB&lt;br/&gt;
-</span><span class='line'>VmallocChunk:     118788kB&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;事实上这里的VmallocUsed只是表示已经被真正使用掉的vmalloc区域，但是区域之前的空隙也就是碎片没有被计算进去。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;所以，回到前面说的/proc/vmallocinfo，假设我们的vmalloc size就是200M。那么区域为0xf3000000- 0xff000000，从vmallocinfo中可以看到，前面大部分虚拟地址空间都用掉了，剩下0xfb600000到0xfefdc000这57M空间，假如申请了64M，那么就会失败了。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;开机分配使用掉vmalloc之后到底该剩余多少目前没有具体依据，一般来说1GB RAM可以设置为400~600M。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;至于lookup_swap_cache、swapin_readahead（预读——read ahead）等函数就不一一分析了，从名字就可以看出其技巧了。都是些在数据库server上的常用技巧。如果你是行家，一眼就能看出来。&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux-2.6.32 NUMA架构之内存和调度]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc-numa/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-06-02T15:32:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc-numa&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.chinaunix.net/uid-7295895-id-3076420.html"&gt;http://blog.chinaunix.net/uid-7295895-id-3076420.html&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux Cache 机制探究]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/09/18/kernel-mm-cache-base/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-09-18T10:57:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/09/18/kernel-mm-cache-base&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.penglixun.com/tech/system/linux_cache_discovery.html"&gt;http://www.penglixun.com/tech/system/linux_cache_discovery.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;Linux-2.6.32 NUMA架构之内存和调度&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;相关源码主要在：&lt;br/&gt;
+</span><span class='line'>./fs/fscache/cache.c    Cache实现的代码&lt;br/&gt;
+</span><span class='line'>./mm/slab.c             SLAB管理器代码&lt;br/&gt;
+</span><span class='line'>./mm/swap.c             缓存替换算法代码&lt;br/&gt;
+</span><span class='line'>./mm/mmap.c             内存管理器代码&lt;br/&gt;
+</span><span class='line'>./mm/mempool.c          内存池实现代码&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  本文将以XLP832通过ICI互连形成的NUMA架构进行分析，主要包括内存管理和调度两方面，参考内核版本2.6.32.9；NUMA架构常见配置选项有：CONFIG_SMP, CONFIG_NUMA, CONFIG_NEED_MULTIPLE_NODES, CONFIG_NODES_SHIFT, CONFIG_SPARSEMEM, CONFIG_CGROUPS, CONFIG_CPUSETS, CONFIG_MIGRATION等。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;0. 预备：Linux内存管理基础&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;本文试图从原理上介绍，尽量避免涉及代码的实现细节。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;创建进程fork()、程序载入execve()、映射文件mmap()、动态内存分配malloc()/brk()等进程相关操作都需要分配内存给进程。不过这时进程申请和获得的还不是实际内存，而是虚拟内存，准确的说是“内存区域”。Linux除了内核以外，App都不能直接使用内存，因为Linux采用Memory Map的管理方式，App拿到的全部是内核映射自物理内存的一块虚拟内存。malloc分配很少会失败，因为malloc只是通知内存App需要内存，在没有正式使用之前，这段内存其实只在真正开始使用的时候才分配，所以malloc成功了并不代表使用的时候就真的可以拿到这么多内存。据说Google的tcmalloc改进了这一点。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h3&gt;1 NUMA架构简介&lt;/h3&gt;
+</span><span class='line'>&lt;p&gt;进程对内存区域的分配最终多会归结到do_mmap()函数上来（brk调用被单独以系统调用实现，不用do_mmap()）。内核使用do_mmap()函数创建一个新的线性地址区间，如果创建的地址区间和一个已经存在的地址区间相邻，并且它们具有相同的访问权限的话，那么两个区间将合并为一个。如果不能合并，那么就确实需要创建一个新的VMA了。但无论哪种情况， do_mmap()函数都会将一个地址区间加入到进程的地址空间中，无论是扩展已存在的内存区域还是创建一个新的区域。同样释放一个内存区域使用函数do_ummap()，它会销毁对应的内存区域。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;NUMA(Non Uniform Memory Access)即非一致内存访问架构，市面上主要有X86_64(JASPER)和MIPS64(XLP)体系。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;另一个重要的部分是SLAB分配器。在Linux中以页为最小单位分配内存对于内核管理系统物理内存来说是比较方便的，但内核自身最常使用的内存却往往是很小（远远小于一页）的内存块，因为大都是一些描述符。一个整页中可以聚集多个这种这些小块内存，如果一样按页分配，那么会被频繁的创建/销毁，开始是非常大的。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;1.1 概念&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;为了满足内核对这种小内存块的需要，Linux系统采用了SLAB分配器。Slab分配器的实现相当复杂，但原理不难，其核心思想就是Memory Pool。内存片段（小块内存）被看作对象，当被使用完后，并不直接释放而是被缓存到Memory Pool里，留做下次使用，这就避免了频繁创建与销毁对象所带来的额外负载。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;NUMA具有多个节点(Node)，每个节点可以拥有多个CPU(每个CPU可以具有多个核或线程)，节点内使用共有的内存控制器，因此节点的所有内存对于本节点的所有CPU都是等同的，而对于其它节点中的所有CPU都是不同的。节点可分为本地节点(Local Node)、邻居节点(Neighbour Node)和远端节点(Remote Node)三种类型。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;Slab技术不但避免了内存内部分片带来的不便，而且可以很好利用硬件缓存提高访问速度。但Slab仍然是建立在页面基础之上，Slab将页面分成众多小内存块以供分配，Slab中的对象分配和销毁使用kmem_cache_alloc与kmem_cache_free。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;本地节点：对于某个节点中的所有CPU，此节点称为本地节点；&lt;br/&gt;
-</span><span class='line'>邻居节点：与本地节点相邻的节点称为邻居节点；&lt;br/&gt;
-</span><span class='line'>远端节点：非本地节点或邻居节点的节点，称为远端节点。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;关于SALB分配器有一份资料：&lt;a href="http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch08s02.html"&gt;http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch08s02.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;邻居节点和远端节点，称作非本地节点(Off Node)。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;关于内存管理的两份资料：&lt;a href="http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch15.html"&gt;http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch15.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPU访问不同类型节点内存的速度是不相同的：本地节点&gt;邻居节点&gt;远端节点。访问本地节点的速度最快，访问远端节点的速度最慢，即访问速度与节点的距离有关，距离越远访问速度越慢，此距离称作Node Distance。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="http://memorymyann.javaeye.com/blog/193061"&gt;http://memorymyann.javaeye.com/blog/193061&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;常用的NUMA系统中：硬件设计已保证系统中所有的Cache是一致的(Cache Coherent, ccNUMA)；不同类型节点间的Cache同步时间不一样，会导致资源竞争不公平，对于某些特殊的应用，可以考虑使用FIFO Spinlock保证公平性。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;1. Linux Cache的体系&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;1.2 关键信息&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;在 Linux 中，当App需要读取Disk文件中的数据时，Linux先分配一些内存，将数据从Disk读入到这些内存中，然后再将数据传给App。当需要往文件中写数据时，Linux先分配内存接收用户数据，然后再将数据从内存写到Disk上。Linux Cache 管理指的就是对这些由Linux分配，并用来存储文件数据的内存的管理。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) 物理内存区域与Node号之间的映射关系；&lt;br/&gt;
-</span><span class='line'>2) 各Node之间的Node Distance；&lt;br/&gt;
-</span><span class='line'>3) 逻辑CPU号与Node号之间的映射关系。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;下图描述了 Linux 中文件 Cache 管理与内存管理以及文件系统的关系。从图中可以看到，在 Linux 中，具体的文件系统，如 ext2/ext3/ext4 等，负责在文件 Cache和存储设备之间交换数据，位于具体文件系统之上的虚拟文件系统VFS负责在应用程序和文件 Cache 之间通过 read/write 等接口交换数据，而内存管理系统负责文件 Cache 的分配和回收，同时虚拟内存管理系统(VMM)则允许应用程序和文件 Cache 之间通过 memory map的方式交换数据，FS Cache底层通过SLAB管理器来管理内存。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h3&gt;2 XLP832 NUMA初始化&lt;/h3&gt;
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-1.jpg" alt="" /&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;首先需要完成1.2节中描述的3个关键信息的初始化。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;下图则非常清晰的描述了Cache所在的位置，磁盘与VFS之间的纽带。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2.1 CPU和Node的关系&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-2.jpg" alt="" /&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;start_kernel()-&gt;setup_arch()-&gt;prom_init():&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;2. Linux Cache的结构&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #ifdef CONFIG_NUMA
-</span><span class='line'>    build_node_cpu_map();
-</span><span class='line'>#endif
+</span><span class='line'>&lt;p&gt;在 Linux 中，文件 Cache 分为两层，一是 Page Cache，另一个 Buffer Cache，每一个 Page Cache 包含若干 Buffer Cache。内存管理系统和 VFS 只与 Page Cache 交互，内存管理系统负责维护每项 Page Cache 的分配和回收，同时在使用 memory map 方式访问时负责建立映射；VFS 负责 Page Cache 与用户空间的数据交换。而具体文件系统则一般只与 Buffer Cache 交互，它们负责在外围存储设备和 Buffer Cache 之间交换数据。读缓存以Page Cache为单位，每次读取若干个Page Cache，回写磁盘以Buffer Cache为单位，每次回写若干个Buffer Cache。
+</span><span class='line'>Page Cache、Buffer Cache、文件以及磁盘之间的关系如下图所示。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-3.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Page 结构和 buffer_head 数据结构的关系如下图所示。Page指向一组Buffer的头指针，Buffer的头指针指向磁盘块。在这两个图中，假定了 Page 的大小是 4K，磁盘块的大小是 1K。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-4.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在 Linux 内核中，文件的每个数据块最多只能对应一个 Page Cache 项，它通过两个数据结构来管理这些 Cache 项，一个是 Radix Tree，另一个是双向链表。Radix Tree 是一种搜索树，Linux 内核利用这个数据结构来通过文件内偏移快速定位 Cache 项，图 4 是 radix tree的一个示意图，该 radix tree 的分叉为4(22)，树高为4，用来快速定位8位文件内偏移。Linux(2.6.7) 内核中的分叉为 64(26)，树高为 6(64位系统)或者 11(32位系统)，用来快速定位 32 位或者 64 位偏移，Radix tree 中的每一个到叶子节点的路径上的Key所拼接起来的字串都是一个地址，指向文件内相应偏移所对应的Cache项。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-5.gif" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;查看Page Cache的核心数据结构struct address_space就可以看到上述结构（略去了无关结构）：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>struct address_space  {
+</span><span class='line'>    struct inode             *host;              /* owner: inode, block_device */
+</span><span class='line'>    struct radix_tree_root      page_tree;         /* radix tree of all pages */
+</span><span class='line'>    unsigned long           nrpages;  /* number of total pages */
+</span><span class='line'>    struct address_space       *assoc_mapping;      /* ditto */
+</span><span class='line'>    ......
+</span><span class='line'>} __attribute__((aligned(sizeof(long))));
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下面是一个Radix Tree实例：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-6.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;另一个数据结构是双向链表，Linux内核为每一片物理内存区域(zone) 维护active_list和inactive_list两个双向链表，这两个list主要用来实现物理内存的回收。这两个链表上除了文件Cache之 外，还包括其它匿名(Anonymous)内存，如进程堆栈等。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-7.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;相关数据结构如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    truct page{
+</span><span class='line'>    struct list_head list;   //通过使用它进入下面的数据结构free_area_struct结构中的双向链队列
+</span><span class='line'>    struct address_space * mapping;   //用于内存交换的数据结构
+</span><span class='line'>    unsigned long index;//当页面进入交换文件后
+</span><span class='line'>    struct page *next_hash; //自身的指针，这样就可以链接成一个链表
+</span><span class='line'>    atomic t count; //用于页面交换的计数,若页面为空闲则为0，分配就赋值1，没建立或恢复一次映射就加1，断开映射就减一
+</span><span class='line'>    unsigned long flags;//反应页面各种状态，例如活跃，不活跃脏，不活跃干净，空闲
+</span><span class='line'>    struct list_head lru;
+</span><span class='line'>    unsigned long age; //表示页面寿命
+</span><span class='line'>    wait_queue_head_t wait;
+</span><span class='line'>    struct page ** pprev_hash;
+</span><span class='line'>    struct buffer_head * buffers;
+</span><span class='line'>    void * virtual
+</span><span class='line'>    struct zone_struct * zone; //指向所属的管理区
+</span><span class='line'>}
+</span><span class='line'>typedef struct free_area_struct {
+</span><span class='line'>    struct list_head free_list;   //linux 中通用的双向链队列
+</span><span class='line'>    unsigned int * map;
+</span><span class='line'>} free_area_t;
+</span><span class='line'>typedef struct zone_struct{
+</span><span class='line'>    spinlock_t        lock;
+</span><span class='line'>    unsigned long offset;  //表示该管理区在mem-map数组中，起始的页号
+</span><span class='line'>    unsigned long free pages;
+</span><span class='line'>    unsigned long inactive_clean_pages;
+</span><span class='line'>    unsigned long inactive_dirty_pages;
+</span><span class='line'>    unsigned pages_min, pages_low, pages_high;
+</span><span class='line'>    struct list_head inactive_clean_list;   //用于页面交换的队列，基于linux页面交换的机制。这里存贮的是不活动“干净”页面
+</span><span class='line'>    free_area_t free_area[MAX_ORDER]; //一组“空闲区间”队列，free_area_t定义在上面，其中空闲下标表示的是页面大小，例如：数组第一个元素0号，表示所有区间大小为2的 0次方的页面链接成的双向队列，1号表示所有2的1次方页面链接链接成的双向队列，2号表示所有2的2次方页面链接成的队列，其中要求是这些页面地址连续
+</span><span class='line'>    char * name;
+</span><span class='line'>    unsigned long size;
+</span><span class='line'>    struct pglist_data * zone_pgdat;   //用于指向它所属的存贮节点，及下面的数据结构
+</span><span class='line'>    unsigned  long  zone_start_paddr;
+</span><span class='line'>    unsigned  long    zone_start_mapnr;
+</span><span class='line'>    struct page * zone_mem_map;
+</span><span class='line'>} zone_t;
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;build_node_cpu_map()函数工作：&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;3. Cache预读与换出&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;a) 确定CPU与Node的相互关系，做法很简单：&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;Linux 内核中文件预读算法的具体过程是这样的：
+</span><span class='line'>对于每个文件的第一个读请求，系统读入所请求的页面并读入紧随其后的少数几个页面(不少于一个页面，通常是三个页 面)，这时的预读称为同步预读。对于第二次读请求，如果所读页面不在Cache中，即不在前次预读的group中，则表明文件访问不是顺序访问，系统继续 采用同步预读；如果所读页面在Cache中，则表明前次预读命中，操作系统把预读group扩大一倍，并让底层文件系统读入group中剩下尚不在 Cache中的文件数据块，这时的预读称为异步预读。无论第二次读请求是否命中，系统都要更新当前预读group的大小。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define cpu_to_node(cpu)       (cpu &gt;&gt; 5)
-</span><span class='line'>#define cpumask_of_node    (NODE_CPU_MASK(node)) /* node0:0~31; node1: 32~63 */
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>&lt;p&gt;此外，系统中定义了一个 window，它包括前一次预读的group和本次预读的group。任何接下来的读请求都会处于两种情况之一：&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;说明：XLP832每个节点有1个物理CPU，每个物理CPU有8个核，每个核有4个超线程，因此每个节点对应32个逻辑CPU，按节点依次展开。另外，实际物理存在的CPU数目是通过DTB传递给内核的；numa_node_id()可以获取当前CPU所处的Node号。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;第一种情况是所请求的页面处于预读 window中，这时继续进行异步预读并更新相应的window和group；&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;b) 设置每个物理存在的节点的在线状态，具体是通过node_set_online()函数来设置全局变量&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;第二种情况是所请求的页面处于预读window之外，这时系统就要进行同步 预读并重置相应的window和group。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;nodemask_t node_states[];&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;下图是Linux内核预读机制的一个示意图，其中a是某次读操作之前的情况，b是读操作所请求页面不在 window中的情况，而c是读操作所请求页面在window中的情况。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;这样，类似于CPU号，Node号也就具有如下功能宏：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>for_each_node(node);
-</span><span class='line'>for_each_online_node(node);
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-8.gif" alt="" /&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;详细可参考include/linux/nodemask.h&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;Linux内核中文件Cache替换的具体过程是这样的：刚刚分配的Cache项链入到inactive_list头部，并将其状态设置为active，当内存不够需要回收Cache时，系统首先从尾部开始反向扫描 active_list并将状态不是referenced的项链入到inactive_list的头部，然后系统反向扫描inactive_list，如果所扫描的项的处于合适的状态就回收该项，直到回收了足够数目的Cache项。其中Active_list的含义是热访问数据，及多次被访问的，inactive_list是冷访问数据，表示尚未被访问的。如果数据被访问了，Page会被打上一个Refrence标记，如果Page没有被访问过，则打上Unrefrence标记。这些处理在swap.c中可以找到。
+</span><span class='line'>下图也描述了这个过程。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2.2 Node Distance确立&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-09-18-7.png" alt="" /&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;作用：建立buddy时用，可以依此来构建zonelist，以及zone relaim(zone_reclaim_mode)使用，详见后面的4.2.2节。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2.3 内存区域与Node的关系&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;start_kernel()-&gt;setup_arch()-&gt;arch_mem_init-&gt;bootmem_init()-&gt;nlm_numa_bootmem_init():&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;nlm_get_dram_mapping();&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;XLP832上电后的默认memory-mapped物理地址空间分布：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-30.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  其中PCIE配置空间映射地址范围为[0x1800_0000, 0x1BFF_FFFF]，由寄存器ECFG_BASE和ECFG_LIMIT指定(注：但这2个寄存器本身是处于PCIE配置空间之中的)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;PCIE配置空间：&lt;br/&gt;
-</span><span class='line'>  PCIE配置空间与memory-mapped物理地址的映射方式：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-31.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;XLP832实现了所有设备都位于虚拟总线0上，每个节点有8个设备，按节点依次排开。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;DRAM映射寄存器组：&lt;br/&gt;
-</span><span class='line'>  每个节点都独立实现有几组不同类型的DRAM(每组有8个相同类型的)寄存器可以配置DRAM空间映射到物理地址空间中的基址和大小，以及所属的节点信息(这些寄存器的值事先会由bootloader设好)；这组寄存器位于虚拟总线0的设备0/8/16/24(依次对应每个节点的第一个设备号)的Function0(每个设备最多可定义8个Function，每个Function有着独立的PCIE 4KB的配置空间)的PCIE配置空间中(这个配置空间实现的是DRAM/Bridge控制器)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本小节涉及到的3组不同类型的寄存器(注：按索引对应即DRAM_BAR&lt;n&gt;,DRAM_LIMIT&lt;n&gt;和 DRAM_NODE_TRANSLATION&lt;n&gt;描述一个内存区域属性)：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;第一组(DRAM空间映射物理空间基址)：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>DRAM_BAR0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x54
-</span><span class='line'>DRAM_BAR1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x55
-</span><span class='line'>DRAM_BAR2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x56
-</span><span class='line'>DRAM_BAR3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x57
-</span><span class='line'>DRAM_BAR4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x58
-</span><span class='line'>DRAM_BAR5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x59
-</span><span class='line'>DRAM_BAR6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5A
-</span><span class='line'>DRAM_BAR7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5B
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;第二组(DRAM空间映射物理空间长度)：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>DRAM_LIMIT0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5C
-</span><span class='line'>DRAM_LIMIT1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5D
-</span><span class='line'>DRAM_LIMIT2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5E
-</span><span class='line'>DRAM_LIMIT3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5F
-</span><span class='line'>DRAM_LIMIT4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x60
-</span><span class='line'>DRAM_LIMIT5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x61
-</span><span class='line'>DRAM_LIMIT6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x62
-</span><span class='line'>DRAM_LIMIT7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x63
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;第三组(节点相关)：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>DRAM_NODE_TRANSLATION0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x64
-</span><span class='line'>DRAM_NODE_TRANSLATION1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x65
-</span><span class='line'>DRAM_NODE_TRANSLATION2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x66
-</span><span class='line'>DRAM_NODE_TRANSLATION3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x67
-</span><span class='line'>DRAM_NODE_TRANSLATION4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x68
-</span><span class='line'>DRAM_NODE_TRANSLATION5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x69
-</span><span class='line'>DRAM_NODE_TRANSLATION6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6A
-</span><span class='line'>DRAM_NODE_TRANSLATION7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6B
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;根据上述的PCIE配置空间memory-mapped映射方式便可直接获取寄存器中的值，就可以建立各个节点中的所有内存区域(最多8个区域)信息。关于这些寄存器的使用可以参考“XLP® Processor Family Programming Reference Manual”的“Chapter 7 Memory and I/O Subsystem”。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;3 Bootmem初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;bootmem_init()-&gt;…-&gt;init_bootmem_node()-&gt;init_bootmem_core():&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-32.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;每个节点拥有各自的bootmem管理(code&amp;data之前可以为空闲页面)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;4 Buddy初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;初始化流程最后会设置全局struct node_active_region early_node_map[]用于初始化Buddy系统，for_each_online_node()遍历所有在线节点调用free_area_init_node()初始化，主要初始化每个zone的大小和所涉及页面的struct page结构(flags中初始化有所属zone和node信息，由set_page_links()函数设置)等。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;4.1 NUMA带来的变化&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) pglist_data
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>typedef struct pglist_data {
-</span><span class='line'>    struct zone node_zones[MAX_NR_ZONES];
-</span><span class='line'>    struct zonelist node_zonelists[MAX_ZONELISTS];
-</span><span class='line'>    int nr_zones;
-</span><span class='line'>    struct bootmem_data *bdata;
-</span><span class='line'>    unsigned long node_start_pfn;
-</span><span class='line'>    unsigned long node_present_pages; /* total number of physical pages */
-</span><span class='line'>    unsigned long node_spanned_pages; /* total size of physical pagerange, including holes */
-</span><span class='line'>    int node_id;
-</span><span class='line'>    wait_queue_head_t kswapd_wait;
-</span><span class='line'>    struct task_struct *kswapd;
-</span><span class='line'>    int kswapd_max_order;
-</span><span class='line'>} pg_data_t;
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a)上节的bootmem结构的描述信息存放在NODE_DATA(node)-&gt; bdata中；NODE_DATA(i)宏返回节点i的struct pglist_data结构，需要在架构相关的mmzone.h中实现；&lt;br/&gt;
-</span><span class='line'>b) #define MAX_ZONELISTS 2，请参考后面的“zonelist初始化”。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2) zone
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct zone {
-</span><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>    int node;
-</span><span class='line'>    /*
-</span><span class='line'>     * zone reclaim becomes active if more unmapped pages exist.
-</span><span class='line'>     */
-</span><span class='line'>    unsigned long        min_unmapped_pages;
-</span><span class='line'>    unsigned long        min_slab_pages;
-</span><span class='line'>    struct per_cpu_pageset   *pageset[NR_CPUS];
-</span><span class='line'>#else
-</span><span class='line'>    … …
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a)最终调用kmalloc_node()为pageset成员在每个CPU的对应的内存节点分配内存；&lt;br/&gt;
-</span><span class='line'>b)min_unmapped_pages 对应/proc/sys/vm/min_unmapped_ratio，默认值为1；&lt;br/&gt;
-</span><span class='line'>  min_slab_pages对应/proc/sys/vm/min_slab_ratio，默认值为5；&lt;br/&gt;
-</span><span class='line'>  作用：当剩余可回收的非文件映射和SLAB页面超过这2个值时，才激活当前zone回收；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;c) 增加了zone对应的节点号。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;4.2 zonelist初始化&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  本节讲述zonelist的构建方式，实现位于start_kernel()-&gt;build_all_zonelists()中，zonelist的组织方式非常关键(这一点与以前的2.6.21内核版本不一样，2.6.32组织得更清晰)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4.2.1 zonelist order&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;NUMA系统中存在多个节点，每个节点对应一个struct pglist_data结构，此结构中可以包含多个zone，如：ZONE_DMA, ZONE_NORMAL，这样就产生几种排列顺序，以2个节点2个zone为例(zone从高到低排列, ZONE_DMA0表示节点0的ZONE_DMA，其它类似)：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a) Legacy方式&lt;br/&gt;
-</span><span class='line'>&lt;img src="/images/kernel/2015-06-02-33.jpg" alt="" /&gt;&lt;br/&gt;
-</span><span class='line'>  每个节点只排列自己的zone；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;b)Node方式&lt;br/&gt;
-</span><span class='line'>&lt;img src="/images/kernel/2015-06-02-34.jpg" alt="" /&gt;&lt;br/&gt;
-</span><span class='line'>  按节点顺序依次排列，先排列本地节点的所有zone，再排列其它节点的所有zone。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;c) Zone方式&lt;br/&gt;
-</span><span class='line'>&lt;img src="/images/kernel/2015-06-02-35.jpg" alt="" /&gt;&lt;br/&gt;
-</span><span class='line'>  按zone类型从高到低依次排列各节点的同相类型zone。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;可通过启动参数“numa_zonelist_order”来配置zonelist order，内核定义了3种配置：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define ZONELIST_ORDER_DEFAULT  0 /* 智能选择Node或Zone方式 */
-</span><span class='line'>#define ZONELIST_ORDER_NODE     1 /* 对应Node方式 */
-</span><span class='line'>#define ZONELIST_ORDER_ZONE     2 /* 对应Zone方式 */
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;默认配置为ZONELIST_ORDER_DEFAULT，由内核通过一个算法来判断选择Node或Zone方式，算法思想：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;a) alloc_pages()分配内存是按照ZONE从高到低的顺序进行的，例如上节“Node方式”的图示中，从ZONE_NORMAL0中分配内存时，ZONE_NORMAL0中无内存时将落入较低的ZONE_DMA0中分配，这样当ZONE_DMA0比较小的时候，很容易将ZONE_DMA0中的内存耗光，这样是很不理智的，因为还有更好的分配方式即从ZONE_NORMAL1中分配；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;b) 内核会检测各ZONE的页面数来选择Zone组织方式，当ZONE_DMA很小时，选择ZONELIST_ORDER_DEFAULT时，内核将倾向于选择ZONELIST_ORDER_ZONE方式，否则选择ZONELIST_ORDER_NODE方式。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，可以通过/proc/sys/vm/numa_zonelist_order动态改变zonelist order的分配方式。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4.2.2 Node Distance&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上节中的例子是以2个节点为例，如果有&gt;2个节点存在，就需要考虑不同节点间的距离来安排节点，例如以4个节点2个ZONE为例，各节点的布局(如4个XLP832物理CPU级联)值如下：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-36.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上图中，Node0和Node2的Node Distance为25，Node1和Node3的Node Distance为25，其它的Node Distance为15。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h6&gt;4.2.2.1 优先进行Zone Reclaim&lt;/h6&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，当Node Distance超过20的时候，内核会在某个zone分配内存不足的时候，提前激活本zone的内存回收工作，由全局变量zone_reclaim_mode控制，build_zonelists()中：&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;下面的代码描述了一个Page被访问它的标记为变化：&lt;/p&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;    /*
-</span><span class='line'> * If another node is sufficiently far away then it is better
-</span><span class='line'> * to reclaim pages in a zone before going off node.
+</span><span class='line'> * Mark a page as having seen activity.
+</span><span class='line'> *
+</span><span class='line'> * inactive,unreferenced        -&amp;gt;      inactive,referenced
+</span><span class='line'> * inactive,referenced          -&amp;gt;      active,unreferenced
+</span><span class='line'> * active,unreferenced          -&amp;gt;      active,referenced
 </span><span class='line'> */
-</span><span class='line'>if (distance &gt; RECLAIM_DISTANCE)
-</span><span class='line'>    zone_reclaim_mode = 1;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;通过/proc/sys/vm/zone_reclaim_mode可以动态调整zone_reclaim_mode的值来控制回收模式，含义如下：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define RECLAIM_OFF    0
-</span><span class='line'>#define RECLAIM_ZONE  (1&lt;&lt;0)     /* Run shrink_inactive_list on the zone */
-</span><span class='line'>#define RECLAIM_WRITE (1&lt;&lt;1)     /* Writeout pages during reclaim */
-</span><span class='line'>#define RECLAIM_SWAP  (1&lt;&lt;2)     /* Swap pages out during reclaim */
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h6&gt;4.2.2.2 影响zonelist方式&lt;/h6&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;采用Node方式组织的zonelist为：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-37.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  即各节点按照与本节点的Node Distance距离大小来排序，以达到更优的内存分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;4.2.3 zonelist[2]&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后，每个节点将关联2个zonelist：&lt;br/&gt;
-</span><span class='line'>  1) zonelist[0]中存放以Node方式或Zone方式组织的zonelist，包括所有节点的zone；&lt;br/&gt;
-</span><span class='line'>  2) zonelist[1]中只存放本节点的zone即Legacy方式；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;zonelist[1]用来实现仅从节点自身zone中的内存分配(参考&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标志)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;5 SLAB初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后对SLAB(本文不涉及SLOB或SLUB)的初始化影响不大，只是在分配一些变量采用类似Buddy系统的per_cpu_pageset(单面页缓存)在CPU本地节点进行内存分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;5.1 NUMA带来的变化&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct kmem_cache {
-</span><span class='line'>    struct array_cache *array[NR_CPUS];
-</span><span class='line'>    … …
-</span><span class='line'>    struct kmem_list3 *nodelists[MAX_NUMNODES];
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct kmem_list3 {
-</span><span class='line'>    … …
-</span><span class='line'>    struct array_cache *shared;    /* shared per node */
-</span><span class='line'>    struct array_cache **alien;    /* on other nodes */
-</span><span class='line'>    … …
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct slab {
-</span><span class='line'>    … …
-</span><span class='line'>    unsigned short nodeid;
-</span><span class='line'>    … …
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上面的4种类型的指针变量在SLAB初始化完毕后将改用kmalloc_node()分配的内存。具体实现请参考enable_cpucache()，此函数最终调用alloc_arraycache()和alloc_kmemlist()来分配这些变量代表的空间。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  nodelists[MAX_NUMNODES]存放的是所有节点对应的相关数据，本文称作SLAB节点。每个节点拥有各自的数据；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：有些非NUMA系统比如非连续内存系统可能根据不同的内存区域定义多个节点(实际上Node Distance都是0即物理内存访问速度相同)，所以这些变量并没有采用CONFIG_NUMA宏来控制，本文暂称为NUMA带来的变化。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;5.2 SLAB缓存&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后，SLAB将有三种类型的缓存：本地缓存(当前CPU的缓存)，共享缓存(节点内的缓存)和外部缓存(节点间的缓存)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB系统分配对象时，先从本地缓存中查找，如果本地缓存为空，则将共享缓存中的缓存搬运本地缓存中，重新从本地缓存中分配；如果共享缓存为空，则从SLAB中进行分配；如果SLAB中已经无空闲对象，则分配新的SLAB后重新分配本地缓存。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB系统释放对象时，先不归还给SLAB (简化分配流程，也可充分利用CPU Cache)，如果是同节点的SLAB对象先放入本地缓存中，如果本地缓存溢出(满)，则转移一部分(以batch为单位)至共享缓存中；如果是跨节点释放，则先放入外部缓存中，如果外部缓存溢出，则转移一部分至共享缓存中，以供后续分配时使用；如果共享缓存溢出，则调用free_block()函数释放溢出的缓存对象。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;关于这三种类型缓存的大小以及参数设置，不在本文的讨论范围。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本地缓存&lt;br/&gt;
-</span><span class='line'>  kmem_cache-&gt; array[] 中缓存每个CPU的SLAB cached objects；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;共享缓存&lt;br/&gt;
-</span><span class='line'>  kmem_list3[]-&gt;shared(如果存在shared缓存)中缓存与当前CPU同节点的所有CPU (如XLP832 NUMA系统中的Node0包含为CPU0~CPU31) 本地缓存溢出的缓存，详细实现请参考cache_flusharray()；另外，大对象SLAB不存在共享缓存。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;外部缓存&lt;br/&gt;
-</span><span class='line'>  kmem_list3[]-&gt;alien中存放其它节点的SLAB cached objects，当在某个节点上分配的SLAB 的object在另外一个节点上被释放的时候(即slab-&gt;nodeid与numa_node_id()当前节点不相等时)，将加入到对象所在节点的alien缓存中(如果不存在此alien缓存，此对象不会被缓存，而是直接释放给此对象所属SLAB)，否则加入本地缓存或共享缓存(本地缓存溢出且存在shared缓存时)；当alien缓存满的时候，会调用cache_free_alien()搬迁至shared缓存中(如果不存在shared缓存，直接释放给SLAB)；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;slab-&gt;nodeid记录本SLAB内存块(若干个页面)所在的节点。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;示例&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;例如2个节点，CPU0~31位于Node0，CPU32~CPU63位于Node1：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;64个(依次对应于CPU0~CPU63)本地缓存&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;array[0~31]:在Node0分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;array[32~63]:在Node1分配“array_cache结构+cached Objs指针”；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2个SLAB节点&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]:在Node0分配“kmem_list3结构”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]:在Node1分配“kmem_list3结构”；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB节点0(CPU0~CPU31)共享缓存和外部缓存alien[1]&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;shared:在Node0分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;alien:在Node0分配“节点数&lt;em&gt;sizeof(void&lt;/em&gt;)”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;alien[0]:置为NULL；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[0]-&gt;alien[1]:在Node0分配“array_cache结构+cached Objs指针”；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB节点1(CPU32~CPU63)共享缓存和外部缓存alien[0]&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;shared:在Node1分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;alien:在Node1分配“节点数&lt;em&gt;sizeof(void&lt;/em&gt;)”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;alien[0]:在Node1分配“array_cache结构+cached Objs指针”；&lt;br/&gt;
-</span><span class='line'>kmem_cache-&gt;nodelists[1]-&gt;alien[1]:置为NULL；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，可以用内核启动参数“use_alien_caches”来控制是否开启alien缓存：默认值为1，当系统中的节点数目为1时，use_alien_caches初始化为0；use_alien_caches目的是用于某些多节点非连续内存(访问速度相同)的非NUMA系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;由上可见，随着节点个数的增加，SLAB明显会开销越来越多的缓存，这也是SLUB涎生的一个重要原因。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;5.3 __GFP_THISNODE&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB在某个节点创建新的SLAB时，都会置&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标记向Buddy系统提交页面申请，Buddy系统中看到此标记，选用申请节点的Legacy zonelist[1]，仅从申请节点的zone中分配内存，并且不会走内存不足流程，也不会重试或告警，这一点需要引起注意。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;SLAB在申请页面的时候会置GFP_THISNODE标记后调用cache_grow()来增长SLAB；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;GFP_THISNODE定义如下：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>#define GFP_THISNODE     (__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;6 调度初始化&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置NUMA后负载均衡会多一层NUMA调度域，根据需要在topology.h中定义，示例：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define SD_NODE_INIT (struct sched_domain) {                 \
-</span><span class='line'>    .parent             = NULL,                              \
-</span><span class='line'>    .child              = NULL,                              \
-</span><span class='line'>    .groups             = NULL,                              \
-</span><span class='line'>    .min_interval       = 8,                                 \
-</span><span class='line'>    .max_interval       = 32,                                \
-</span><span class='line'>    .busy_factor        = 32,                                \
-</span><span class='line'>    .imbalance_pct      = 125,                               \
-</span><span class='line'>    .cache_nice_tries   = 1,                                 \
-</span><span class='line'>    .flags              = SD_LOAD_BALANCE | SD_BALANCE_EXEC, \
-</span><span class='line'>    .last_balance       = jiffies,                           \
-</span><span class='line'>    .balance_interval   = 1,                                 \
-</span><span class='line'>    .nr_balance_failed  = 0,                                 \
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  顺便提一下，2.6.32对于实时任务不走负载均衡流程，采用了全局优先级调度的思想，保证实时任务的及时运行；这样的做法同时也解决了低版本内核在处理同一个逻辑CPU上相同最高优先级实时任务的负载均衡的时延。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;7 NUMA内存分配&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Zonelist[2]组织方式在NUMA内存分配过程中起着至关重要的作用，它决定了整个页面在不同节点间的申请顺序和流程。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;7.1显式分配&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;显式分配即指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages_node()和SLAB系统的kmem_cache_alloc_node()，其它的函数都可以从这2个派生出来。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;例如，kmalloc_node()最终调用kmem_cache_alloc_node()进行分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.1.1 Buddy显式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;alloc_pages_node(node, gfp_flags, order)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 如果node小于0，node取本地节点号(node = numa_node_id())；&lt;br/&gt;
-</span><span class='line'>  2) NODE_DATA(node)得到node对应的struct pglist_data结构，从而得到zonelist[2]；&lt;br/&gt;
-</span><span class='line'>  3) 如果gfp_flags含有&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标志，仅在此节点分配内存，使用node节点的Legacy zonelist[1]，否则使用其包含所有节点zone的zonelist[0] (见4.2.2.3节)；&lt;br/&gt;
-</span><span class='line'>  4) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如&lt;code&gt;__GFP_HIGHMEM&lt;/code&gt;表示最高的zone为ZONE_HIGH；&lt;br/&gt;
-</span><span class='line'>  5) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.1.2 SLAB显式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;kmem_cache_alloc_node(cachep, gfp_flags, node)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 如果node值为-1，node取本地节点号(node = numa_node_id())；&lt;br/&gt;
-</span><span class='line'>  2) 如果node &lt; -1，则执行fall back行为，此行为与用户策略有关，有点类似隐式分配：&lt;br/&gt;
-</span><span class='line'>a) 根据用户策略(包括CPUSET和内存策略)依次选取节点，根据gfp_flags选取合适的zonelist进行分配；&lt;br/&gt;
-</span><span class='line'>b) 如果内存不足分配失败，则跳过内存策略直接进行隐式Buddy页面分配(仍受CPUSET的限定，关于CPUSET和内存策略后面会介绍)，最终构建成新的SLAB并完成本次分配；转5)；&lt;br/&gt;
-</span><span class='line'>  3) 如果node是正常节点号，则先在node节点上根据gfp_flags选取合适的zonelist进行分配；&lt;br/&gt;
-</span><span class='line'>  4) 如果3)中node节点内存不足分配失败，转2) a)执行fall back行为。&lt;br/&gt;
-</span><span class='line'>  5) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：fall back行为指的是某个节点上内存不足时会落到此节点的zonelist[0]中定义的其它节点zone分配。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.1.3 设备驱动&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;配置CONFIG_NUMA后，设备会关联一个NUMA节点信息，struct device结构中会多一个numa_node字段记录本设备所在的节点，这个结构嵌套在各种类型的驱动中，如struct net_device结构。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct device {
-</span><span class='line'>    … …
-</span><span class='line'>    #ifdef CONFIG_NUMA
-</span><span class='line'>        int          numa_node;    /* NUMA node this device is close to */
-</span><span class='line'>    #endif
-</span><span class='line'>    … …
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;附&lt;code&gt;__netdev_alloc_skb()&lt;/code&gt;的实现：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
-</span><span class='line'>        unsigned int length, gfp_t gfp_mask)
+</span><span class='line'>void mark_page_accessed(struct page *page)
 </span><span class='line'>{
-</span><span class='line'>    int node = dev-&gt;dev.parent ? dev_to_node(dev-&gt;dev.parent) : -1;
-</span><span class='line'>    struct sk_buff *skb;
-</span><span class='line'>
-</span><span class='line'>    skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, node);
-</span><span class='line'>    if (likely(skb)) {
-</span><span class='line'>        skb_reserve(skb, NET_SKB_PAD);
-</span><span class='line'>        skb-&gt;dev = dev;
+</span><span class='line'>    if (!PageActive(page) &amp;amp;&amp;amp; !PageUnevictable(page) &amp;amp;&amp;amp;
+</span><span class='line'>            PageReferenced(page) &amp;amp;&amp;amp; PageLRU(page)) {
+</span><span class='line'>        activate_page(page);
+</span><span class='line'>        ClearPageReferenced(page);
+</span><span class='line'>    } else if (!PageReferenced(page)) {
+</span><span class='line'>        SetPageReferenced(page);
 </span><span class='line'>    }
-</span><span class='line'>    return skb;
 </span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;code&gt;__alloc_skb()&lt;/code&gt;最终调用kmem_cache_alloc_node()和kmalloc_node()在此node上分配内存。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;参考文章：&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;7.2 隐式分配和内存策略&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="http://lsec.cc.ac.cn/~tengfei/doc/ldd3/"&gt;http://lsec.cc.ac.cn/~tengfei/doc/ldd3/&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;隐式分配即不指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages()和SLAB系统的kmem_cache_alloc()，其它的函数都可以从这2个派生出来。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="http://memorymyann.javaeye.com/blog/193061"&gt;http://memorymyann.javaeye.com/blog/193061&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;隐式分配涉及到NUMA内存策略(Memory Policy)，内核定义了四种内存策略。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="http://www.cublog.cn/u/20047/showart.php?id=121850"&gt;http://www.cublog.cn/u/20047/showart.php?id=121850&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：隐式分配还涉及到CPUSET，本文后面会介绍。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.chinaunix.net/u2/74194/showart_1089736.html"&gt;http://blog.chinaunix.net/u2/74194/showart_1089736.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.2.1 内存策略&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核mm/mempolicy.c中实现了NUMA内存的四种内存分配策略：MPOL_DEFAULT, MPOL_PREFERRED, MPOL_INTERLEAVE和MPOL_BIND，内存策略会从父进程继承。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;MPOL_DEFAULT：使用本地节点的zonelist；&lt;br/&gt;
-</span><span class='line'>MPOL_PREFERRED：使用指定节点的zonelist；&lt;br/&gt;
-</span><span class='line'>MPOL_BIND： 设置一个节点集合，只能从这个集合中节点的zone申请内存：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  1)无&lt;code&gt;__GFP_THISNODE&lt;/code&gt;申请标记，使用本地节点的zonelist[0]；&lt;br/&gt;
-</span><span class='line'>  2)置有&lt;code&gt;__GFP_THISNODE&lt;/code&gt;申请标记，如果本地节点：&lt;br/&gt;
-</span><span class='line'>a)在集合中，使用本地节点的zonelist[1]；&lt;br/&gt;
-</span><span class='line'>b)不在集合中，使用集合中最小节点号的zonelist[1]；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;MPOL_INTERLEAVE：采用Round-Robin方式从设定的节点集合中选出某个节点，使用此节点的zonelist；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核实现的内存策略，用struct mempolicy结构来描述：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct mempolicy {
-</span><span class='line'>    atomic_t refcnt;
-</span><span class='line'>    unsigned short mode;              /* See MPOL_* above */
-</span><span class='line'>    unsigned short flags;             /* See set_mempolicy() MPOL_F_* above */
-</span><span class='line'>    union {
-</span><span class='line'>        short         preferred_node; /* preferred */
-</span><span class='line'>        nodemask_t    nodes;          /* interleave/bind */
-</span><span class='line'>        /* undefined for default */
-</span><span class='line'>    } v;
-</span><span class='line'>    union {
-</span><span class='line'>        nodemask_t cpuset_mems_allowed;     /* relative to these nodes */
-</span><span class='line'>        nodemask_t user_nodemask;           /* nodemask passed by user */
-</span><span class='line'>    } w;
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;成员mode表示使用四种分配策略中的哪一种，联合体v根据不同的分配策略记录相应的分配信息。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，MPOL_PREFERRED策略有一种特殊的模式，当其flags置上MPOL_F_LOCAL标志后，将等同于MPOL_DEFAULT策略，内核默认使用此种策略，见全局变量default_policy。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内存策略涉及的分配函数有2个：alloc_pages_current()和alloc_page_vma()，可以分别为不同任务以及任务的不同VMA设置内存策略。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.2.2 Buddy隐式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;以默认的NUMA内存策略为例讲解，alloc_pages(gfp_flags, order)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 得到本地节点对应的struct pglist_data结构，从而得到zonelist[2]；&lt;br/&gt;
-</span><span class='line'>  2) 如果gfp_flags含有&lt;code&gt;__GFP_THISNODE&lt;/code&gt;标志，仅在此节点分配内存即使用本地节点的Legacy zonelist[1]，否则使用zonelist[0] (见4.2.2.3节)；&lt;br/&gt;
-</span><span class='line'>  3) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如&lt;code&gt;__GFP_HIGHMEM&lt;/code&gt;表示最高的zone为ZONE_HIGH；&lt;br/&gt;
-</span><span class='line'>  4) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;7.2.3 SLAB隐式分配&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;以默认的NUMA内存策略为例讲解，kmem_cache_alloc(cachep, gfp_flags)分配流程：&lt;br/&gt;
-</span><span class='line'>  1) 调用&lt;code&gt;____cache_alloc()&lt;/code&gt;函数在本地节点local_node分配，此函数无fall back行为；&lt;br/&gt;
-</span><span class='line'>  2) 如果1)中本地节点内存不足分配失败，调用&lt;code&gt;____cache_alloc_node&lt;/code&gt;(cachep, gfp_flags,local_node)再次尝试在本地节点分配，如果还失败此函数会进行fall back行为；&lt;br/&gt;
-</span><span class='line'>  3) 分配结束。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;7.3 小结&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上文提到的所有的内存分配函数都允许fall back行为，但有2种情况例外：&lt;br/&gt;
-</span><span class='line'>  1) &lt;code&gt;__GFP_THISNODE&lt;/code&gt;分配标记限制了只能从某一个节点上分配内存；&lt;br/&gt;
-</span><span class='line'>  2) MPOL_BIND策略，限制了只能从一个节点集合中的节点上分配内存；&lt;br/&gt;
-</span><span class='line'>   (gfp_zone(gfp_flags) &lt; policy_zone的情况，MPOL_BIND不限制节点)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;注：还有一种情况，CPUSET限制的内存策略，后面会介绍。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;8 CPUSET&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPUSET基于CGROUP的框架构建的子系统，有如下特点：&lt;br/&gt;
-</span><span class='line'>  1) 限定一组任务所允许使用的内存Node和CPU资源；&lt;br/&gt;
-</span><span class='line'>  2) CPUSET在内核各子系统中添加的检测代码很少，对内核没有性能影响；&lt;br/&gt;
-</span><span class='line'>  3) CPUSET的限定优先级高于内存策略(针对于Node)和绑定(针对于CPU)；&lt;br/&gt;
-</span><span class='line'>  4) 没有额外实现系统调用接口，只能通过/proc文件系统和用户交互。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;本节只讲述CPUSET的使用方法和说明。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.1 创建CPUSET&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;因为CPUSET只能使用/proc文件系统访问，所以第一步就要先mount cpuset文件系统，配置CONFIG_CGROUPS和CONFIG_CPUSETS后/proc/filesystems中将有这个文件系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CPUSET是分层次的，可以在cpuset文件系统根目录是最顶层的CPUSET，可以在其下创建CPUSET子项，创建方式很简单即创建一个新的目录。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;mount命令：mount nodev –t cpuset /your_dir或mount nodev –t cgroup –o cpuset /your_dir&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Mount成功后，进入mount目录，这个就是最顶层的CPUSET了(top_cpuset)，下面附一个演示例子：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-38.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.2 CPUSET文件&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;介绍几个重要的CPUSET文件：&lt;br/&gt;
-</span><span class='line'>1) tasks，实际上是CGROUPS文件，为此CPUSET包含的线程pid集合；&lt;br/&gt;
-</span><span class='line'>  echo 100 &gt; tasks&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2) cgroup.procs是CGROUPS文件，为此CPUSET包含的线程组tgid集合；&lt;br/&gt;
-</span><span class='line'>  echo 100 &gt; cgroup.procs&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;3) cpus是CPUSET文件，表示此CPUSET允许的CPU；&lt;br/&gt;
-</span><span class='line'>  echo 0-8 &gt; cpus&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;4) mems是CPUSET文件，表示此CPUSET允许的内存节点；
-</span><span class='line'>  echo 0-1 &gt; mems  (对应于struct task_struct中的mems_allowed字段)&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;5) sched_load_balance，为CPUSET文件，设置cpus集合的CPU是否参与负载均衡；
-</span><span class='line'>  echo 0 &gt; sched_load_balance (禁止负载均衡)；默认值为1表示开启负载均衡；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;6) sched_relax_domain_level，为CPUSET文件，数值代表某个调度域级别，大于此级别的调度域层次将禁用闲时均衡和唤醒均衡，而其余级别的调度域都开启；
-</span><span class='line'>也可以通过启动参数“relax_domain_level”设置，其值含义：&lt;br/&gt;
-</span><span class='line'>  -1 : 无效果，此为默认值&lt;br/&gt;
-</span><span class='line'>   0 - 设置此值会禁用所有调度域的闲时均衡和唤醒均衡&lt;br/&gt;
-</span><span class='line'>   1 - 超线程域&lt;br/&gt;
-</span><span class='line'>   2 - 核域&lt;br/&gt;
-</span><span class='line'>   3 - 物理域&lt;br/&gt;
-</span><span class='line'>   4 - NUMA域&lt;br/&gt;
-</span><span class='line'>   5 - ALLNODES模式的NUMA域&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;7) mem_exclusive和mem_hardwall，为CPUSET文件，表示内存硬墙标记；默认为0，表示软墙；有关CPUSET的内存硬墙(HardWall)和内存软墙(SoftWall)，下文会介绍；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;8) memory_spread_page和memory_spread_slab，为CPUSET文件，设定CPUSET中的任务PageCache和SLAB(创建时置有SLAB_MEM_SPREAD)以Round-Robin方式使用内存节点(类似于MPOL_INTERLEAVE)；默认为0，表示未开启；struct task_struct结构中增加成员cpuset_mem_spread_rotor记录下次使用的节点号；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;9) memory_migrate，为CPUSET文件，表明开启此CPUSET的内存迁移，默认为0；&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  当一个任务从一个CPUSET1(mems值为0)迁移至另一个CPUSET2(mems值为1)的时候，此任务在节点0上分配的页面内容将迁移至节点1上分配新的页面(将数据同步到新页面)，这样就避免了此任务的非本地节点的内存访问。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-39.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;上图为单Node，8个CPU的系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) 顶层CPUSET包含了系统中的所有CPU以及Node，而且是只读的，不能更改；&lt;br/&gt;
-</span><span class='line'>2) 顶层CPUSET包含了系统中的所有任务，可以更改；&lt;br/&gt;
-</span><span class='line'>3) child为新创建的子CPUSET，子CPUSET的资源不能超过父CPUSET的资源；&lt;br/&gt;
-</span><span class='line'>4) 新创建的CPUSET的mems和cpus都是空的，使用前必须先初始化；&lt;br/&gt;
-</span><span class='line'>5) 添加任务：设置tasks和cgroup.procs文件；&lt;br/&gt;
-</span><span class='line'>6) 删除任务：将任务重新添加至其它CPUSET(如顶层)就可以从本CPUSET删除任务。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.3 利用CPUSET限定CPU和Node&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;设置步骤：&lt;br/&gt;
-</span><span class='line'>1) 在某个父CPUSET中创建子CPUSET；&lt;br/&gt;
-</span><span class='line'>2) 在子CPUSET目录下，输入指定的Node号至mems文件；&lt;br/&gt;
-</span><span class='line'>3) 在子CPUSET目录下，输入指定的Node号至mems文件；&lt;br/&gt;
-</span><span class='line'>4) 在子CPUSET目录下，设定任务至tasks或group.procs文件；&lt;br/&gt;
-</span><span class='line'>5) 还可以设置memory_migrate为1，激活内存页面的迁移功能。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这样限定后，此CPUSET中所有的任务都将使用限定的CPU和Node，但毕竟系统中的任务并不能完全孤立，比如还是可能会全局共享Page Cache，动态库等资源，因此内核在某些情况下还是可以允许打破这个限制，如果不允许内核打破这个限制，需要设定CPUSET的内存硬墙标志即mem_exclusive或mem_hardwall置1即可；CPUSET默认是软墙。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;硬软墙用于Buddy系统的页面分配，优先级高于内存策略，请参考内核函数：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;cpuset_zone_allowed_hardwall()和cpuset_zone_allowed_softwall()&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;另外，当内核分不到内存将导致Oops的时候，CPUSET所有规则将被打破，毕竟一个系统的正常运行才是最重要的：&lt;br/&gt;
-</span><span class='line'>  1) &lt;code&gt;__GFP_THISNODE&lt;/code&gt;标记分配内存的时候(通常是SLAB系统)；&lt;br/&gt;
-</span><span class='line'>  2) 中断中分配内存的时候；&lt;br/&gt;
-</span><span class='line'>  3) 任务置有TIF_MEMDIE标记即被内核OOM杀死的任务。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;8.4 利用CPUSET动态改变调度域结构&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;利用sched_load_balance文件可以禁用掉某些CPU的负载均衡，同时重新构建调度域，此功能类似启动参数“isolcpus”的功能。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;8个CPU的系统中，系统中存在一个物理域，现需要禁掉CPU4~CPU7的负载均衡，配置步骤为：&lt;br/&gt;
-</span><span class='line'>  1) “mkdir child”在顶层CPUSET中创建子CPUSET，记为child；&lt;br/&gt;
-</span><span class='line'>  2) “echo 0-3 &gt; child/cpus ”(新建CPUSET的sched_load_balance默认是是打开的)；&lt;br/&gt;
-</span><span class='line'>  3) “echo 0 &gt; sched_load_balance”关闭顶层CPUSET的负载均衡。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;操作过程见下图：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-40.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;由图可见，CPU4~CPU7的调度域已经不存在了，具体效果是将CPU4~CPU7从负载均衡中隔离出来。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;9 NUMA杂项&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) /sys/devices/system/node/中记录有系统中的所有内存节点信息；&lt;br/&gt;
-</span><span class='line'>2)任务额外关联一个/proc/&lt;tid&gt;/numa_smaps文件信息；&lt;br/&gt;
-</span><span class='line'>3) tmpfs可以指定在某个Node上创建；&lt;br/&gt;
-</span><span class='line'>4) libnuma库和其numactl小工具可以方便操作NUMA内存；&lt;br/&gt;
-</span><span class='line'>5) … …&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;10 参考资料&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;ol&gt;
-</span><span class='line'>&lt;li&gt;www.kernel.org&lt;/li&gt;
-</span><span class='line'>&lt;li&gt;ULK3&lt;/li&gt;
-</span><span class='line'>&lt;li&gt;XLP® Processor Family Programming Reference Manual&lt;/li&gt;
-</span><span class='line'>&lt;/ol&gt;
-</span><span class='line'>
+</span><span class='line'>&lt;p&gt;关于内存管理，Linux有一个网页：&lt;a href="http://linux-mm.org/"&gt;http://linux-mm.org/&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux内存管理]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-06-02T15:05:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-alloc&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/myarrow/article/details/8624687"&gt;http://blog.csdn.net/myarrow/article/details/8624687&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[linux mmap 详解]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/09/11/kernel-mm-mmap/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-09-11T16:46:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/09/11/kernel-mm-mmap&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.chinaunix.net/uid-20321537-id-3483405.html"&gt;http://blog.chinaunix.net/uid-20321537-id-3483405.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.csdn.net/myarrow/article/details/8682819"&gt;http://blog.csdn.net/myarrow/article/details/8682819&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;h3&gt;一.前言&lt;/h3&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;1. Linux物理内存三级架构&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;mmap的具体实现以前在学习内核时学习过，但是对于其中的很多函数是一知半解的，有些只能根据其函数名来猜测其具体的功能，在本文中，一起来重新深入理解其具体的实现。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02-20.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>&lt;h3&gt;二.mmap的用户层应用&lt;/h3&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;对于内存管理，Linux采用了与具体体系架构不相关的设计模型，实现了良好的可伸缩性。它主要由内存节点node、内存区域zone和物理页框page三级架构组成。&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void *mmap(void *start,size_t length,int prot,int flags,int fd,off_t offsize);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;内存节点node&lt;/h5&gt;
+</span><span class='line'>&lt;p&gt;具体参数含义&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  内存节点node是计算机系统中对物理内存的一种描述方法，一个总线主设备访问位于同一个节点中的任意内存单元所花的代价相同，而访问任意两个不同节点中的内存单元所花的代价不同。在一致存储结构(Uniform Memory Architecture，简称UMA)计算机系统中只有一个节点，而在非一致性存储结构(NUMA)计算机系统中有多个节点。Linux内核中使用数据结构pg_data_t来表示内存节点node。如常用的ARM架构为UMA架构。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;start ：  指向欲映射的内存起始地址，通常设为 NULL，代表让系统自动选定地址，映射成功后返回该地址。&lt;br/&gt;
+</span><span class='line'>length：  代表将文件中多大的部分映射到内存。&lt;br/&gt;
+</span><span class='line'>prot  ：  映射区域的保护方式。可以为以下几种方式的组合：&lt;br/&gt;
+</span><span class='line'>    PROT_EXEC 映射区域可被执行&lt;br/&gt;
+</span><span class='line'>    PROT_READ 映射区域可被读取&lt;br/&gt;
+</span><span class='line'>    PROT_WRITE 映射区域可被写入&lt;br/&gt;
+</span><span class='line'>    PROT_NONE 映射区域不能存取&lt;br/&gt;
+</span><span class='line'>flags ：  影响映射区域的各种特性。在调用mmap()时必须要指定MAP_SHARED 或MAP_PRIVATE。&lt;br/&gt;
+</span><span class='line'>    MAP_FIXED 如果参数start所指的地址无法成功建立映射时，则放弃映射，不对地址做修正。通常不鼓励用此旗标。&lt;br/&gt;
+</span><span class='line'>    MAP_SHARED 对映射区域的写入数据会复制回文件内，而且允许其他映射该文件的进程共享。&lt;br/&gt;
+</span><span class='line'>    MAP_PRIVATE 对映射区域的写入操作会产生一个映射文件的复制，即私人的“写入时复制”（copy on write）对此区域作的任何修改都不会写回原来的文件内容。&lt;br/&gt;
+</span><span class='line'>    MAP_ANONYMOUS建立匿名映射。此时会忽略参数fd，不涉及文件，而且映射区域无法和其他进程共享。&lt;br/&gt;
+</span><span class='line'>    MAP_DENYWRITE只允许对映射区域的写入操作，其他对文件直接写入的操作将会被拒绝。&lt;br/&gt;
+</span><span class='line'>    MAP_LOCKED 将映射区域锁定住，这表示该区域不会被置换（swap）。&lt;br/&gt;
+</span><span class='line'>fd    ：  要映射到内存中的文件描述符。如果使用匿名内存映射时，即flags中设置了MAP_ANONYMOUS，fd设为-1。有些系统不支持匿名内存映射，则可以使用fopen打开/dev/zero文件，&lt;br/&gt;
+</span><span class='line'>然后对该文件进行映射，可以同样达到匿名内存映射的效果。&lt;br/&gt;
+</span><span class='line'>offset：文件映射的偏移量，通常设置为0，代表从文件最前方开始对应，offset必须是PAGE_SIZE的整数倍。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h5&gt;内存区域zone&lt;/h5&gt;
+</span><span class='line'>&lt;p&gt;返回值：&lt;br/&gt;
+</span><span class='line'>若映射成功则返回映射区的内存起始地址，否则返回MAP_FAILED(－1)，错误原因存于errno 中。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  内存区域位于同一个内存节点之内，由于各种原因它们的用途和使用方法并不一样。如基于IA32体系结构的个人计算机系统中，由于历史原因使得ISA设备只能使用最低16MB来进行DMA传输。又如，由于Linux内核采用&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;错误代码：&lt;br/&gt;
+</span><span class='line'>EBADF  参数fd 不是有效的文件描述词&lt;br/&gt;
+</span><span class='line'>EACCES 存取权限有误。如果是MAP_PRIVATE 情况下文件必须可读，使用MAP_SHARED则要有PROT_WRITE以及该文件要能写入。&lt;br/&gt;
+</span><span class='line'>EINVAL 参数start、length 或offset有一个不合法。&lt;br/&gt;
+</span><span class='line'>EAGAIN 文件被锁住，或是有太多内存被锁住。&lt;br/&gt;
+</span><span class='line'>ENOMEM 内存不足。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt; • 物理页框page&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;用户层的调用很简单，其具体功能就是直接将物理内存直接映射到用户虚拟内存，使用户空间可以直接对物理空间操作。但是对于内核层而言，其具体实现比较复杂。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;2. Linux虚拟内存三级页表&lt;/h4&gt;
+</span><span class='line'>&lt;h3&gt;三.mmap的内核实现&lt;/h3&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;Linux虚拟内存三级管理由以下三级组成：&lt;br/&gt;
-</span><span class='line'> • PGD: Page Global Directory (页目录)&lt;br/&gt;
-</span><span class='line'> • PMD: Page Middle Directory (页目录)&lt;br/&gt;
-</span><span class='line'> • PTE:  Page Table Entry     (页表项)&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;对于mmap的内核有了解的都会知道用户层的mmap到内核层的mmap其中多了一个参数vma_struct这个结构体，在开始时对于这个参数很疑惑就是这个参数的值是哪儿来的，在这里我们会一一来讲述。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;每一级有以下三个关键描述宏：&lt;br/&gt;
-</span><span class='line'> • SHIFT&lt;br/&gt;
-</span><span class='line'> • SIZE&lt;br/&gt;
-</span><span class='line'> • MASK&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;mmap() &mdash;&gt; sys_mmap_pgoff() 内核系统调用函数&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;如页的对应描述为：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>/* PAGE_SHIFT determines the page size  asm/page.h */  
-</span><span class='line'>#define PAGE_SHIFT      12  
-</span><span class='line'>#define PAGE_SIZE       (_AC(1,UL) &lt;&lt; PAGE_SHIFT)  
-</span><span class='line'>#define PAGE_MASK       (~(PAGE_SIZE-1))  
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;munmap() &mdash;&gt;sys_munmap() 内核系统调用函数，其最终调用unmap_region()来解除映射关系,不需要对应的file_operation有unmap操作项.&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;数据结构定义如下：</span></code></pre></td></tr></table></div></figure>
-    /<em> asm/page.h </em>/<br/>
-    typedef unsigned long pteval_t;</p>
+</span><span class='line'>&lt;p&gt;还是从do_mmap开始吧。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;3.1 do_mmap&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;参数说明：&lt;br/&gt;
+</span><span class='line'>file  :就是用户层想要映射的file&lt;br/&gt;
+</span><span class='line'>addr  :欲映射的起始地址，即用户层的start&lt;br/&gt;
+</span><span class='line'>prot  :用户层传入的port&lt;br/&gt;
+</span><span class='line'>flag  :同上&lt;br/&gt;
+</span><span class='line'>offset:同上&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;从这里可以知道，这里面的参数几乎均是用户层传入的参数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline unsigned long do_mmap(struct file *file, unsigned long addr,unsigned long len, unsigned long prot,
+</span><span class='line'>                                    unsigned long flag, unsigned long offset)
+</span><span class='line'>{
+</span><span class='line'>    unsigned long ret = -EINVAL;
+</span><span class='line'>    if ((offset + PAGE_ALIGN(len)) &lt; offset)  --页对齐len，检测传入参数是否有误。
+</span><span class='line'>        goto out;
+</span><span class='line'>    if (!(offset &amp; ~PAGE_MASK))           --检测offset是否页对齐。映射时只能映射页对齐的长度。
+</span><span class='line'>        ret = do_mmap_pgoff(file, addr, len, prot, flag, offset &gt;&gt; PAGE_SHIFT);
+</span><span class='line'>out:
+</span><span class='line'>    return ret;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;3.2 do_mmap_pgoff&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这个函数是巨大的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    unsigned long do_mmap_pgoff(struct file * file, unsigned long addr,unsigned long len, unsigned long prot,unsigned long flags, unsigned long pgoff)
+</span><span class='line'>{
+</span><span class='line'>    struct mm_struct * mm = current-&gt;mm;      --当前用户进程的mm
+</span><span class='line'>    struct inode *inode;
+</span><span class='line'>    unsigned int vm_flags;
+</span><span class='line'>    int error;
+</span><span class='line'>    int accountable = 1;
+</span><span class='line'>    unsigned long reqprot = prot;
+</span><span class='line'>
+</span><span class='line'>    if ((prot &amp; PROT_READ) &amp;&amp; (current-&gt;personality &amp; READ_IMPLIES_EXEC))   --是否隐藏了可执行属性。
+</span><span class='line'>        if (!(file &amp;&amp; (file-&gt;f_path.mnt-&gt;mnt_flags &amp; MNT_NOEXEC)))
+</span><span class='line'>            prot |= PROT_EXEC;
+</span><span class='line'>
+</span><span class='line'>    if (!len)
+</span><span class='line'>        return -EINVAL;
+</span><span class='line'>
+</span><span class='line'>    if (!(flags &amp; MAP_FIXED))              -
+</span><span class='line'>        addr = round_hint_to_min(addr);    --判断输入的欲映射的起始地址是否小于最小映射地址，如果小于，将addr修改为最小地址，不过前提是MAP_FIXED旗标没有设置。
+</span><span class='line'>
+</span><span class='line'>    error = arch_mmap_check(addr, len, flags);   --不同平台对于mmap参数的不同检测。这里之间返回0
+</span><span class='line'>    if (error)
+</span><span class='line'>        return error;
+</span><span class='line'>
+</span><span class='line'>    len = PAGE_ALIGN(len);        --检测len是否越界，len的范围在0~TASK_SIZE之间。
+</span><span class='line'>    if (!len || len &gt; TASK_SIZE)
+</span><span class='line'>        return -ENOMEM;             --错误值为nomem
+</span><span class='line'>
+</span><span class='line'>    if ((pgoff + (len &gt;&gt; PAGE_SHIFT)) &lt; pgoff)  --再次检测是否越界。我们这里不得不小心哪个晕头了传入一个莫名其妙的值
+</span><span class='line'>    return -EOVERFLOW;
+</span><span class='line'>
+</span><span class='line'>    if (mm-&gt;map_count &gt; sysctl_max_map_count)   --在一个进程中对于mmap个数是有限制的。超出了还是nomem的错误。
+</span><span class='line'>        return -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>    addr = get_unmapped_area(file, addr, len, pgoff, flags);  --获取没有映射的地址，这个是查询mm中空闲的内存地址，这个在下面理解。
+</span><span class='line'>    if (addr &amp; ~PAGE_MASK)
+</span><span class='line'>        return addr;
+</span><span class='line'>
+</span><span class='line'>    vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags) | mm-&gt;def_flags |
+</span><span class='line'>               VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;      --设置vm_flags，根据传入的port和flags以及mm本身自有的旗标来设置。
+</span><span class='line'>
+</span><span class='line'>    if (flags &amp; MAP_LOCKED) {
+</span><span class='line'>        if (!can_do_mlock())
+</span><span class='line'>            return -EPERM;
+</span><span class='line'>        vm_flags |= VM_LOCKED;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    if (vm_flags &amp; VM_LOCKED) {
+</span><span class='line'>        unsigned long locked, lock_limit;
+</span><span class='line'>        locked = len &gt;&gt; PAGE_SHIFT;
+</span><span class='line'>        locked += mm-&gt;locked_vm;
+</span><span class='line'>        lock_limit = current-&gt;signal-&gt;rlim[RLIMIT_MEMLOCK].rlim_cur;
+</span><span class='line'>        lock_limit &gt;&gt;= PAGE_SHIFT;
+</span><span class='line'>        if (locked &gt; lock_limit &amp;&amp; !capable(CAP_IPC_LOCK))
+</span><span class='line'>            return -EAGAIN;
+</span><span class='line'>    }
+</span><span class='line'>    --关于锁定的内存区在以后学习中再看，这里就不细看。
+</span><span class='line'>    inode = file ? file-&gt;f_path.dentry-&gt;d_inode : NULL;  --判断是否匿名映射，如果不是则赋值inode
+</span><span class='line'>
+</span><span class='line'>    if (file) {
+</span><span class='line'>        switch (flags &amp; MAP_TYPE) {   --MAP_TYPE = 0x0F type的掩码
+</span><span class='line'>        case MAP_SHARED:
+</span><span class='line'>            if ((prot&amp;PROT_WRITE) &amp;&amp; !(file-&gt;f_mode&amp;FMODE_WRITE))   --file应该被打开并允许写入。
+</span><span class='line'>                return -EACCES;
+</span><span class='line'>            if (IS_APPEND(inode) &amp;&amp; (file-&gt;f_mode &amp; FMODE_WRITE))  --不能写入一个只允许写追加的文件
+</span><span class='line'>                return -EACCES;
+</span><span class='line'>            if (locks_verify_locked(inode))      --确保文件没有被强制锁定。
+</span><span class='line'>                return -EAGAIN;
+</span><span class='line'>
+</span><span class='line'>            vm_flags |= VM_SHARED | VM_MAYSHARE;  --尝试允许其他进程共享。
+</span><span class='line'>            if (!(file-&gt;f_mode &amp; FMODE_WRITE))    --如果file不允许写就算了，共享也没有用啊，因为file就一直固定死了，共享也没有意义。
+</span><span class='line'>                vm_flags &amp;= ~(VM_MAYWRITE | VM_SHARED);
+</span><span class='line'>        case MAP_PRIVATE:
+</span><span class='line'>            if (!(file-&gt;f_mode &amp; FMODE_READ))
+</span><span class='line'>                return -EACCES;
+</span><span class='line'>            if (file-&gt;f_path.mnt-&gt;mnt_flags &amp; MNT_NOEXEC) {
+</span><span class='line'>                if (vm_flags &amp; VM_EXEC)
+</span><span class='line'>                    return -EPERM;
+</span><span class='line'>                vm_flags &amp;= ~VM_MAYEXEC;
+</span><span class='line'>            }
+</span><span class='line'>            if (is_file_hugepages(file))
+</span><span class='line'>                accountable = 0;
+</span><span class='line'>
+</span><span class='line'>            if (!file-&gt;f_op || !file-&gt;f_op-&gt;mmap)
+</span><span class='line'>                return -ENODEV;
+</span><span class='line'>            break;
+</span><span class='line'>
+</span><span class='line'>        default:
+</span><span class='line'>            return -EINVAL;
+</span><span class='line'>        }
+</span><span class='line'>    } else {
+</span><span class='line'>        switch (flags &amp; MAP_TYPE) {
+</span><span class='line'>        case MAP_SHARED:
+</span><span class='line'>            pgoff = 0;
+</span><span class='line'>            vm_flags |= VM_SHARED | VM_MAYSHARE;
+</span><span class='line'>            break;
+</span><span class='line'>        case MAP_PRIVATE:
+</span><span class='line'>            pgoff = addr &gt;&gt; PAGE_SHIFT;
+</span><span class='line'>            break;
+</span><span class='line'>        default:
+</span><span class='line'>            return -EINVAL;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    --上面就是对一些旗标进行检测，防止出现旗标冲突，比如我欲映射的文件不允许写，而我映射的旗标却设定是可写并可以共享的，这个就冲突了。
+</span><span class='line'>    error = security_file_mmap(file, reqprot, prot, flags, addr, 0);   --这个函数就忽略了。
+</span><span class='line'>    if (error)
+</span><span class='line'>        return error;
+</span><span class='line'>
+</span><span class='line'>    return mmap_region(file, addr, len, flags, vm_flags, pgoff,accountable);  --最后一个参数为是否为大页，如果是的就为0.其余的参数都好理解。
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;3.3 get_unmapped_area&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这个是获取没有被映射的内存区&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,unsigned long pgoff, unsigned long flags)
+</span><span class='line'>{
+</span><span class='line'>    unsigned long (*get_area)(struct file *, unsigned long,unsigned long, unsigned long, unsigned long);
+</span><span class='line'>    get_area = current-&gt;mm-&gt;get_unmapped_area;
+</span><span class='line'>    if (file &amp;&amp; file-&gt;f_op &amp;&amp; file-&gt;f_op-&gt;get_unmapped_area)
+</span><span class='line'>        get_area = file-&gt;f_op-&gt;get_unmapped_area;
+</span><span class='line'>    addr = get_area(file, addr, len, pgoff, flags);
+</span><span class='line'>    if (IS_ERR_VALUE(addr))
+</span><span class='line'>        return addr;
+</span><span class='line'>
+</span><span class='line'>    if (addr &gt; TASK_SIZE - len)
+</span><span class='line'>        return -ENOMEM;
+</span><span class='line'>    if (addr &amp; ~PAGE_MASK)
+</span><span class='line'>        return -EINVAL;
+</span><span class='line'>
+</span><span class='line'>    return arch_rebalance_pgtables(addr, len);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;对于get_area函数我们以arch_get_unmapped_area为例来看如何查找一个空闲的mmap area&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,unsigned long len, unsigned long pgoff, unsigned long flags)
+</span><span class='line'>{
+</span><span class='line'>    struct mm_struct *mm = current-&gt;mm;
+</span><span class='line'>    struct vm_area_struct *vma;
+</span><span class='line'>    unsigned long start_addr;
+</span><span class='line'>
+</span><span class='line'>    if (len &gt; TASK_SIZE)
+</span><span class='line'>        return -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>    if (flags &amp; MAP_FIXED)    --还记否这个MAP_FIXED是什么含义不？
+</span><span class='line'>        return addr;
+</span><span class='line'>
+</span><span class='line'>    if (addr) {
+</span><span class='line'>        addr = PAGE_ALIGN(addr);
+</span><span class='line'>        vma = find_vma(mm, addr); --vma为NULL即addr的地址不在任一个VMA(vma-&gt;vm_start~vma-&gt;vm_end) addr的地址没有被映射，
+</span><span class='line'>                        而且空洞足够我们这次的映射，那么返回addr以准备这次的映射
+</span><span class='line'>        if (TASK_SIZE - len &gt;= addr &amp;&amp;(!vma || addr + len &lt;= vma-&gt;vm_start))
+</span><span class='line'>            return addr;
+</span><span class='line'>    }
+</span><span class='line'>    if (len &gt; mm-&gt;cached_hole_size) { --如果所需的长度大于当前vma之间的空洞长度
+</span><span class='line'>            start_addr = addr = mm-&gt;free_area_cache;
+</span><span class='line'>    } else {
+</span><span class='line'>            start_addr = addr = TASK_UNMAPPED_BASE;  --需要的长度小于当前空洞，为了不至于时间浪费，那么从0开始搜寻，
+</span><span class='line'>                    这里的搜寻基地址TASK_UNMAPPED_BASE很重要，用户mmap的地址的基地址必须在TASK_UNMAPPED_BASE之上，
+</span><span class='line'>                    但是一定这样严格 吗？看上面的if (addr)判断，如果用户给了一个地址在TASK_UNMAPPED_BASE之下，
+</span><span class='line'>                    映射实际上还是会发生的。
+</span><span class='line'>            mm-&gt;cached_hole_size = 0;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>full_search:
+</span><span class='line'>    for (vma = find_vma(mm, addr); ; vma = vma-&gt;vm_next) {
+</span><span class='line'>        if (TASK_SIZE - len &lt; addr) {
+</span><span class='line'>            if (start_addr != TASK_UNMAPPED_BASE) {
+</span><span class='line'>                addr = TASK_UNMAPPED_BASE;
+</span><span class='line'>              start_addr = addr;
+</span><span class='line'>                mm-&gt;cached_hole_size = 0;
+</span><span class='line'>                goto full_search;
+</span><span class='line'>            }
+</span><span class='line'>            return -ENOMEM;
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        if (!vma || addr + len &lt;= vma-&gt;vm_start) {        --如果第一次find_vma返回值即为NULL ，vma没有被映射并且空洞足够映射
+</span><span class='line'>                        !vma的条件只有可能在循环的第一次满足，在其后不可能满足，在其后的判断条件即为
+</span><span class='line'>                        vma-&gt;vma_end~vma-&gt;vma_next-&gt;vma_start之间的空洞大小大于所需要映射的长度即可，
+</span><span class='line'>                        下面判断条件中的addr为vma-&gt;vma_end,而vma-&gt;vm_start为 vma-&gt;vma_next-&gt;vma_start
+</span><span class='line'>            mm-&gt;free_area_cache = addr + len;
+</span><span class='line'>            return addr;
+</span><span class='line'>        }
+</span><span class='line'>        if (addr + mm-&gt;cached_hole_size &lt; vma-&gt;vm_start)  --在循环的第一次如果vma不为NULL，不会满足下面的条件，在以后循环中mm-&gt;cached_hole_size
+</span><span class='line'>                        则为该次vma-&gt;vm_start 与上一次的vma-&gt;vm_end之间的差值
+</span><span class='line'>
+</span><span class='line'>                mm-&gt;cached_hole_size = vma-&gt;vm_start - addr;
+</span><span class='line'>        addr = vma-&gt;vm_end;
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;还记否以前看的红黑树，这里就现实的用了红黑树的算法。关于这个我们就不看了。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
+</span><span class='line'>{
+</span><span class='line'>    struct vm_area_struct *vma = NULL;
+</span><span class='line'>
+</span><span class='line'>    if (mm) {
+</span><span class='line'>        vma = mm-&gt;mmap_cache;
+</span><span class='line'>        if (!(vma &amp;&amp; vma-&gt;vm_end &gt; addr &amp;&amp; vma-&gt;vm_start &lt;= addr)) {
+</span><span class='line'>            struct rb_node * rb_node;
+</span><span class='line'>            rb_node = mm-&gt;mm_rb.rb_node;
+</span><span class='line'>            vma = NULL;
+</span><span class='line'>            while (rb_node) {
+</span><span class='line'>                struct vm_area_struct * vma_tmp;
+</span><span class='line'>
+</span><span class='line'>                vma_tmp = rb_entry(rb_node,struct vm_area_struct, vm_rb);
+</span><span class='line'>                if (vma_tmp-&gt;vm_end &gt; addr) {
+</span><span class='line'>                    vma = vma_tmp;
+</span><span class='line'>                    if (vma_tmp-&gt;vm_start &lt;= addr)
+</span><span class='line'>                        break;
+</span><span class='line'>                    rb_node = rb_node-&gt;rb_left;
+</span><span class='line'>                } else
+</span><span class='line'>                    rb_node = rb_node-&gt;rb_right;
+</span><span class='line'>            }
+</span><span class='line'>            if (vma)
+</span><span class='line'>                mm-&gt;mmap_cache = vma;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    return vma;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;3.4 mmap_region&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    unsigned long mmap_region(struct file *file, unsigned long addr,unsigned long len, unsigned long flags,
+</span><span class='line'>                unsigned int vm_flags, unsigned long pgoff,int accountable)
+</span><span class='line'>{
+</span><span class='line'>    struct mm_struct *mm = current-&gt;mm;
+</span><span class='line'>    struct vm_area_struct *vma, *prev;
+</span><span class='line'>    struct vm_area_struct *merged_vma;
+</span><span class='line'>    int correct_wcount = 0;
+</span><span class='line'>    int error;
+</span><span class='line'>    struct rb_node **rb_link, *rb_parent;
+</span><span class='line'>    unsigned long charged = 0;
+</span><span class='line'>    struct inode *inode =  file ? file-&gt;f_path.dentry-&gt;d_inode : NULL;
+</span><span class='line'>
+</span><span class='line'>    /* Clear old maps */
+</span><span class='line'>    error = -ENOMEM;
+</span><span class='line'>munmap_back:
+</span><span class='line'>    vma = find_vma_prepare(mm, addr, &amp;prev, &amp;rb_link, &amp;rb_parent); --函数find_vma_prepare()与find_vma()基本相同，它扫描当前进程地址空间的vm_area_struct
+</span><span class='line'>                        结构所形成的红黑树，试图找到结束地址高于addr的第一个区间；如果找到了一个虚拟区，
+</span><span class='line'>                        说明addr所在的虚拟区已经在使用，也就是已经有映射存在，因此要调用do_munmap()
+</span><span class='line'>                        把这个老的虚拟区从进程地址空间中撤销，如果撤销不成功，就返回一个负数；
+</span><span class='line'>                        如果撤销成功，就继续查找，直到在红黑树中找不到addr所在的虚拟区
+</span><span class='line'>    if (vma &amp;&amp; vma-&gt;vm_start &lt; addr + len) {
+</span><span class='line'>        if (do_munmap(mm, addr, len))
+</span><span class='line'>            return -ENOMEM;
+</span><span class='line'>        goto munmap_back;
+</span><span class='line'>    }
+</span><span class='line'>    if (!may_expand_vm(mm, len &gt;&gt; PAGE_SHIFT))                   -- 页数和超过限定值返回 0 ，不超过返回1
+</span><span class='line'>        return -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>    if (flags &amp; MAP_NORESERVE)              -- 如果flags参数中没有设置MAP_NORESERVE标志，新的虚拟区含有私有的可写页，空闲页面数小于要映射的虚拟区
+</span><span class='line'>                        的大小；则函数终止并返回一个负数；其中函数security_vm_enough_memory()用来检查一个
+</span><span class='line'>                        进程的地址空间中是否有足够的内存来进行一个新的映射
+</span><span class='line'>        vm_flags |= VM_NORESERVE;
+</span><span class='line'>
+</span><span class='line'>    if (accountable &amp;&amp; (!(flags &amp; MAP_NORESERVE) ||
+</span><span class='line'>                sysctl_overcommit_memory == OVERCOMMIT_NEVER)) {
+</span><span class='line'>        if (vm_flags &amp; VM_SHARED) {
+</span><span class='line'>            /* Check memory availability in shmem_file_setup? */
+</span><span class='line'>            vm_flags |= VM_ACCOUNT;
+</span><span class='line'>        } else if (vm_flags &amp; VM_WRITE) {
+</span><span class='line'>            charged = len &gt;&gt; PAGE_SHIFT;
+</span><span class='line'>            if (security_vm_enough_memory(charged))
+</span><span class='line'>                return -ENOMEM;
+</span><span class='line'>            vm_flags |= VM_ACCOUNT;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    if (!file &amp;&amp; !(vm_flags &amp; VM_SHARED)) { --如果是匿名映射（file为空），并且这个虚拟区是非共享的，则可以把这个虚拟区和与它紧挨的前一个虚拟区进行合并；
+</span><span class='line'>        虚拟区的合并是由vma_merge()函数实现的。如果合并成功，则转out处，请看后面out处的代码。
+</span><span class='line'>        vma = vma_merge(mm, prev, addr, addr + len, vm_flags,
+</span><span class='line'>                    NULL, NULL, pgoff, NULL);
+</span><span class='line'>        if (vma)
+</span><span class='line'>            goto out;
+</span><span class='line'>    }
+</span><span class='line'>    vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+</span><span class='line'>    if (!vma) {
+</span><span class='line'>        error = -ENOMEM;
+</span><span class='line'>        goto unacct_error;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    vma-&gt;vm_mm = mm;
+</span><span class='line'>    vma-&gt;vm_start = addr;
+</span><span class='line'>    vma-&gt;vm_end = addr + len;
+</span><span class='line'>    vma-&gt;vm_flags = vm_flags;
+</span><span class='line'>    vma-&gt;vm_page_prot = vm_get_page_prot(vm_flags);
+</span><span class='line'>    vma-&gt;vm_pgoff = pgoff;
+</span><span class='line'>
+</span><span class='line'>    if (file) {
+</span><span class='line'>        error = -EINVAL;
+</span><span class='line'>        if (vm_flags &amp; (VM_GROWSDOWN|VM_GROWSUP))
+</span><span class='line'>            goto free_vma;
+</span><span class='line'>        if (vm_flags &amp; VM_DENYWRITE) {
+</span><span class='line'>            error = deny_write_access(file);
+</span><span class='line'>            if (error)
+</span><span class='line'>                goto free_vma;
+</span><span class='line'>            correct_wcount = 1;
+</span><span class='line'>        }
+</span><span class='line'>        vma-&gt;vm_file = file;
+</span><span class='line'>        get_file(file);
+</span><span class='line'>        error = file-&gt;f_op-&gt;mmap(file, vma);    -- (⊙o⊙)哦 ，终于可以调用设备文件中真正的mmap
+</span><span class='line'>        if (error)
+</span><span class='line'>            goto unmap_and_free_vma;
+</span><span class='line'>        if (vm_flags &amp; VM_EXECUTABLE)
+</span><span class='line'>            added_exe_file_vma(mm);
+</span><span class='line'>    } else if (vm_flags &amp; VM_SHARED) {
+</span><span class='line'>        error = shmem_zero_setup(vma);// it will call shmem_file_setup(), the same way as called in ashmem.c
+</span><span class='line'>        if (error)
+</span><span class='line'>            goto free_vma;
+</span><span class='line'>    }
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果建立的是从文件到虚存区间的映射，则：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1.当参数flags中的VM_GROWSDOWN或VM_GROWSUP标志位为1时，说明这个区间可以向低地址或高地址扩展，但从文件映射的区间不能进行扩展，因此转到free_vma，释放给vm_area_struct分配的Slab，并返回一个错误；&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2.当flags中的VM_DENYWRITE标志位为1时，就表示不允许通过常规的文件操作访问该文件，所以要调用deny_write_access（）排斥常规的文件操作（参见第八章）。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3.get_file（）函数的主要作用是递增file结构中的共享计数；&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;4.每个文件系统都有个fiel_operation数据结构，其中的函数指针mmap提供了用来建立从该类文件到虚存区间进行映射的操作，这是最具有实质意义的函数；对于大部分文件系统，这个函数为generic_file_mmap( )函数实现的，该函数执行以下操作：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  (1)初始化vm_area_struct结构中的vm_ops域。如果VM_SHARED标志为1，就把该域设置成file_shared_mmap， 否则就把该域设置成file_private_mmap。从某种意义上说，这个步骤所做的事情类似于打开一个文件并初始化文件对象的方法。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  (2)从索引节点的i_mode域（参见第八章）检查要映射的文件是否是一个常规文件。如果是其他类型的文件（例如目录或套接字），就返回一个错误代码。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  (3)从索引节点的i_op域中检查是否定义了readpage( )的索引节点操作。如果没有定义，就返回一个错误代码。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  (4)调用update_atime( )函数把当前时间存放在该文件索引节点的i_atime域中，并将这个索引节点标记成脏。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;5.如果flags参数中的MAP_SHARED标志位为1，则调用shmem_zero_setup（）进行共享内存的映射。</span></code></pre></td></tr></table></div></figure>
+        if ((vm_flags &amp; (VM_SHARED|VM_ACCOUNT)) == (VM_SHARED|VM_ACCOUNT))
+            vma->vm_flags &amp;= ~VM_ACCOUNT;</p>
 
-<pre><code>typedef pteval_t pte_t;  
-typedef unsigned long pmd_t;  
-typedef unsigned long pgd_t[2];  
-typedef unsigned long pgprot_t;  
+<pre><code>    addr = vma-&gt;vm_start;
+    pgoff = vma-&gt;vm_pgoff;
+    vm_flags = vma-&gt;vm_flags;
 
-#define pte_val(x)      (x)  
-#define pmd_val(x)      (x)  
-#define pgd_val(x)  ((x)[0])  
-#define pgprot_val(x)   (x)  
+    if (vma_wants_writenotify(vma))
+        vma-&gt;vm_page_prot = vm_get_page_prot(vm_flags &amp; ~VM_SHARED);
 
-#define __pte(x)        (x)  
-#define __pmd(x)        (x)  
-#define __pgprot(x)     (x)  
+    merged_vma = NULL;
+    if (file)
+        merged_vma = vma_merge(mm, prev, addr, vma-&gt;vm_end,
+            vma-&gt;vm_flags, NULL, file, pgoff, vma_policy(vma));
+    if (merged_vma) {
+        mpol_put(vma_policy(vma));
+        kmem_cache_free(vm_area_cachep, vma);
+        fput(file);
+        if (vm_flags &amp; VM_EXECUTABLE)
+            removed_exe_file_vma(mm);
+        vma = merged_vma;
+    } else {
+        vma_link(mm, vma, prev, rb_link, rb_parent);
+        file = vma-&gt;vm_file;
+    }
 </code></pre>
 
 <pre><code>
-##### 2.1 Page Directory (PGD and PMD)
+此时，把新建的虚拟区插入到进程的地址空间，这是由函数vma_link（）完成的，该函数具有三方面的功能：  
+（1）把vma 插入到虚拟区链表中  
+（2）把vma插入到虚拟区形成的红黑树中  
+（3）把vam插入到索引节点（inode）共享链表中  
 
-  每个进程有它自己的PGD( Page Global Directory)，它是一个物理页，并包含一个pgd_t数组。其定义见&lt;asm/page.h&gt;。 进程的pgd_t数据见 task_struct -&gt; mm_struct -&gt; pgd_t * pgd;    
-
-  ARM架构的PGD和PMD的定义如下&lt;arch/arm/include/asm/pgtable.h&gt;：
+函数atomic_inc（x）给*x加1，这是一个原子操作。在内核代码中，有很多地方调用了以atomic为前缀的函数。原子操作，在操作过程中不会被中断。
 </code></pre>
 
-<pre><code>#define PTRS_PER_PTE  512    // PTE中可包含的指针&lt;u32&gt;数 (21-12=9bit)  
-#define PTRS_PER_PMD  1  
-#define PTRS_PER_PGD  2048   // PGD中可包含的指针&lt;u32&gt;数 (32-21=11bit)&lt;/p&gt;&lt;p&gt;#define PTE_HWTABLE_PTRS (PTRS_PER_PTE)  
-#define PTE_HWTABLE_OFF  (PTE_HWTABLE_PTRS * sizeof(pte_t))  
-#define PTE_HWTABLE_SIZE (PTRS_PER_PTE * sizeof(u32))
-/*  
- * PMD_SHIFT determines the size of the area a second-level page table can map  
- * PGDIR_SHIFT determines what a third-level page table entry can map  
- */  
-#define PMD_SHIFT  21  
-#define PGDIR_SHIFT  21
-</code></pre>
+<pre><code>    if (correct_wcount)
+        atomic_inc(&amp;inode-&gt;i_writecount);
+out:
+    mm-&gt;total_vm += len &gt;&gt; PAGE_SHIFT;
+    vm_stat_account(mm, vm_flags, file, len &gt;&gt; PAGE_SHIFT);
+    if (vm_flags &amp; VM_LOCKED) {
+        long nr_pages = mlock_vma_pages_range(vma, addr, addr + len);
+        if (nr_pages &lt; 0)
+            return nr_pages;    /* vma gone! */
+        mm-&gt;locked_vm += (len &gt;&gt; PAGE_SHIFT) - nr_pages;
+    } else if ((flags &amp; MAP_POPULATE) &amp;&amp; !(flags &amp; MAP_NONBLOCK))
+        make_pages_present(addr, addr + len);
+    return addr;
 
-<pre><code>
-虚拟地址SHIFT宏图：
+unmap_and_free_vma:
+    if (correct_wcount)
+        atomic_inc(&amp;inode-&gt;i_writecount);
+    vma-&gt;vm_file = NULL;
+    fput(file);
 
-![](/images/kernel/2015-06-02-21.png)  
-
-虚拟地址MASK和SIZE宏图：
-
-![](/images/kernel/2015-06-02-22.png)  
-
-
-##### 2.2 Page Table Entry
-
-PTEs, PMDs和PGDs分别由pte_t, pmd_t 和pgd_t来描述。为了存储保护位，pgprot_t被定义，它拥有相关的flags并经常被存储在page table entry低位(lower bits)，其具体的存储方式依赖于CPU架构。
-
-每个pte_t指向一个物理页的地址，并且所有的地址都是页对齐的。因此在32位地址中有PAGE_SHIFT(12)位是空闲的，它可以为PTE的状态位。
-
-PTE的保护和状态位如下图所示：
-
-![](/images/kernel/2015-06-02-23.png)  
-
-##### 2.3 如何通过3级页表访问物理内存
-为了通过PGD、PMD和PTE访问物理内存，其相关宏在asm/pgtable.h中定义。
-
-• pgd_offset 
-
-根据当前虚拟地址和当前进程的mm_struct获取pgd项的宏定义如下： 
-</code></pre>
-
-<pre><code>/* to find an entry in a page-table-directory */  
-#define pgd_index(addr)     ((addr) &gt;&gt; PGDIR_SHIFT)  //获得在pgd表中的索引  
-
-#define pgd_offset(mm, addr)    ((mm)-&gt;pgd + pgd_index(addr)) //获得pmd表的起始地址  
-
-/* to find an entry in a kernel page-table-directory */  
-#define pgd_offset_k(addr)  pgd_offset(&amp;init_mm, addr)  
-</code></pre>
-
-<pre><code>
-• pmd_offset
-
-根据通过pgd_offset获取的pgd 项和虚拟地址，获取相关的pmd项(即pte表的起始地址) 
-</code></pre>
-
-<pre><code>/* Find an entry in the second-level page table.. */  
-#define pmd_offset(dir, addr)   ((pmd_t *)(dir))   //即为pgd项的值  
-</code></pre>
-
-<pre><code>
-• pte_offset
-
-  根据通过pmd_offset获取的pmd项和虚拟地址，获取相关的pte项(即物理页的起始地址)
-</code></pre>
-
-<pre><code>#ifndef CONFIG_HIGHPTE  
-#define __pte_map(pmd)      pmd_page_vaddr(*(pmd))  
-#define __pte_unmap(pte)    do { } while (0)  
-#else  
-#define __pte_map(pmd)      (pte_t *)kmap_atomic(pmd_page(*(pmd)))  
-#define __pte_unmap(pte)    kunmap_atomic(pte)  
-#endif  
-
-#define pte_index(addr)     (((addr) &gt;&gt; PAGE_SHIFT) &amp; (PTRS_PER_PTE - 1))  
-
-#define pte_offset_kernel(pmd,addr) (pmd_page_vaddr(*(pmd)) + pte_index(addr))  
-
-#define pte_offset_map(pmd,addr)    (__pte_map(pmd) + pte_index(addr))  
-#define pte_unmap(pte)          __pte_unmap(pte)  
-
-#define pte_pfn(pte)        (pte_val(pte) &gt;&gt; PAGE_SHIFT)  
-#define pfn_pte(pfn,prot)   __pte(__pfn_to_phys(pfn) | pgprot_val(prot))  
-
-#define pte_page(pte)       pfn_to_page(pte_pfn(pte))  
-#define mk_pte(page,prot)   pfn_pte(page_to_pfn(page), prot)  
-
-#define set_pte_ext(ptep,pte,ext) cpu_set_pte_ext(ptep,pte,ext)  
-#define pte_clear(mm,addr,ptep) set_pte_ext(ptep, __pte(0), 0)  
-</code></pre>
-
-<pre><code>其示意图如下图所示：
-
-![](/images/kernel/2015-06-02-24.png)  
-
-##### 2.4 根据虚拟地址获取物理页的示例代码
-
-  根据虚拟地址获取物理页的示例代码详见&lt;mm/memory.c中的函数follow_page&gt;。
-</code></pre>
-
-<pre><code>/** 
- * follow_page - look up a page descriptor from a user-virtual address 
- * @vma: vm_area_struct mapping @address 
- * @address: virtual address to look up 
- * @flags: flags modifying lookup behaviour 
- * 
- * @flags can have FOLL_ flags set, defined in &lt;linux/mm.h&gt; 
- * 
- * Returns the mapped (struct page *), %NULL if no mapping exists, or 
- * an error pointer if there is a mapping to something not represented 
- * by a page descriptor (see also vm_normal_page()). 
- */  
-struct page *follow_page(struct vm_area_struct *vma, unsigned long address,  
-            unsigned int flags)  
-{  
-    pgd_t *pgd;  
-    pud_t *pud;  
-    pmd_t *pmd;  
-    pte_t *ptep, pte;  
-    spinlock_t *ptl;  
-    struct page *page;  
-    struct mm_struct *mm = vma-&gt;vm_mm;  
-
-    page = follow_huge_addr(mm, address, flags &amp; FOLL_WRITE);  
-    if (!IS_ERR(page)) {  
-        BUG_ON(flags &amp; FOLL_GET);  
-        goto out;  
-    }  
-
-    page = NULL;  
-    pgd = pgd_offset(mm, address);  
-    if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))  
-        goto no_page_table;  
-
-    pud = pud_offset(pgd, address);  
-    if (pud_none(*pud))  
-        goto no_page_table;  
-    if (pud_huge(*pud) &amp;&amp; vma-&gt;vm_flags &amp; VM_HUGETLB) {  
-        BUG_ON(flags &amp; FOLL_GET);  
-        page = follow_huge_pud(mm, address, pud, flags &amp; FOLL_WRITE);  
-        goto out;  
-    }  
-    if (unlikely(pud_bad(*pud)))  
-        goto no_page_table;  
-
-    pmd = pmd_offset(pud, address);  
-    if (pmd_none(*pmd))  
-        goto no_page_table;  
-    if (pmd_huge(*pmd) &amp;&amp; vma-&gt;vm_flags &amp; VM_HUGETLB) {  
-        BUG_ON(flags &amp; FOLL_GET);  
-        page = follow_huge_pmd(mm, address, pmd, flags &amp; FOLL_WRITE);  
-        goto out;  
-    }  
-    if (pmd_trans_huge(*pmd)) {  
-        if (flags &amp; FOLL_SPLIT) {  
-            split_huge_page_pmd(mm, pmd);  
-            goto split_fallthrough;  
-        }  
-        spin_lock(&amp;mm-&gt;page_table_lock);  
-        if (likely(pmd_trans_huge(*pmd))) {  
-            if (unlikely(pmd_trans_splitting(*pmd))) {  
-                spin_unlock(&amp;mm-&gt;page_table_lock);  
-                wait_split_huge_page(vma-&gt;anon_vma, pmd);  
-            } else {  
-                page = follow_trans_huge_pmd(mm, address,  
-                                 pmd, flags);  
-                spin_unlock(&amp;mm-&gt;page_table_lock);  
-                goto out;  
-            }  
-        } else  
-            spin_unlock(&amp;mm-&gt;page_table_lock);  
-        /* fall through */  
-    }  
-split_fallthrough:  
-    if (unlikely(pmd_bad(*pmd)))  
-        goto no_page_table;  
-
-    ptep = pte_offset_map_lock(mm, pmd, address, &amp;ptl);  
-
-    pte = *ptep;  
-    if (!pte_present(pte))  
-        goto no_page;  
-    if ((flags &amp; FOLL_WRITE) &amp;&amp; !pte_write(pte))  
-        goto unlock;  
-
-    page = vm_normal_page(vma, address, pte);  
-    if (unlikely(!page)) {  
-        if ((flags &amp; FOLL_DUMP) ||  
-            !is_zero_pfn(pte_pfn(pte)))  
-            goto bad_page;  
-        page = pte_page(pte);  
-    }  
-
-    if (flags &amp; FOLL_GET)  
-        get_page(page);  
-    if (flags &amp; FOLL_TOUCH) {  
-        if ((flags &amp; FOLL_WRITE) &amp;&amp;  
-            !pte_dirty(pte) &amp;&amp; !PageDirty(page))  
-            set_page_dirty(page);  
-        /* 
-         * pte_mkyoung() would be more correct here, but atomic care 
-         * is needed to avoid losing the dirty bit: it is easier to use 
-         * mark_page_accessed(). 
-         */  
-        mark_page_accessed(page);  
-    }  
-    if ((flags &amp; FOLL_MLOCK) &amp;&amp; (vma-&gt;vm_flags &amp; VM_LOCKED)) {  
-        /* 
-         * The preliminary mapping check is mainly to avoid the 
-         * pointless overhead of lock_page on the ZERO_PAGE 
-         * which might bounce very badly if there is contention. 
-         * 
-         * If the page is already locked, we don't need to 
-         * handle it now - vmscan will handle it later if and 
-         * when it attempts to reclaim the page. 
-         */  
-        if (page-&gt;mapping &amp;&amp; trylock_page(page)) {  
-            lru_add_drain();  /* push cached pages to LRU */  
-            /* 
-             * Because we lock page here and migration is 
-             * blocked by the pte's page reference, we need 
-             * only check for file-cache page truncation. 
-             */  
-            if (page-&gt;mapping)  
-                mlock_vma_page(page);  
-            unlock_page(page);  
-        }  
-    }  
-unlock:  
-    pte_unmap_unlock(ptep, ptl);  
-out:  
-    return page;  
-
-bad_page:  
-    pte_unmap_unlock(ptep, ptl);  
-    return ERR_PTR(-EFAULT);  
-
-no_page:  
-    pte_unmap_unlock(ptep, ptl);  
-    if (!pte_none(pte))  
-        return page;  
-
-no_page_table:  
-    /* 
-     * When core dumping an enormous anonymous area that nobody 
-     * has touched so far, we don't want to allocate unnecessary pages or 
-     * page tables.  Return error instead of NULL to skip handle_mm_fault, 
-     * then get_dump_page() will return NULL to leave a hole in the dump. 
-     * But we can only make this optimization where a hole would surely 
-     * be zero-filled if handle_mm_fault() actually did handle it. 
-     */  
-    if ((flags &amp; FOLL_DUMP) &amp;&amp;  
-        (!vma-&gt;vm_ops || !vma-&gt;vm_ops-&gt;fault))  
-        return ERR_PTR(-EFAULT);  
-    return page;  
+    unmap_region(mm, vma, prev, vma-&gt;vm_start, vma-&gt;vm_end);
+    charged = 0;
+free_vma:
+    kmem_cache_free(vm_area_cachep, vma);
+unacct_error:
+    if (charged)
+        vm_unacct_memory(charged);
+    return error;
 }
 </code></pre>
 
 <pre><code>
--------------
+ok！到此mmap的内核核心就可以了，关于具体的mmap的实现，以后再看。
 
-#### 1. First Fit分配器
+### 四.总结
 
-  First Fit分配器是最基本的内存分配器，它使用bitmap而不是空闲块列表来表示内存。在bitmap中，如果page对应位为1，则表示此page已经被分配，为0则表示此page没有被分配。为了分配小于一个page的内存块，First Fit分配器记录了最后被分配的PFN (Page Frame Number)和分配的结束地址在页内的偏移量。随后小的内存分配被Merge到一起并存储到同一页中。
+mmap的实质是什么，其实就是从每一个进程中的用户空间分配一段空间用于映射。 这里面的机关重重，需要好好理解，不过谨记一点，进程的vma_struct是采用了红黑树来管理的。对于每一段的内存区都会有一个vma_struct 来描述，比如数据区，code区等等，以及mmap所需要的一段内存区。
 
-  First Fit分配器不会造成严重的内存碎片，但其效率较低，由于内存经常通过线性地址进行search，而First Fit中的小块内存经常在物理内存的开始处，为了分配大块内存而不得不扫描前面大量的内存。
+### 五.其它
 
-#### 2. Boot Memory分配器
+#### 1、特点：
+① 进程相关的  
+② 与XSI共享内存一样，需要与同步原语一起使用  
+③ 只能是有共同祖先的进程才能使用  
 
-  物理内存分配器如何分配内存来初始化其自己呢？
+#### 2、使用
+系统调用mmap()用于共享内存的两种方式：  
+（1）使用普通文件提供的内存映射：  
+   适用于任何进程之间。此时，需要打开或创建一个文件，然后再调用mmap()
 
-  答案是：通过Boot Memory分配器来实现，而Boot Memory分配器则通过最基本的First Fit分配器来实现。
-
-##### 2.1 Boot Map定义 
-
-  Boot Map通过数据结构bootmem_data来定义，详见&lt;linux/bootmem.h&gt;，其定义如下所示： 
+典型调用代码如下：
 </code></pre>
 
-<pre><code>typedef struct bootmem_data {  
-    unsigned long node_boot_start; // 描述的物理内存的起始地址  
-    unsigned long node_low_pfn;    // 结束物理地址，即ZONE_NORMAL的结束  
-    void *node_bootmem_map;        // 描述“使用或空闲的位图”的地址  
-    unsigned long last_offset;     // 最后被分配的页内偏移量，即在llast_pos描述的物理页中，  
-                                 // 从last_offset开始，没有被分配   
-    unsigned long last_pos;        // 最后被分配的页的PFN  
-} bootmem_data_t;  
+<pre><code>fd=open(name, flag, mode); if(fd&lt;0) ...
+ptr=mmap(NULL, len , PROT_READ|PROT_WRITE, MAP_SHARED , fd , 0);
 </code></pre>
 
 <pre><code>
-所有bootmem_data被放于全局变量bdata_list中。
+ 通过mmap()实现共享内存的通信方式有许多特点和要注意的地方，可以参看UNIX网络编程第二卷。【3】
 
-##### 2.2 Boot Memory分配器初始化
+（2）使用特殊文件提供匿名内存映射：  
+  适用于具有亲缘关系的进程之间。由于父子进程特殊的亲缘关系，在父进程中先调用mmap()，然后调用fork()。那么在调用fork()之后，子进程 继承父进程匿名映射后的地址空间，同样也继承mmap()返回的地址，这样，父子进程就可以通过映射区域进行通信了。一般来说，子进程单独维护从父进程继 承下来的一些变量。而mmap()返回的地址，却由父子进程共同维护。对于具有亲缘关系的进程实现共享内存最好的方式应该是采用匿名内存映射的方式。此时，不必指定具体的文件，只要设置相应的标志即可。
 
-  每一个CPU架构被要求提供setup_arch函数，它负责获取初始化boot memory分配器的必要参数。不同的CPU架构通过不同的函数来实现，如ARM通过bootmem_init来实现。它负责获取以下参数：
+#### 3、说明
+##### (1)
 </code></pre>
 
-<pre><code>• min_low_pfn： 系统中可获得的最小的PFN，装载kernel image结束之后的第一页，在mm/bootmem.c中定义
-• max_low_pfn：低端内存(ZONE_NORMAL)中可获得的最大PFN
-• highstart_pfn：高端内存(ZONE_HIGHMEM)的起始PFN
-• highend_pfn：高端内存(ZONE_HIGHMEM)的结束PFN
-• max_pfn：系统中可获得的最大的PFN， 在mm/bootmem.c中定义
+<pre><code>void *mmap(void *addr, size_t len, int prot, int flag, int fd, off_t offset );
 </code></pre>
 
-<pre><code>
-PFN是在物理内存map的偏移量，以page为单位。Kernel可直接访问ZONE_NORMAL，其偏移量为：PAGE_OFFSET。
+<pre><code>把文件或设备映射或解除映射到内存中
 
-通过以上5个参数明确了可用物理内存之后，调用init_bootmem-&gt;init_bootmem_core来初始化contig_page_data。它主要完成以下两件事：  
-  1) 将把与此node对应pgdat_data_t插入到pgdat_list中  
-  2) 初始化bootmem_data_t的中参数，并分配表示页分配状态的bitmap，其大小为: (end_pfn-start_pfn+7)/8  
+0）flag：必须有MAP_SHARED 标志  
+MAP_SHARED对映射区域的写入数据会复制回文件内，而且允许其他映射该文件的进程共享。  
+MAP_PRIVATE 对映射区域的写入操作会产生一个映射文件的复制，即私人的“写入时复制”（copy on write）对此区域作的任何修改都不会写回原来的文件内容。  
+MAP_ANONYMOUS建立匿名共享。此时会忽略参数fd(fd可以指定为-1)，不涉及文件，而且映射区域无法和其他进程共享(只能用于具有亲缘关系的进程间通信)。  
+  映射/dev/zero可为调用程序提供零填充的虚拟内存块。
 
-bitmap的物理地址为：bootmem_data_t-&gt;node_boot_start  
-bitmap的虚拟地直为：bootmem_data_t-&gt;node_bootmem_map  
+1）start：指向欲映射的内存起始地址，通常设为 NULL，代表让系统自动选定地址，映射成功后返回该地址。
 
-##### 2.3 分配内存
- • reserve_bootmem：用于预留物理页面。但用于通用的内存分配是低率的，它主要用于各种驱动(如：Video Codec)预留内存。
+2）length：代表将文件中多大的部分映射到内存。
 
-常用的内存分配函数如下(in UMA架构，我们常的ARM架构为UMA架构)：
+3）offset 必须是页面大小的整数倍。页面大小由 getpagesize(2)得到。
+
+4）被映射的文件大小应是页面大小的整数倍。如一个文件大小不是页面大小的整数倍，映射时多出来的区域将被赋为0，对这些区域的写不会被写回到文件中。
+
+5)munmap()系统调用将删除指定地址范围内的映射区域。随后对这个范围内区域的引用将产生非法的内存引用。当这个进程终止后，这个区域也会被删除。另一方面，关闭文件描述符并不会删除映射区域。
+
+6）fd：要映射到内存中的文件描述符。如果使用匿名内存映射时，即flags中设置了MAP_ANONYMOUS，fd设为-1。有些系统不支持匿名内存映射，则可以使用fopen打开/dev/zero文件，然后对该文件进行映射，可以同样达到匿名内存映射的效果。
+
+7）若映射成功则返回映射区的内存起始地址，否则返回MAP_FAILED(－1)。
+
+##### (2) munmap
 </code></pre>
 
-<pre><code>• alloc_bootmem
-• alloc_bootmem_low
-• alloc_bootmem_pages
-• alloc_bootmem_low_pages
+<pre><code>int munmap( void * addr, size_t len )
 </code></pre>
 
-<pre><code>
-其调用关系如下图所示：
+<pre><code>在进程地址空间中解除一个映射关系，当映射关系解除后，对原来映射地址的访问将导致段错误发生。
 
-###### 2.3.1 `__alloc_bootmem`
+void * addr ：调用mmap()时返回的地址  
+size_t len ：映射区的大小  
 
-`__alloc_bootmem()` 需要以下参数：  
- • pgdat 用于分配内存块的节点，在UMA架构中，它被忽略，因为它总是为：contig_page_data  
- • size  指定请求分配的内存大小，以字节为单位  
- • align 请求以多少字节对齐，地于小块内存分配，一般以SMP_CACHE_BYTES对齐，如在X86上，与L1硬件cache对齐  
- • goal  偏好的分配内存的起始地址,  
-
-###### 2.3.2 __alloc_bootmem_core
-
-它从goal指定的地址开始，线性地扫描内存，以寻找可以满足内存分配要求的内存块。它的另外一项功能是决定是否需要把新分配的内存块与以前已经分配的内存块merge到一起。
-
-分配内存常用函数定义如下： 
+##### (3)
 </code></pre>
 
-<pre><code>#ifdef CONFIG_NO_BOOTMEM  
-/* We are using top down, so it is safe to use 0 here */  
-#define BOOTMEM_LOW_LIMIT 0  
-#else  
-#define BOOTMEM_LOW_LIMIT __pa(MAX_DMA_ADDRESS)  
-#endif  
-
-#define alloc_bootmem(x) \  
-    __alloc_bootmem(x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_align(x, align) \  
-    __alloc_bootmem(x, align, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_nopanic(x) \  
-    __alloc_bootmem_nopanic(x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages(x) \  
-    __alloc_bootmem(x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages_nopanic(x) \  
-    __alloc_bootmem_nopanic(x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_node(pgdat, x) \  
-    __alloc_bootmem_node(pgdat, x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_node_nopanic(pgdat, x) \  
-    __alloc_bootmem_node_nopanic(pgdat, x, SMP_CACHE_BYTES, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages_node(pgdat, x) \  
-    __alloc_bootmem_node(pgdat, x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-#define alloc_bootmem_pages_node_nopanic(pgdat, x) \  
-    __alloc_bootmem_node_nopanic(pgdat, x, PAGE_SIZE, BOOTMEM_LOW_LIMIT)  
-
-#define alloc_bootmem_low(x) \  
-    __alloc_bootmem_low(x, SMP_CACHE_BYTES, 0)  
-#define alloc_bootmem_low_pages(x) \  
-    __alloc_bootmem_low(x, PAGE_SIZE, 0)  
-#define alloc_bootmem_low_pages_node(pgdat, x) \  
-    __alloc_bootmem_low_node(pgdat, x, PAGE_SIZE, 0)  
-</code></pre>
-
-<pre><code>
-##### 2.4 释放内存
-
-调用free_bootmem来释放内存。
-</code></pre>
-
-<pre><code>void __init free_bootmem(unsigned long addr, unsigned long size)  
-{  
-    unsigned long start, end;  
-
-    kmemleak_free_part(__va(addr), size);  
-
-    start = PFN_UP(addr);  
-    end = PFN_DOWN(addr + size);  
-
-    mark_bootmem(start, end, 0, 0);  
-}
+<pre><code>int msync ( void * addr , size_t len, int flags)
 </code></pre>
 
 <p>```</p>
+
+<p>一般说来，进程在映射空间的对共享内容的改变并不直接写回到磁盘文件中，往往在调用munmap()后才执行该操作。可以调用msync()实现磁盘上文件与共享内存区的内容一致。</p>
+
+<p>void * addr ：调用mmap()时返回的地址<br/>
+size_t len ：映射区的大小<br/>
+int flags ：MS_ASYN: 异步写，MS_SYN : 同步写，MS_INVALIDAT : 无效的cache 数据。</p>
+
+<h4>5、其他</h4>
+
+<p>1）进程调用mmap()时，只是在进程空间内新增了一块相应大小的缓冲区，并设置了相应的访问标识，但并没有建立进程空间到物理页面的映射。因此，第一次访问该空间时，会引发一个缺页异常。</p>
+
+<p>2）一个共享内存区域可以看作是特殊文件系统shm中的一个文件，shm的安装点在交换区上。</p>
+
+<p>3）mmap()系统调用使得进程之间通过映射同一个普通文件实现共享内存。普通文件被映射到进程地址空间后，进程可以向访问普通内存一样对文件进行访问，不必再调用read()，write()等操作。</p>
+
+<p>4）最终被映射文件的内容的长度不会超过文件本身的初始大小，即映射不能改变文件的大小。文件被映射部分而不是整个文件决定了进程能够访问的空间大小，另外，如果指定文件的偏移部分，一定要注意为页面大小的整数倍。</p>
+
+<p><img src="/images/kernel/2015-09-11-11.png" alt="" /></p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[SMP、NUMA体系结构]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-smp-numa/"/>
-    <updated>2015-06-02T14:34:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/06/02/kernel-mm-smp-numa</id>
-    <content type="html"><![CDATA[<p><a href="http://www.cnblogs.com/yubo/archive/2010/04/23/1718810.html">http://www.cnblogs.com/yubo/archive/2010/04/23/1718810.html</a></p>
+    <title type="html"><![CDATA[linux进程地址空间--vma的基本操作]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/11/kernel-mm-vma-base/"/>
+    <updated>2015-09-11T16:39:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/11/kernel-mm-vma-base</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/vanbreaker/article/details/7855007">http://blog.csdn.net/vanbreaker/article/details/7855007</a></p>
 
-<p>blog.csdn.net/skymanwu/article/details/7551670</p>
+<p>在32位的系统上，线性地址空间可达到4GB，这4GB一般按照3:1的比例进行分配，也就是说用户进程享有前3GB线性地址空间，而内核独享最后1GB线性地址空间。由于虚拟内存的引入，每个进程都可拥有3GB的虚拟内存，并且用户进程之间的地址空间是互不可见、互不影响的，也就是说即使两个进程对同一个地址进行操作，也不会产生问题。在前面介绍的一些分配内存的途径中，无论是伙伴系统中分配页的函数，还是slab分配器中分配对象的函数，它们都会尽量快速地响应内核的分配请求，将相应的内存提交给内核使用，而内核对待用户空间显然不能如此。用户空间动态申请内存时往往只是获得一块线性地址的使用权，而并没有将这块线性地址区域与实际的物理内存对应上，只有当用户空间真正操作申请的内存时，才会触发一次缺页异常，这时内核才会分配实际的物理内存给用户空间。</p>
 
-<p>  从系统架构来看，目前的商用服务器大体可以分为三类，即对称多处理器结构 (SMP ： Symmetric Multi-Processor) ，非一致存储访问结构 (NUMA ： Non-Uniform Memory Access) ，以及海量并行处理结构 (MPP ： Massive Parallel Processing) 。它们的特征分别描述如下：</p>
+<p>用户进程的虚拟地址空间包含了若干区域，这些区域的分布方式是特定于体系结构的，不过所有的方式都包含下列成分：</p>
 
-<h4>1. SMP(Symmetric Multi-Processor)</h4>
+<p>  可执行文件的二进制代码，也就是程序的代码段<br/>
+  存储全局变量的数据段<br/>
+  用于保存局部变量和实现函数调用的栈<br/>
+  环境变量和命令行参数<br/>
+  程序使用的动态库的代码<br/>
+  用于映射文件内容的区域</p>
 
-<p>  SMP (Symmetric Multi Processing),对称多处理系统内有许多紧耦合多处理器，在这样的系统中，所有的CPU共享全部资源，如总线，内存和I/O系统等，操作系统或管理数据库的复本只有一个，这种系统有一个最大的特点就是共享所有资源。多个CPU之间没有区别，平等地访问内存、外设、一个操作系统。操作系统管理着一个队列，每个处理器依次处理队列中的进程。如果两个处理器同时请求访问一个资源（例如同一段内存地址），由硬件、软件的锁机制去解决资源争用问题。Access to RAM is serialized; this and cache coherency issues causes performance to lag slightly behind the number of additional processors in the system.</p>
+<p>由此可以看到进程的虚拟内存空间会被分成不同的若干区域，每个区域都有其相关的属性和用途，一个合法的地址总是落在某个区域当中的，这些区域也不会重叠。在linux内核中，这样的区域被称之为虚拟内存区域(virtual memory areas),简称vma。一个vma就是一块连续的线性地址空间的抽象，它拥有自身的权限(可读，可写，可执行等等) ，每一个虚拟内存区域都由一个相关的struct vm_area_struct结构来描述</p>
 
-<p><img src="/images/kernel/2015-06-02-10.gif" alt="" /></p>
+<pre><code>    struct vm_area_struct {
+        struct mm_struct * vm_mm;   /* 所属的内存描述符 */
+        unsigned long vm_start;    /* vma的起始地址 */
+        unsigned long vm_end;       /* vma的结束地址 */
 
-<p>  所谓对称多处理器结构，是指服务器中多个 CPU 对称工作，无主次或从属关系。各 CPU 共享相同的物理内存，每个 CPU 访问内存中的任何地址所需时间是相同的，因此 SMP 也被称为一致存储器访问结构 (UMA ： Uniform Memory Access) 。对 SMP 服务器进行扩展的方式包括增加内存、使用更快的 CPU 、增加 CPU 、扩充 I/O( 槽口数与总线数 ) 以及添加更多的外部设备 ( 通常是磁盘存储 ) 。</p>
+        /* 该vma的在一个进程的vma链表中的前驱vma和后驱vma指针，链表中的vma都是按地址来排序的*/
+        struct vm_area_struct *vm_next, *vm_prev;
 
-<p>  SMP 服务器的主要特征是共享，系统中所有资源 (CPU 、内存、 I/O 等 ) 都是共享的。也正是由于这种特征，导致了 SMP 服务器的主要问题，那就是它的扩展能力非常有限。对于 SMP 服务器而言，每一个共享的环节都可能造成 SMP 服务器扩展时的瓶颈，而最受限制的则是内存。由于每个 CPU 必须通过相同的内存总线访问相同的内存资源，因此随着 CPU 数量的增加，内存访问冲突将迅速增加，最终会造成 CPU 资源的浪费，使 CPU 性能的有效性大大降低。实验证明， SMP 服务器 CPU 利用率最好的情况是 2 至 4 个 CPU 。</p>
+        pgprot_t vm_page_prot;      /* vma的访问权限 */
+        unsigned long vm_flags;    /* 标识集 */
 
-<p><img src="/images/kernel/2015-06-02-11.gif" alt="" /></p>
+        struct rb_node vm_rb;      /* 红黑树中对应的节点 */
 
-<h4>2. NUMA(Non-Uniform Memory Access)</h4>
+        /*
+         * For areas with an address space and backing store,
+         * linkage into the address_space-&gt;i_mmap prio tree, or
+         * linkage to the list of like vmas hanging off its node, or
+         * linkage of vma in the address_space-&gt;i_mmap_nonlinear list.
+         */
+        /* shared联合体用于和address space关联 */
+        union {
+            struct {
+                struct list_head list;/* 用于链入非线性映射的链表 */
+                void *parent;   /* aligns with prio_tree_node parent */
+                struct vm_area_struct *head;
+            } vm_set;
 
-<p>  由于 SMP 在扩展能力上的限制，人们开始探究如何进行有效地扩展从而构建大型系统的技术， NUMA 就是这种努力下的结果之一。利用 NUMA 技术，可以把几十个 CPU( 甚至上百个 CPU) 组合在一个服务器内。其 CPU 模块结构如图 2 所示：</p>
+            struct raw_prio_tree_node prio_tree_node;/*线性映射则链入i_mmap优先树*/
+        } shared;
 
-<p><img src="/images/kernel/2015-06-02-12.gif" alt="" /><br/>
-图 2.NUMA 服务器 CPU 模块结构</p>
+        /*
+         * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
+         * list, after a COW of one of the file pages.  A MAP_SHARED vma
+         * can only be in the i_mmap tree.  An anonymous MAP_PRIVATE, stack
+         * or brk vma (with NULL file) can only be in an anon_vma list.
+         */
+        /*anno_vma_node和annon_vma用于管理源自匿名映射的共享页*/
+        struct list_head anon_vma_node; /* Serialized by anon_vma-&gt;lock */
+        struct anon_vma *anon_vma;  /* Serialized by page_table_lock */
 
-<p>  NUMA 服务器的基本特征是具有多个 CPU 模块，每个 CPU 模块由多个 CPU( 如 4 个 ) 组成，并且具有独立的本地内存、 I/O 槽口等。由于其节点之间可以通过互联模块 ( 如称为 Crossbar Switch) 进行连接和信息交互，因此每个 CPU 可以访问整个系统的内存 ( 这是 NUMA 系统与 MPP 系统的重要差别 ) 。显然，访问本地内存的速度将远远高于访问远地内存 ( 系统内其它节点的内存 ) 的速度，这也是非一致存储访问 NUMA 的由来。由于这个特点，为了更好地发挥系统性能，开发应用程序时需要尽量减少不同 CPU 模块之间的信息交互。</p>
+        /* Function pointers to deal with this struct. */
+        /*该vma上的各种标准操作函数指针集*/
+        const struct vm_operations_struct *vm_ops;
 
-<p>  利用 NUMA 技术，可以较好地解决原来 SMP 系统的扩展问题，在一个物理服务器内可以支持上百个 CPU 。比较典型的 NUMA 服务器的例子包括 HP 的 Superdome 、 SUN15K 、 IBMp690 等。</p>
+        /* Information about our backing store: */
+        unsigned long vm_pgoff;     /* 映射文件的偏移量，以PAGE_SIZE为单位 */
+        struct file * vm_file;          /* 映射的文件，没有则为NULL */
+        void * vm_private_data;     /* was vm_pte (shared mem) */
+        unsigned long vm_truncate_count;/* truncate_count or restart_addr */
 
-<p>  但 NUMA 技术同样有一定缺陷，由于访问远地内存的延时远远超过本地内存，因此当 CPU 数量增加时，系统性能无法线性增加。如 HP 公司发布 Superdome 服务器时，曾公布了它与 HP 其它 UNIX 服务器的相对性能值，结果发现， 64 路 CPU 的 Superdome (NUMA 结构 ) 的相对性能值是 20 ，而 8 路 N4000( 共享的 SMP 结构 ) 的相对性能值是 6.3 。从这个结果可以看到， 8 倍数量的 CPU 换来的只是 3 倍性能的提升。</p>
-
-<hr />
-
-<p><img src="/images/kernel/2015-06-02-13.png" alt="" /></p>
-
-<p><img src="/images/kernel/2015-06-02-14.jpg" alt="" /></p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[Linux 中的零拷贝技术 splice]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/05/07/kernel-mm-splice/"/>
-    <updated>2015-05-07T15:26:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/05/07/kernel-mm-splice</id>
-    <content type="html"><![CDATA[<p><a href="http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415">http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415</a></p>
-
-<p>linux下如何实现文件对拷呢？</p>
-
-<p>最容易想到的方法就是，申请一份内存buf，read 源文件一段数据到buf，然后将此buf write到目标文件，示例代码如下：
-<code>
-    char buf[max_read];
-    off_t size = stat_buf.st_size;
-    while ( off_in &lt; size ) {
-        int len = size - off_in &gt; max_read ? max_read : size - off_in;
-        len = read(f_in, buf, len);
-        off_in += len;
-        write(f_out, buf, len);
-    }
-</code></p>
-
-<p>还有一种大家都知道的方式，就是通过mmap实现，示例代码如下：
-<code>
-    size_t filesize = stat_buf.st_size;
-    source = mmap(0, filesize, PROT_READ, MAP_SHARED, f_in, 0);
-    target = mmap(0, filesize, PROT_WRITE, MAP_SHARED, f_out, 0);
-    memcpy(target, source, filesize);
-</code>
-因为mmap不需要内核态和用户态的内存拷贝，效率大大提高。</p>
-
-<p>本文还想介绍另外一种，是今天无意google到的，就是如标题所述，基于splice实现，splice是Linux 2.6.17新加入的系统调用，官方文档的描述是，用于在两个文件间移动数据，而无需内核态和用户态的内存拷贝，但需要借助管道（pipe）实现。大概原理就是通过pipe buffer实现一组内核内存页（pages of kernel memory）的引用计数指针（reference-counted pointers），数据拷贝过程中并不真正拷贝数据，而是创建一个新的指向内存页的指针。也就是说拷贝过程实质是指针的拷贝。示例代码如下：
-<code>
-    int pipefd[2];
-    pipe( pipefd );
-    int max_read = 4096;
-    off_t size = stat_buf.st_size;
-    while ( off_in &lt; size ) {
-        int len = size - off_in &gt; max_read ? max_read : size - off_in;
-        len = splice(f_in, &amp;off_in, pipefd[1], NULL, len, SPLICE_F_MORE |SPLICE_F_MOVE);
-        splice(pipefd[0], NULL, f_out, &amp;off_out, len, SPLICE_F_MORE |SPLICE_F_MOVE);
-    }
-</code>
-使用splice一定要注意，因为其借助管道实现，而管道有众所周知的空间限制问题，超过了限制就会hang住，所以每次写入管道的数据量好严格控制，保守的建议值是一个内存页大小，即4k。另外，off_in和off_out传递的是指针，其值splice会做一定变动，使用时应注意。</p>
-
-<p>splice kernel bug: <a href="https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae">https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae</a></p>
-
-<hr />
-
-<p><a href="http://ogris.de/howtos/splice.html">http://ogris.de/howtos/splice.html</a></p>
-
-<p><a href="http://blog.csdn.net/eroswang/article/details/1999034">http://blog.csdn.net/eroswang/article/details/1999034</a></p>
-
-<p><a href="http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file">http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file</a></p>
-
-<pre><code>   EINVAL Target  file  system  doesn't  support  splicing; target file is
-          opened in append mode; neither of the descriptors  refers  to  a
-          pipe; or offset given for non-seekable device.
+    #ifndef CONFIG_MMU
+        struct vm_region *vm_region;    /* NOMMU mapping region */
+    #endif
+    #ifdef CONFIG_NUMA
+        struct mempolicy *vm_policy;    /* NUMA policy for the VMA */
+    #endif
+    };
 </code></pre>
 
-<hr />
+<p>进程的若干个vma区域都得按一定的形式组织在一起，这些vma都包含在进程的内存描述符中，也就是struct mm_struct中，这些vma在mm_struct以两种方式进行组织，一种是链表方式，对应于mm_struct中的mmap链表头，一种是红黑树方式，对应于mm_struct中的mm_rb根节点，和内核其他地方一样，链表用于遍历，红黑树用于查找。</p>
 
-<h4>file to file sample</h4>
+<p>下面以文件映射为例，来阐述文件的address_space和与其建立映射关系的vma是如何联系上的。首先来看看struct address_space中与vma相关的变量
+<code>
+    struct address_space {
+        struct inode        *host;      /* owner: inode, block_device */
+        ...
+        struct prio_tree_root   i_mmap;     /* tree of private and shared mappings */
+        struct list_head    i_mmap_nonlinear;          /*list VM_NONLINEAR mappings */
+        ...
+    } __attr
+</code></p>
 
-<pre><code>    #define _GNU_SOURCE
-    #include &lt;fcntl.h&gt;
-    #include &lt;stdio.h&gt;
-    #include &lt;unistd.h&gt;
-    #include &lt;errno.h&gt;
-    #include &lt;string.h&gt;
-    #include &lt;time.h&gt;
+<p>与此同时，struct file和struct inode中都包含有一个struct address_space的指针，分别为f_mapping和i_mapping。struct file是一个特定于进程的数据结构，而struct inode则是一个特定于文件的数据结构。每当进程打开一个文件时，都会将file->f_mapping设置到inode->i_mapping,下图则给出了文件和与其建立映射关系的vma的联系</p>
 
-    int main(int argc, char **argv)
+<p><img src="/images/kernel/2015-09-11-1.png" alt="" /></p>
+
+<p>下面来看几个vma的基本操作函数，这些函数都是后面实现具体功能的基础</p>
+
+<p>find_vma()用来寻找一个针对于指定地址的vma，该vma要么包含了指定的地址，要么位于该地址之后并且离该地址最近，或者说寻找第一个满足addr&lt;vma_end的vma</p>
+
+<pre><code>    struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
     {
-        int pipefd[2];
-        int result;
-        FILE *in_file;
-        FILE *out_file;
-        char buff[65537];
+        struct vm_area_struct *vma = NULL;
 
-        if (argc != 3) {
-            printf("usage: ./client infile outfile\n");
-            exit(0);
+        if (mm) {
+            /* Check the cache first. */
+            /* (Cache hit rate is typically around 35%.) */
+            vma = mm-&gt;mmap_cache; //首先尝试mmap_cache中缓存的vma
+            /*如果不满足下列条件中的任意一个则从红黑树中查找合适的vma
+              1.缓存vma不存在
+              2.缓存vma的结束地址小于给定的地址
+              3.缓存vma的起始地址大于给定的地址*/
+            if (!(vma &amp;&amp; vma-&gt;vm_end &gt; addr &amp;&amp; vma-&gt;vm_start &lt;= addr)) {
+                struct rb_node * rb_node;
+
+                rb_node = mm-&gt;mm_rb.rb_node;//获取红黑树根节点
+                vma = NULL;
+
+                while (rb_node) {
+                    struct vm_area_struct * vma_tmp;
+
+                    vma_tmp = rb_entry(rb_node,   //获取节点对应的vma
+                            struct vm_area_struct, vm_rb);
+
+                    /*首先确定vma的结束地址是否大于给定地址，如果是的话，再确定
+                      vma的起始地址是否小于给定地址，也就是优先保证给定的地址是
+                      处于vma的范围之内的，如果无法保证这点，则只能找到一个距离
+                      给定地址最近的vma并且该vma的结束地址要大于给定地址*/
+                    if (vma_tmp-&gt;vm_end &gt; addr) {
+                        vma = vma_tmp;
+                        if (vma_tmp-&gt;vm_start &lt;= addr)
+                            break;
+                        rb_node = rb_node-&gt;rb_left;
+                    } else
+                        rb_node = rb_node-&gt;rb_right;
+                }
+                if (vma)
+                    mm-&gt;mmap_cache = vma;//将结果保存在缓存中
+            }
         }
-        result = pipe(pipefd);
+        return vma;
+    }
+</code></pre>
 
-        in_file = fopen(argv[1], "rb");
-        out_file = fopen(argv[2], "wb");
+<p>当一个新区域被加到进程的地址空间时，内核会检查它是否可以与一个或多个现存区域合并，vma_merge()函数在可能的情况下，将一个新区域与周边区域进行合并。参数：</p>
 
-        off_t off_in = 0, off_out = 0;
-        int len = 1024*1024*30;
-        while (len &gt; 0) {
-            int size = 65536;
-            if (len &lt; size) size = len;
-            len -= size;
+<p>mm:新区域所属的进程地址空间<br/>
+prev:在地址上紧接着新区域的前面一个vma<br/>
+addr:新区域的起始地址<br/>
+end:新区域的结束地址<br/>
+vm_flags:新区域的标识集<br/>
+anon_vma:新区域所属的匿名映射<br/>
+file:新区域映射的文件<br/>
+pgoff:新区域映射文件的偏移<br/>
+policy:和NUMA相关</p>
 
-            result = splice(fileno(in_file), &amp;off_in, pipefd[1], NULL, size, SPLICE_F_MORE | SPLICE_F_MOVE);
-            result = splice(pipefd[0], NULL, fileno(out_file), &amp;off_out, size, SPLICE_F_MORE | SPLICE_F_MOVE);
-            //printf("%d\n", result);
+<pre><code>    struct vm_area_struct *vma_merge(struct mm_struct *mm,
+                struct vm_area_struct *prev, unsigned long addr,
+                unsigned long end, unsigned long vm_flags,
+                struct anon_vma *anon_vma, struct file *file,
+                pgoff_t pgoff, struct mempolicy *policy)
+    {
+        pgoff_t pglen = (end - addr) &gt;&gt; PAGE_SHIFT;
+        struct vm_area_struct *area, *next;
 
-    //        read(fileno(in_file), buff, size);
-    //        write(fileno(out_file), buff, size);
+        /*
+         * We later require that vma-&gt;vm_flags == vm_flags,
+         * so this tests vma-&gt;vm_flags &amp; VM_SPECIAL, too.
+         */
+        if (vm_flags &amp; VM_SPECIAL)
+            return NULL;
+
+        if (prev)//指定了先驱vma，则获取先驱vma的后驱vma
+            next = prev-&gt;vm_next;
+        else     //否则指定mm的vma链表中的第一个元素为后驱vma
+            next = mm-&gt;mmap;
+        area = next;
+
+        /*后驱节点存在，并且后驱vma的结束地址和给定区域的结束地址相同，
+          也就是说两者有重叠，那么调整后驱vma*/
+        if (next &amp;&amp; next-&gt;vm_end == end)     /* cases 6, 7, 8 */
+            next = next-&gt;vm_next;
+
+        /*
+         * 先判断给定的区域能否和前驱vma进行合并，需要判断如下的几个方面:
+           1.前驱vma必须存在
+           2.前驱vma的结束地址正好等于给定区域的起始地址
+           3.两者的struct mempolicy中的相关属性要相同，这项检查只对NUMA架构有意义
+           4.其他相关项必须匹配，包括两者的vm_flags，是否映射同一个文件等等
+         */
+        if (prev &amp;&amp; prev-&gt;vm_end == addr &amp;&amp;
+                mpol_equal(vma_policy(prev), policy) &amp;&amp;
+                can_vma_merge_after(prev, vm_flags,
+                            anon_vma, file, pgoff)) {
+            /*
+             *确定可以和前驱vma合并后再判断是否能和后驱vma合并，判断方式和前面一样，
+              不过这里多了一项检查，在给定区域能和前驱、后驱vma合并的情况下还要检查
+              前驱、后驱vma的匿名映射可以合并
+             */
+            if (next &amp;&amp; end == next-&gt;vm_start &amp;&amp;
+                    mpol_equal(policy, vma_policy(next)) &amp;&amp;
+                    can_vma_merge_before(next, vm_flags,
+                        anon_vma, file, pgoff+pglen) &amp;&amp;
+                    is_mergeable_anon_vma(prev-&gt;anon_vma,
+                                  next-&gt;anon_vma)) {
+                                /* cases 1, 6 */
+                vma_adjust(prev, prev-&gt;vm_start,
+                    next-&gt;vm_end, prev-&gt;vm_pgoff, NULL);
+            } else                  /* cases 2, 5, 7 */
+                vma_adjust(prev, prev-&gt;vm_start,
+                    end, prev-&gt;vm_pgoff, NULL);
+            return prev;
         }
-        close(pipefd[0]);
-        close(pipefd[1]);
-        fclose(in_file);
-        fclose(out_file);
 
+        /*
+         * Can this new request be merged in front of next?
+         */
+         /*如果前面的步骤失败，那么则从后驱vma开始进行和上面类似的步骤*/
+        if (next &amp;&amp; end == next-&gt;vm_start &amp;&amp;
+                mpol_equal(policy, vma_policy(next)) &amp;&amp;
+                can_vma_merge_before(next, vm_flags,
+                        anon_vma, file, pgoff+pglen)) {
+            if (prev &amp;&amp; addr &lt; prev-&gt;vm_end)  /* case 4 */
+                vma_adjust(prev, prev-&gt;vm_start,
+                    addr, prev-&gt;vm_pgoff, NULL);
+            else                    /* cases 3, 8 */
+                vma_adjust(area, addr, next-&gt;vm_end,
+                    next-&gt;vm_pgoff - pglen, NULL);
+            return area;
+        }
+
+        return NULL;
+    }
+</code></pre>
+
+<p>vma_adjust会执行具体的合并调整操作</p>
+
+<pre><code>    void vma_adjust(struct vm_area_struct *vma, unsigned long start,
+        unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert)
+    {
+        struct mm_struct *mm = vma-&gt;vm_mm;
+        struct vm_area_struct *next = vma-&gt;vm_next;
+        struct vm_area_struct *importer = NULL;
+        struct address_space *mapping = NULL;
+        struct prio_tree_root *root = NULL;
+        struct file *file = vma-&gt;vm_file;
+        struct anon_vma *anon_vma = NULL;
+        long adjust_next = 0;
+        int remove_next = 0;
+
+        if (next &amp;&amp; !insert) {
+            /*指定的范围已经跨越了整个后驱vma，并且有可能超过后驱vma*/
+            if (end &gt;= next-&gt;vm_end) {
+                /*
+                 * vma expands, overlapping all the next, and
+                 * perhaps the one after too (mprotect case 6).
+                 */
+    again:          remove_next = 1 + (end &gt; next-&gt;vm_end);//确定是否超过了后驱vma
+                end = next-&gt;vm_end;
+                anon_vma = next-&gt;anon_vma;
+                importer = vma;
+            } else if (end &gt; next-&gt;vm_start) {/*指定的区域和后驱vma部分重合*/
+
+                /*
+                 * vma expands, overlapping part of the next:
+                 * mprotect case 5 shifting the boundary up.
+                 */
+                adjust_next = (end - next-&gt;vm_start) &gt;&gt; PAGE_SHIFT;
+                anon_vma = next-&gt;anon_vma;
+                importer = vma;
+            } else if (end &lt; vma-&gt;vm_end) {/*指定的区域没到达后驱vma的结束处*/
+                /*
+                 * vma shrinks, and !insert tells it's not
+                 * split_vma inserting another: so it must be
+                 * mprotect case 4 shifting the boundary down.
+                 */
+                adjust_next = - ((vma-&gt;vm_end - end) &gt;&gt; PAGE_SHIFT);
+                anon_vma = next-&gt;anon_vma;
+                importer = next;
+            }
+        }
+
+        if (file) {//如果有映射文件
+            mapping = file-&gt;f_mapping;//获取文件对应的address_space
+            if (!(vma-&gt;vm_flags &amp; VM_NONLINEAR))
+                root = &amp;mapping-&gt;i_mmap;
+            spin_lock(&amp;mapping-&gt;i_mmap_lock);
+            if (importer &amp;&amp;
+                vma-&gt;vm_truncate_count != next-&gt;vm_truncate_count) {
+                /*
+                 * unmap_mapping_range might be in progress:
+                 * ensure that the expanding vma is rescanned.
+                 */
+                importer-&gt;vm_truncate_count = 0;
+            }
+            /*如果指定了待插入的vma，则根据vma是否以非线性的方式映射文件来选择是将
+            vma插入file对应的address_space的优先树(对应线性映射)还是双向链表(非线性映射)*/
+            if (insert) {
+                insert-&gt;vm_truncate_count = vma-&gt;vm_truncate_count;
+                /*
+                 * Put into prio_tree now, so instantiated pages
+                 * are visible to arm/parisc __flush_dcache_page
+                 * throughout; but we cannot insert into address
+                 * space until vma start or end is updated.
+                 */
+                __vma_link_file(insert);
+            }
+        }
+
+        /*
+         * When changing only vma-&gt;vm_end, we don't really need
+         * anon_vma lock.
+         */
+        if (vma-&gt;anon_vma &amp;&amp; (insert || importer || start != vma-&gt;vm_start))
+            anon_vma = vma-&gt;anon_vma;
+        if (anon_vma) {
+            spin_lock(&amp;anon_vma-&gt;lock);
+            /*
+             * Easily overlooked: when mprotect shifts the boundary,
+             * make sure the expanding vma has anon_vma set if the
+             * shrinking vma had, to cover any anon pages imported.
+             */
+            if (importer &amp;&amp; !importer-&gt;anon_vma) {
+                importer-&gt;anon_vma = anon_vma;
+                __anon_vma_link(importer);//将importer插入importer的anon_vma匿名映射链表中
+            }
+        }
+
+        if (root) {
+            flush_dcache_mmap_lock(mapping);
+            vma_prio_tree_remove(vma, root);
+            if (adjust_next)
+                vma_prio_tree_remove(next, root);
+        }
+
+        /*调整vma的相关量*/
+        vma-&gt;vm_start = start;
+        vma-&gt;vm_end = end;
+        vma-&gt;vm_pgoff = pgoff;
+        if (adjust_next) {//调整后驱vma的相关量
+            next-&gt;vm_start += adjust_next &lt;&lt; PAGE_SHIFT;
+            next-&gt;vm_pgoff += adjust_next;
+        }
+
+        if (root) {
+            if (adjust_next)//如果后驱vma被调整了，则重新插入到优先树中
+                vma_prio_tree_insert(next, root);
+            vma_prio_tree_insert(vma, root);//将vma插入到优先树中
+            flush_dcache_mmap_unlock(mapping);
+        }
+
+        if (remove_next) {//给定区域与后驱vma有重合
+            /*
+             * vma_merge has merged next into vma, and needs
+             * us to remove next before dropping the locks.
+             */
+            __vma_unlink(mm, next, vma);//将后驱vma从红黑树中删除
+            if (file)//将后驱vma从文件对应的address space中删除
+                __remove_shared_vm_struct(next, file, mapping);
+            if (next-&gt;anon_vma)//将后驱vma从匿名映射链表中删除
+                __anon_vma_merge(vma, next);
+        } else if (insert) {
+            /*
+             * split_vma has split insert from vma, and needs
+             * us to insert it before dropping the locks
+             * (it may either follow vma or precede it).
+             */
+            __insert_vm_struct(mm, insert);//将待插入的vma插入mm的红黑树，双向链表以及
+                            //匿名映射链表
+        }
+
+        if (anon_vma)
+            spin_unlock(&amp;anon_vma-&gt;lock);
+        if (mapping)
+            spin_unlock(&amp;mapping-&gt;i_mmap_lock);
+
+        if (remove_next) {
+            if (file) {
+                fput(file);
+                if (next-&gt;vm_flags &amp; VM_EXECUTABLE)
+                    removed_exe_file_vma(mm);
+            }
+            mm-&gt;map_count--;
+            mpol_put(vma_policy(next));
+            kmem_cache_free(vm_area_cachep, next);
+            /*
+             * In mprotect's case 6 (see comments on vma_merge),
+             * we must remove another next too. It would clutter
+             * up the code too much to do both in one go.
+             */
+            if (remove_next == 2) {//还有待删除的区域
+                next = vma-&gt;vm_next;
+                goto again;
+            }
+        }
+
+        validate_mm(mm);
+    }
+</code></pre>
+
+<p>insert_vm_struct()函数用于插入一块新区域</p>
+
+<pre><code>    int insert_vm_struct(struct mm_struct * mm, struct vm_area_struct * vma)
+    {
+        struct vm_area_struct * __vma, * prev;
+        struct rb_node ** rb_link, * rb_parent;
+
+        /*
+         * The vm_pgoff of a purely anonymous vma should be irrelevant
+         * until its first write fault, when page's anon_vma and index
+         * are set.  But now set the vm_pgoff it will almost certainly
+         * end up with (unless mremap moves it elsewhere before that
+         * first wfault), so /proc/pid/maps tells a consistent story.
+         *
+         * By setting it to reflect the virtual start address of the
+         * vma, merges and splits can happen in a seamless way, just
+         * using the existing file pgoff checks and manipulations.
+         * Similarly in do_mmap_pgoff and in do_brk.
+         */
+        if (!vma-&gt;vm_file) {
+            BUG_ON(vma-&gt;anon_vma);
+            vma-&gt;vm_pgoff = vma-&gt;vm_start &gt;&gt; PAGE_SHIFT;
+        }
+        /*__vma用来保存和vma-&gt;start对应的vma(与find_vma()一样)，同时获取以下信息:
+          1.prev用来保存对应的前驱vma
+          2.rb_link保存该vma区域插入对应的红黑树节点
+          3.rb_parent保存该vma区域对应的父节点*/
+        __vma = find_vma_prepare(mm,vma-&gt;vm_start,&amp;prev,&amp;rb_link,&amp;rb_parent);
+        if (__vma &amp;&amp; __vma-&gt;vm_start &lt; vma-&gt;vm_end)
+            return -ENOMEM;
+        if ((vma-&gt;vm_flags &amp; VM_ACCOUNT) &amp;&amp;
+             security_vm_enough_memory_mm(mm, vma_pages(vma)))
+            return -ENOMEM;
+        vma_link(mm, vma, prev, rb_link, rb_parent);//将vma关联到所有的数据结构中
         return 0;
     }
 </code></pre>
 
-<h4>more sample</h4>
+<pre><code>    static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
+                struct vm_area_struct *prev, struct rb_node **rb_link,
+                struct rb_node *rb_parent)
+    {
+        struct address_space *mapping = NULL;
 
-<p><a href="/download/kernel/splice_sample.tar.gz">splice sample</a></p>
+        if (vma-&gt;vm_file)//如果存在文件映射则获取文件对应的地址空间
+            mapping = vma-&gt;vm_file-&gt;f_mapping;
 
-<p>like:<br/>
-file to socket<br/>
-socket to file<br/>
-socket to socket</p>
+        if (mapping) {
+            spin_lock(&amp;mapping-&gt;i_mmap_lock);
+            vma-&gt;vm_truncate_count = mapping-&gt;truncate_count;
+        }
+        anon_vma_lock(vma);
+
+        /*将vma插入到相应的数据结构中--双向链表，红黑树和匿名映射链表*/
+        __vma_link(mm, vma, prev, rb_link, rb_parent);
+        __vma_link_file(vma);//将vma插入到文件地址空间的相应数据结构中
+
+        anon_vma_unlock(vma);
+        if (mapping)
+            spin_unlock(&amp;mapping-&gt;i_mmap_lock);
+
+        mm-&gt;map_count++;
+        validate_mm(mm);
+    }
+</code></pre>
+
+<p>在创建新的vma区域之前先要寻找一块足够大小的空闲区域，该项工作由get_unmapped_area()函数完成，而实际的工作将会由mm_struct中定义的辅助函数来完成。根据进程虚拟地址空间的布局，会选择使用不同的映射函数，在这里考虑大多数系统上采用的标准函数arch_get_unmapped_area();</p>
+
+<pre><code>    unsigned long
+    arch_get_unmapped_area(struct file *filp, unsigned long addr,
+            unsigned long len, unsigned long pgoff, unsigned long flags)
+    {
+        struct mm_struct *mm = current-&gt;mm;
+        struct vm_area_struct *vma;
+        unsigned long start_addr;
+
+        if (len &gt; TASK_SIZE)
+            return -ENOMEM;
+
+        if (flags &amp; MAP_FIXED)
+            return addr;
+
+        if (addr) {
+            addr = PAGE_ALIGN(addr);//将地址按页对齐
+            vma = find_vma(mm, addr);//获取一个vma，该vma可能包含了addr也可能在addr后面并且离addr最近
+            /*这里确定是否有一块适合的空闲区域，先要保证addr+len不会
+              超过进程地址空间的最大允许范围，然后如果前面vma获取成功的话则要保证
+              vma位于addr的后面并且addr+len不会延伸到该vma的区域*/
+            if (TASK_SIZE - len &gt;= addr &amp;&amp;
+                (!vma || addr + len &lt;= vma-&gt;vm_start))
+                return addr;
+        }
+        /*前面获取不成功的话则要调整起始地址了，根据情况选择缓存的空闲区域地址
+          或者TASK_UNMAPPED_BASE=TASK_SIZE/3*/
+        if (len &gt; mm-&gt;cached_hole_size) {
+                start_addr = addr = mm-&gt;free_area_cache;
+        } else {
+                start_addr = addr = TASK_UNMAPPED_BASE;
+                mm-&gt;cached_hole_size = 0;
+        }
+
+    full_search:
+        /*从addr开始遍历用户地址空间*/
+        for (vma = find_vma(mm, addr); ; vma = vma-&gt;vm_next) {
+            /* At this point:  (!vma || addr &lt; vma-&gt;vm_end). */
+            if (TASK_SIZE - len &lt; addr) {//这里判断是否已经遍历到了用户地址空间的末端
+                /*
+                 * Start a new search - just in case we missed
+                 * some holes.
+                 */
+                 //如果上次不是从TAKS_UNMAPPED_BASE开始遍历的，则尝试从TASK_UNMAPPED_BASE开始遍历
+                if (start_addr != TASK_UNMAPPED_BASE) {
+                    addr = TASK_UNMAPPED_BASE;
+                        start_addr = addr;
+                    mm-&gt;cached_hole_size = 0;
+                    goto full_search;
+                }
+                return -ENOMEM;
+            }
+            if (!vma || addr + len &lt;= vma-&gt;vm_start) {//判断是否有空闲区域
+                /*
+                 *找到空闲区域的话则记住我们搜索的结束处，以便下次搜索
+                 */
+                mm-&gt;free_area_cache = addr + len;
+                return addr;
+            }
+            /*该空闲区域不符合大小要求，但是如果这个空闲区域大于之前保存的最大值的话
+              则将这个空闲区域保存，这样便于前面确定从哪里开始搜索*/
+            if (addr + mm-&gt;cached_hole_size &lt; vma-&gt;vm_start)
+                    mm-&gt;cached_hole_size = vma-&gt;vm_start - addr;
+            addr = vma-&gt;vm_end;
+        }
+    }
+</code></pre>
 ]]></content>
   </entry>
   

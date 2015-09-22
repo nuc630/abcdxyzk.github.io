@@ -1,0 +1,310 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>Linux内核页回收 swappiness参数 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>cp -rf * .</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" id="query" type="text" placeholder="search...">
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+<script type="text/javascript">
+var query = GetRequest("query");
+if (query != null) {
+	document.getElementById("query").value = query;
+}
+</script>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">Linux内核页回收 swappiness参数</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-18T11:21:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>11:21:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="http://www.douban.com/note/349467816/">http://www.douban.com/note/349467816/</a></p>
+
+<p>本文主要尝试解释两个问题：<br/>
+1. swappiness的确切含义是什么，它对内核进行页回收机制的影响。<br/>
+2. swappiness设置成0，为什么系统仍然可能会有swap发生。</p>
+
+<h4>一. 关于内存分配与页回收(page reclaim)</h4>
+
+<p>page reclaim发生的场景主要有两类，一个是kswapd后台线程进行的活动，另一个是direct reclaim，即分配页时没有空闲内存满足，需要立即直接进行的页回收。大体上内存分配的流程会分为两部分，一部分是fast path，另一部分是slow path，通常内存使用非紧张情况下，都会在fast path就可以满足要求。并且fast path下的内存分配不会出现dirty writeback及swap等页回收引起的IO阻塞情况。</p>
+
+<p>fast path大体流程如下：</p>
+
+<p>1.如果系统挂载使用了memory cgroup，则首先检查是否超过cgroup限额，如果超过则进行direct reclaim，通过do_try_to_free_pages完成。如果没超过则进行cgroup的charge工作（charge是通过两阶段提交完成的，这里不展开了）。</p>
+
+<p>2.从本地prefered zone内存节点查找空闲页，需要判断是否满足系统watermark及dirty ratio的要求，如果满足则从buddy system上摘取相应page,否则尝试对本地prefered zone进行页回收,本次fast path下页回收只会回收clean page，即不会考虑dirty page以及mapped page，这样就不会产生任何swap及writeback，即不会引起任何blocking的IO操作，如果这次回收仍然无法满足请求的内存页数目则进入slow path</p>
+
+<p>slow path大体流程如下：</p>
+
+<ol>
+<li><p>首先唤醒kswapd进行page reclaim后台操作。</p></li>
+<li><p>重新尝试本地prefered zone进行分配内存，如果失败会根据请求的GFP相关参数决定是否尝试忽略watermark, dirty ratio以及本地节点分配等要求进行再次重试，这一步中如果分配页时有指定<code>__GFP_NOFAIL</code>标记，则分配失败会一直等待重试。</p></li>
+<li><p>如果没有<code>__GFP_NOFAIL</code>标记，则会需开始进行page compact及page direct reclaim操作，之后如果仍然没有可用内存，则进入OOM流程。</p></li>
+</ol>
+
+
+<p>相关内容可以参阅内核代码<code>__alloc_pages</code>函数的逻辑，另外无论page reclaim是由谁发起的，最终都会统一入口到shrink_zone，即针对每个zone独立进行reclaim操作，最终会进入shrink_lruvec函数，进行每个zone相应page lru链表的扫描与回收操作。</p>
+
+<h4>二. 关于页回收的一些背景知识</h4>
+
+<p>页回收大体流程会先在每个zone上扫描相应的page链表，主要包括inactive anon/active anon(匿名页链表)以及inactive file/active file链表（file cache/映射页链表），一共四条链表，我们所有使用过的page在被回收前基本是保存在这四条链表中的某一条中的（还有一部分在unevictable链表中，忽略），根据其被引用的次数会决定其处于active还是inactive链表中，根据其类型决定处于anon还是file链表中。</p>
+
+<p>页回收总体会扫描逐个内存节点的所有zone，然后先扫描active，将不频繁访问的页挪到inactive链表中，随后扫描inactive链表，会将其中被频繁引用的页重新挪回到active中，确认不频繁的页则最终被回收，如果是file based的页则根据是否clean进行释放或回写(writeback，filecache则直接释放)，如果是anon则进行swap，所以本文实际关心的是swappiness参数对anon链表扫描的影响。</p>
+
+<p>另外还需要了解前面描述的四个链表原来是放在zone数据结构上的，后来引入了mem_cgroup则，重新定义了一组mem_cgroup_per_zone/mem_cgroup_per_node的数据结构，这四个链表同时定义在这组数据结构上，如果系统开启了mem cgroup则使用后者，否则用前者。</p>
+
+<p>另外再重点说下swap只是page reclaim的一种处理措施，主要针对anon page，我们最终来看下swappiness的确切含义</p>
+
+<h4>三. swappiness对page reclaim的确切影响</h4>
+
+<p>page reclaim逻辑中对前面所述四个链表进行扫描的逻辑在vmscan.c中的get_scan_count函数内，该函数大部分逻辑注释写得非常清楚，我们简单梳理下，主要关注scan_balance变量的取值：</p>
+
+<ol>
+<li>首先如果系统禁用了swap或者没有swap空间，则只扫描file based的链表，即不进行匿名页链表扫描
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;may_swap || (get_nr_swap_pages() &lt;= 0)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果当前进行的不是全局页回收（cgroup资源限额引起的页回收），并且swappiness设为0，则不进行匿名页链表扫描，这个是没得商量，这里swappiness值直接决定了是否有swap发生，设成0则肯定不会发生，另外需要注意，这种情况下需要设置的是cgroup配置文件memory.swappiness，而不是全局的sysctl vm.swappiness
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!global_reclaim(sc) && !vmscan_swappiness(sc)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果进行链表扫描前设置的priority(这个值决定扫描多少分之一的链表元素)为0，且swappiness非0，则可能会进行swap
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;priority && vmscan_swappiness(sc)) {
+</span><span class='line'>&#9;scan_balance = SCAN_EQUAL;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果是全局页回收，并且当前空闲内存和所有file based链表page数目的加和都小于系统的high watermark，则必须进行匿名页回收，则必然会发生swap,可以看到这里swappiness的值如何设置是完全无关的，这也解释了为什么其为0，系统也会进行swap的原因，另外最后我们会详细解释系统page watermark是如何计算的。
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>anon = get_lru_size(lruvec, LRU_ACTIVE_ANON) +
+</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_ANON);
+</span><span class='line'>file = get_lru_size(lruvec, LRU_ACTIVE_FILE) +
+</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_FILE);
+</span><span class='line'>
+</span><span class='line'>if (global_reclaim(sc)) {
+</span><span class='line'>&#9;free = zone_page_state(zone, NR_FREE_PAGES);
+</span><span class='line'>&#9;if (unlikely(file + free &lt;= high_wmark_pages(zone))) {
+</span><span class='line'>&#9;&#9;scan_balance = SCAN_ANON;
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果系统inactive file链表比较充足，则不考虑进行匿名页的回收，即不进行swap
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!inactive_file_is_low(lruvec)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>最后一种情况则要根据swappiness值与之前统计的file与anon哪个更有价值来综合决定file和anon链表扫描的比例，这时如果swappiness设置成0，则也不会扫描anon链表，即不进行swap,代码比较多，不再贴出。</li>
+</ol>
+
+
+<h4>四. 系统内存watermark的计算</h4>
+
+<p>前面看到系统内存watermark对页回收机制是有决定影响的，其实在内存分配中也会频繁用到这个值，确切的说它有三个值，分别是low,min和high,根据分配页时来指定用哪个，如果系统空闲内存低于相应watermark则分配会失败，这也是进入slow path或者wakeup kswapd的依据。</p>
+
+<p>实际这个值的计算是通过sysctl里的vm.min_free_kbytes来决定的，大体的计算公式如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pages_min = min_free_kbytes &gt;&gt; (PAGE_SHIFT - 10);
+</span><span class='line'>tmp = (u64)pages_min * zone-&gt;managed_pages;
+</span><span class='line'>do_div(tmp, lowmem_pages);
+</span><span class='line'>zone-&gt;watermark[WMARK_MIN] = tmp;
+</span><span class='line'>zone-&gt;watermark[WMARK_LOW] = min_wmark_pages(zone) + (tmp &gt;&gt; 2);
+</span><span class='line'>zone-&gt;watermark[WMARK_HIGH] = min_wmark_pages(zone) + (tmp &gt;&gt; 1);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即根据min_free_kbytes的值按照每个zone管理页面的比例算出zone的min_watermark，然后再加min的1/4就是low，加1/2就是high了</p>
+
+<h4>总结：</h4>
+
+<p>swappiness的值是个参考值，是否会发生swap跟当前是哪种page reclaim及系统当前状态都有关系，所以设置了swappiness=0并不代表一定没有swap发生，同时设为0也确实会可能发生OOM。</p>
+
+<p>个人仍然认为线上环境设置swappiness=0是没有任何问题的。</p>
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2015-09-18T11:21:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>11:21:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~mm/'>mm</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2015/09/18/kernel-mm-swap/" title="Previous Post: Linux swap实现">&laquo; Linux swap实现</a>
+      
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2015 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>

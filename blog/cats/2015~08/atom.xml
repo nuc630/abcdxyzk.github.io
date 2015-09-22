@@ -1,0 +1,3830 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2015~08 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2015~08/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2015-09-22T11:40:38+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[NAPI机制分析]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/08/27/kernel-net-napi/"/>
+    <updated>2015-08-27T01:29:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/08/27/kernel-net-napi</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/shanshanpt/article/details/20564845">http://blog.csdn.net/shanshanpt/article/details/20564845</a></p>
+
+<p>NAPI 的核心在于：在一个繁忙网络，每次有网络数据包到达时，不需要都引发中断，因为高频率的中断可能会影响系统的整体效率，假象一个场景，我们此时使用标准的 100M 网卡，可能实际达到的接收速率为 80MBits/s，而此时数据包平均长度为 1500Bytes，则每秒产生的中断数目为：
+<code>
+    80M bits/s / (8 Bits/Byte * 1500 Byte) = 6667 个中断 /s
+</code></p>
+
+<p>每秒 6667 个中断，对于系统是个很大的压力，此时其实可以转为使用轮询 (polling) 来处理，而不是中断;但轮询在网络流量较小的时没有效率，因此低流量时，基于中断的方式则比较合适，这就是 NAPI 出现的原因，在低流量时候使用中断接收数据包，而在高流量时候则使用基于轮询的方式接收。</p>
+
+<p>现在内核中 NIC 基本上已经全部支持 NAPI 功能，由前面的叙述可知，NAPI 适合处理高速率数据包的处理，而带来的好处则是：</p>
+
+<p>  1、中断缓和 (Interrupt mitigation)，由上面的例子可以看到，在高流量下，网卡产生的中断可能达到每秒几千次，而如果每次中断都需要系统来处理，是一个很大的压力，而 NAPI 使用轮询时是禁止了网卡的接收中断的，这样会减小系统处理中断的压力；</p>
+
+<p>  2、数据包节流 (Packet throttling)，NAPI 之前的 Linux NIC 驱动总在接收到数据包之后产生一个 IRQ，接着在中断服务例程里将这个 skb 加入本地的 softnet，然后触发本地 NET_RX_SOFTIRQ 软中断后续处理。如果包速过高，因为 IRQ 的优先级高于 SoftIRQ，导致系统的大部分资源都在响应中断，但 softnet 的队列大小有限，接收到的超额数据包也只能丢掉，所以这时这个模型是在用宝贵的系统资源做无用功。而 NAPI 则在这样的情况下，直接把包丢掉，不会继续将需要丢掉的数据包扔给内核去处理，这样，网卡将需要丢掉的数据包尽可能的早丢弃掉，内核将不可见需要丢掉的数据包，这样也减少了内核的压力。</p>
+
+<p>对NAPI 的使用，一般包括以下的几个步骤：</p>
+
+<p>  1、在中断处理函数中，先禁止接收中断，且告诉网络子系统，将以轮询方式快速收包，其中禁止接收中断完全由硬件功能决定，而告诉内核将以轮询方式处理包则是使用函数 netif_rx_schedule()，也可以使用下面的方式，其中的 netif_rx_schedule_prep 是为了判定现在是否已经进入了轮询模式：</p>
+
+<p>将网卡预定为轮询模式
+<code>
+    void netif_rx_schedule(struct net_device *dev);
+</code>
+或者
+<code>
+    if (netif_rx_schedule_prep(dev))
+        __netif_rx_schedule(dev);
+</code></p>
+
+<p>  2、在驱动中创建轮询函数，它的工作是从网卡获取数据包并将其送入到网络子系统，其原型是：</p>
+
+<p>NAPI 的轮询方法
+<code>
+    int (*poll)(struct net_device *dev, int *budget);
+</code></p>
+
+<p>这里的轮询函数用于在将网卡切换为轮询模式之后，用 poll() 方法处理接收队列中的数据包，如队列为空，则重新切换为中断模式。切换回中断模式需要先关闭轮询模式，使用的是函数 netif_rx_complete ()，接着开启网卡接收中断 .。</p>
+
+<p>退出轮询模式
+<code>
+    void netif_rx_complete(struct net_device *dev);
+</code></p>
+
+<p>  3、在驱动中创建轮询函数，需要和实际的网络设备 struct net_device 关联起来，这一般在网卡的初始化时候完成，示例代码如下：</p>
+
+<p>设置网卡支持轮询模式
+<code>
+    dev-&gt;poll = my_poll;
+    dev-&gt;weight = 64;
+</code></p>
+
+<p>里面另外一个字段为权重 (weight)，该值并没有一个非常严格的要求，实际上是个经验数据，一般 10Mb 的网卡，我们设置为 16，而更快的网卡，我们则设置为 64。</p>
+
+<p>NAPI的一些相关Interface</p>
+
+<p>下面是 NAPI 功能的一些接口，在前面都基本有涉及，我们简单看看：</p>
+
+<pre><code>    netif_rx_schedule(dev)
+</code></pre>
+
+<p>在网卡的中断处理函数中调用，用于将网卡的接收模式切换为轮询</p>
+
+<pre><code>    netif_rx_schedule_prep(dev)
+</code></pre>
+
+<p>在网卡是 Up 且运行状态时，将该网卡设置为准备将其加入到轮询列表的状态，可以将该函数看做是 netif_rx_schedule(dev) 的前半部分
+<code>
+    __netif_rx_schedule(dev)
+</code></p>
+
+<p>将设备加入轮询列表，前提是需要 netif_schedule_prep(dev) 函数已经返回了 1</p>
+
+<pre><code>    __netif_rx_schedule_prep(dev)
+</code></pre>
+
+<p>与 netif_rx_schedule_prep(dev) 相似，但是没有判断网卡设备是否 Up 及运行，不建议使用</p>
+
+<pre><code>    netif_rx_complete(dev)
+</code></pre>
+
+<p>用于将网卡接口从轮询列表中移除，一般在轮询函数完成之后调用该函数。</p>
+
+<pre><code>    __netif_rx_complete(dev)
+</code></pre>
+
+<h4>Newer newer NAPI</h4>
+
+<p>其实之前的 NAPI(New API) 这样的命名已经有点让人忍俊不禁了，可见 Linux 的内核极客们对名字的掌控，比对代码的掌控差太多，于是乎，连续的两次对 NAPI 的重构，被戏称为 Newer newer NAPI 了。</p>
+
+<p>与 netif_rx_complete(dev) 类似，但是需要确保本地中断被禁止</p>
+
+<p>Newer newer NAPI</p>
+
+<p>在最初实现的 NAPI 中，有 2 个字段在结构体 net_device 中，分别为轮询函数 poll() 和权重 weight，而所谓的 Newer newer NAPI，是在 2.6.24 版内核之后，对原有的 NAPI 实现的几次重构，其核心是将 NAPI 相关功能和 net_device 分离，这样减少了耦合，代码更加的灵活，因为 NAPI 的相关信息已经从特定的网络设备剥离了，不再是以前的一对一的关系了。例如有些网络适配器，可能提供了多个 port，但所有的 port 却是共用同一个接受数据包的中断，这时候，分离的 NAPI 信息只用存一份，同时被所有的 port 来共享，这样，代码框架上更好地适应了真实的硬件能力。Newer newer NAPI 的中心结构体是napi_struct:</p>
+
+<p>NAPI 结构体
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+<span class='line-number'>412</span>
+<span class='line-number'>413</span>
+<span class='line-number'>414</span>
+<span class='line-number'>415</span>
+<span class='line-number'>416</span>
+<span class='line-number'>417</span>
+<span class='line-number'>418</span>
+<span class='line-number'>419</span>
+<span class='line-number'>420</span>
+<span class='line-number'>421</span>
+<span class='line-number'>422</span>
+<span class='line-number'>423</span>
+<span class='line-number'>424</span>
+<span class='line-number'>425</span>
+<span class='line-number'>426</span>
+<span class='line-number'>427</span>
+<span class='line-number'>428</span>
+<span class='line-number'>429</span>
+<span class='line-number'>430</span>
+<span class='line-number'>431</span>
+<span class='line-number'>432</span>
+<span class='line-number'>433</span>
+<span class='line-number'>434</span>
+<span class='line-number'>435</span>
+<span class='line-number'>436</span>
+<span class='line-number'>437</span>
+<span class='line-number'>438</span>
+<span class='line-number'>439</span>
+<span class='line-number'>440</span>
+<span class='line-number'>441</span>
+<span class='line-number'>442</span>
+<span class='line-number'>443</span>
+<span class='line-number'>444</span>
+<span class='line-number'>445</span>
+<span class='line-number'>446</span>
+<span class='line-number'>447</span>
+<span class='line-number'>448</span>
+<span class='line-number'>449</span>
+<span class='line-number'>450</span>
+<span class='line-number'>451</span>
+<span class='line-number'>452</span>
+<span class='line-number'>453</span>
+<span class='line-number'>454</span>
+<span class='line-number'>455</span>
+<span class='line-number'>456</span>
+<span class='line-number'>457</span>
+<span class='line-number'>458</span>
+<span class='line-number'>459</span>
+<span class='line-number'>460</span>
+<span class='line-number'>461</span>
+<span class='line-number'>462</span>
+<span class='line-number'>463</span>
+<span class='line-number'>464</span>
+<span class='line-number'>465</span>
+<span class='line-number'>466</span>
+<span class='line-number'>467</span>
+<span class='line-number'>468</span>
+<span class='line-number'>469</span>
+<span class='line-number'>470</span>
+<span class='line-number'>471</span>
+<span class='line-number'>472</span>
+<span class='line-number'>473</span>
+<span class='line-number'>474</span>
+<span class='line-number'>475</span>
+<span class='line-number'>476</span>
+<span class='line-number'>477</span>
+<span class='line-number'>478</span>
+<span class='line-number'>479</span>
+<span class='line-number'>480</span>
+<span class='line-number'>481</span>
+<span class='line-number'>482</span>
+<span class='line-number'>483</span>
+<span class='line-number'>484</span>
+<span class='line-number'>485</span>
+<span class='line-number'>486</span>
+<span class='line-number'>487</span>
+<span class='line-number'>488</span>
+<span class='line-number'>489</span>
+<span class='line-number'>490</span>
+<span class='line-number'>491</span>
+<span class='line-number'>492</span>
+<span class='line-number'>493</span>
+<span class='line-number'>494</span>
+<span class='line-number'>495</span>
+<span class='line-number'>496</span>
+<span class='line-number'>497</span>
+<span class='line-number'>498</span>
+<span class='line-number'>499</span>
+<span class='line-number'>500</span>
+<span class='line-number'>501</span>
+<span class='line-number'>502</span>
+<span class='line-number'>503</span>
+<span class='line-number'>504</span>
+<span class='line-number'>505</span>
+<span class='line-number'>506</span>
+<span class='line-number'>507</span>
+<span class='line-number'>508</span>
+<span class='line-number'>509</span>
+<span class='line-number'>510</span>
+<span class='line-number'>511</span>
+<span class='line-number'>512</span>
+<span class='line-number'>513</span>
+<span class='line-number'>514</span>
+<span class='line-number'>515</span>
+<span class='line-number'>516</span>
+<span class='line-number'>517</span>
+<span class='line-number'>518</span>
+<span class='line-number'>519</span>
+<span class='line-number'>520</span>
+<span class='line-number'>521</span>
+<span class='line-number'>522</span>
+<span class='line-number'>523</span>
+<span class='line-number'>524</span>
+<span class='line-number'>525</span>
+<span class='line-number'>526</span>
+<span class='line-number'>527</span>
+<span class='line-number'>528</span>
+<span class='line-number'>529</span>
+<span class='line-number'>530</span>
+<span class='line-number'>531</span>
+<span class='line-number'>532</span>
+<span class='line-number'>533</span>
+<span class='line-number'>534</span>
+<span class='line-number'>535</span>
+<span class='line-number'>536</span>
+<span class='line-number'>537</span>
+<span class='line-number'>538</span>
+<span class='line-number'>539</span>
+<span class='line-number'>540</span>
+<span class='line-number'>541</span>
+<span class='line-number'>542</span>
+<span class='line-number'>543</span>
+<span class='line-number'>544</span>
+<span class='line-number'>545</span>
+<span class='line-number'>546</span>
+<span class='line-number'>547</span>
+<span class='line-number'>548</span>
+<span class='line-number'>549</span>
+<span class='line-number'>550</span>
+<span class='line-number'>551</span>
+<span class='line-number'>552</span>
+<span class='line-number'>553</span>
+<span class='line-number'>554</span>
+<span class='line-number'>555</span>
+<span class='line-number'>556</span>
+<span class='line-number'>557</span>
+<span class='line-number'>558</span>
+<span class='line-number'>559</span>
+<span class='line-number'>560</span>
+<span class='line-number'>561</span>
+<span class='line-number'>562</span>
+<span class='line-number'>563</span>
+<span class='line-number'>564</span>
+<span class='line-number'>565</span>
+<span class='line-number'>566</span>
+<span class='line-number'>567</span>
+<span class='line-number'>568</span>
+<span class='line-number'>569</span>
+<span class='line-number'>570</span>
+<span class='line-number'>571</span>
+<span class='line-number'>572</span>
+<span class='line-number'>573</span>
+<span class='line-number'>574</span>
+<span class='line-number'>575</span>
+<span class='line-number'>576</span>
+<span class='line-number'>577</span>
+<span class='line-number'>578</span>
+<span class='line-number'>579</span>
+<span class='line-number'>580</span>
+<span class='line-number'>581</span>
+<span class='line-number'>582</span>
+<span class='line-number'>583</span>
+<span class='line-number'>584</span>
+<span class='line-number'>585</span>
+<span class='line-number'>586</span>
+<span class='line-number'>587</span>
+<span class='line-number'>588</span>
+<span class='line-number'>589</span>
+<span class='line-number'>590</span>
+<span class='line-number'>591</span>
+<span class='line-number'>592</span>
+<span class='line-number'>593</span>
+<span class='line-number'>594</span>
+<span class='line-number'>595</span>
+<span class='line-number'>596</span>
+<span class='line-number'>597</span>
+<span class='line-number'>598</span>
+<span class='line-number'>599</span>
+<span class='line-number'>600</span>
+<span class='line-number'>601</span>
+<span class='line-number'>602</span>
+<span class='line-number'>603</span>
+<span class='line-number'>604</span>
+<span class='line-number'>605</span>
+<span class='line-number'>606</span>
+<span class='line-number'>607</span>
+<span class='line-number'>608</span>
+<span class='line-number'>609</span>
+<span class='line-number'>610</span>
+<span class='line-number'>611</span>
+<span class='line-number'>612</span>
+<span class='line-number'>613</span>
+<span class='line-number'>614</span>
+<span class='line-number'>615</span>
+<span class='line-number'>616</span>
+<span class='line-number'>617</span>
+<span class='line-number'>618</span>
+<span class='line-number'>619</span>
+<span class='line-number'>620</span>
+<span class='line-number'>621</span>
+<span class='line-number'>622</span>
+<span class='line-number'>623</span>
+<span class='line-number'>624</span>
+<span class='line-number'>625</span>
+<span class='line-number'>626</span>
+<span class='line-number'>627</span>
+<span class='line-number'>628</span>
+<span class='line-number'>629</span>
+<span class='line-number'>630</span>
+<span class='line-number'>631</span>
+<span class='line-number'>632</span>
+<span class='line-number'>633</span>
+<span class='line-number'>634</span>
+<span class='line-number'>635</span>
+<span class='line-number'>636</span>
+<span class='line-number'>637</span>
+<span class='line-number'>638</span>
+<span class='line-number'>639</span>
+<span class='line-number'>640</span>
+<span class='line-number'>641</span>
+<span class='line-number'>642</span>
+<span class='line-number'>643</span>
+<span class='line-number'>644</span>
+<span class='line-number'>645</span>
+<span class='line-number'>646</span>
+<span class='line-number'>647</span>
+<span class='line-number'>648</span>
+<span class='line-number'>649</span>
+<span class='line-number'>650</span>
+<span class='line-number'>651</span>
+<span class='line-number'>652</span>
+<span class='line-number'>653</span>
+<span class='line-number'>654</span>
+<span class='line-number'>655</span>
+<span class='line-number'>656</span>
+<span class='line-number'>657</span>
+<span class='line-number'>658</span>
+<span class='line-number'>659</span>
+<span class='line-number'>660</span>
+<span class='line-number'>661</span>
+<span class='line-number'>662</span>
+<span class='line-number'>663</span>
+<span class='line-number'>664</span>
+<span class='line-number'>665</span>
+<span class='line-number'>666</span>
+<span class='line-number'>667</span>
+<span class='line-number'>668</span>
+<span class='line-number'>669</span>
+<span class='line-number'>670</span>
+<span class='line-number'>671</span>
+<span class='line-number'>672</span>
+<span class='line-number'>673</span>
+<span class='line-number'>674</span>
+<span class='line-number'>675</span>
+<span class='line-number'>676</span>
+<span class='line-number'>677</span>
+<span class='line-number'>678</span>
+<span class='line-number'>679</span>
+<span class='line-number'>680</span>
+<span class='line-number'>681</span>
+<span class='line-number'>682</span>
+<span class='line-number'>683</span>
+<span class='line-number'>684</span>
+<span class='line-number'>685</span>
+<span class='line-number'>686</span>
+<span class='line-number'>687</span>
+<span class='line-number'>688</span>
+<span class='line-number'>689</span>
+<span class='line-number'>690</span>
+<span class='line-number'>691</span>
+<span class='line-number'>692</span>
+<span class='line-number'>693</span>
+<span class='line-number'>694</span>
+<span class='line-number'>695</span>
+<span class='line-number'>696</span>
+<span class='line-number'>697</span>
+<span class='line-number'>698</span>
+<span class='line-number'>699</span>
+<span class='line-number'>700</span>
+<span class='line-number'>701</span>
+<span class='line-number'>702</span>
+<span class='line-number'>703</span>
+<span class='line-number'>704</span>
+<span class='line-number'>705</span>
+<span class='line-number'>706</span>
+<span class='line-number'>707</span>
+<span class='line-number'>708</span>
+<span class='line-number'>709</span>
+<span class='line-number'>710</span>
+<span class='line-number'>711</span>
+<span class='line-number'>712</span>
+<span class='line-number'>713</span>
+<span class='line-number'>714</span>
+<span class='line-number'>715</span>
+<span class='line-number'>716</span>
+<span class='line-number'>717</span>
+<span class='line-number'>718</span>
+<span class='line-number'>719</span>
+<span class='line-number'>720</span>
+<span class='line-number'>721</span>
+<span class='line-number'>722</span>
+<span class='line-number'>723</span>
+<span class='line-number'>724</span>
+<span class='line-number'>725</span>
+<span class='line-number'>726</span>
+<span class='line-number'>727</span>
+<span class='line-number'>728</span>
+<span class='line-number'>729</span>
+<span class='line-number'>730</span>
+<span class='line-number'>731</span>
+<span class='line-number'>732</span>
+<span class='line-number'>733</span>
+<span class='line-number'>734</span>
+<span class='line-number'>735</span>
+<span class='line-number'>736</span>
+<span class='line-number'>737</span>
+<span class='line-number'>738</span>
+<span class='line-number'>739</span>
+<span class='line-number'>740</span>
+<span class='line-number'>741</span>
+<span class='line-number'>742</span>
+<span class='line-number'>743</span>
+<span class='line-number'>744</span>
+<span class='line-number'>745</span>
+<span class='line-number'>746</span>
+<span class='line-number'>747</span>
+<span class='line-number'>748</span>
+<span class='line-number'>749</span>
+<span class='line-number'>750</span>
+<span class='line-number'>751</span>
+<span class='line-number'>752</span>
+<span class='line-number'>753</span>
+<span class='line-number'>754</span>
+<span class='line-number'>755</span>
+<span class='line-number'>756</span>
+<span class='line-number'>757</span>
+<span class='line-number'>758</span>
+<span class='line-number'>759</span>
+<span class='line-number'>760</span>
+<span class='line-number'>761</span>
+<span class='line-number'>762</span>
+<span class='line-number'>763</span>
+<span class='line-number'>764</span>
+<span class='line-number'>765</span>
+<span class='line-number'>766</span>
+<span class='line-number'>767</span>
+<span class='line-number'>768</span>
+<span class='line-number'>769</span>
+<span class='line-number'>770</span>
+<span class='line-number'>771</span>
+<span class='line-number'>772</span>
+<span class='line-number'>773</span>
+<span class='line-number'>774</span>
+<span class='line-number'>775</span>
+<span class='line-number'>776</span>
+<span class='line-number'>777</span>
+<span class='line-number'>778</span>
+<span class='line-number'>779</span>
+<span class='line-number'>780</span>
+<span class='line-number'>781</span>
+<span class='line-number'>782</span>
+<span class='line-number'>783</span>
+<span class='line-number'>784</span>
+<span class='line-number'>785</span>
+<span class='line-number'>786</span>
+<span class='line-number'>787</span>
+<span class='line-number'>788</span>
+<span class='line-number'>789</span>
+<span class='line-number'>790</span>
+<span class='line-number'>791</span>
+<span class='line-number'>792</span>
+<span class='line-number'>793</span>
+<span class='line-number'>794</span>
+<span class='line-number'>795</span>
+<span class='line-number'>796</span>
+<span class='line-number'>797</span>
+<span class='line-number'>798</span>
+<span class='line-number'>799</span>
+<span class='line-number'>800</span>
+<span class='line-number'>801</span>
+<span class='line-number'>802</span>
+<span class='line-number'>803</span>
+<span class='line-number'>804</span>
+<span class='line-number'>805</span>
+<span class='line-number'>806</span>
+<span class='line-number'>807</span>
+<span class='line-number'>808</span>
+<span class='line-number'>809</span>
+<span class='line-number'>810</span>
+<span class='line-number'>811</span>
+<span class='line-number'>812</span>
+<span class='line-number'>813</span>
+<span class='line-number'>814</span>
+<span class='line-number'>815</span>
+<span class='line-number'>816</span>
+<span class='line-number'>817</span>
+<span class='line-number'>818</span>
+<span class='line-number'>819</span>
+<span class='line-number'>820</span>
+<span class='line-number'>821</span>
+<span class='line-number'>822</span>
+<span class='line-number'>823</span>
+<span class='line-number'>824</span>
+<span class='line-number'>825</span>
+<span class='line-number'>826</span>
+<span class='line-number'>827</span>
+<span class='line-number'>828</span>
+<span class='line-number'>829</span>
+<span class='line-number'>830</span>
+<span class='line-number'>831</span>
+<span class='line-number'>832</span>
+<span class='line-number'>833</span>
+<span class='line-number'>834</span>
+<span class='line-number'>835</span>
+<span class='line-number'>836</span>
+<span class='line-number'>837</span>
+<span class='line-number'>838</span>
+<span class='line-number'>839</span>
+<span class='line-number'>840</span>
+<span class='line-number'>841</span>
+<span class='line-number'>842</span>
+<span class='line-number'>843</span>
+<span class='line-number'>844</span>
+<span class='line-number'>845</span>
+<span class='line-number'>846</span>
+<span class='line-number'>847</span>
+<span class='line-number'>848</span>
+<span class='line-number'>849</span>
+<span class='line-number'>850</span>
+<span class='line-number'>851</span>
+<span class='line-number'>852</span>
+<span class='line-number'>853</span>
+<span class='line-number'>854</span>
+<span class='line-number'>855</span>
+<span class='line-number'>856</span>
+<span class='line-number'>857</span>
+<span class='line-number'>858</span>
+<span class='line-number'>859</span>
+<span class='line-number'>860</span>
+<span class='line-number'>861</span>
+<span class='line-number'>862</span>
+<span class='line-number'>863</span>
+<span class='line-number'>864</span>
+<span class='line-number'>865</span>
+<span class='line-number'>866</span>
+<span class='line-number'>867</span>
+<span class='line-number'>868</span>
+<span class='line-number'>869</span>
+<span class='line-number'>870</span>
+<span class='line-number'>871</span>
+<span class='line-number'>872</span>
+<span class='line-number'>873</span>
+<span class='line-number'>874</span>
+<span class='line-number'>875</span>
+<span class='line-number'>876</span>
+<span class='line-number'>877</span>
+<span class='line-number'>878</span>
+<span class='line-number'>879</span>
+<span class='line-number'>880</span>
+<span class='line-number'>881</span>
+<span class='line-number'>882</span>
+<span class='line-number'>883</span>
+<span class='line-number'>884</span>
+<span class='line-number'>885</span>
+<span class='line-number'>886</span>
+<span class='line-number'>887</span>
+<span class='line-number'>888</span>
+<span class='line-number'>889</span>
+<span class='line-number'>890</span>
+<span class='line-number'>891</span>
+<span class='line-number'>892</span>
+<span class='line-number'>893</span>
+<span class='line-number'>894</span>
+<span class='line-number'>895</span>
+<span class='line-number'>896</span>
+<span class='line-number'>897</span>
+<span class='line-number'>898</span>
+<span class='line-number'>899</span>
+<span class='line-number'>900</span>
+<span class='line-number'>901</span>
+<span class='line-number'>902</span>
+<span class='line-number'>903</span>
+<span class='line-number'>904</span>
+<span class='line-number'>905</span>
+<span class='line-number'>906</span>
+<span class='line-number'>907</span>
+<span class='line-number'>908</span>
+<span class='line-number'>909</span>
+<span class='line-number'>910</span>
+<span class='line-number'>911</span>
+<span class='line-number'>912</span>
+<span class='line-number'>913</span>
+<span class='line-number'>914</span>
+<span class='line-number'>915</span>
+<span class='line-number'>916</span>
+<span class='line-number'>917</span>
+<span class='line-number'>918</span>
+<span class='line-number'>919</span>
+<span class='line-number'>920</span>
+<span class='line-number'>921</span>
+<span class='line-number'>922</span>
+<span class='line-number'>923</span>
+<span class='line-number'>924</span>
+<span class='line-number'>925</span>
+<span class='line-number'>926</span>
+<span class='line-number'>927</span>
+<span class='line-number'>928</span>
+<span class='line-number'>929</span>
+<span class='line-number'>930</span>
+<span class='line-number'>931</span>
+<span class='line-number'>932</span>
+<span class='line-number'>933</span>
+<span class='line-number'>934</span>
+<span class='line-number'>935</span>
+<span class='line-number'>936</span>
+<span class='line-number'>937</span>
+<span class='line-number'>938</span>
+<span class='line-number'>939</span>
+<span class='line-number'>940</span>
+<span class='line-number'>941</span>
+<span class='line-number'>942</span>
+<span class='line-number'>943</span>
+<span class='line-number'>944</span>
+<span class='line-number'>945</span>
+<span class='line-number'>946</span>
+<span class='line-number'>947</span>
+<span class='line-number'>948</span>
+<span class='line-number'>949</span>
+<span class='line-number'>950</span>
+<span class='line-number'>951</span>
+<span class='line-number'>952</span>
+<span class='line-number'>953</span>
+<span class='line-number'>954</span>
+<span class='line-number'>955</span>
+<span class='line-number'>956</span>
+<span class='line-number'>957</span>
+<span class='line-number'>958</span>
+<span class='line-number'>959</span>
+<span class='line-number'>960</span>
+<span class='line-number'>961</span>
+<span class='line-number'>962</span>
+<span class='line-number'>963</span>
+<span class='line-number'>964</span>
+<span class='line-number'>965</span>
+<span class='line-number'>966</span>
+<span class='line-number'>967</span>
+<span class='line-number'>968</span>
+<span class='line-number'>969</span>
+<span class='line-number'>970</span>
+<span class='line-number'>971</span>
+<span class='line-number'>972</span>
+<span class='line-number'>973</span>
+<span class='line-number'>974</span>
+<span class='line-number'>975</span>
+<span class='line-number'>976</span>
+<span class='line-number'>977</span>
+<span class='line-number'>978</span>
+<span class='line-number'>979</span>
+<span class='line-number'>980</span>
+<span class='line-number'>981</span>
+<span class='line-number'>982</span>
+<span class='line-number'>983</span>
+<span class='line-number'>984</span>
+<span class='line-number'>985</span>
+<span class='line-number'>986</span>
+<span class='line-number'>987</span>
+<span class='line-number'>988</span>
+<span class='line-number'>989</span>
+<span class='line-number'>990</span>
+<span class='line-number'>991</span>
+<span class='line-number'>992</span>
+<span class='line-number'>993</span>
+<span class='line-number'>994</span>
+<span class='line-number'>995</span>
+<span class='line-number'>996</span>
+<span class='line-number'>997</span>
+<span class='line-number'>998</span>
+<span class='line-number'>999</span>
+<span class='line-number'>1000</span>
+<span class='line-number'>1001</span>
+<span class='line-number'>1002</span>
+<span class='line-number'>1003</span>
+<span class='line-number'>1004</span>
+<span class='line-number'>1005</span>
+<span class='line-number'>1006</span>
+<span class='line-number'>1007</span>
+<span class='line-number'>1008</span>
+<span class='line-number'>1009</span>
+<span class='line-number'>1010</span>
+<span class='line-number'>1011</span>
+<span class='line-number'>1012</span>
+<span class='line-number'>1013</span>
+<span class='line-number'>1014</span>
+<span class='line-number'>1015</span>
+<span class='line-number'>1016</span>
+<span class='line-number'>1017</span>
+<span class='line-number'>1018</span>
+<span class='line-number'>1019</span>
+<span class='line-number'>1020</span>
+<span class='line-number'>1021</span>
+<span class='line-number'>1022</span>
+<span class='line-number'>1023</span>
+<span class='line-number'>1024</span>
+<span class='line-number'>1025</span>
+<span class='line-number'>1026</span>
+<span class='line-number'>1027</span>
+<span class='line-number'>1028</span>
+<span class='line-number'>1029</span>
+<span class='line-number'>1030</span>
+<span class='line-number'>1031</span>
+<span class='line-number'>1032</span>
+<span class='line-number'>1033</span>
+<span class='line-number'>1034</span>
+<span class='line-number'>1035</span>
+<span class='line-number'>1036</span>
+<span class='line-number'>1037</span>
+<span class='line-number'>1038</span>
+<span class='line-number'>1039</span>
+<span class='line-number'>1040</span>
+<span class='line-number'>1041</span>
+<span class='line-number'>1042</span>
+<span class='line-number'>1043</span>
+<span class='line-number'>1044</span>
+<span class='line-number'>1045</span>
+<span class='line-number'>1046</span>
+<span class='line-number'>1047</span>
+<span class='line-number'>1048</span>
+<span class='line-number'>1049</span>
+<span class='line-number'>1050</span>
+<span class='line-number'>1051</span>
+<span class='line-number'>1052</span>
+<span class='line-number'>1053</span>
+<span class='line-number'>1054</span>
+<span class='line-number'>1055</span>
+<span class='line-number'>1056</span>
+<span class='line-number'>1057</span>
+<span class='line-number'>1058</span>
+<span class='line-number'>1059</span>
+<span class='line-number'>1060</span>
+<span class='line-number'>1061</span>
+<span class='line-number'>1062</span>
+<span class='line-number'>1063</span>
+<span class='line-number'>1064</span>
+<span class='line-number'>1065</span>
+<span class='line-number'>1066</span>
+<span class='line-number'>1067</span>
+<span class='line-number'>1068</span>
+<span class='line-number'>1069</span>
+<span class='line-number'>1070</span>
+<span class='line-number'>1071</span>
+<span class='line-number'>1072</span>
+<span class='line-number'>1073</span>
+<span class='line-number'>1074</span>
+<span class='line-number'>1075</span>
+<span class='line-number'>1076</span>
+<span class='line-number'>1077</span>
+<span class='line-number'>1078</span>
+<span class='line-number'>1079</span>
+<span class='line-number'>1080</span>
+<span class='line-number'>1081</span>
+<span class='line-number'>1082</span>
+<span class='line-number'>1083</span>
+<span class='line-number'>1084</span>
+<span class='line-number'>1085</span>
+<span class='line-number'>1086</span>
+<span class='line-number'>1087</span>
+<span class='line-number'>1088</span>
+<span class='line-number'>1089</span>
+<span class='line-number'>1090</span>
+<span class='line-number'>1091</span>
+<span class='line-number'>1092</span>
+<span class='line-number'>1093</span>
+<span class='line-number'>1094</span>
+<span class='line-number'>1095</span>
+<span class='line-number'>1096</span>
+<span class='line-number'>1097</span>
+<span class='line-number'>1098</span>
+<span class='line-number'>1099</span>
+<span class='line-number'>1100</span>
+<span class='line-number'>1101</span>
+<span class='line-number'>1102</span>
+<span class='line-number'>1103</span>
+<span class='line-number'>1104</span>
+<span class='line-number'>1105</span>
+<span class='line-number'>1106</span>
+<span class='line-number'>1107</span>
+<span class='line-number'>1108</span>
+<span class='line-number'>1109</span>
+<span class='line-number'>1110</span>
+<span class='line-number'>1111</span>
+<span class='line-number'>1112</span>
+<span class='line-number'>1113</span>
+<span class='line-number'>1114</span>
+<span class='line-number'>1115</span>
+<span class='line-number'>1116</span>
+<span class='line-number'>1117</span>
+<span class='line-number'>1118</span>
+<span class='line-number'>1119</span>
+<span class='line-number'>1120</span>
+<span class='line-number'>1121</span>
+<span class='line-number'>1122</span>
+<span class='line-number'>1123</span>
+<span class='line-number'>1124</span>
+<span class='line-number'>1125</span>
+<span class='line-number'>1126</span>
+<span class='line-number'>1127</span>
+<span class='line-number'>1128</span>
+<span class='line-number'>1129</span>
+<span class='line-number'>1130</span>
+<span class='line-number'>1131</span>
+<span class='line-number'>1132</span>
+<span class='line-number'>1133</span>
+<span class='line-number'>1134</span>
+<span class='line-number'>1135</span>
+<span class='line-number'>1136</span>
+<span class='line-number'>1137</span>
+<span class='line-number'>1138</span>
+<span class='line-number'>1139</span>
+<span class='line-number'>1140</span>
+<span class='line-number'>1141</span>
+<span class='line-number'>1142</span>
+<span class='line-number'>1143</span>
+<span class='line-number'>1144</span>
+<span class='line-number'>1145</span>
+<span class='line-number'>1146</span>
+<span class='line-number'>1147</span>
+<span class='line-number'>1148</span>
+<span class='line-number'>1149</span>
+<span class='line-number'>1150</span>
+<span class='line-number'>1151</span>
+<span class='line-number'>1152</span>
+<span class='line-number'>1153</span>
+<span class='line-number'>1154</span>
+<span class='line-number'>1155</span>
+<span class='line-number'>1156</span>
+<span class='line-number'>1157</span>
+<span class='line-number'>1158</span>
+<span class='line-number'>1159</span>
+<span class='line-number'>1160</span>
+<span class='line-number'>1161</span>
+<span class='line-number'>1162</span>
+<span class='line-number'>1163</span>
+<span class='line-number'>1164</span>
+<span class='line-number'>1165</span>
+<span class='line-number'>1166</span>
+<span class='line-number'>1167</span>
+<span class='line-number'>1168</span>
+<span class='line-number'>1169</span>
+<span class='line-number'>1170</span>
+<span class='line-number'>1171</span>
+<span class='line-number'>1172</span>
+<span class='line-number'>1173</span>
+<span class='line-number'>1174</span>
+<span class='line-number'>1175</span>
+<span class='line-number'>1176</span>
+<span class='line-number'>1177</span>
+<span class='line-number'>1178</span>
+<span class='line-number'>1179</span>
+<span class='line-number'>1180</span>
+<span class='line-number'>1181</span>
+<span class='line-number'>1182</span>
+<span class='line-number'>1183</span>
+<span class='line-number'>1184</span>
+<span class='line-number'>1185</span>
+<span class='line-number'>1186</span>
+<span class='line-number'>1187</span>
+<span class='line-number'>1188</span>
+<span class='line-number'>1189</span>
+<span class='line-number'>1190</span>
+<span class='line-number'>1191</span>
+<span class='line-number'>1192</span>
+<span class='line-number'>1193</span>
+<span class='line-number'>1194</span>
+<span class='line-number'>1195</span>
+<span class='line-number'>1196</span>
+<span class='line-number'>1197</span>
+<span class='line-number'>1198</span>
+<span class='line-number'>1199</span>
+<span class='line-number'>1200</span>
+<span class='line-number'>1201</span>
+<span class='line-number'>1202</span>
+<span class='line-number'>1203</span>
+<span class='line-number'>1204</span>
+<span class='line-number'>1205</span>
+<span class='line-number'>1206</span>
+<span class='line-number'>1207</span>
+<span class='line-number'>1208</span>
+<span class='line-number'>1209</span>
+<span class='line-number'>1210</span>
+<span class='line-number'>1211</span>
+<span class='line-number'>1212</span>
+<span class='line-number'>1213</span>
+<span class='line-number'>1214</span>
+<span class='line-number'>1215</span>
+<span class='line-number'>1216</span>
+<span class='line-number'>1217</span>
+<span class='line-number'>1218</span>
+<span class='line-number'>1219</span>
+<span class='line-number'>1220</span>
+<span class='line-number'>1221</span>
+<span class='line-number'>1222</span>
+<span class='line-number'>1223</span>
+<span class='line-number'>1224</span>
+<span class='line-number'>1225</span>
+<span class='line-number'>1226</span>
+<span class='line-number'>1227</span>
+<span class='line-number'>1228</span>
+<span class='line-number'>1229</span>
+<span class='line-number'>1230</span>
+<span class='line-number'>1231</span>
+<span class='line-number'>1232</span>
+<span class='line-number'>1233</span>
+<span class='line-number'>1234</span>
+<span class='line-number'>1235</span>
+<span class='line-number'>1236</span>
+<span class='line-number'>1237</span>
+<span class='line-number'>1238</span>
+<span class='line-number'>1239</span>
+<span class='line-number'>1240</span>
+<span class='line-number'>1241</span>
+<span class='line-number'>1242</span>
+<span class='line-number'>1243</span>
+<span class='line-number'>1244</span>
+<span class='line-number'>1245</span>
+<span class='line-number'>1246</span>
+<span class='line-number'>1247</span>
+<span class='line-number'>1248</span>
+<span class='line-number'>1249</span>
+<span class='line-number'>1250</span>
+<span class='line-number'>1251</span>
+<span class='line-number'>1252</span>
+<span class='line-number'>1253</span>
+<span class='line-number'>1254</span>
+<span class='line-number'>1255</span>
+<span class='line-number'>1256</span>
+<span class='line-number'>1257</span>
+<span class='line-number'>1258</span>
+<span class='line-number'>1259</span>
+<span class='line-number'>1260</span>
+<span class='line-number'>1261</span>
+<span class='line-number'>1262</span>
+<span class='line-number'>1263</span>
+<span class='line-number'>1264</span>
+<span class='line-number'>1265</span>
+<span class='line-number'>1266</span>
+<span class='line-number'>1267</span>
+<span class='line-number'>1268</span>
+<span class='line-number'>1269</span>
+<span class='line-number'>1270</span>
+<span class='line-number'>1271</span>
+<span class='line-number'>1272</span>
+<span class='line-number'>1273</span>
+<span class='line-number'>1274</span>
+<span class='line-number'>1275</span>
+<span class='line-number'>1276</span>
+<span class='line-number'>1277</span>
+<span class='line-number'>1278</span>
+<span class='line-number'>1279</span>
+<span class='line-number'>1280</span>
+<span class='line-number'>1281</span>
+<span class='line-number'>1282</span>
+<span class='line-number'>1283</span>
+<span class='line-number'>1284</span>
+<span class='line-number'>1285</span>
+<span class='line-number'>1286</span>
+<span class='line-number'>1287</span>
+<span class='line-number'>1288</span>
+<span class='line-number'>1289</span>
+<span class='line-number'>1290</span>
+<span class='line-number'>1291</span>
+<span class='line-number'>1292</span>
+<span class='line-number'>1293</span>
+<span class='line-number'>1294</span>
+<span class='line-number'>1295</span>
+<span class='line-number'>1296</span>
+<span class='line-number'>1297</span>
+<span class='line-number'>1298</span>
+<span class='line-number'>1299</span>
+<span class='line-number'>1300</span>
+<span class='line-number'>1301</span>
+<span class='line-number'>1302</span>
+<span class='line-number'>1303</span>
+<span class='line-number'>1304</span>
+<span class='line-number'>1305</span>
+<span class='line-number'>1306</span>
+<span class='line-number'>1307</span>
+<span class='line-number'>1308</span>
+<span class='line-number'>1309</span>
+<span class='line-number'>1310</span>
+<span class='line-number'>1311</span>
+<span class='line-number'>1312</span>
+<span class='line-number'>1313</span>
+<span class='line-number'>1314</span>
+<span class='line-number'>1315</span>
+<span class='line-number'>1316</span>
+<span class='line-number'>1317</span>
+<span class='line-number'>1318</span>
+<span class='line-number'>1319</span>
+<span class='line-number'>1320</span>
+<span class='line-number'>1321</span>
+<span class='line-number'>1322</span>
+<span class='line-number'>1323</span>
+<span class='line-number'>1324</span>
+<span class='line-number'>1325</span>
+<span class='line-number'>1326</span>
+<span class='line-number'>1327</span>
+<span class='line-number'>1328</span>
+<span class='line-number'>1329</span>
+<span class='line-number'>1330</span>
+<span class='line-number'>1331</span>
+<span class='line-number'>1332</span>
+<span class='line-number'>1333</span>
+<span class='line-number'>1334</span>
+<span class='line-number'>1335</span>
+<span class='line-number'>1336</span>
+<span class='line-number'>1337</span>
+<span class='line-number'>1338</span>
+<span class='line-number'>1339</span>
+<span class='line-number'>1340</span>
+<span class='line-number'>1341</span>
+<span class='line-number'>1342</span>
+<span class='line-number'>1343</span>
+<span class='line-number'>1344</span>
+<span class='line-number'>1345</span>
+<span class='line-number'>1346</span>
+<span class='line-number'>1347</span>
+<span class='line-number'>1348</span>
+<span class='line-number'>1349</span>
+<span class='line-number'>1350</span>
+<span class='line-number'>1351</span>
+<span class='line-number'>1352</span>
+<span class='line-number'>1353</span>
+<span class='line-number'>1354</span>
+<span class='line-number'>1355</span>
+<span class='line-number'>1356</span>
+<span class='line-number'>1357</span>
+<span class='line-number'>1358</span>
+<span class='line-number'>1359</span>
+<span class='line-number'>1360</span>
+<span class='line-number'>1361</span>
+<span class='line-number'>1362</span>
+<span class='line-number'>1363</span>
+<span class='line-number'>1364</span>
+<span class='line-number'>1365</span>
+<span class='line-number'>1366</span>
+<span class='line-number'>1367</span>
+<span class='line-number'>1368</span>
+<span class='line-number'>1369</span>
+<span class='line-number'>1370</span>
+<span class='line-number'>1371</span>
+<span class='line-number'>1372</span>
+<span class='line-number'>1373</span>
+<span class='line-number'>1374</span>
+<span class='line-number'>1375</span>
+<span class='line-number'>1376</span>
+<span class='line-number'>1377</span>
+<span class='line-number'>1378</span>
+<span class='line-number'>1379</span>
+<span class='line-number'>1380</span>
+<span class='line-number'>1381</span>
+<span class='line-number'>1382</span>
+<span class='line-number'>1383</span>
+<span class='line-number'>1384</span>
+<span class='line-number'>1385</span>
+<span class='line-number'>1386</span>
+<span class='line-number'>1387</span>
+<span class='line-number'>1388</span>
+<span class='line-number'>1389</span>
+<span class='line-number'>1390</span>
+<span class='line-number'>1391</span>
+<span class='line-number'>1392</span>
+<span class='line-number'>1393</span>
+<span class='line-number'>1394</span>
+<span class='line-number'>1395</span>
+<span class='line-number'>1396</span>
+<span class='line-number'>1397</span>
+<span class='line-number'>1398</span>
+<span class='line-number'>1399</span>
+<span class='line-number'>1400</span>
+<span class='line-number'>1401</span>
+<span class='line-number'>1402</span>
+<span class='line-number'>1403</span>
+<span class='line-number'>1404</span>
+<span class='line-number'>1405</span>
+<span class='line-number'>1406</span>
+<span class='line-number'>1407</span>
+<span class='line-number'>1408</span>
+<span class='line-number'>1409</span>
+<span class='line-number'>1410</span>
+<span class='line-number'>1411</span>
+<span class='line-number'>1412</span>
+<span class='line-number'>1413</span>
+<span class='line-number'>1414</span>
+<span class='line-number'>1415</span>
+<span class='line-number'>1416</span>
+<span class='line-number'>1417</span>
+<span class='line-number'>1418</span>
+<span class='line-number'>1419</span>
+<span class='line-number'>1420</span>
+<span class='line-number'>1421</span>
+<span class='line-number'>1422</span>
+<span class='line-number'>1423</span>
+<span class='line-number'>1424</span>
+<span class='line-number'>1425</span>
+<span class='line-number'>1426</span>
+<span class='line-number'>1427</span>
+<span class='line-number'>1428</span>
+<span class='line-number'>1429</span>
+<span class='line-number'>1430</span>
+<span class='line-number'>1431</span>
+<span class='line-number'>1432</span>
+<span class='line-number'>1433</span>
+<span class='line-number'>1434</span>
+<span class='line-number'>1435</span>
+<span class='line-number'>1436</span>
+<span class='line-number'>1437</span>
+<span class='line-number'>1438</span>
+<span class='line-number'>1439</span>
+<span class='line-number'>1440</span>
+<span class='line-number'>1441</span>
+<span class='line-number'>1442</span>
+<span class='line-number'>1443</span>
+<span class='line-number'>1444</span>
+<span class='line-number'>1445</span>
+<span class='line-number'>1446</span>
+<span class='line-number'>1447</span>
+<span class='line-number'>1448</span>
+<span class='line-number'>1449</span>
+<span class='line-number'>1450</span>
+<span class='line-number'>1451</span>
+<span class='line-number'>1452</span>
+<span class='line-number'>1453</span>
+<span class='line-number'>1454</span>
+<span class='line-number'>1455</span>
+<span class='line-number'>1456</span>
+<span class='line-number'>1457</span>
+<span class='line-number'>1458</span>
+<span class='line-number'>1459</span>
+<span class='line-number'>1460</span>
+<span class='line-number'>1461</span>
+<span class='line-number'>1462</span>
+<span class='line-number'>1463</span>
+<span class='line-number'>1464</span>
+<span class='line-number'>1465</span>
+<span class='line-number'>1466</span>
+<span class='line-number'>1467</span>
+<span class='line-number'>1468</span>
+<span class='line-number'>1469</span>
+<span class='line-number'>1470</span>
+<span class='line-number'>1471</span>
+<span class='line-number'>1472</span>
+<span class='line-number'>1473</span>
+<span class='line-number'>1474</span>
+<span class='line-number'>1475</span>
+<span class='line-number'>1476</span>
+<span class='line-number'>1477</span>
+<span class='line-number'>1478</span>
+<span class='line-number'>1479</span>
+<span class='line-number'>1480</span>
+<span class='line-number'>1481</span>
+<span class='line-number'>1482</span>
+<span class='line-number'>1483</span>
+<span class='line-number'>1484</span>
+<span class='line-number'>1485</span>
+<span class='line-number'>1486</span>
+<span class='line-number'>1487</span>
+<span class='line-number'>1488</span>
+<span class='line-number'>1489</span>
+<span class='line-number'>1490</span>
+<span class='line-number'>1491</span>
+<span class='line-number'>1492</span>
+<span class='line-number'>1493</span>
+<span class='line-number'>1494</span>
+<span class='line-number'>1495</span>
+<span class='line-number'>1496</span>
+<span class='line-number'>1497</span>
+<span class='line-number'>1498</span>
+<span class='line-number'>1499</span>
+<span class='line-number'>1500</span>
+<span class='line-number'>1501</span>
+<span class='line-number'>1502</span>
+<span class='line-number'>1503</span>
+<span class='line-number'>1504</span>
+<span class='line-number'>1505</span>
+<span class='line-number'>1506</span>
+<span class='line-number'>1507</span>
+<span class='line-number'>1508</span>
+<span class='line-number'>1509</span>
+<span class='line-number'>1510</span>
+<span class='line-number'>1511</span>
+<span class='line-number'>1512</span>
+<span class='line-number'>1513</span>
+<span class='line-number'>1514</span>
+<span class='line-number'>1515</span>
+<span class='line-number'>1516</span>
+<span class='line-number'>1517</span>
+<span class='line-number'>1518</span>
+<span class='line-number'>1519</span>
+<span class='line-number'>1520</span>
+<span class='line-number'>1521</span>
+<span class='line-number'>1522</span>
+<span class='line-number'>1523</span>
+<span class='line-number'>1524</span>
+<span class='line-number'>1525</span>
+<span class='line-number'>1526</span>
+<span class='line-number'>1527</span>
+<span class='line-number'>1528</span>
+<span class='line-number'>1529</span>
+<span class='line-number'>1530</span>
+<span class='line-number'>1531</span>
+<span class='line-number'>1532</span>
+<span class='line-number'>1533</span>
+<span class='line-number'>1534</span>
+<span class='line-number'>1535</span>
+<span class='line-number'>1536</span>
+<span class='line-number'>1537</span>
+<span class='line-number'>1538</span>
+<span class='line-number'>1539</span>
+<span class='line-number'>1540</span>
+<span class='line-number'>1541</span>
+<span class='line-number'>1542</span>
+<span class='line-number'>1543</span>
+<span class='line-number'>1544</span>
+<span class='line-number'>1545</span>
+<span class='line-number'>1546</span>
+<span class='line-number'>1547</span>
+<span class='line-number'>1548</span>
+<span class='line-number'>1549</span>
+<span class='line-number'>1550</span>
+<span class='line-number'>1551</span>
+<span class='line-number'>1552</span>
+<span class='line-number'>1553</span>
+<span class='line-number'>1554</span>
+<span class='line-number'>1555</span>
+<span class='line-number'>1556</span>
+<span class='line-number'>1557</span>
+<span class='line-number'>1558</span>
+<span class='line-number'>1559</span>
+<span class='line-number'>1560</span>
+<span class='line-number'>1561</span>
+<span class='line-number'>1562</span>
+<span class='line-number'>1563</span>
+<span class='line-number'>1564</span>
+<span class='line-number'>1565</span>
+<span class='line-number'>1566</span>
+<span class='line-number'>1567</span>
+<span class='line-number'>1568</span>
+<span class='line-number'>1569</span>
+<span class='line-number'>1570</span>
+<span class='line-number'>1571</span>
+<span class='line-number'>1572</span>
+<span class='line-number'>1573</span>
+<span class='line-number'>1574</span>
+<span class='line-number'>1575</span>
+<span class='line-number'>1576</span>
+<span class='line-number'>1577</span>
+<span class='line-number'>1578</span>
+<span class='line-number'>1579</span>
+<span class='line-number'>1580</span>
+<span class='line-number'>1581</span>
+<span class='line-number'>1582</span>
+<span class='line-number'>1583</span>
+<span class='line-number'>1584</span>
+<span class='line-number'>1585</span>
+<span class='line-number'>1586</span>
+<span class='line-number'>1587</span>
+<span class='line-number'>1588</span>
+<span class='line-number'>1589</span>
+<span class='line-number'>1590</span>
+<span class='line-number'>1591</span>
+<span class='line-number'>1592</span>
+<span class='line-number'>1593</span>
+<span class='line-number'>1594</span>
+<span class='line-number'>1595</span>
+<span class='line-number'>1596</span>
+<span class='line-number'>1597</span>
+<span class='line-number'>1598</span>
+<span class='line-number'>1599</span>
+<span class='line-number'>1600</span>
+<span class='line-number'>1601</span>
+<span class='line-number'>1602</span>
+<span class='line-number'>1603</span>
+<span class='line-number'>1604</span>
+<span class='line-number'>1605</span>
+<span class='line-number'>1606</span>
+<span class='line-number'>1607</span>
+<span class='line-number'>1608</span>
+<span class='line-number'>1609</span>
+<span class='line-number'>1610</span>
+<span class='line-number'>1611</span>
+<span class='line-number'>1612</span>
+<span class='line-number'>1613</span>
+<span class='line-number'>1614</span>
+<span class='line-number'>1615</span>
+<span class='line-number'>1616</span>
+<span class='line-number'>1617</span>
+<span class='line-number'>1618</span>
+<span class='line-number'>1619</span>
+<span class='line-number'>1620</span>
+<span class='line-number'>1621</span>
+<span class='line-number'>1622</span>
+<span class='line-number'>1623</span>
+<span class='line-number'>1624</span>
+<span class='line-number'>1625</span>
+<span class='line-number'>1626</span>
+<span class='line-number'>1627</span>
+<span class='line-number'>1628</span>
+<span class='line-number'>1629</span>
+<span class='line-number'>1630</span>
+<span class='line-number'>1631</span>
+<span class='line-number'>1632</span>
+<span class='line-number'>1633</span>
+<span class='line-number'>1634</span>
+<span class='line-number'>1635</span>
+<span class='line-number'>1636</span>
+<span class='line-number'>1637</span>
+<span class='line-number'>1638</span>
+<span class='line-number'>1639</span>
+<span class='line-number'>1640</span>
+<span class='line-number'>1641</span>
+<span class='line-number'>1642</span>
+<span class='line-number'>1643</span>
+<span class='line-number'>1644</span>
+<span class='line-number'>1645</span>
+<span class='line-number'>1646</span>
+<span class='line-number'>1647</span>
+<span class='line-number'>1648</span>
+<span class='line-number'>1649</span>
+<span class='line-number'>1650</span>
+<span class='line-number'>1651</span>
+<span class='line-number'>1652</span>
+<span class='line-number'>1653</span>
+<span class='line-number'>1654</span>
+<span class='line-number'>1655</span>
+<span class='line-number'>1656</span>
+<span class='line-number'>1657</span>
+<span class='line-number'>1658</span>
+<span class='line-number'>1659</span>
+<span class='line-number'>1660</span>
+<span class='line-number'>1661</span>
+<span class='line-number'>1662</span>
+<span class='line-number'>1663</span>
+<span class='line-number'>1664</span>
+<span class='line-number'>1665</span>
+<span class='line-number'>1666</span>
+<span class='line-number'>1667</span>
+<span class='line-number'>1668</span>
+<span class='line-number'>1669</span>
+<span class='line-number'>1670</span>
+<span class='line-number'>1671</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/&lt;em&gt;
+</span><span class='line'> * Structure for NAPI scheduling similar to tasklet but with weighting
+</span><span class='line'>&lt;/em&gt;/
+</span><span class='line'>struct napi_struct {
+</span><span class='line'>    /&lt;em&gt; The poll_list must only be managed by the entity which
+</span><span class='line'>     * changes the state of the NAPI_STATE_SCHED bit.  This means
+</span><span class='line'>     * whoever atomically sets that bit can add this napi_struct
+</span><span class='line'>     * to the per-cpu poll_list, and whoever clears that bit
+</span><span class='line'>     * can remove from the list right before clearing the bit.
+</span><span class='line'>     &lt;/em&gt;/
+</span><span class='line'>    struct list_head      poll_list;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    unsigned long          state; 
+</span><span class='line'>int              weight; 
+</span><span class='line'>int              (*poll)(struct napi_struct *, int); 
+</span><span class='line'> #ifdef CONFIG_NETPOLL 
+</span><span class='line'>spinlock_t          poll_lock; 
+</span><span class='line'>int              poll_owner; 
+</span><span class='line'> #endif 
+</span><span class='line'>
+</span><span class='line'>unsigned int          gro_count; 
+</span><span class='line'>
+</span><span class='line'>struct net_device      *dev; 
+</span><span class='line'>struct list_head      dev_list; 
+</span><span class='line'>struct sk_buff          *gro_list; 
+</span><span class='line'>struct sk_buff          *skb; 
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>熟悉老的 NAPI 接口实现的话，里面的字段 poll_list、state、weight、poll、dev、没什么好说的，gro_count 和 gro_list 会在后面讲述 GRO 时候会讲述。需要注意的是，与之前的 NAPI 实现的最大的区别是该结构体不再是 net_device 的一部分，事实上，现在希望网卡驱动自己单独分配与管理 napi 实例，通常将其放在了网卡驱动的私有信息，这样最主要的好处在于，如果驱动愿意，可以创建多个 napi_struct，因为现在越来越多的硬件已经开始支持多接收队列 (multiple receive queues)，这样，多个 napi_struct 的实现使得多队列的使用也更加的有效。
+</span><span class='line'>
+</span><span class='line'>与最初的 NAPI 相比较，轮询函数的注册有些变化，现在使用的新接口是：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void netif_napi_add(struct net_device *dev, struct napi_struct *napi, 
+</span><span class='line'>                int (*poll)(struct napi_struct *, int), int weight)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>熟悉老的 NAPI 接口的话，这个函数也没什么好说的。
+</span><span class='line'>
+</span><span class='line'>值得注意的是，前面的轮询 poll() 方法原型也开始需要一些小小的改变：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;int (*poll)(struct napi_struct *napi, int budget);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>大部分 NAPI 相关的函数也需要改变之前的原型，下面是打开轮询功能的 API：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void netif_rx_schedule(struct net_device *dev, 
+</span><span class='line'>                    struct napi_struct *napi); 
+</span><span class='line'>/* ...or... */ 
+</span><span class='line'>int netif_rx_schedule_prep(struct net_device *dev, 
+</span><span class='line'>                    struct napi_struct *napi); 
+</span><span class='line'>void __netif_rx_schedule(struct net_device *dev, 
+</span><span class='line'>                    struct napi_struct *napi);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>轮询功能的关闭则需要使用：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void netif_rx_complete(struct net_device *dev, 
+</span><span class='line'>                    struct napi_struct *napi);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>因为可能存在多个 napi_struct 的实例，要求每个实例能够独立的使能或者禁止，因此，需要驱动作者保证在网卡接口关闭时，禁止所有的 napi_struct 的实例。
+</span><span class='line'>
+</span><span class='line'>函数 netif_poll_enable() 和 netif_poll_disable() 不再需要，因为轮询管理不再和 net_device 直接管理，取而代之的是下面的两个函数：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void napi_enable(struct napi *napi); 
+</span><span class='line'>void napi_disable(struct napi *napi);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[linux下ip协议(V4)的实现]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-ipv4/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-08-25T23:34:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-ipv4&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;这次主要介绍的是ip层的切片与组包的实现。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先来看一下分片好的帧的一些概念：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 第一个帧的offset位非0并且MF位为1&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 所有的在第一个帧和最后一个帧之间的帧都拥有长度大于0的域&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3 最后一个帧MF位为0 并且offset位非0。(这样就能判断是否是最后一个帧了).&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里要注意在linux中，ip头的frag_off域包含了 rfcip头的定义中的nf,df,以及offset域，因此我们每次需要按位与来取得相应的域的值,看下面&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_local_deliver的代码片段就清楚了：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        // 取出mf位和offset域，从而决定是否要组包。
+</span><span class='line'>    if (ip_hdr(skb)-&gt;frag_off &amp; htons(IP_MF | IP_OFFSET)) {
+</span><span class='line'>        if (ip_defrag(skb, IP_DEFRAG_LOCAL_DELIVER))
+</span><span class='line'>            return 0;
+</span><span class='line'>    }
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而fragmentation/defragmentation 子系统的初始化是通过ipfrag_init来实现了，而它是被inet_init来调用的。它主要做的是注册sys文件系统节点，并开启一个定时器，以及初始化一些相关的变量.这个函数的初始化以及相关的数据结构的详细介绍，我们会在后面的组包小节中介绍。现在我们先来看切片的处理。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;相对于组包，切片逻辑什么的都比较简单。切片的主要函数是ip_fragment.它的输入包包括下面几种：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 要被转发的包(没有切片的)。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 要被转发的包(已经被路由器或者源主机切片了的).&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3 被本地函数所创建的buffer，简而言之也就是本地所要传输的数据包(还未加包头)，但是需要被切片的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;而ip_fragment所必须处理下面几种情况：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 一大块数据需要被分割为更小的部分。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 一堆数据片段(我的上篇blog有介绍，也就是ip_append_data已经切好的数据包，或者tcp已经切好的数据包)不需要再被切片。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;上面的两种情况其实就是看高层(4层)协议有没有做切片工作(按照PMTU）了。如果已经被切片(其实也算不上切片(4层不能处理ip头)，只能说i4层为了ip层更好的处理数据包，从而帮ip层做了一部分工作)，则ip层所做的很简单，就是给每个包加上ip头就可以了。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;切片分为两种类型，一种是fast (或者说 efficient)切片，这种也就是4层已经切好片，这里只需要加上ip头就可以了，一种是slow切片，也就是需要现在切片。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下来来看切片的主要任务：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 将数据包切片为MTU大小(通过ptmu).&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 初始化每一个fragment的ip 头。还要判断一些option的copy位，因为并不是每一种option都要放在所有已切片的fragment 的ip头中的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3 计算ip层的校验值。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;4 通过netfilter过滤。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;5 update 一些kernel 域以及snmp 统计值。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看ip_fragment的具体实现：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff*))
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;第一个参数skb表示将要被切片的ip包，第二个参数是一个传输切片的输出函数(切片完毕后就交给这个函数处理)。比如ip_finish_output2类似的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这个函数我们来分段看，首先来看它进行切片前的一些准备工作：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        // 先是取出了一些下面将要使用的变量。
+</span><span class='line'>    struct iphdr *iph;
+</span><span class='line'>    int raw = 0;
+</span><span class='line'>    int ptr;
+</span><span class='line'>    struct net_device *dev;
+</span><span class='line'>    struct sk_buff *skb2;
+</span><span class='line'>    unsigned int mtu, hlen, left, len, ll_rs, pad;
+</span><span class='line'>    int offset;
+</span><span class='line'>    __be16 not_last_frag;
+</span><span class='line'>    // 路由表
+</span><span class='line'>    struct rtable *rt = skb-&gt;rtable;
+</span><span class='line'>    int err = 0;
+</span><span class='line'>    // 网络设备
+</span><span class='line'>    dev = rt-&gt;u.dst.dev;
+</span><span class='line'>
+</span><span class='line'>    // ip头
+</span><span class='line'>    iph = ip_hdr(skb);
+</span><span class='line'>    // 判断DF位，我们知道如果df位被设置了话就表示不要被切片，这时ip_fragment将会发送一个icmp豹纹返回到源主机。这里主要是为forward数据所判断。
+</span><span class='line'>    if (unlikely((iph-&gt;frag_off &amp; htons(IP_DF)) &amp;&amp; !skb-&gt;local_df)) {
+</span><span class='line'>        IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+</span><span class='line'>        icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+</span><span class='line'>              htonl(ip_skb_dst_mtu(skb)));
+</span><span class='line'>        kfree_skb(skb);
+</span><span class='line'>        return -EMSGSIZE;
+</span><span class='line'>    }
+</span><span class='line'>    // 得到ip头的长度
+</span><span class='line'>    hlen = iph-&gt;ihl * 4;
+</span><span class='line'>    // 得到mtu的大小。这里要注意，他的大小减去了hlen，也就是ip头的大小。
+</span><span class='line'>    mtu = dst_mtu(&amp;rt-&gt;u.dst) - hlen;    /* Size of data space */
+</span><span class='line'>    IPCB(skb)-&gt;flags |= IPSKB_FRAG_COMPLETE;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;不管是slow还是fast 被切片的任何一个帧如果传输失败，ip_fragment都会立即返回一个错误给4层，并且紧跟着的帧也不会再被传输，然后将处理方法交给4层去做。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来我们来看fast 切片。 一般用fast切片的都是经由4层的ip_append_data和ip_push_pending函数(udp)将数据包已经切片好的，或者是tcp层已经切片好的数据包，才会用fast切片.&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里要主要几个问题：&lt;br/&gt;
+</span><span class='line'>1 每一个切片的大小都不能超过PMTU。&lt;br/&gt;
+</span><span class='line'>2 只有最后一个切片才会有3层的整个数据包的大小。&lt;br/&gt;
+</span><span class='line'>3 每一个切片都必须有足够的大小来允许2层加上自己的头。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们先看一下skb_pagelen这个函数(下面的处理会用到),这个函数用来得到当前skb的len，首先我们要知道(我前面的blog有介绍)在sk_write_queue的sk_buff队列中，每一个sk_buff的len = x(也就是么一个第一个切片的包的l4 payload的长度) + S1 (这里表示所有的frags域的数据的总大小，也就是data_len的长度)。可以先看下面的图：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-21.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;很容易一目了然。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int skb_pagelen(const struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    int i, len = 0;
+</span><span class='line'>    // 我们知道如果设备支持S/G IO的话，nr_frags会包含一些L4 payload，因此我们需要先遍历nr_frags.然后加入它的长度。
+</span><span class='line'>    for (i = (int)skb_shinfo(skb)-&gt;nr_frags - 1; i &gt;= 0; i--)
+</span><span class='line'>        len += skb_shinfo(skb)-&gt;frags[i].size;
+</span><span class='line'>    // 最后加上skb_headlen,而skb_headlen = skb-&gt;len - skb-&gt;data_len;因此这里就会返回这个数据包的len。
+</span><span class='line'>    return len + skb_headlen(skb);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        // 通过上一篇blog我们知道，如果4层将数据包分片了，那么就会把这些数据包放到skb的frag_list链表中，因此我们这里首先先判断frag_list链表是否为空，为空的话我们将会进行slow 切片。
+</span><span class='line'>    if (skb_shinfo(skb)-&gt;frag_list) {
+</span><span class='line'>        struct sk_buff *frag;
+</span><span class='line'>        // 取得第一个数据报的len.我们知道当sk_write_queue队列被flush后，除了第一个切好包的另外的包都会加入到frag_list中，而这里我们我们需要得到的第一个包(也就是本身这个sk_buff）的长度。
+</span><span class='line'>        int first_len = skb_pagelen(skb);
+</span><span class='line'>        int truesizes = 0;
+</span><span class='line'>        // 接下来的判断都是为了确定我们能进行fast切片。切片不能被共享，这是因为在fast path 中，我们需要加给每个切片不同的ip头(而并不会复制每个切片)。因此在fast path中是不可接受的。而在slow path中，就算有共享也无所谓，因为他会复制每一个切片，使用一个新的buff。
+</span><span class='line'>
+</span><span class='line'>        // 判断第一个包长度是否符合一些限制(包括mtu，mf位等一些限制).如果第一个数据报的len没有包含mtu的大小这里之所以要把第一个切好片的数据包单独拿出来检测，是因为一些域是第一个包所独有的(比如IP_MF要为1）。这里由于这个mtu是不包括hlen的mtu，因此我们需要减去一个hlen。
+</span><span class='line'>        if (first_len - hlen &gt; mtu ||
+</span><span class='line'>            ((first_len - hlen) &amp; 7) ||
+</span><span class='line'>            (iph-&gt;frag_off &amp; htons(IP_MF|IP_OFFSET)) ||
+</span><span class='line'>            skb_cloned(skb))
+</span><span class='line'>            goto slow_path;
+</span><span class='line'>        // 遍历剩余的frag。
+</span><span class='line'>        for (frag = skb_shinfo(skb)-&gt;frag_list; frag; frag = frag-&gt;next) {
+</span><span class='line'>            /* Correct geometry. */
+</span><span class='line'>            // 判断每个帧的mtu，以及相关的东西，如果不符合条件则要进行slow path,基本和上面的第一个skb的判断类似。
+</span><span class='line'>            if (frag-&gt;len &gt; mtu ||
+</span><span class='line'>                ((frag-&gt;len &amp; 7) &amp;&amp; frag-&gt;next) ||
+</span><span class='line'>                skb_headroom(frag) &lt; hlen)
+</span><span class='line'>                goto slow_path;
+</span><span class='line'>            // 判断是否共享。
+</span><span class='line'>            /* Partially cloned skb? */
+</span><span class='line'>            if (skb_shared(frag))
+</span><span class='line'>                goto slow_path;
+</span><span class='line'>
+</span><span class='line'>            BUG_ON(frag-&gt;sk);
+</span><span class='line'>            // 进行socket的一些操作。
+</span><span class='line'>            if (skb-&gt;sk) {
+</span><span class='line'>                sock_hold(skb-&gt;sk);
+</span><span class='line'>                frag-&gt;sk = skb-&gt;sk;
+</span><span class='line'>                frag-&gt;destructor = sock_wfree;
+</span><span class='line'>                truesizes += frag-&gt;truesize;
+</span><span class='line'>            }
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        // 通过上面的检测，都通过了，因此我们可以进行fast path切片了。
+</span><span class='line'>
+</span><span class='line'>        // 先是设置一些将要处理的变量的值。
+</span><span class='line'>        err = 0;
+</span><span class='line'>        offset = 0;
+</span><span class='line'>        // 取得frag_list列表
+</span><span class='line'>        frag = skb_shinfo(skb)-&gt;frag_list;
+</span><span class='line'>        skb_shinfo(skb)-&gt;frag_list = NULL;
+</span><span class='line'>
+</span><span class='line'>        // 得到数据(不包括头)的大小。
+</span><span class='line'>        skb-&gt;data_len = first_len - skb_headlen(skb);
+</span><span class='line'>        skb-&gt;truesize -= truesizes;
+</span><span class='line'>        // 得到
+</span><span class='line'>        skb-&gt;len = first_len;
+</span><span class='line'>        iph-&gt;tot_len = htons(first_len);
+</span><span class='line'>        // 设置mf位
+</span><span class='line'>        iph-&gt;frag_off = htons(IP_MF);
+</span><span class='line'>        // 执行校验
+</span><span class='line'>        ip_send_check(iph);
+</span><span class='line'>
+</span><span class='line'>        for (;;) {
+</span><span class='line'>            // 开始进行发送。
+</span><span class='line'>            if (frag) {
+</span><span class='line'>                // 设置校验位
+</span><span class='line'>                frag-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>                // 设置相应的头部。
+</span><span class='line'>                skb_reset_transport_header(frag);
+</span><span class='line'>                __skb_push(frag, hlen);
+</span><span class='line'>                skb_reset_network_header(frag);
+</span><span class='line'>                // 复制ip头。
+</span><span class='line'>                memcpy(skb_network_header(frag), iph, hlen);
+</span><span class='line'>                // 修改每个切片的ip头的一些属性。
+</span><span class='line'>                iph = ip_hdr(frag);
+</span><span class='line'>                iph-&gt;tot_len = htons(frag-&gt;len);
+</span><span class='line'>                // 将当前skb的一些属性付给将要传递的切片好的帧。
+</span><span class='line'>                ip_copy_metadata(frag, skb);
+</span><span class='line'>                if (offset == 0)
+</span><span class='line'>                // 处理ip_option
+</span><span class='line'>                    ip_options_fragment(frag);
+</span><span class='line'>                offset += skb-&gt;len - hlen;
+</span><span class='line'>                // 设置位移。
+</span><span class='line'>                iph-&gt;frag_off = htons(offset&gt;&gt;3);
+</span><span class='line'>                if (frag-&gt;next != NULL)
+</span><span class='line'>                    iph-&gt;frag_off |= htons(IP_MF);
+</span><span class='line'>                /* Ready, complete checksum */
+</span><span class='line'>                ip_send_check(iph);
+</span><span class='line'>            }
+</span><span class='line'>            // 调用输出函数。
+</span><span class='line'>            err = output(skb);
+</span><span class='line'>
+</span><span class='line'>            if (!err)
+</span><span class='line'>                IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGCREATES);
+</span><span class='line'>            if (err || !frag)
+</span><span class='line'>                break;
+</span><span class='line'>            // 处理链表中下一个buf。
+</span><span class='line'>            skb = frag;
+</span><span class='line'>            frag = skb-&gt;next;
+</span><span class='line'>            skb-&gt;next = NULL;
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        if (err == 0) {
+</span><span class='line'>            IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGOKS);
+</span><span class='line'>            return 0;
+</span><span class='line'>        }
+</span><span class='line'>        // 释放内存。
+</span><span class='line'>        while (frag) {
+</span><span class='line'>            skb = frag-&gt;next;
+</span><span class='line'>            kfree_skb(frag);
+</span><span class='line'>            frag = skb;
+</span><span class='line'>        }
+</span><span class='line'>        IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+</span><span class='line'>        return err;
+</span><span class='line'>    }
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;再接下来我们来看slow fragmentation：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        // 切片开始的位移
+</span><span class='line'>    left = skb-&gt;len - hlen;      /* Space per frame */
+</span><span class='line'>    // 而ptr就是切片开始的指针。
+</span><span class='line'>    ptr = raw + hlen;       /* Where to start from */
+</span><span class='line'>
+</span><span class='line'>    /* for bridged IP traffic encapsulated inside f.e. a vlan header,
+</span><span class='line'>     * we need to make room for the encapsulating header
+</span><span class='line'>     */
+</span><span class='line'>    // 处理桥接的相关操作。
+</span><span class='line'>    pad = nf_bridge_pad(skb);
+</span><span class='line'>    ll_rs = LL_RESERVED_SPACE_EXTRA(rt-&gt;u.dst.dev, pad);
+</span><span class='line'>    mtu -= pad;
+</span><span class='line'>
+</span><span class='line'>    // 其实也就是取出取出ip offset域。
+</span><span class='line'>    offset = (ntohs(iph-&gt;frag_off) &amp; IP_OFFSET) &lt;&lt; 3;
+</span><span class='line'>    // not_last_frag，顾名思义，其实也就是表明这个帧是否是最后一个切片。
+</span><span class='line'>    not_last_frag = iph-&gt;frag_off &amp; htons(IP_MF);
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>    // 开始为循环处理，每一个切片创建一个skb buffer。
+</span><span class='line'>    while (left &gt; 0) {
+</span><span class='line'>        len = left;
+</span><span class='line'>        // 如果len大于mtu，我们设置当前的将要切片的数据大小为mtu。
+</span><span class='line'>        if (len &gt; mtu)
+</span><span class='line'>            len = mtu;
+</span><span class='line'>        // 长度也必须位对齐。
+</span><span class='line'>        if (len &lt; left)  {
+</span><span class='line'>            len &amp;= ~7;
+</span><span class='line'>        }
+</span><span class='line'>        // malloc一个新的buff。它的大小包括ip payload,ip head,以及L2 head.
+</span><span class='line'>        if ((skb2 = alloc_skb(len+hlen+ll_rs, GFP_ATOMIC)) == NULL) {
+</span><span class='line'>            NETDEBUG(KERN_INFO "IP: frag: no memory for new fragment!\n");
+</span><span class='line'>            err = -ENOMEM;
+</span><span class='line'>            goto fail;
+</span><span class='line'>        }
+</span><span class='line'>        // 调用ip_copy_metadata复制一些相同的值的域。
+</span><span class='line'>        ip_copy_metadata(skb2, skb);
+</span><span class='line'>        // 进行skb的相关操作。为了加上ip头。
+</span><span class='line'>        skb_reserve(skb2, ll_rs);
+</span><span class='line'>        skb_put(skb2, len + hlen);
+</span><span class='line'>        skb_reset_network_header(skb2);
+</span><span class='line'>        skb2-&gt;transport_header = skb2-&gt;network_header + hlen;
+</span><span class='line'>        // 将每一个分片的ip包都关联到源包的socket上。
+</span><span class='line'>        if (skb-&gt;sk)
+</span><span class='line'>            skb_set_owner_w(skb2, skb-&gt;sk);
+</span><span class='line'>        // 开始填充新的ip包的数据。
+</span><span class='line'>
+</span><span class='line'>        // 先拷贝包头。
+</span><span class='line'>        skb_copy_from_linear_data(skb, skb_network_header(skb2), hlen);
+</span><span class='line'>        // 拷贝数据部分，这个函数实现的比较复杂。
+</span><span class='line'>        if (skb_copy_bits(skb, ptr, skb_transport_header(skb2), len))
+</span><span class='line'>            BUG();
+</span><span class='line'>        left -= len;
+</span><span class='line'>        // 填充相应的ip头。
+</span><span class='line'>        iph = ip_hdr(skb2);
+</span><span class='line'>        iph-&gt;frag_off = htons((offset &gt;&gt; 3));
+</span><span class='line'>
+</span><span class='line'>        // 第一个包，因此进行ip_option处理。
+</span><span class='line'>        if (offset == 0)
+</span><span class='line'>            ip_options_fragment(skb);
+</span><span class='line'>        // 不是最后一个包，因此设置mf位。
+</span><span class='line'>        if (left &gt; 0 || not_last_frag)
+</span><span class='line'>            iph-&gt;frag_off |= htons(IP_MF);
+</span><span class='line'>        // 移动指针以及更改位移大小。
+</span><span class='line'>        ptr += len;
+</span><span class='line'>        offset += len;
+</span><span class='line'>        // update包头的大小。
+</span><span class='line'>        iph-&gt;tot_len = htons(len + hlen);
+</span><span class='line'>        // 重新计算校验。
+</span><span class='line'>        ip_send_check(iph);
+</span><span class='line'>        //最终输出。
+</span><span class='line'>        err = output(skb2);
+</span><span class='line'>        if (err)
+</span><span class='line'>            goto fail;
+</span><span class='line'>
+</span><span class='line'>        IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGCREATES);
+</span><span class='line'>    }
+</span><span class='line'>    kfree_skb(skb);
+</span><span class='line'>    IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGOKS);
+</span><span class='line'>    return err;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看ip组包的实现。首先要知道每一个切片(属于同一个源包的)的ip包 id都是相同的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先来看相应的数据结构。在内核中，每一个ip包(切片好的)都是一个struct ipq链表。而不同的数据包(这里指不是属于同一个源包的数据包)都保&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;存在一个hash表中。也就是ip4_frags这个变量：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static struct inet_frags ip4_frags;
+</span><span class='line'>
+</span><span class='line'>#define INETFRAGS_HASHSZ        64
+</span><span class='line'>
+</span><span class='line'>struct inet_frags {
+</span><span class='line'>    struct hlist_head   hash[INETFRAGS_HASHSZ];
+</span><span class='line'>    rwlock_t        lock;
+</span><span class='line'>    // 随机值，它被用在计算hash值上面，下面会介绍到，过一段时间，内核就会更新这个值。
+</span><span class='line'>    u32         rnd;
+</span><span class='line'>    int         qsize;
+</span><span class='line'>    int         secret_interval;
+</span><span class='line'>    struct timer_list   secret_timer;
+</span><span class='line'>    // hash函数
+</span><span class='line'>    unsigned int        (*hashfn)(struct inet_frag_queue *);
+</span><span class='line'>    void            (*constructor)(struct inet_frag_queue *q,
+</span><span class='line'>                        void *arg);
+</span><span class='line'>    void            (*destructor)(struct inet_frag_queue *);
+</span><span class='line'>    void            (*skb_free)(struct sk_buff *);
+</span><span class='line'>    int         (*match)(struct inet_frag_queue *q,
+</span><span class='line'>                        void *arg);
+</span><span class='line'>    void            (*frag_expire)(unsigned long data);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct ipq {
+</span><span class='line'>    struct inet_frag_queue q;
+</span><span class='line'>    u32     user;
+</span><span class='line'>    // 都是ip头相关的一些域。
+</span><span class='line'>    __be32      saddr;
+</span><span class='line'>    __be32      daddr;
+</span><span class='line'>    __be16      id;
+</span><span class='line'>    u8      protocol;
+</span><span class='line'>    int             iif;
+</span><span class='line'>    unsigned int    rid;
+</span><span class='line'>    struct inet_peer *peer;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct inet_frag_queue {
+</span><span class='line'>    struct hlist_node   list;
+</span><span class='line'>    struct netns_frags  *net;
+</span><span class='line'>    // 基于LRU算法，主要用在GC上。
+</span><span class='line'>    struct list_head    lru_list;   /* lru list member */
+</span><span class='line'>    spinlock_t      lock;
+</span><span class='line'>    atomic_t        refcnt;
+</span><span class='line'>    // 属于同一个源的数据包的定时器，当定时器到期，切片还没到达，此时就会drop掉所有的数据切片。
+</span><span class='line'>    struct timer_list   timer;      /* when will this queue expire? */
+</span><span class='line'>    // 保存有所有的切片链表(从属于同一个ip包)
+</span><span class='line'>    struct sk_buff      *fragments; /* list of received fragments */
+</span><span class='line'>    ktime_t         stamp;
+</span><span class='line'>    int         len;        /* total length of orig datagram */
+</span><span class='line'>    // 表示从源ip包已经接收的字节数。
+</span><span class='line'>    int         meat;
+</span><span class='line'>    // 这个域主要可以设置为下面的3种值。
+</span><span class='line'>    __u8            last_in;    /* first/last segment arrived? */
+</span><span class='line'>
+</span><span class='line'>// 完成，第一个帧以及最后一个帧。
+</span><span class='line'>#define INET_FRAG_COMPLETE  4
+</span><span class='line'>#define INET_FRAG_FIRST_IN  2
+</span><span class='line'>#define INET_FRAG_LAST_IN   1
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;看下面的图就一目了然了：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-22.jpg" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先来看组包要解决的一些问题：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 fragment必须存储在内存中，知道他们全部都被网络子系统处理。才会释放，因此内存会是个巨大的浪费。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 这里虽然使用了hash表，可是假设恶意攻击者得到散列算法并且伪造数据包来尝试着降低一些hash表中的元素的比重，从而使执行变得缓慢。这里linux使用一个定时器通过制造的随机数来使hash值的生成不可预测。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这个定时器的初始化是通过ipfrag_init(它会初始化上面提到的ip4_frags全局变量)调用inet_frags_init进行的：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void inet_frags_init(struct inet_frags *f)
+</span><span class='line'>{
+</span><span class='line'>    int i;
+</span><span class='line'>
+</span><span class='line'>    for (i = 0; i &lt; INETFRAGS_HASHSZ; i++)
+</span><span class='line'>        INIT_HLIST_HEAD(&amp;f-&gt;hash[i]);
+</span><span class='line'>
+</span><span class='line'>    rwlock_init(&amp;f-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>    f-&gt;rnd = (u32) ((num_physpages ^ (num_physpages&gt;&gt;7)) ^
+</span><span class='line'>                   (jiffies ^ (jiffies &gt;&gt; 6)));
+</span><span class='line'>    // 安装定时器，当定时器到期就会调用inet_frag_secret_rebuild方法。
+</span><span class='line'>    setup_timer(&amp;f-&gt;secret_timer, inet_frag_secret_rebuild,
+</span><span class='line'>            (unsigned long)f);
+</span><span class='line'>    f-&gt;secret_timer.expires = jiffies + f-&gt;secret_interval;
+</span><span class='line'>    add_timer(&amp;f-&gt;secret_timer);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void inet_frag_secret_rebuild(unsigned long dummy)
+</span><span class='line'>{
+</span><span class='line'>................................................
+</span><span class='line'>
+</span><span class='line'>    write_lock(&amp;f-&gt;lock);
+</span><span class='line'>    // 得到随机值
+</span><span class='line'>    get_random_bytes(&amp;f-&gt;rnd, sizeof(u32));
+</span><span class='line'>
+</span><span class='line'>    // 然后通过这个随机值重新计算整个hash表的hash值。
+</span><span class='line'>    for (i = 0; i &lt; INETFRAGS_HASHSZ; i++) {
+</span><span class='line'>        struct inet_frag_queue *q;
+</span><span class='line'>        struct hlist_node *p, *n;
+</span><span class='line'>
+</span><span class='line'>        hlist_for_each_entry_safe(q, p, n, &amp;f-&gt;hash[i], list) {
+</span><span class='line'>            unsigned int hval = f-&gt;hashfn(q);
+</span><span class='line'>
+</span><span class='line'>            if (hval != i) {
+</span><span class='line'>                hlist_del(&amp;q-&gt;list);
+</span><span class='line'>
+</span><span class='line'>                /* Relink to new hash chain. */
+</span><span class='line'>                hlist_add_head(&amp;q-&gt;list, &amp;f-&gt;hash[hval]);
+</span><span class='line'>            }
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>..............................................
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3 ip协议是不可靠的，因此切片有可能被丢失。内核处理这个，是使用了一个定时器(每个数据包(也就是这个切片从属于的那个数据包)).当定时器到期，而切片没有到达，就会丢弃这个包。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;4 由于ip协议是无连接的，因此当高层决定重传数据包的时候，组包时有可能会出现多个重复分片的情况。这是因为ip包是由4个域来判断的，源和目的地址，包id以及4层的协议类型。而最主要的是包id。可是包id只有16位，因此一个gigabit网卡几乎在半秒时间就能用完这个id一次。而第二次重传的数据包有可能走的和第一个第一次时不同的路径，因此内核必须每个切片都要检测和前面接受的切片的重叠情况的发生。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;先来看ip_defrag用到的几个函数：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;inet_frag_create: 创建一个新的ipq实例&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_evitor: remove掉所有的未完成的数据包。它每次都会update一个LRU链表。每次都会把一个新的ipq数据结构加到ipq_lru_list的结尾。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_find: 发现切片所从属的数据包的切片链表。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_frag_queue: 排队一个给定的切片刀一个切片列表。这个经常和上一个方法一起使用。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_frag_reasm: 当所有的切片都到达后，build一个ip数据包。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_frag_destroy: remove掉传进来的ipq数据结构。包括和他有联系的所有的ip切片。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ipq_put: 将引用计数减一，如果为0，则直接调用ip_frag_destroy.&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline void inet_frag_put(struct inet_frag_queue *q, struct inet_frags *f)
+</span><span class='line'>{
+</span><span class='line'>    if (atomic_dec_and_test(&amp;q-&gt;refcnt))
+</span><span class='line'>        inet_frag_destroy(q, f, NULL);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ipq_kill: 主要用在gc上，标记一个ipq数据结构可以被remove，由于一些帧没有按时到达。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来来看ip_defrag的实现。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int ip_defrag(struct sk_buff *skb, u32 user)
+</span><span class='line'>{
+</span><span class='line'>    struct ipq *qp;
+</span><span class='line'>    struct net *net;
+</span><span class='line'>
+</span><span class='line'>    net = skb-&gt;dev ? dev_net(skb-&gt;dev) : dev_net(skb-&gt;dst-&gt;dev);
+</span><span class='line'>    IP_INC_STATS_BH(net, IPSTATS_MIB_REASMREQDS);
+</span><span class='line'>
+</span><span class='line'>    // 如果内存不够，则依据lru算法进行清理。
+</span><span class='line'>    if (atomic_read(&amp;net-&gt;ipv4.frags.mem) &gt; net-&gt;ipv4.frags.high_thresh)
+</span><span class='line'>        ip_evictor(net);
+</span><span class='line'>
+</span><span class='line'>    // 查找相应的iqp，如果不存在则会新创建一个(这些都在ip_find里面实现)
+</span><span class='line'>    if ((qp = ip_find(net, ip_hdr(skb), user)) != NULL) {
+</span><span class='line'>        int ret;
+</span><span class='line'>
+</span><span class='line'>        spin_lock(&amp;qp-&gt;q.lock);
+</span><span class='line'>        // 排队进队列。
+</span><span class='line'>        ret = ip_frag_queue(qp, skb);
+</span><span class='line'>
+</span><span class='line'>        spin_unlock(&amp;qp-&gt;q.lock);
+</span><span class='line'>        ipq_put(qp);
+</span><span class='line'>        return ret;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    IP_INC_STATS_BH(net, IPSTATS_MIB_REASMFAILS);
+</span><span class='line'>    kfree_skb(skb);
+</span><span class='line'>    return -ENOMEM;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们可以看到这里最重要的一个函数其实是ip_frag_queue,它主要任务是：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 发现输入帧在源包的位置。&lt;br/&gt;
+</span><span class='line'>2 基于blog刚开始所描述的，判断是否是最后一个切片。&lt;br/&gt;
+</span><span class='line'>3 插入切片到切片列表(从属于相同的ip包)&lt;br/&gt;
+</span><span class='line'>4 update 垃圾回收所用到的ipq的一些相关域。&lt;br/&gt;
+</span><span class='line'>5 校验l4层的校验值(在硬件计算).&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    // 其中qp是源ip包的所有切片链表，而skb是将要加进来切片。
+</span><span class='line'>static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    .............................
+</span><span class='line'>    //  INET_FRAG_COMPLETE表示所有的切片包都已经抵达，这个时侯就不需要再组包了，因此这里就是校验函数有没有被错误的调用。
+</span><span class='line'>    if (qp-&gt;q.last_in &amp; INET_FRAG_COMPLETE)
+</span><span class='line'>        goto err;
+</span><span class='line'>    .................................................
+</span><span class='line'>    // 将offset 8字节对齐、
+</span><span class='line'>    offset = ntohs(ip_hdr(skb)-&gt;frag_off);
+</span><span class='line'>    flags = offset &amp; ~IP_OFFSET;
+</span><span class='line'>    offset &amp;= IP_OFFSET;
+</span><span class='line'>    offset &lt;&lt;= 3;     /* offset is in 8-byte chunks */
+</span><span class='line'>    ihl = ip_hdrlen(skb);
+</span><span class='line'>
+</span><span class='line'>    // 计算这个新的切片包的结束位置。
+</span><span class='line'>    end = offset + skb-&gt;len - ihl;
+</span><span class='line'>    err = -EINVAL;
+</span><span class='line'>
+</span><span class='line'>    // MF没有设置，表明这个帧是最后一个帧。进入相关处理。
+</span><span class='line'>    if ((flags &amp; IP_MF) == 0) {
+</span><span class='line'>        /* If we already have some bits beyond end
+</span><span class='line'>         * or have different end, the segment is corrrupted.
+</span><span class='line'>         */
+</span><span class='line'>    // 设置相应的len位置，以及last_in域。
+</span><span class='line'>        if (end &lt; qp-&gt;q.len ||
+</span><span class='line'>            ((qp-&gt;q.last_in &amp; INET_FRAG_LAST_IN) &amp;&amp; end != qp-&gt;q.len))
+</span><span class='line'>            goto err;
+</span><span class='line'>        qp-&gt;q.last_in |= INET_FRAG_LAST_IN;
+</span><span class='line'>        qp-&gt;q.len = end;
+</span><span class='line'>    } else {
+</span><span class='line'>        // 除了最后一个切片，每个切片都必须是8字节的倍数。
+</span><span class='line'>        if (end&amp;7) {
+</span><span class='line'>            // 不是8字节的倍数，kernel截断这个切片。此时就需要l4层的校验重新计算，因此设置ip_summed为 CHECKSUM_NONE
+</span><span class='line'>            end &amp;= ~7;
+</span><span class='line'>            if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY)
+</span><span class='line'>                skb-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>        }
+</span><span class='line'>        if (end &gt; qp-&gt;q.len) {
+</span><span class='line'>            // 数据包太大，并且是最后一个包，则表明这个数据包出错，因此drop它。
+</span><span class='line'>            /* Some bits beyond end -&gt; corruption. */
+</span><span class='line'>            if (qp-&gt;q.last_in &amp; INET_FRAG_LAST_IN)
+</span><span class='line'>                goto err;
+</span><span class='line'>            qp-&gt;q.len = end;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    // ip头不能被切片，因此end肯定会大于offset。
+</span><span class='line'>    if (end == offset)
+</span><span class='line'>        goto err;
+</span><span class='line'>
+</span><span class='line'>    err = -ENOMEM;
+</span><span class='line'>    // remove掉ip头。
+</span><span class='line'>    if (pskb_pull(skb, ihl) == NULL)
+</span><span class='line'>        goto err;
+</span><span class='line'>    // trim掉一些padding，然后重新计算checksum。
+</span><span class='line'>    err = pskb_trim_rcsum(skb, end - offset);
+</span><span class='line'>    if (err)
+</span><span class='line'>        goto err;
+</span><span class='line'>
+</span><span class='line'>    // 接下来遍历并将切片(为了找出当前将要插入的切片的位置)，是以offset为基准。这里要合租要FRAG_CB宏是用来提取sk_buff-&gt;cb域。
+</span><span class='line'>    prev = NULL;
+</span><span class='line'>    for (next = qp-&gt;q.fragments; next != NULL; next = next-&gt;next) {
+</span><span class='line'>        if (FRAG_CB(next)-&gt;offset &gt;= offset)
+</span><span class='line'>            break;  /* bingo! */
+</span><span class='line'>        prev = next;
+</span><span class='line'>    }
+</span><span class='line'>    // 当prev!=NULL时，说明这个切片要插入到列表当中。
+</span><span class='line'>    if (prev) {
+</span><span class='line'>        // 计算有没有重叠。
+</span><span class='line'>        int i = (FRAG_CB(prev)-&gt;offset + prev-&gt;len) - offset;
+</span><span class='line'>        // 大于0.证明有重叠，因此进行相关处理
+</span><span class='line'>        if (i &gt; 0) {
+</span><span class='line'>            // 将重叠部分用新的切片覆盖。
+</span><span class='line'>            offset += i;
+</span><span class='line'>            err = -EINVAL;
+</span><span class='line'>            if (end &lt;= offset)
+</span><span class='line'>                goto err;
+</span><span class='line'>            err = -ENOMEM;
+</span><span class='line'>            //移动i个位置。
+</span><span class='line'>            if (!pskb_pull(skb, i))
+</span><span class='line'>                goto err;
+</span><span class='line'>            // 需要重新计算L4的校验。
+</span><span class='line'>            if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY)
+</span><span class='line'>                skb-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    err = -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>    while (next &amp;&amp; FRAG_CB(next)-&gt;offset &lt; end) {
+</span><span class='line'>        // 和上面的判断很类似，也是先计算重叠数。这里要注意重叠分为两种情况：1；一个或多个切片被新的切片完全覆盖。2；被部分覆盖，因此这里我们需要分两种情况进行处理。
+</span><span class='line'>        int i = end - FRAG_CB(next)-&gt;offset; /* overlap is 'i' bytes */
+</span><span class='line'>
+</span><span class='line'>        if (i &lt; next-&gt;len) {
+</span><span class='line'>            // 被部分覆盖的情况。将新的切片offset移动i字节，然后remove掉老的切片中的i个字节。
+</span><span class='line'>            /* Eat head of the next overlapped fragment
+</span><span class='line'>             * and leave the loop. The next ones cannot overlap.
+</span><span class='line'>             */
+</span><span class='line'>            if (!pskb_pull(next, i))
+</span><span class='line'>                goto err;
+</span><span class='line'>            FRAG_CB(next)-&gt;offset += i;
+</span><span class='line'>            // 将接收到的源数据报的大小减去i，也就是remove掉不完全覆盖的那一部分。
+</span><span class='line'>            qp-&gt;q.meat -= i;
+</span><span class='line'>            // 重新计算l4层的校验。
+</span><span class='line'>            if (next-&gt;ip_summed != CHECKSUM_UNNECESSARY)
+</span><span class='line'>                next-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>            break;
+</span><span class='line'>        } else {
+</span><span class='line'>            // 老的切片完全被新的切片覆盖，此时只需要remove掉老的切片就可以了。
+</span><span class='line'>            struct sk_buff *free_it = next;
+</span><span class='line'>            next = next-&gt;next;
+</span><span class='line'>
+</span><span class='line'>            if (prev)
+</span><span class='line'>                prev-&gt;next = next;
+</span><span class='line'>            else
+</span><span class='line'>                qp-&gt;q.fragments = next;
+</span><span class='line'>            // 将qp的接受字节数更新。
+</span><span class='line'>            qp-&gt;q.meat -= free_it-&gt;len;
+</span><span class='line'>            frag_kfree_skb(qp-&gt;q.net, free_it, NULL);
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    FRAG_CB(skb)-&gt;offset = offset;
+</span><span class='line'>
+</span><span class='line'>....................................................
+</span><span class='line'>    atomic_add(skb-&gt;truesize, &amp;qp-&gt;q.net-&gt;mem);
+</span><span class='line'>    // offset为0说明是第一个切片，因此设置相应的位。
+</span><span class='line'>    if (offset == 0)
+</span><span class='line'>        qp-&gt;q.last_in |= INET_FRAG_FIRST_IN;
+</span><span class='line'>
+</span><span class='line'>    if (qp-&gt;q.last_in == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &amp;&amp;
+</span><span class='line'>        qp-&gt;q.meat == qp-&gt;q.len)
+</span><span class='line'>        // 所有条件的满足了，就开始buildip包。
+</span><span class='line'>        return ip_frag_reasm(qp, prev, dev);
+</span><span class='line'>    write_lock(&amp;ip4_frags.lock);
+</span><span class='line'>    // 从将此切片加入到lry链表中。
+</span><span class='line'>    list_move_tail(&amp;qp-&gt;q.lru_list, &amp;qp-&gt;q.net-&gt;lru_list);
+</span><span class='line'>    write_unlock(&amp;ip4_frags.lock);
+</span><span class='line'>    return -EINPROGRESS;
+</span><span class='line'>
+</span><span class='line'>err:
+</span><span class='line'>    kfree_skb(skb);
+</span><span class='line'>    return err;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果网络设备提供L4层的硬件校验的话，输入ip帧还会进行L4的校验计算。当帧通过ip_frag_reasm组合好，它会进行校验的重新计算。我们这里通过设置skb-&gt;ip_summed到CHECKSUM_NONE，来表示需要娇艳的标志。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后来看下GC。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;内核为ip切片数据包实现了两种类型的垃圾回收。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;1 系统内存使用限制。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;2 组包的定时器&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里有一个全局的ip_frag_mem变量，来表示当前被切片所占用的内存数。每次一个新的切片被加入，这个值都会更新。而所能使用的最大内存可以在运行时改变，是通过/proc的sysctl_ipfrag_high_thresh来改变的，因此我们能看到当ip_defrag时，一开始会先判断内存的限制：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (atomic_read(&amp;net-&gt;ipv4.frags.mem) &gt; net-&gt;ipv4.frags.high_thresh)
+</span><span class='line'>        ip_evictor(net);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;当一个切片数据包到达后，内核会启动一个组包定时器，他是为了避免一个数据包占据ipq_hash太长时间，因此当定时器到期后，它就会清理掉在hash表中的相应的qp结构(也就是所有的未完成切片包).这个处理函数就是ip_expire,它的初始化是在ipfrag_init进行的。:&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void ip_expire(unsigned long arg)
+</span><span class='line'>{
+</span><span class='line'>    struct ipq *qp;
+</span><span class='line'>    struct net *net;
+</span><span class='line'>    // 取出相应的qp，以及net域。
+</span><span class='line'>    qp = container_of((struct inet_frag_queue *) arg, struct ipq, q);
+</span><span class='line'>    net = container_of(qp-&gt;q.net, struct net, ipv4.frags);
+</span><span class='line'>
+</span><span class='line'>    spin_lock(&amp;qp-&gt;q.lock);
+</span><span class='line'>    // 如果数据包已经传输完毕，则不进行任何处理，直接退出。
+</span><span class='line'>    if (qp-&gt;q.last_in &amp; INET_FRAG_COMPLETE)
+</span><span class='line'>        goto out;
+</span><span class='line'>    // 调用ipq_kill，这个函数主要是减少qp的引用计数，并从相关链表(比如LRU_LIST)中移除它。
+</span><span class='line'>    ipq_kill(qp);
+</span><span class='line'>
+</span><span class='line'>    IP_INC_STATS_BH(net, IPSTATS_MIB_REASMTIMEOUT);
+</span><span class='line'>    IP_INC_STATS_BH(net, IPSTATS_MIB_REASMFAILS);
+</span><span class='line'>
+</span><span class='line'>    // 如果是第一个切片，则发送一个ICMP给源主机。
+</span><span class='line'>    if ((qp-&gt;q.last_in &amp; INET_FRAG_FIRST_IN) &amp;&amp; qp-&gt;q.fragments != NULL) {
+</span><span class='line'>        struct sk_buff *head = qp-&gt;q.fragments;
+</span><span class='line'>
+</span><span class='line'>        /* Send an ICMP "Fragment Reassembly Timeout" message. */
+</span><span class='line'>        if ((head-&gt;dev = dev_get_by_index(net, qp-&gt;iif)) != NULL) {
+</span><span class='line'>            icmp_send(head, ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, 0);
+</span><span class='line'>            dev_put(head-&gt;dev);
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>out:
+</span><span class='line'>    spin_unlock(&amp;qp-&gt;q.lock);
+</span><span class='line'>    ipq_put(qp);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[dev_queue_xmi函数详解]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-dev_queue_xmit/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-08-25T23:20:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-dev_queue_xmit&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;blog.chinaunix.net/uid-20788636-id-3181312.html&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;前面在分析IPv6的数据流程时，当所有的信息都准备好了之后，例如，出口设备，下一跳的地址，以及链路层地址。就会调用dev.c文件中的dev_queue_xmin函数，该函数是设备驱动程序执行传输的接口。也就是所有的数据包在填充完成后，最终发送数据时，都会调用该函数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;dev_queue_xmit函数只接收一个skb_buff结构作为输入的值。此数据结构包含了此函数所需要的一切信息。Skb-&gt;dev是出口设备，skb-&gt;data为有效的载荷的开头，其长度为skb-&gt;len.下面是2.6.37版本内核中的dev_queue_xmit函数，该版本的内核与之前的版本有了不少的区别。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int dev_queue_xmit(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    struct net_device *dev = skb-&gt;dev;
+</span><span class='line'>    struct netdev_queue *txq;
+</span><span class='line'>    struct Qdisc *q;
+</span><span class='line'>    int rc = -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>    /* Disable soft irqs for various locks below. Also
+</span><span class='line'>     * stops preemption for RCU.
+</span><span class='line'>     */
+</span><span class='line'>    //关闭软中断 - __rcu_read_lock_bh()---&gt;local_bh_disable();
+</span><span class='line'>    rcu_read_lock_bh();
+</span><span class='line'>    // 选择一个发送队列，如果设备提供了select_queue回调函数就使用它，否则由内核选择一个队列,这里只是Linux内核多队列的实现，但是要真正的使用都队列，需要网卡支持多队列才可以，一般的网卡都只有一个队列。在调用alloc_etherdev分配net_device是，设置队列的个数
+</span><span class='line'>    txq = dev_pick_tx(dev, skb);
+</span><span class='line'>    //从netdev_queue结构上获取设备的qdisc
+</span><span class='line'>    q = rcu_dereference_bh(txq-&gt;qdisc);
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NET_CLS_ACT
+</span><span class='line'>    skb-&gt;tc_verd = SET_TC_AT(skb-&gt;tc_verd, AT_EGRESS);
+</span><span class='line'>#endif
+</span><span class='line'>    //如果硬件设备有队列可以使用，该函数由dev_queue_xmit函数直接调用或由dev_queue_xmit通过qdisc_run函数调用
+</span><span class='line'>    trace_net_dev_queue(skb);
+</span><span class='line'>    if (q-&gt;enqueue) {
+</span><span class='line'>        rc = __dev_xmit_skb(skb, q, dev, txq); //使用流控对象发送数据包(包含入队和出队)
+</span><span class='line'>        //更详细的内容参考说明3
+</span><span class='line'>        goto out;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    //下面的处理是在没有发送队列的情况下
+</span><span class='line'>    /* The device has no queue. Common case for software devices:
+</span><span class='line'>     loopback, all the sorts of tunnels...
+</span><span class='line'>
+</span><span class='line'>     Really, it is unlikely that netif_tx_lock protection is necessary
+</span><span class='line'>     here. (f.e. loopback and IP tunnels are clean ignoring statistics
+</span><span class='line'>     counters.)
+</span><span class='line'>     However, it is possible, that they rely on protection
+</span><span class='line'>     made by us here.
+</span><span class='line'>
+</span><span class='line'>     Check this and shot the lock. It is not prone from deadlocks.
+</span><span class='line'>     Either shot noqueue qdisc, it is even simpler 8)
+</span><span class='line'>     */
+</span><span class='line'>    //首先，确定设备是开启的，并且还要确定队列是运行的，启动和停止队列有驱动程序决定
+</span><span class='line'>    //设备没有输出队列典型的是回环设备。这里需要做的就是直接调用dev_start_queue_xmit、、函数，经过驱动发送出去，如果发送失败，就直接丢弃，没有队列可以保存。
+</span><span class='line'>    if (dev-&gt;flags &amp; IFF_UP) {
+</span><span class='line'>        int cpu = smp_processor_id(); /* ok because BHs are off */
+</span><span class='line'>
+</span><span class='line'>        if (txq-&gt;xmit_lock_owner != cpu) {
+</span><span class='line'>
+</span><span class='line'>            if (__this_cpu_read(xmit_recursion) &gt; RECURSION_LIMIT)
+</span><span class='line'>                goto recursion_alert;
+</span><span class='line'>
+</span><span class='line'>            HARD_TX_LOCK(dev, txq, cpu);
+</span><span class='line'>
+</span><span class='line'>            if (!netif_tx_queue_stopped(txq)) {
+</span><span class='line'>                __this_cpu_inc(xmit_recursion);
+</span><span class='line'>                rc = dev_hard_start_xmit(skb, dev, txq);//见说明4
+</span><span class='line'>                __this_cpu_dec(xmit_recursion);
+</span><span class='line'>                if (dev_xmit_complete(rc)) {
+</span><span class='line'>                    HARD_TX_UNLOCK(dev, txq);
+</span><span class='line'>                    goto out;
+</span><span class='line'>                }
+</span><span class='line'>            }
+</span><span class='line'>            HARD_TX_UNLOCK(dev, txq);
+</span><span class='line'>            if (net_ratelimit())
+</span><span class='line'>                printk(KERN_CRIT "Virtual device %s asks to "
+</span><span class='line'>                 "queue packet!\n", dev-&gt;name);
+</span><span class='line'>        } else {
+</span><span class='line'>            /* Recursion is It is possible,
+</span><span class='line'>             * unfortunately
+</span><span class='line'>             */
+</span><span class='line'>recursion_alert:
+</span><span class='line'>            if (net_ratelimit())
+</span><span class='line'>                printk(KERN_CRIT "Dead loop on virtual device "
+</span><span class='line'>                 "%s, fix it urgently!\n", dev-&gt;name);
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    rc = -ENETDOWN;
+</span><span class='line'>    rcu_read_unlock_bh();
+</span><span class='line'>
+</span><span class='line'>    kfree_skb(skb);
+</span><span class='line'>    return rc;
+</span><span class='line'>out:
+</span><span class='line'>    rcu_read_unlock_bh();
+</span><span class='line'>    return rc;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;1. 下面是dev_pick_tx函数。&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static struct netdev_queue *dev_pick_tx(struct net_device *dev,
+</span><span class='line'>                    struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>    int queue_index;
+</span><span class='line'>    const struct net_device_ops *ops = dev-&gt;netdev_ops;
+</span><span class='line'>
+</span><span class='line'>    if (ops-&gt;ndo_select_queue) {
+</span><span class='line'>        //选择一个索引，这个策略可以设置，比如优先选择视频和音频队列，而哪个队列邦定哪个策略也是设定的。
+</span><span class='line'>        queue_index = ops-&gt;ndo_select_queue(dev, skb);
+</span><span class='line'>        queue_index = dev_cap_txqueue(dev, queue_index);
+</span><span class='line'>    } else {
+</span><span class='line'>        struct sock *sk = skb-&gt;sk;
+</span><span class='line'>        queue_index = sk_tx_queue_get(sk);
+</span><span class='line'>        if (queue_index &lt; 0 || queue_index &gt;= dev-&gt;real_num_tx_queues) {
+</span><span class='line'>
+</span><span class='line'>            queue_index = 0;
+</span><span class='line'>            if (dev-&gt;real_num_tx_queues &gt; 1)
+</span><span class='line'>                queue_index = skb_tx_hash(dev, skb);
+</span><span class='line'>
+</span><span class='line'>            if (sk) {
+</span><span class='line'>                struct dst_entry *dst = rcu_dereference_check(sk-&gt;sk_dst_cache, 1);
+</span><span class='line'>
+</span><span class='line'>                if (dst &amp;&amp; skb_dst(skb) == dst)
+</span><span class='line'>                    sk_tx_queue_set(sk, queue_index);
+</span><span class='line'>            }
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    skb_set_queue_mapping(skb, queue_index);
+</span><span class='line'>    return netdev_get_tx_queue(dev, queue_index);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;2. 下面是其中的一种网卡类型调用函数alloc_etherdev时，&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    dev = alloc_etherdev(sizeof(struct ether1_priv));
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;其实该函数是一个宏定义：其中第二参数表示的就是队列的数量，这里在Linux2.6.37内核中找到的一种硬件网卡的实现，可用的队列是1个。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define alloc_etherdev(sizeof_priv) alloc_etherdev_mq(sizeof_priv, 1)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下面是alloc_etherdev_mq函数的定义实现。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int queue_count)
+</span><span class='line'>{
+</span><span class='line'>    return alloc_netdev_mq(sizeof_priv, "eth%d", ether_setup, queue_count);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;3.&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;几乎所有的设备都会使用队列调度出口的流量，而内核可以使用对了规则的算法安排那个帧进行发送，使其以最优效率的次序进行传输。这里检查这个队列中是否有enqueue函数，如果有则说明设备会使用这个队列，否则需另外处理。关于enqueue函数的设置，我找到dev_open-&gt;dev_activate中调用了qdisc_create_dflt来设置，需要注意的是，这里并不是将传进来的skb直接发送，而是先入队，然后调度队列，具体发送哪个数据包由enqueue和dequeue函数决定，这体现了设备的排队规则&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Enqueue 把一个元素添加的队列&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Dequeue 从队列中提取一个元素&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Requeue 把一个原先已经提取的元素放回到队列，可以由于传输失败。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;if (q-&gt;enqueue)为真的话，表明这个设备有队列，可以进行相关的流控。调用__dev_xmit_skb函数进行处理。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+</span><span class='line'>                 struct net_device *dev,
+</span><span class='line'>                 struct netdev_queue *txq)
+</span><span class='line'>{
+</span><span class='line'>    spinlock_t *root_lock = qdisc_lock(q);
+</span><span class='line'>    bool contended = qdisc_is_running(q);
+</span><span class='line'>    int rc;
+</span><span class='line'>
+</span><span class='line'>    /*
+</span><span class='line'>     * Heuristic to force contended enqueues to serialize on a
+</span><span class='line'>     * separate lock before trying to get qdisc main lock.
+</span><span class='line'>     * This permits __QDISC_STATE_RUNNING owner to get the lock more often
+</span><span class='line'>     * and dequeue packets faster.
+</span><span class='line'>     */
+</span><span class='line'>    if (unlikely(contended))
+</span><span class='line'>        spin_lock(&amp;q-&gt;busylock);
+</span><span class='line'>
+</span><span class='line'>    spin_lock(root_lock);
+</span><span class='line'>    if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &amp;q-&gt;state))) {
+</span><span class='line'>        kfree_skb(skb);
+</span><span class='line'>        rc = NET_XMIT_DROP;
+</span><span class='line'>    } else if ((q-&gt;flags &amp; TCQ_F_CAN_BYPASS) &amp;&amp; !qdisc_qlen(q) &amp;&amp;
+</span><span class='line'>         qdisc_run_begin(q)) {
+</span><span class='line'>        /*
+</span><span class='line'>         * This is a work-conserving queue; there are no old skbs
+</span><span class='line'>         * waiting to be sent out; and the qdisc is not running -
+</span><span class='line'>         * xmit the skb directly.
+</span><span class='line'>         */
+</span><span class='line'>        if (!(dev-&gt;priv_flags &amp; IFF_XMIT_DST_RELEASE))
+</span><span class='line'>            skb_dst_force(skb);
+</span><span class='line'>        __qdisc_update_bstats(q, skb-&gt;len);
+</span><span class='line'>        if (sch_direct_xmit(skb, q, dev, txq, root_lock)) {
+</span><span class='line'>            if (unlikely(contended)) {
+</span><span class='line'>                spin_unlock(&amp;q-&gt;busylock);
+</span><span class='line'>                contended = false;
+</span><span class='line'>            }
+</span><span class='line'>            __qdisc_run(q);
+</span><span class='line'>        } else
+</span><span class='line'>            qdisc_run_end(q);
+</span><span class='line'>
+</span><span class='line'>        rc = NET_XMIT_SUCCESS;
+</span><span class='line'>    } else {
+</span><span class='line'>        skb_dst_force(skb);
+</span><span class='line'>        rc = qdisc_enqueue_root(skb, q);
+</span><span class='line'>        if (qdisc_run_begin(q)) {
+</span><span class='line'>            if (unlikely(contended)) {
+</span><span class='line'>                spin_unlock(&amp;q-&gt;busylock);
+</span><span class='line'>                contended = false;
+</span><span class='line'>            }
+</span><span class='line'>            __qdisc_run(q);
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    spin_unlock(root_lock);
+</span><span class='line'>    if (unlikely(contended))
+</span><span class='line'>        spin_unlock(&amp;q-&gt;busylock);
+</span><span class='line'>    return rc;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;_dev_xmit_skb函数主要做两件事情：&lt;br/&gt;
+</span><span class='line'> （1） 如果流控对象为空的，试图直接发送数据包。&lt;br/&gt;
+</span><span class='line'> （2） 如果流控对象不空，将数据包加入流控对象，并运行流控对象。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;当设备进入调度队列准备传输时，qdisc_run函数就会选出下一个要传输的帧，而该函数会间接的调用相关联的队列规则dequeue函数，从对了中取出数据进行传输。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;有两个时机将会调用qdisc_run()：&lt;br/&gt;
+</span><span class='line'>  1.&lt;code&gt;__dev_xmit_skb()&lt;/code&gt;&lt;br/&gt;
+</span><span class='line'>  2.软中断服务线程NET_TX_SOFTIRQ&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;其实，真正的工作有qdisc_restart函数实现。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void __qdisc_run(struct Qdisc *q)
+</span><span class='line'>{
+</span><span class='line'>    unsigned long start_time = jiffies;
+</span><span class='line'>
+</span><span class='line'>    while (qdisc_restart(q)) { //返回值大于0，说明流控对象非空。
+</span><span class='line'>        /*
+</span><span class='line'>         * Postpone processing if
+</span><span class='line'>         * 1. another process needs the CPU;
+</span><span class='line'>         * 2. we've been doing it for too long.
+</span><span class='line'>         */
+</span><span class='line'>        if (need_resched() || jiffies != start_time) { //已经不允许继续运行本流控对象。
+</span><span class='line'>            __netif_schedule(q); //将本队列加入软中断的output_queue链表中。
+</span><span class='line'>            break;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    qdisc_run_end(q);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果发现本队列运行的时间太长了，将会停止队列的运行，并将队列加入output_queue链表头。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int qdisc_restart(struct Qdisc *q)
+</span><span class='line'>{
+</span><span class='line'>    struct netdev_queue *txq;
+</span><span class='line'>    struct net_device *dev;
+</span><span class='line'>    spinlock_t *root_lock;
+</span><span class='line'>    struct sk_buff *skb;
+</span><span class='line'>
+</span><span class='line'>    /* Dequeue packet */
+</span><span class='line'>    skb = dequeue_skb(q);//一开始就调用dequeue函数。
+</span><span class='line'>    if (unlikely(!skb))
+</span><span class='line'>        return 0;
+</span><span class='line'>    WARN_ON_ONCE(skb_dst_is_noref(skb));
+</span><span class='line'>    root_lock = qdisc_lock(q);
+</span><span class='line'>    dev = qdisc_dev(q);
+</span><span class='line'>    txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
+</span><span class='line'>
+</span><span class='line'>    return sch_direct_xmit(skb, q, dev, txq, root_lock);//用于发送数据包
+</span><span class='line'>}
+</span><span class='line'>* Returns to the caller:
+</span><span class='line'> *                0 - queue is empty or throttled.
+</span><span class='line'> *                &gt;0 - queue is not empty.
+</span><span class='line'> */
+</span><span class='line'>int sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
+</span><span class='line'>         struct net_device *dev, struct netdev_queue *txq,
+</span><span class='line'>         spinlock_t *root_lock)
+</span><span class='line'>{
+</span><span class='line'>    int ret = NETDEV_TX_BUSY;
+</span><span class='line'>
+</span><span class='line'>    /* And release qdisc */
+</span><span class='line'>    spin_unlock(root_lock);
+</span><span class='line'>
+</span><span class='line'>    HARD_TX_LOCK(dev, txq, smp_processor_id());
+</span><span class='line'>    if (!netif_tx_queue_stopped(txq) &amp;&amp; !netif_tx_queue_frozen(txq)) //设备没有被停止，且发送队列没有被冻结
+</span><span class='line'>        ret = dev_hard_start_xmit(skb, dev, txq); //发送数据包
+</span><span class='line'>
+</span><span class='line'>    HARD_TX_UNLOCK(dev, txq);
+</span><span class='line'>
+</span><span class='line'>    spin_lock(root_lock);
+</span><span class='line'>
+</span><span class='line'>    if (dev_xmit_complete(ret)) {
+</span><span class='line'>        /* Driver sent out skb successfully or skb was consumed */
+</span><span class='line'>        //发送成功，返回新的队列的长度
+</span><span class='line'>        ret = qdisc_qlen(q);
+</span><span class='line'>    } else if (ret == NETDEV_TX_LOCKED) {
+</span><span class='line'>        /* Driver try lock failed */
+</span><span class='line'>        ret = handle_dev_cpu_collision(skb, txq, q);
+</span><span class='line'>    } else {
+</span><span class='line'>        /* Driver returned NETDEV_TX_BUSY - requeue skb */
+</span><span class='line'>        if (unlikely (ret != NETDEV_TX_BUSY &amp;&amp; net_ratelimit()))
+</span><span class='line'>            printk(KERN_WARNING "BUG %s code %d qlen %d\n",
+</span><span class='line'>             dev-&gt;name, ret, q-&gt;q.qlen);
+</span><span class='line'>         //设备繁忙，重新调度发送（利用softirq）
+</span><span class='line'>        ret = dev_requeue_skb(skb, q);
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    if (ret &amp;&amp; (netif_tx_queue_stopped(txq) ||
+</span><span class='line'>         netif_tx_queue_frozen(txq)))
+</span><span class='line'>        ret = 0;
+</span><span class='line'>
+</span><span class='line'>    return ret;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;4. 我们看一下下面的发送函数。&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt; 从此函数可以看出，当驱动使用发送队列的时候会循环从队列中取出包发送, 而不使用队列的时候只发送一次，如果没发送成功就直接丢弃&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct netdev_queue *txq)
+</span><span class='line'>{
+</span><span class='line'>    const struct net_device_ops *ops = dev-&gt;netdev_ops;//驱动程序的函数集
+</span><span class='line'>    int rc = NETDEV_TX_OK;
+</span><span class='line'>
+</span><span class='line'>    if (likely(!skb-&gt;next)) {
+</span><span class='line'>        if (!list_empty(&amp;ptype_all))
+</span><span class='line'>            dev_queue_xmit_nit(skb, dev);//如果dev_add_pack加入的是ETH_P_ALL，那么就会复制一份给你的回调函数。
+</span><span class='line'>
+</span><span class='line'>        /*
+</span><span class='line'>         * If device doesnt need skb-&gt;dst, release it right now while
+</span><span class='line'>         * its hot in this cpu cache
+</span><span class='line'>         */
+</span><span class='line'>        if (dev-&gt;priv_flags &amp; IFF_XMIT_DST_RELEASE)
+</span><span class='line'>            skb_dst_drop(skb);
+</span><span class='line'>
+</span><span class='line'>        skb_orphan_try(skb);
+</span><span class='line'>
+</span><span class='line'>        if (vlan_tx_tag_present(skb) &amp;&amp;
+</span><span class='line'>         !(dev-&gt;features &amp; NETIF_F_HW_VLAN_TX)) {
+</span><span class='line'>            skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
+</span><span class='line'>            if (unlikely(!skb))
+</span><span class='line'>                goto out;
+</span><span class='line'>
+</span><span class='line'>            skb-&gt;vlan_tci = 0;
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        if (netif_needs_gso(dev, skb)) {
+</span><span class='line'>            if (unlikely(dev_gso_segment(skb)))
+</span><span class='line'>                goto out_kfree_skb;
+</span><span class='line'>            if (skb-&gt;next)
+</span><span class='line'>                goto gso;
+</span><span class='line'>        } else {
+</span><span class='line'>            if (skb_needs_linearize(skb, dev) &amp;&amp;
+</span><span class='line'>             __skb_linearize(skb))
+</span><span class='line'>                goto out_kfree_skb;
+</span><span class='line'>
+</span><span class='line'>            /* If packet is not checksummed and device does not
+</span><span class='line'>             * support checksumming for this protocol, complete
+</span><span class='line'>             * checksumming here.
+</span><span class='line'>             */
+</span><span class='line'>            if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
+</span><span class='line'>                skb_set_transport_header(skb, skb-&gt;csum_start -
+</span><span class='line'>                     skb_headroom(skb));
+</span><span class='line'>                if (!dev_can_checksum(dev, skb) &amp;&amp;
+</span><span class='line'>                 skb_checksum_help(skb))
+</span><span class='line'>                    goto out_kfree_skb;
+</span><span class='line'>            }
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>        rc = ops-&gt;ndo_start_xmit(skb, dev);//调用网卡的驱动程序发送数据。不同的网络设备有不同的发送函数
+</span><span class='line'>        trace_net_dev_xmit(skb, rc);
+</span><span class='line'>        if (rc == NETDEV_TX_OK)
+</span><span class='line'>            txq_trans_update(txq);
+</span><span class='line'>        return rc;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>gso:
+</span><span class='line'>    do {
+</span><span class='line'>        struct sk_buff *nskb = skb-&gt;next;
+</span><span class='line'>
+</span><span class='line'>        skb-&gt;next = nskb-&gt;next;
+</span><span class='line'>        nskb-&gt;next = NULL;
+</span><span class='line'>
+</span><span class='line'>        /*
+</span><span class='line'>         * If device doesnt need nskb-&gt;dst, release it right now while
+</span><span class='line'>         * its hot in this cpu cache
+</span><span class='line'>         */
+</span><span class='line'>        if (dev-&gt;priv_flags &amp; IFF_XMIT_DST_RELEASE)
+</span><span class='line'>            skb_dst_drop(nskb);
+</span><span class='line'>
+</span><span class='line'>        rc = ops-&gt;ndo_start_xmit(nskb, dev); //调用网卡的驱动程序发送数据。不同的网络设备有不同的发送函数
+</span><span class='line'>        trace_net_dev_xmit(nskb, rc);
+</span><span class='line'>        if (unlikely(rc != NETDEV_TX_OK)) {
+</span><span class='line'>            if (rc &amp; ~NETDEV_TX_MASK)
+</span><span class='line'>                goto out_kfree_gso_skb;
+</span><span class='line'>            nskb-&gt;next = skb-&gt;next;
+</span><span class='line'>            skb-&gt;next = nskb;
+</span><span class='line'>            return rc;
+</span><span class='line'>        }
+</span><span class='line'>        txq_trans_update(txq);
+</span><span class='line'>        if (unlikely(netif_tx_queue_stopped(txq) &amp;&amp; skb-&gt;next))
+</span><span class='line'>            return NETDEV_TX_BUSY;
+</span><span class='line'>    } while (skb-&gt;next);
+</span><span class='line'>
+</span><span class='line'>out_kfree_gso_skb:
+</span><span class='line'>    if (likely(skb-&gt;next == NULL))
+</span><span class='line'>        skb-&gt;destructor = DEV_GSO_CB(skb)-&gt;destructor;
+</span><span class='line'>out_kfree_skb:
+</span><span class='line'>    kfree_skb(skb);
+</span><span class='line'>out:
+</span><span class='line'>    return rc;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;5.下面看一下dev_queue_xmit_nit函数。&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;对于通过socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))创建的原始套接口，不但可以接受从外部输入的数据包，而且对于由于本地输出的数据包，如果满足条件，也可以能接受。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;该函数就是用来接收由于本地输出的数据包，在链路层的输出过程中，会调用此函数，将满足条件的数据包输入到RAW套接口，&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>    struct packet_type *ptype;
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NET_CLS_ACT
+</span><span class='line'>    if (!(skb-&gt;tstamp.tv64 &amp;&amp; (G_TC_FROM(skb-&gt;tc_verd) &amp; AT_INGRESS)))
+</span><span class='line'>        net_timestamp_set(skb);-----------------（1）
+</span><span class='line'>#else
+</span><span class='line'>    net_timestamp_set(skb);
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>    rcu_read_lock();
+</span><span class='line'>    list_for_each_entry_rcu(ptype, &amp;ptype_all, list) {-----------------（2）
+</span><span class='line'>        /* Never send packets back to the socket
+</span><span class='line'>         * they originated from - MvS (miquels@drinkel.ow.org)
+</span><span class='line'>         */
+</span><span class='line'>        if ((ptype-&gt;dev == dev || !ptype-&gt;dev) &amp;&amp;
+</span><span class='line'>         (ptype-&gt;af_packet_priv == NULL ||
+</span><span class='line'>         (struct sock *)ptype-&gt;af_packet_priv != skb-&gt;sk)) {-----------------（3）
+</span><span class='line'>            struct sk_buff *skb2 = skb_clone(skb, GFP_ATOMIC); -----------------（4）
+</span><span class='line'>            if (!skb2)
+</span><span class='line'>                break;
+</span><span class='line'>
+</span><span class='line'>            /* skb-&gt;nh should be correctly
+</span><span class='line'>             set by sender, so that the second statement is
+</span><span class='line'>             just protection against buggy protocols.
+</span><span class='line'>             */
+</span><span class='line'>            skb_reset_mac_header(skb2);
+</span><span class='line'>
+</span><span class='line'>            if (skb_network_header(skb2) &lt; skb2-&gt;data ||
+</span><span class='line'>             skb2-&gt;network_header &gt; skb2-&gt;tail) {
+</span><span class='line'>                if (net_ratelimit())
+</span><span class='line'>                    printk(KERN_CRIT "protocol %04x is "
+</span><span class='line'>                     "buggy, dev %s\n",
+</span><span class='line'>                     ntohs(skb2-&gt;protocol),
+</span><span class='line'>                     dev-&gt;name);
+</span><span class='line'>                skb_reset_network_header(skb2); -----------------（5）
+</span><span class='line'>            }
+</span><span class='line'>
+</span><span class='line'>            skb2-&gt;transport_header = skb2-&gt;network_header;
+</span><span class='line'>            skb2-&gt;pkt_type = PACKET_OUTGOING;
+</span><span class='line'>            ptype-&gt;func(skb2, skb-&gt;dev, ptype, skb-&gt;dev); -----------------（6）
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>    rcu_read_unlock();
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;说明：&lt;br/&gt;
+</span><span class='line'>（1） 记录该数据包输入的时间戳&lt;br/&gt;
+</span><span class='line'>（2） 遍历ptype_all链表，查找所有符合输入条件的原始套接口，并循环将数据包输入到满足条件的套接口&lt;br/&gt;
+</span><span class='line'>（3） 数据包的输出设备与套接口的输入设备相符或者套接口不指定输入设备，并且该数据包不是有当前用于比较的套接口输出，此时该套接口满足条件，数据包可以输入&lt;br/&gt;
+</span><span class='line'>（4） 由于该数据包是额外输入到这个原始套接口的，因此需要克隆一个数据包&lt;br/&gt;
+</span><span class='line'>（5） 校验数据包是否有效&lt;br/&gt;
+</span><span class='line'>（6） 将数据包输入原始套接口&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;6. 对于lookback设备来说处理有些不同。它的hard_start_xmit函数是loopback_xmit&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在net/lookback.c文件中，定义的struct net_device_ops loopback_ops结构体&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static const struct net_device_ops loopback_ops = {
+</span><span class='line'>    .ndo_init = loopback_dev_init,
+</span><span class='line'>    .ndo_start_xmit= loopback_xmit,
+</span><span class='line'>    .ndo_get_stats64 = loopback_get_stats64,
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;从这里可以看到起发送函数为loopback_xmit函数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static netdev_tx_t loopback_xmit(struct sk_buff *skb,
+</span><span class='line'>                 struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>    struct pcpu_lstats *lb_stats;
+</span><span class='line'>    int len;
+</span><span class='line'>
+</span><span class='line'>    skb_orphan(skb);
+</span><span class='line'>
+</span><span class='line'>    skb-&gt;protocol = eth_type_trans(skb, dev);
+</span><span class='line'>
+</span><span class='line'>    /* it's OK to use per_cpu_ptr() because BHs are off */
+</span><span class='line'>    lb_stats = this_cpu_ptr(dev-&gt;lstats);
+</span><span class='line'>
+</span><span class='line'>    len = skb-&gt;len;
+</span><span class='line'>    if (likely(netif_rx(skb) == NET_RX_SUCCESS)) {//直接调用了netif_rx进行了接收处理
+</span><span class='line'>        u64_stats_update_begin(&amp;lb_stats-&gt;syncp);
+</span><span class='line'>        lb_stats-&gt;bytes += len;
+</span><span class='line'>        lb_stats-&gt;packets++;
+</span><span class='line'>        u64_stats_update_end(&amp;lb_stats-&gt;syncp);
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    return NETDEV_TX_OK;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;7. 已经有了dev_queue_xmit函数，为什么还需要软中断来发送呢？&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;dev_queue_xmit是对skb做些最后的处理并且第一次尝试发送,软中断是将前者发送失败或者没发完的包发送出去。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;主要参考文献：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Linux发送函数dev_queue_xmit分析  &lt;a href="http://shaojiashuai123456.iteye.com/blog/842236"&gt;http://shaojiashuai123456.iteye.com/blog/842236&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;TC流量控制实现分析（初步）  &lt;a href="http://blog.csdn.net/wwwlkk/article/details/5929308"&gt;http://blog.csdn.net/wwwlkk/article/details/5929308&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Linux内核源码剖析 TCP/IP实现&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[路由表 rtable]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-rtable/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-08-25T17:46:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-rtable&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/qy532846454/article/details/6423496"&gt;http://blog.csdn.net/qy532846454/article/details/6423496&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.csdn.net/qy532846454/article/details/6726171"&gt;http://blog.csdn.net/qy532846454/article/details/6726171&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.csdn.net/qy532846454/article/details/7568994"&gt;http://blog.csdn.net/qy532846454/article/details/7568994&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;hr /&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;路由表&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在内核中存在路由表fib_table_hash和路由缓存表rt_hash_table。路由缓存表主要是为了加速路由的查找，每次路由查询都会先查找路由缓存，再查找路由表。这和cache是一个道理，缓存存储最近使用过的路由项，容量小，查找快速；路由表存储所有路由项，容量大，查找慢。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先，应该先了解路由表的意义，下面是route命令查看到的路由表：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>Destination    Netmask        Gateway         Flags  Interface  Metric
+</span><span class='line'>169.254.0.0    255.255.0.0      *               U      eth0       1
+</span><span class='line'>192.168.123.0  255.255.255.0    *               U      eth0       1
+</span><span class='line'>default        0.0.0.0       192.168.123.254    UG     eth0       1
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;一条路由其实就是告知主机要到达一个目的地址，下一跳应该走哪里。比如发往192.168.22.3报文通过查路由表，会得到下一跳为192.168.123.254，再将其发送出去。在路由表项中，还有一个很重要的属性-scope，它代表了到目的网络的距离。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;路由scope可取值：RT_SCOPE_UNIVERSE, RT_SCOPE_LINK, RT_SCOPE_HOST&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在报文的转发过程中，显然是每次转发都要使到达目的网络的距离要越来越小或不变，否则根本到达不了目的网络。上面提到的scope很好的实现这个功能，在查找路由表中，表项的scope一定是更小或相等的scope(比如RT_SCOPE_LINK，则表项scope只能为RT_SCOPE_LINK或RT_SCOPE_HOST)。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;路由缓存&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;路由缓存用于加速路由的查找，当收到报文或发送报文时，首先会查询路由缓存，在内核中被组织成hash表，就是rt_hash_table。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>static struct rt_hash_bucket          *rt_hash_table __read_mostly;      [net/ipv4/route.c]
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;通过ip_route_input()进行查询，首先是缓存操作时，通过[src_ip, dst_ip, iif,rt_genid]计算出hash值
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>hash = rt_hash(daddr, saddr, iif, rt_genid(net));
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;此时rt_hash_table[hash].chain就是要操作的缓存表项的链表，比如遍历该链表
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>for (rth = rt_hash_table[hash].chain; rth; rth = rth-&gt;u.dst.rt_next)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因此，在缓存中查找一个表项，首先计算出hash值，取出这组表项，然后遍历链表，找出指定的表项，这里需要完全匹配[src_ip, dst_ip, iif, tos, mark, net]，实际上struct rtable中有专门的属性用于缓存的查找键值 – struct flowi。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* Cache lookup keys */
+</span><span class='line'>struct flowi                fl;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;当找到表项后会更新表项的最后访问时间，并取出dst
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>dst_use(&amp;rth-&gt;u.dst, jiffies);
+</span><span class='line'>skb_dst_set(skb, &amp;rth-&gt;u.dst);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;路由缓存的创建&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;inet_init() -&gt; ip_init() -&gt; ip_rt_init()
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>rt_hash_table = (struct rt_hash_bucket *)
+</span><span class='line'>    alloc_large_system_hash("IP route cache",
+</span><span class='line'>                                sizeof(struct rt_hash_bucket),
+</span><span class='line'>                                rhash_entries,
+</span><span class='line'>                                (totalram_pages &gt;= 128 * 1024) ?
+</span><span class='line'>                                15 : 17,
+</span><span class='line'>                                0,
+</span><span class='line'>                                &amp;rt_hash_log,
+</span><span class='line'>                                &amp;rt_hash_mask,
+</span><span class='line'>                                rhash_entries ? 0 : 512 * 1024);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;其中rt_hash_mask表示表的大小，rt_hash_log = log(rt_hash_mask)，创建后的结构如图所示：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-1.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;路由缓存插入条目&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;函数rt_intern_hash()&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;要插入的条目是rt，相应散列值是hash，首先通过hash值找到对应的bucket
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>rthp = &amp;rt_hash_table[hash].chain;
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后对bucket进行一遍查询，这次查询的目的有两个：如果是超时的条目，则直接删除；如果是与rt相同键值的条目，则删除并将rt插入头部返回。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    while ((rth = *rthp) != NULL) {
+</span><span class='line'>    if (rt_is_expired(rth)) {     // 超时的条目
+</span><span class='line'>        *rthp = rth-&gt;u.dst.rt_next;
+</span><span class='line'>        rt_free(rth);
+</span><span class='line'>        continue;
+</span><span class='line'>    }
+</span><span class='line'>    if (compare_keys(&amp;rth-&gt;fl, &amp;rt-&gt;fl) &amp;&amp; compare_netns(rth, rt)) { //重复的条目
+</span><span class='line'>        *rthp = rth-&gt;u.dst.rt_next;
+</span><span class='line'>        rcu_assign_pointer(rth-&gt;u.dst.rt_next, rt_hash_table[hash].chain);
+</span><span class='line'>        rcu_assign_pointer(rt_hash_table[hash].chain, rth);
+</span><span class='line'>        ……
+</span><span class='line'>    }
+</span><span class='line'>    ……
+</span><span class='line'>    rthp = &amp;rth-&gt;u.dst.rt_next;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在扫描一遍后，如rt还未存在，则将其插入头部&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    rt-&gt;u.dst.rt_next = rt_hash_table[hash].chain;
+</span><span class='line'>rcu_assign_pointer(rt_hash_table[hash].chain, rt);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果新插入rt满足一定条件，还要与ARP邻居表进行绑定&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Hint：缓存的每个bucket是没有头结点的，单向链表，它所使用的插入和删除操作是值得学习的，简单实用。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;路由缓存删除条目&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;rt_del()&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;要删除的条目是rt，相应散列值是hash，首先通过hash值找到对应的bucket，然后遍历，如果条目超时，或找到rt，则删除它。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    rthp = &amp;rt_hash_table[hash].chain;
+</span><span class='line'>spin_lock_bh(rt_hash_lock_addr(hash));
+</span><span class='line'>ip_rt_put(rt);
+</span><span class='line'>while ((aux = *rthp) != NULL) {
+</span><span class='line'>    if (aux == rt || rt_is_expired(aux)) {
+</span><span class='line'>        *rthp = aux-&gt;u.dst.rt_next;
+</span><span class='line'>        rt_free(aux);
+</span><span class='line'>        continue;
+</span><span class='line'>    }
+</span><span class='line'>    rthp = &amp;aux-&gt;u.dst.rt_next;
+</span><span class='line'>}
+</span><span class='line'>spin_unlock_bh(rt_hash_lock_addr(hash));
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;路由表的创建&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;inet_init() -&gt; ip_init() -&gt; ip_fib_init() -&gt; fib_net_init() -&gt; ip_fib_net_init()[net/ipv4/fib_frontend.c]&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先为路由表分配空间，这里的每个表项hlist_head实际都会链接一个单独的路由表，FIB_TABLE_HASHSZ表示了分配多少个路由表，一般情况下至少有两个 –　LOCAL和MAIN。注意这里仅仅是表头的空间分配，还没有真正分配路由表空间。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    net-&gt;ipv4.fib_table_hash = kzalloc(
+</span><span class='line'>        sizeof(struct hlist_head)*FIB_TABLE_HASHSZ, GFP_KERNEL);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;ip_fib_net_init() -&gt; fib4_rules_init()，这里真正分配了路由表空间&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    local_table = fib_hash_table(RT_TABLE_LOCAL);
+</span><span class='line'>main_table  = fib_hash_table(RT_TABLE_MAIN);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后将local和main表链入之前的fib_table_hash中&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    hlist_add_head_rcu(&amp;local_table-&gt;tb_hlist,
+</span><span class='line'>        &amp;net-&gt;ipv4.fib_table_hash[TABLE_LOCAL_INDEX]);
+</span><span class='line'>
+</span><span class='line'>hlist_add_head_rcu(&amp;main_table-&gt;tb_hlist,
+</span><span class='line'>        &amp;net-&gt;ipv4.fib_table_hash[TABLE_MAIN_INDEX]);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最终生成结构如图，LOCAL表位于fib_table_hash[0]，MAIN表位于fib_table_hash[1]；两张表通过结构tb_hlist链入链表，而tb_id则标识了功能，255是LOCAL表，254是MAIN表。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;关于这里的struct fn_hash，它表示了不同子网掩码长度的hash表[即fn_zone]，对于ipv4，从0~32共33个。而fn_hash的实现则是fib_table的最后一个参数unsigned char tb_data[0]。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-2.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;注意到这里fn_zone还只是空指针，我们还只完成了路由表初始化的一部分。在启动阶段还会调用inet_rtm_newroute() -&gt; fib_table_insert() -&gt; fn_new_zone() [fib_hash.c]来创建fn_zone结构，前面已经讲过，fn_zone一共有33个，其中掩码长度为0[/0]表示为默认路由，fn_zone可以理解为相同掩码的地址集合。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先为fn_zone分配空间
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>struct fn_zone *fz = kzalloc(sizeof(struct fn_zone), GFP_KERNEL);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;传入参数z代表掩码长度， z = 0的掩码用于默认路由，一般只有一个，所以fz_divisor只需设为1；其它设为16；这里要提到fz_divisor的作用，fz-&gt;fz_hash并不是个单链表，而是一个哈希表，而哈希表的大小就是fz_divisor。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>if (z) {
+</span><span class='line'>    fz-&gt;fz_divisor = 16;
+</span><span class='line'>} else {
+</span><span class='line'>    fz-&gt;fz_divisor = 1;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;fz_hashmask实际是用于求余数的，当算出hash值，再hash &amp; fz_hashmask就得出了在哈希表的位置；而fz_hash就是下一层的哈希表了，前面已经提过路由表被多组分层了，这里fz_hash就是根据fz_divisor大小来创建的；fz_order就是子网掩码长度；fz_mask就是子网掩码。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    fz-&gt;fz_hashmask = (fz-&gt;fz_divisor - 1);
+</span><span class='line'>fz-&gt;fz_hash = fz_hash_alloc(fz-&gt;fz_divisor);
+</span><span class='line'>fz-&gt;fz_order = z;
+</span><span class='line'>fz-&gt;fz_mask = inet_make_mask(z);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;从子网长度大于新添加fz的fn_zone中挑选一个不为空的fn_zones[i]，将新创建的fz设成fn_zones[i].next；然后将fz根据掩码长度添加到fn_zones[]中相应位置；fn_zone_list始终指向掩码长度最长的fn_zone。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    for (i=z+1; i&lt;=32; i++)
+</span><span class='line'>    if (table-&gt;fn_zones[i])
+</span><span class='line'>        break;
+</span><span class='line'>if (i&gt;32) {
+</span><span class='line'>    fz-&gt;fz_next = table-&gt;fn_zone_list;
+</span><span class='line'>    table-&gt;fn_zone_list = fz;
+</span><span class='line'>} else {
+</span><span class='line'>    fz-&gt;fz_next = table-&gt;fn_zones[i]-&gt;fz_next;
+</span><span class='line'>    table-&gt;fn_zones[i]-&gt;fz_next = fz;
+</span><span class='line'>}
+</span><span class='line'>table-&gt;fn_zones[z] = fz;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里的fn_hash是数组与链表的结合体，看下fn_hash定义
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>struct fn_hash {
+</span><span class='line'>    struct fn_zone *fn_zones[33];
+</span><span class='line'>    struct fn_zone *fn_zone_list;
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;fn_hash包含33数组元素，每个元素存放一定掩码长度的fn_zone，其中fn_zone[i]存储掩码长度为i。而fn_zone通过内部属性fz_next又彼此串连起来，形成单向链表，其中fn_zone_list可以看作链表头，而这里链表的组织顺序是倒序的，即从掩码长到短。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-3.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;到这里，fz_hash所分配的哈希表还没有插入内容，这部分为fib_insert_node()完成。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;inet_rtm_newroute() -&gt; fib_table_insert() -&gt; fib_insert_node() [net/ipv4/fib_hash.c]&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;这里f是fib_node，可以理解为具有相同网络地址的路由项集合。根据fn_key(网络地址)和fz(掩码长度)来计算hash值，决定将f插入fz_hash的哪个项。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct hlist_head *head = &amp;fz-&gt;fz_hash[fn_hash(f-&gt;fn_key, fz)];
+</span><span class='line'>hlist_add_head(&amp;f-&gt;fn_hash, head);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如何fib_node还不存在，则会创建它，这里的kmem_cache_zalloc()其实就是内存分配&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    new_f = kmem_cache_zalloc(fn_hash_kmem, GFP_KERNEL);
+</span><span class='line'>if (new_f == NULL)
+</span><span class='line'>    goto out;
+</span><span class='line'>INIT_HLIST_NODE(&amp;new_f-&gt;fn_hash);
+</span><span class='line'>INIT_LIST_HEAD(&amp;new_f-&gt;fn_alias);
+</span><span class='line'>new_f-&gt;fn_key = key;
+</span><span class='line'>f = new_f;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;路由表最后一层是fib_info，具体的路由信息都存储在此，它由fib_create_info()创建。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;首先为fib_info分配空间，由于fib_info的最后一个属性是struct fib_nh fib_nh[0]，因此大小是fib_info + nhs * fib_nh，这里的fib_nh代表了下一跳(next hop)的信息，nhs代表了下一跳的数目，一般情况下nhs=1，除非配置了支持多路径。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>fi = kzalloc(sizeof(*fi)+nhs*sizeof(struct fib_nh), GFP_KERNEL);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;设置fi的相关属性
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>fi-&gt;fib_net = hold_net(net);
+</span><span class='line'>fi-&gt;fib_protocol = cfg-&gt;fc_protocol;
+</span><span class='line'>fi-&gt;fib_flags = cfg-&gt;fc_flags;
+</span><span class='line'>fi-&gt;fib_priority = cfg-&gt;fc_priority;
+</span><span class='line'>fi-&gt;fib_prefsrc = cfg-&gt;fc_prefsrc;
+</span><span class='line'>fi-&gt;fib_nhs = nhs;
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;使fi后面所有的nh-&gt;nh_parent指向fi，设置后如图所示
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>change_nexthops(fi) {
+</span><span class='line'>    nexthop_nh-&gt;nh_parent = fi;
+</span><span class='line'>} endfor_nexthops(fi)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-4.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;设置fib_nh的属性，这里仅展示了单一路径的情况：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct fib_nh *nh = fi-&gt;fib_nh;
+</span><span class='line'>nh-&gt;nh_oif = cfg-&gt;fc_oif;
+</span><span class='line'>nh-&gt;nh_gw = cfg-&gt;fc_gw;
+</span><span class='line'>nh-&gt;nh_flags = cfg-&gt;fc_flags;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后，再根据cfg-&gt;fc_scope值来设置nh的其余属性。如果scope是RT_SCOPE_HOST，则设置下一跳scope为RT_SCOPE_NOWHERE&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (cfg-&gt;fc_scope == RT_SCOPE_HOST) {
+</span><span class='line'>    struct fib_nh *nh = fi-&gt;fib_nh;
+</span><span class='line'>    nh-&gt;nh_scope = RT_SCOPE_NOWHERE;
+</span><span class='line'>    nh-&gt;nh_dev = dev_get_by_index(net, fi-&gt;fib_nh-&gt;nh_oif);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果scope是RT_SCOPE_LINK或RT_SCOPE_UNIVERSE，则设置下跳&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    change_nexthops(fi) {
+</span><span class='line'>    if ((err = fib_check_nh(cfg, fi, nexthop_nh)) != 0)
+</span><span class='line'>        goto failure;
+</span><span class='line'>} endfor_nexthops(fi)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后，将fi链入链表中，这里要注意的是所有的fib_info(只要创建了的)都会加入fib_info_hash中，如果路由项使用了优先地址属性，还会加入fib_info_laddrhash中。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    hlist_add_head(&amp;fi-&gt;fib_hash,
+</span><span class='line'>        &amp;fib_info_hash[fib_info_hashfn(fi)]);
+</span><span class='line'>
+</span><span class='line'>if (fi-&gt;fib_prefsrc) {
+</span><span class='line'>    struct hlist_head *head;
+</span><span class='line'>    head = &amp;fib_info_laddrhash[fib_laddr_hashfn(fi-&gt;fib_prefsrc)];
+</span><span class='line'>    hlist_add_head(&amp;fi-&gt;fib_lhash, head);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;无论fib_info在路由表中位于哪个掩码、哪个网段结构下，都与fib_info_hash和fib_info_laddrhash无关，这两个哈希表与路由表独立，主要是用于加速路由信息fib_info的查找。哈希表的大小为fib_hash_size，当超过这个限制时，fib_hash_size * 2(如果哈希函数够好，每个bucket都有一个fib_info)。fib_info在哈希表的图示如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-5.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;由于路由表信息也可能要以设备dev为键值搜索，因此还存在fib_info_devhash哈希表，用于存储nh的设置dev-&gt;ifindex。
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>change_nexthops(fi) {
+</span><span class='line'>    hash = fib_devindex_hashfn(nexthop_nh-&gt;nh_dev-&gt;ifindex);
+</span><span class='line'>    head = &amp;fib_info_devhash[hash];
+</span><span class='line'>    hlist_add_head(&amp;nexthop_nh-&gt;nh_hash, head);
+</span><span class='line'>} endfor_nexthops(fi)
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;上面讲过了路由表各个部分的创建，现在来看下它们是如何一起工作的，在fib_table_insert()[net/ipv4/fib_hash.c]完成整个的路由表创建过程。下面来看下fib_table_insert()函数：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;从fn_zones中取出掩码长度为fc_dst_len的项，如果该项不存在，则创建它[fn_zone的创建前面已经讲过]。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    fz = table-&gt;fn_zones[cfg-&gt;fc_dst_len];
+</span><span class='line'>if (!fz &amp;&amp; !(fz = fn_new_zone(table, cfg-&gt;fc_dst_len)))
+</span><span class='line'>    return -ENOBUFS;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后创建fib_info结构，[前面已经讲过]
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>fi = fib_create_info(cfg);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后在掩码长度相同项里查找指定网络地址key(如145.222.33.0/24)，查找的结果如图所示
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>f = fib_find_node(fz, key);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-25-6.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果不存在该网络地址项，则创建相应的fib_node，并加入到链表fz_hash中</span></code></pre></td></tr></table></div></figure>
+    if (!f) {
+        new_f = kmem_cache_zalloc(fn_hash_kmem, GFP_KERNEL);
+        if (new_f == NULL)
+            goto out;</p>
+
+<pre><code>    INIT_HLIST_NODE(&amp;new_f-&gt;fn_hash);
+    INIT_LIST_HEAD(&amp;new_f-&gt;fn_alias);
+    new_f-&gt;fn_key = key;
+    f = new_f;
+}
+……
+fib_insert_node(fz, new_f);
+</code></pre>
+
+<pre><code>
+
+如果存在该网络地址项，则在fib_node的属性fn_alias中以tos和fi-&gt;fib_priority作为键值查找。一个fib_node可以有多个fib_alias相对应，这些fib_alias以链表形式存在，并按tos并从大到小的顺序排列。因此，fib_find_alias查找到的是第一个fib_alias-&gt;tos不大于tos的fib_alias项。
+</code></pre>
+
+<pre><code>fa = fib_find_alias(&amp;f-&gt;fn_alias, tos, fi-&gt;fib_priority);
+</code></pre>
+
+<pre><code>
+如果查找到的fa与与要插入的路由项完全相同，则按照设置的标置位进行操作，NLM_F_REPLACE则替换掉旧的，NLM_F_APPEND添加在后面。
+
+设置要插入的fib_alias的属性，包括最重要的fib_alias-&gt;fa_info设置为fi
+</code></pre>
+
+<pre><code>new_fa-&gt;fa_info = fi;
+new_fa-&gt;fa_tos = tos;
+new_fa-&gt;fa_type = cfg-&gt;fc_type;
+new_fa-&gt;fa_scope = cfg-&gt;fc_scope;
+new_fa-&gt;fa_state = 0;
+</code></pre>
+
+<pre><code>
+如果没有要插入路由的网络地址项fib_node，则之前已经创建了新的，现在将它插入到路由表中fib_insert_node()；然后将new_fa链入到fib_node-&gt;fn_alias中
+</code></pre>
+
+<pre><code>if (new_f)
+    fib_insert_node(fz, new_f);
+
+list_add_tail(&amp;new_fa-&gt;fa_list,
+            (fa ? &amp;fa-&gt;fa_list : &amp;f-&gt;fn_alias));
+</code></pre>
+
+<pre><code>
+最后，由于新插入的路由表项，会发出通告，告知所以加入RTNLGRP_IPV4_ROUTE组的成员，这个功能可以在linux中使用”ip route monitor”来测试。最终的路由表如图所示：
+</code></pre>
+
+<pre><code>rtmsg_fib(RTM_NEWROUTE, key, new_fa, cfg-&gt;fc_dst_len, tb-&gt;tb_id, &amp;cfg-&gt;fc_nlinfo, 0);
+</code></pre>
+
+<pre><code>
+![](/images/kernel/2015-08-25-7.png)  
+
+
+至此，就完成了路由表项的插入，加上之前的路由表的初始化，整个路由表的创建过程就讲解完了，小小总结一下：
+
+路由表的查找效率是第一位的，因此内核在实现时使用了多级索引来进行加速
+
+第一级：fn_zone　按不同掩码长度分类(如/5和/24)
+
+第二级：fib_node  按不同网络地址分类(如124.44.33.0/24)
+
+第三级：fib_info     下一跳路由信息
+
+
+
+---------
+
+
+路由可以分为两部分：路由缓存(rt_hash_table)和路由表()
+
+路由缓存顾名思义就是加速路由查找的，路由缓存的插入是由内核控制的，而非人为的插入，与之相对比的是路由表是人为插入的，而非内核插入的。在内核中，路由缓存组织成rt_hash_table的结构。
+
+下面是一段IP层协议的代码段[net/ipv4/route.c]，传入IP层的协议在查找路由时先在路由缓存中查找，如果已存在，则skb_dst_set(skb, &amp;rth-&gt;u.dst)并返回；否则在路由表中查询。
+</code></pre>
+
+<pre><code>hash = rt_hash(daddr, saddr, iif, rt_genid(net));  
+
+rcu_read_lock();  
+for (rth = rcu_dereference(rt_hash_table[hash].chain); rth;  
+     rth = rcu_dereference(rth-&gt;u.dst.rt_next)) {  
+    if (((rth-&gt;fl.fl4_dst ^ daddr) |  
+         (rth-&gt;fl.fl4_src ^ saddr) |  
+         (rth-&gt;fl.iif ^ iif) |  
+         rth-&gt;fl.oif |  
+         (rth-&gt;fl.fl4_tos ^ tos)) == 0 &amp;&amp;  
+        rth-&gt;fl.mark == skb-&gt;mark &amp;&amp;  
+        net_eq(dev_net(rth-&gt;u.dst.dev), net) &amp;&amp;  
+        !rt_is_expired(rth)) {  
+        dst_use(&amp;rth-&gt;u.dst, jiffies);  
+        RT_CACHE_STAT_INC(in_hit);  
+        rcu_read_unlock();  
+        skb_dst_set(skb, &amp;rth-&gt;u.dst);  
+        return 0;  
+    }  
+    RT_CACHE_STAT_INC(in_hlist_search);  
+}  
+rcu_read_unlock();  
+</code></pre>
+
+<pre><code>
+在ip_route_input()中查询完陆由缓存后会处理组播地址，如果是组播地址，则下面判断会成功：ipv4_is_multicast(daddr)。
+
+然后执行ip_route_input_mc()，它的主要作用就是生成路由缓存项rth，并插入缓存。rth的生成与初始化只给出了input函数的，其它略去了，可以看出组播报文会通过ip_local_deliver()继续向上传递。
+</code></pre>
+
+<pre><code>rth-&gt;u.dst.input= ip_local_deliver;  
+hash = rt_hash(daddr, saddr, dev-&gt;ifindex, rt_genid(dev_net(dev)));  
+return rt_intern_hash(hash, rth, NULL, skb, dev-&gt;ifindex);  
+</code></pre>
+
+<pre><code>
+路由表又可以分为两个：RT_TABLE_LOCAL和RT_TABLE_MAIN  
+  RT_TABLE_LOCAL存储目的地址是本机的路由表项，这些目的地址就是为各个网卡配置的IP地址；  
+  RT_TABLE_MAIN存储到其它主机的路由表项；  
+
+显然，RT_TABLE_MAIN路由表只有当主机作为路由器时才有作用，一般主机该表是空的，因为主机不具有转发数据包的功能。RT_TABLE_LOCAL对主机就足够了，为各个网卡配置的IP地址都会加入RT_TABLE_LOCAL中，如为eth1配置了1.2.3.4的地址，则RT_TABLE_LOCAL中会存在1.2.3.4的路由项。只有本地的网卡地址会被加入，比如lo、eth1。IP模块在初始化时ip_init() -&gt; ip_rt_init() - &gt; ip_fib_init()会注册notifier机制，当为网卡地址配置时会执行fib_netdev_notifier和fib_inetaddr_notifier，使更改反映到RT_TABLE_LOCAL中。
+</code></pre>
+
+<pre><code>register_netdevice_notifier(&amp;fib_netdev_notifier);  
+register_inetaddr_notifier(&amp;fib_inetaddr_notifier);  
+</code></pre>
+
+<pre><code>
+而当在路由缓存中没有查找到缓存项时，会进行路由表查询，还是以IP层协议中的代码段为例[net/ipv4/route.c]，fib_lookup()会在MAIN和LOCAL两张表中进行查找。
+</code></pre>
+
+<pre><code>if ((err = fib_lookup(net, &amp;fl, &amp;res)) != 0) {  
+    if (!IN_DEV_FORWARD(in_dev))  
+        goto e_hostunreach;  
+    goto no_route;  
+}  
+</code></pre>
+
+<pre><code>
+如果主机配置成了支持转发，则无论在路由表中找到与否，都会生成这次查询的一个缓存，包括源IP、目的IP、接收的网卡，插入路由缓存中：
+</code></pre>
+
+<pre><code>hash = rt_hash(daddr, saddr, fl.iif, rt_genid(net));  
+err = rt_intern_hash(hash, rth, NULL, skb, fl.iif);  
+</code></pre>
+
+<pre><code>
+不同的是，如果在路由表中查询失败，即数据包不是发往本机，也不能被本机转发，则会设置插入路由缓存的缓存项u.dst.input=ip_error，而u.dst.input即为IP层处理完后向上传递的函数，而ip_error()会丢弃数据包，被发送相应的ICMP错误报文。不在路由表中的路由项也要插入路由缓存，这可以看作路由学习功能，下次就可以直接在路由缓存中找到。
+</code></pre>
+
+<pre><code>rth-&gt;u.dst.input= ip_error;  
+rth-&gt;u.dst.error= -err;  
+rth-&gt;rt_flags    &amp;= ~RTCF_LOCAL;  
+</code></pre>
+
+<pre><code>
+但如果主机不支持转发，即没有路由功能，则只有在找到时才会添加路由缓存项，都不会生成路由缓存项。这是因为在LOCAL表中没有找到，表明数据包不是发往本机的，此时缓存这样的路由项对于主机的数据包传输没有一点意义。它只需要知道哪些数据包是发给它的，其余的一律不管！
+
+路由查询整合起来，就是由ip_route_input()引入，然后依次进行路由缓存和路由表查询，并对路由缓存进行更新。路由缓存在每个数据包到来时都可能发生更新，但路由表则不一样，只能通过RTM机制更新，LOCAL表是在网卡配置时更新的，MAIN表则是由人工插入的(inet_rtm_newroute)。
+
+ip_route_input()  
+  - 路由缓存查询  
+  - 路由表查询：ip_route_input_slow() -&gt; fib_lookup()  
+
+
+----------
+
+这次将以更实际的例子来分析过程中路由表的使用情况，注意下文都是对路由缓存表的描述，因为路由表在配置完网卡地址后就不会再改变了(除非人为的去改动)，测试环境如下图：
+
+![](/images/kernel/2015-08-25-11.jpg)  
+
+
+两台主机Host1与Host2，分别配置了IP地址192.168.1.1与192.168.1.2，两台主机间用网线直连。在两台主机上分别执行如下操作：  
+  1. 在Host1上ping主机Host2  
+  2. 在Host2上ping主机Host1  
+
+很简单常的两台主机互ping的例子，下面来分析这过程中路由表的变化，准备说是路由缓存的变化。首先，路由缓存会存在几个条目？答案不是2条而是3条，这点很关键，具体可以通过/proc/net/rt_cache来查看路由缓存表，下图是执行上述操作后得到的结果：
+
+![](/images/kernel/2015-08-25-12.jpg)  
+
+
+ brcm0.1是Host主机上的网卡设备，等同于常用的eth0，lo是环路设备。对结果稍加分析，可以发现，条目1和条目2是完全一样的，除了计数的Use稍有差别，存在这种情况的原因是缓存表是以Hash表的形式存储的，尽管两者内容相同，在实际插入时使用的键值是不同的，下面以Host2主机的路由缓存表为视角，针对互ping的过程进行逐一分析。
+
+假设brcm0.1设备的index = 2
+
+步骤0：初始时陆由缓存为空
+
+步骤1：主机Host1 ping 主机Host2
+
+Host2收到来自Host1的echo报文(dst = 192.168.1.2, src = 192.168.1.1)  
+在报文进入IP层后会查询路由表，以确定报文的接收方式，相应调用流程：  
+ip_route_input() -&gt; ip_route_input_slow()  
+在ip_route_input()中查询路由缓存，使用的键值是[192.168.1.2, 192.168.1.1, 2, id]，由于缓存表为空，查询失败，继续走ip_route_input_slow()来创建并插入新的缓存项。
+</code></pre>
+
+<pre><code>hash = rt_hash(daddr, saddr, iif, rt_genid(net));  
+</code></pre>
+
+<pre><code>
+在ip_route_input_slow()中查询路由表，因为发往本机，在会LOCAL表中匹配192.168.1.2条目，查询结果res.type==RTN_LOCAL。
+</code></pre>
+
+<pre><code>if ((err = fib_lookup(net, &amp;fl, &amp;res)) != 0) {  
+ if (!IN_DEV_FORWARD(in_dev))  
+  goto e_hostunreach;  
+ goto no_route;  
+}  
+</code></pre>
+
+<pre><code>
+然后根据res.type跳转到local_input代码段，创建新的路由缓存项，并插入陆由缓存。
+</code></pre>
+
+<pre><code>rth = dst_alloc(&amp;ipv4_dst_ops);  
+……  
+rth-&gt;u.dst.dev = net-&gt;loopback_dev;  
+rth-&gt;rt_dst = daddr;  
+rth-&gt;rt_src = saddr;  
+rth-&gt;rt_gateway = daddr;  
+rth-&gt;rt_spec_dst = spec_dst; (spec_dst=daddr)  
+……  
+hash = rt_hash(daddr, saddr, fl.iif, rt_genid(net));  
+err = rt_intern_hash(hash, rth, NULL, skb, fl.iif);  
+</code></pre>
+
+<pre><code>
+因此插入的第一条缓存信息如下：
+</code></pre>
+
+<pre><code>    Key = [dst = 192.168.1.2  src = 192.168.1.1 idx = 2 id = id]
+    Value = [Iface = lo dst = 192.168.1.2 src = 192.168.1.1 idx = 2 id = id ……]
+</code></pre>
+
+<pre><code>
+步骤2：
+主机Host2 发送echo reply报文给主机 Host1 (dst = 192.168.1.1 src = 192.168.1.2)  
+步骤2是紧接着步骤1的，Host2在收到echo报文后会立即回复echo reply报文，相应调用流程：  
+icmp_reply() -&gt; ip_route_output_key() -&gt; ip_route_output_flow() -&gt; __ip_route_output_key() -&gt; ip_route_output_slow() -&gt; ip_mkroute_output() -&gt; __mkroute_output()  
+在icmp_reply()中生成稍后路由查找中的关键数据flowi，可以看作查找的键值，由于是回复已收到的报文，因此目的与源IP地址者是已知的，下面结构中daddr=192.168.1.1，saddr=192.168.1.2。  
+</code></pre>
+
+<pre><code>struct flowi fl = { .nl_u = { .ip4_u =  
+  { .daddr = daddr,  
+  .saddr = rt-&gt;rt_spec_dst,  
+  .tos = RT_TOS(ip_hdr(skb)-&gt;tos) } },  
+  .proto = IPPROTO_ICMP };  
+</code></pre>
+
+<pre><code>
+在__ip_route_output_key()时会查询路由缓存表，查询的键值是[192.168.1.1, 192.168.1.2, 0, id]，由于此时路由缓存中只有一条刚刚插入的从192.168.1.1-&gt;192.168.1.2的缓存项，因而查询失败，继续走ip_route_output_slow()来创建并插入新的缓存项。
+</code></pre>
+
+<pre><code>hash = rt_hash(flp-&gt;fl4_dst, flp-&gt;fl4_src, flp-&gt;oif, rt_genid(net));  
+</code></pre>
+
+<pre><code>
+在ip_route_input_slow()中查询路由表，因为在同一网段，在会MAIN表中匹配192.168.1.0/24条目，查询结果res.type==RTN_UNICAST。
+</code></pre>
+
+<pre><code>if (fib_lookup(net, &amp;fl, &amp;res)) {  
+…..  
+}  
+</code></pre>
+
+<pre><code>
+然后调用__mkroute_output()来生成新的路由缓存，信息如下：
+</code></pre>
+
+<pre><code>rth-&gt;u.dst.dev = dev_out;  
+rth-&gt;rt_dst = fl-&gt;fl4_dst;  
+rth-&gt;rt_src = fl-&gt;fl4_src;  
+rth-&gt;rt_gateway = fl-&gt;fl4_dst;  
+rth-&gt;rt_spec_dst= fl-&gt;fl4_src;  
+rth-&gt;fl.oif = oldflp-&gt;oif; (oldflp-&gt;oif为0)  
+</code></pre>
+
+<pre><code>
+插入路由缓存表时使用的键值是：
+</code></pre>
+
+<pre><code>hash = rt_hash(oldflp-&gt;fl4_dst, oldflp-&gt;fl4_src, oldflp-&gt;oif, rt_genid(dev_net(dev_out)));  
+</code></pre>
+
+<pre><code>
+这条语句很关键，缓存的存储形式是hash表，除了生成缓存信息外，还要有相应的键值，这句的hash就是产生的键值，可以看到，它是由(dst, src, oif, id)四元组生成的，dst和src很好理解，id对于net来说是定值，oif则是关键，注意这里用的是oldflp-&gt;oif(它的值为0)，尽管路由缓存对应的出接口设备是dev_out。所以，第二条缓存信息的如下：
+</code></pre>
+
+<pre><code>    Key = [dst = 192.168.1.1  src = 192.168.1.2 idx = 0 id = id]
+    Value = [Iface = brcm0.1  dst = 192.168.1.1 src = 192.168.1.2 idx = 2 id = id ……]
+</code></pre>
+
+<pre><code>
+步骤3：
+
+主机Host2 ping 主机Host1    
+Host2向Host1发送echo报文(dst = 192.168.1.1, src = 192.168.1.2)  
+Host2主动发送echo报文，使用SOCK_RAW与IPPROTO_ICMP组合的套接字，相应调用流程：  
+raw_sendmsg() -&gt; ip_route_output_flow() -&gt; __ip_route_output_key() -&gt; ip_route_output_slow() -&gt; ip_mkroute_output() -&gt; __mkroute_output()  
+在raw_sendmsg()中生成稍后路由查找中的关键数据flowi，可以看作查找的键值，由于是主动发送的报文，源IP地址者还是未知的，因为主机可能是多接口的，在查询完路由表后才能得到要走的设备接口和相应的源IP地址。下面结构中daddr=192.168.1.1，saddr=0。
+</code></pre>
+
+<pre><code>struct flowi fl = { .oif = ipc.oif,  
+  .mark = sk-&gt;sk_mark,  
+  .nl_u = { .ip4_u =  
+    { .daddr = daddr,  
+   .saddr = saddr,  
+   .tos = tos } },  
+  .proto = inet-&gt;hdrincl ? IPPROTO_RAW :  
+        sk-&gt;sk_protocol,  
+ };  
+</code></pre>
+
+<pre><code>
+在__ip_route_output_key()时会查询路由缓存表，查询的键值是[192.168.1.1, 0, 0, id]，尽管此时路由缓存中刚刚插入了192.168.1.2-&gt;192.168.1.1的条目，但由于两者的键值不同，因而查询依旧失败，继续走ip_route_output_slow()来创建并插入新的缓存项。
+</code></pre>
+
+<pre><code>hash = rt_hash(flp-&gt;fl4_dst, flp-&gt;fl4_src, flp-&gt;oif, rt_genid(net));  
+</code></pre>
+
+<pre><code>
+与Host2回复Host1的echo报文相比，除了进入函数不同(前者为icmp_reply，后者为raw_sendmsg)，后续调用流程是完全相同的，导致最终路由缓存不同(准确说是键值)是因为初始时flowi不同。  
+此处，raw_sendmsg()中，flowi的初始值：dst = 192.168.1.1, src = 0, oif = 0  
+对比icmp_reply()中，flowi的初始值：dst = 192.168.1.1, src = 192.168.1.2, oif = 0  
+在上述调用流程中，在__ip_route_output_key()中查找路由缓存，尽管此时路由缓存有从192.168.1.2到192.168.1.1的缓存项，但它的键值与此次查找的键值[192.168.1.1, 192.168.1.2, 0]，从下表可以明显看出：  
+
+![](/images/kernel/2015-08-25-13.jpg)  
+
+
+由于查找失败，生成新的路由缓存项并插入路由缓存表，注意在ip_route_output_slow()中查找完路由表后，设置了缓存的src。
+</code></pre>
+
+<pre><code>if (!fl.fl4_src)  
+    fl.fl4_src = FIB_RES_PREFSRC(res);  
+</code></pre>
+
+<pre><code>
+ 因此插入的第三条缓存信息如下，它与第二条缓存完成相同，区别在于键值不同：
+</code></pre>
+
+<pre><code>    Key = [dst = 192.168.1.1  src = 0 idx = 0 id = id]
+    Value = [Iface = brcm0.1  dst = 192.168.1.1 src = 192.168.1.2 idx = 2 id = id ……]
+</code></pre>
+
+<p>```</p>
+
+<p>最终，路由缓存表如下：</p>
+
+<p><img src="/images/kernel/2015-08-25-14.jpg" alt="" /></p>
+
+<p> 第三条缓存条目键值使用src=0, idx=0的原因是当主机要发送报文给192.168.1.1的主机时，直到IP层路由查询前，它都无法知道该使用的接口地址(如果没有绑定的话)，而路由缓存的查找发生在路由查询之前，所以src=0,idx=0才能保证后续报文使用该条目。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[ifconfig statistics]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-ifconfig/"/>
+    <updated>2015-08-25T14:27:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/08/25/kernel-net-ifconfig</id>
+    <content type="html"><![CDATA[<p><a href="http://jaseywang.me/2014/08/16/ifconfig-%E4%B8%8B%E9%9D%A2%E7%9A%84%E4%B8%80%E4%BA%9B%E5%AD%97%E6%AE%B5errors-dropped-overruns/">http://jaseywang.me/2014/08/16/ifconfig-%E4%B8%8B%E9%9D%A2%E7%9A%84%E4%B8%80%E4%BA%9B%E5%AD%97%E6%AE%B5errors-dropped-overruns/</a></p>
+
+<p><a href="http://unix.stackexchange.com/questions/184604/whats-the-difference-between-errors-dropped-overruns-and-frame-fiel">http://unix.stackexchange.com/questions/184604/whats-the-difference-between-errors-dropped-overruns-and-frame-fiel</a></p>
+
+<p>RX errors: 表示总的收包的错误数量，这包括 too-long-frames 错误，Ring Buffer 溢出错误，crc 校验错误，帧同步错误，fifo overruns 以及 missed pkg 等等。</p>
+
+<p>RX dropped: 表示数据包已经进入了 Ring Buffer，但是由于内存不够等系统原因，导致在拷贝到内存的过程中被丢弃。</p>
+
+<p>RX overruns: 表示了 fifo 的 overruns，这是由于 Ring Buffer(aka Driver Queue) 传输的 IO 大于 kernel 能够处理的 IO 导致的，而 Ring Buffer 则是指在发起 IRQ 请求之前的那块 buffer。很明显，overruns 的增大意味着数据包没到 Ring Buffer 就被网卡物理层给丢弃了，而 CPU 无法即使的处理中断是造成 Ring Buffer 满的原因之一，上面那台有问题的机器就是因为 interruprs 分布的不均匀(都压在 core0)，没有做 affinity 而造成的丢包。</p>
+
+<p>RX frame: 表示 misaligned 的 frames，接收到的位长度不是8的倍数，不是字节。it means frames with a length not divisible by 8. Because of that length is not a valid frame and it is simply discarded.</p>
+]]></content>
+  </entry>
+  
+</feed>

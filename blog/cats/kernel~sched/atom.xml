@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~sched | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~sched/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-07-27T18:24:50+08:00</updated>
+  <updated>2015-09-22T11:40:38+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,157 +14,579 @@
 
   
   <entry>
-    <title type="html"><![CDATA[用户态到内核态切换]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-user-to-kernel/"/>
-    <updated>2015-06-02T14:16:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-user-to-kernel</id>
-    <content type="html"><![CDATA[<p><a href="http://www.cnblogs.com/justcxtoworld/p/3155741.html">http://www.cnblogs.com/justcxtoworld/p/3155741.html</a></p>
+    <title type="html"><![CDATA[Linux RCU机制详解]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/07/31/kernel-sched-rcu/"/>
+    <updated>2015-07-31T10:07:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/07/31/kernel-sched-rcu</id>
+    <content type="html"><![CDATA[<p><a href="http://wenku.baidu.com/link?url=bzayVU6qmUlc6UO9WGdgdxGDzrRBVWCiwjysigFxYuJToiZgtaXF5ss01GENBv4l4xxfyedZtm2Ehz7StlFSIECo65pdZHI3kZxuPv5zzwO">http://wenku.baidu.com/link?url=bzayVU6qmUlc6UO9WGdgdxGDzrRBVWCiwjysigFxYuJToiZgtaXF5ss01GENBv4l4xxfyedZtm2Ehz7StlFSIECo65pdZHI3kZxuPv5zzwO</a></p>
 
-<p>本文将主要研究在X86体系下Linux系统中用户态到内核态切换条件，及切换过程中内核栈和任务状态段TSS在中断机制/任务切换中的作用及相关寄存器的变化。</p>
+<p><a href="http://blog.csdn.net/lili20082008/article/details/17675093">http://blog.csdn.net/lili20082008/article/details/17675093</a></p>
 
-<h4>一、用户态到内核态切换途径：</h4>
+<p><a href="http://blog.csdn.net/junguo/article/details/8244530">http://blog.csdn.net/junguo/article/details/8244530</a></p>
 
-<p> 1：系统调用        2：中断 　　3：异常</p>
+<h4>一:前言</h4>
 
-<p>对应代码，在3.3内核中，可以在/arch/x86/kernel/entry_32.S文件中查看。</p>
+<p>  RCU机制出现的比较早,只是在linux kernel中一直到2.5版本的时候才被采用.关于RCU机制,这里就不做过多的介绍了,网上有很多有关RCU介绍和使用的文档.请自行查阅.本文主要是从linux kernel源代码的角度.来分析RCU的实现.</p>
 
-<h4>二、内核栈</h4>
+<p>在讨论RCU的实现之前.有必要重申以下几点:</p>
 
-<p>内核栈：Linux中每个进程有两个栈，分别用于用户态和内核态的进程执行，其中的内核栈就是用于内核态的堆栈，它和进程的task_struct结构，更具体的是thread_info结构一起放在两个连续的页框大小的空间内。</p>
+<p>1:RCU使用在读者多而写者少的情况.RCU和读写锁相似.但RCU的读者占锁没有任何的系统开销.写者与写写者之间必须要保持同步,且写者必须要等它之前的读者全部都退出之后才能释放之前的资源.</p>
 
-<p>在内核源代码中使用C语言定义了一个联合结构方便地表示一个进程的thread_info和内核栈：</p>
+<p>2:RCU保护的是指针.这一点尤其重要.因为指针赋值是一条单指令.也就是说是一个原子操作.因它更改指针指向没必要考虑它的同步.只需要考虑cache的影响.</p>
 
-<p>此结构在3.3内核版本中的定义在include/linux/sched.h文件的第2106行：
+<p>3:读者是可以嵌套的.也就是说rcu_read_lock()可以嵌套调用.</p>
+
+<p>4:读者在持有rcu_read_lock()的时候,不能发生进程上下文切换.否则,因为写者需要要等待读者完成,写者进程也会一直被阻塞.</p>
+
+<p>以下的代码是基于linux kernel 2.6.26</p>
+
+<h4>二:使用RCU的实例</h4>
+
+<p>Linux kernel中自己附带有详细的文档来介绍RCU,这些文档位于linux-2.6.26.3/Documentation/RCU. 这些文档值得多花点时间去仔细研读一下.</p>
+
+<p>下面以whatisRCU.txt中的例子作为今天分析的起点:
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct foo {
+</span><span class='line'>    int a;
+</span><span class='line'>    char b;
+</span><span class='line'>    long c;
+</span><span class='line'>};
+</span><span class='line'>DEFINE_SPINLOCK(foo_mutex);&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct foo *gbl_foo;
+</span><span class='line'>void foo_update_a(int new_a)
+</span><span class='line'>{
+</span><span class='line'>struct foo *new_fp;
+</span><span class='line'>struct foo *old_fp;
+</span><span class='line'>
+</span><span class='line'>new_fp = kmalloc(sizeof(*new_fp), GFP_KERNEL);
+</span><span class='line'>spin_lock(&amp;foo_mutex);
+</span><span class='line'>old_fp = gbl_foo;
+</span><span class='line'>*new_fp = *old_fp;
+</span><span class='line'>new_fp-&gt;a = new_a;
+</span><span class='line'>rcu_assign_pointer(gbl_foo, new_fp);
+</span><span class='line'>spin_unlock(&amp;foo_mutex);
+</span><span class='line'>synchronize_rcu();
+</span><span class='line'>kfree(old_fp);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int foo_get_a(void)
+</span><span class='line'>{
+</span><span class='line'>int retval;
+</span><span class='line'>
+</span><span class='line'>rcu_read_lock();
+</span><span class='line'>retval = rcu_dereference(gbl_foo)-&gt;a;
+</span><span class='line'>rcu_read_unlock();
+</span><span class='line'>return retval;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>如上代码所示,RCU被用来保护全局指针struct foo *gbl_foo. foo_get_a()用来从RCU保护的结构中取得gbl_foo的值.而foo_update_a()用来更新被RCU保护的gbl_foo的值.
+</span><span class='line'>
+</span><span class='line'>另外,我们思考一下,为什么要在foo_update_a()中使用自旋锁foo_mutex呢?
+</span><span class='line'>
+</span><span class='line'>假设中间没有使用自旋锁.那foo_update_a()的代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void foo_update_a(int new_a)
+</span><span class='line'>{
+</span><span class='line'>struct foo *new_fp;
+</span><span class='line'>struct foo *old_fp;
+</span><span class='line'>
+</span><span class='line'>new_fp = kmalloc(sizeof(*new_fp), GFP_KERNEL);
+</span><span class='line'>
+</span><span class='line'>old_fp = gbl_foo;
+</span><span class='line'>1:-------------------------     
+</span><span class='line'>*new_fp = *old_fp;
+</span><span class='line'>new_fp-&gt;a = new_a;
+</span><span class='line'>rcu_assign_pointer(gbl_foo, new_fp);
+</span><span class='line'>
+</span><span class='line'>synchronize_rcu();
+</span><span class='line'>kfree(old_fp);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;假设A进程在上图----标识处被B进程抢点.B进程也执行了goo_ipdate_a().等B执行完后，再切换回A进程.此时,A进程所持的old_fd实际上已经被B进程给释放掉了.此后A进程对old_fd的操作都是非法的.
+</span><span class='line'>
+</span><span class='line'>另外,我们在上面也看到了几个有关RCU的核心API.它们为别是:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;rcu_read_lock()
+</span><span class='line'>rcu_read_unlock()
+</span><span class='line'>synchronize_rcu()
+</span><span class='line'>rcu_assign_pointer()
+</span><span class='line'>rcu_dereference()
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;其中,rcu_read_lock()和rcu_read_unlock()用来保持一个读者的RCU临界区.在该临界区内不允许发生上下文切换.
+</span><span class='line'>
+</span><span class='line'>rcu_dereference():读者调用它来获得一个被RCU保护的指针.
+</span><span class='line'>
+</span><span class='line'>Rcu_assign_pointer():写者使用该函数来为被RCU保护的指针分配一个新的值.这样是为了安全从写者到读者更改其值.这个函数会返回一个新值
+</span><span class='line'>
+</span><span class='line'>#### 三:RCU API实现分析
+</span><span class='line'>
+</span><span class='line'>Rcu_read_lock()和rcu_read_unlock()的实现如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define rcu_read_lock() __rcu_read_lock()
+</span><span class='line'>#define rcu_read_unlock() __rcu_read_unlock()
+</span><span class='line'>
+</span><span class='line'>#define __rcu_read_lock() \
+</span><span class='line'>do { \
+</span><span class='line'>    preempt_disable(); \
+</span><span class='line'>    __acquire(RCU); \
+</span><span class='line'>    rcu_read_acquire(); \
+</span><span class='line'>} while (0)
+</span><span class='line'>#define __rcu_read_unlock() \
+</span><span class='line'>do { \
+</span><span class='line'>    rcu_read_release(); \
+</span><span class='line'>    __release(RCU); \
+</span><span class='line'>    preempt_enable(); \
+</span><span class='line'>} while (0)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>其中__acquire(),rcu_read_read_acquire(),rcu_read_release(),rcu_read_release()都是一些选择编译函数,可以忽略不可看.因此可以得知.rcu_read_lock(),rcu_read_unlock()只是禁止和启用抢占.因为在读者临界区,不允许发生上下文切换.
+</span><span class='line'>
+</span><span class='line'>rcu_dereference()和rcu_assign_pointer()的实现如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define rcu_dereference(p)     ({ \
+</span><span class='line'>            typeof(p) _________p1 = ACCESS_ONCE(p); \
+</span><span class='line'>            smp_read_barrier_depends(); \
+</span><span class='line'>            (_________p1); \
+</span><span class='line'>            })
+</span><span class='line'>#define rcu_assign_pointer(p, v) \
+</span><span class='line'>({ \
+</span><span class='line'>    if (!__builtin_constant_p(v) || \
+</span><span class='line'>        ((v) != NULL)) \
+</span><span class='line'>        smp_wmb(); \
+</span><span class='line'>    (p) = (v); \
+</span><span class='line'>})
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>它们的实现也很简单.因为它们本身都是原子操作.因为只是为了cache一致性,插上了内存屏障.可以让其它的读者/写者可以看到保护指针的最新值.
+</span><span class='line'>
+</span><span class='line'>synchronize_rcu()在RCU中是一个最核心的函数,它用来等待之前的读者全部退出.我们后面的大部份分析也是围绕着它而进行.实现如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void synchronize_rcu(void)
+</span><span class='line'>{
+</span><span class='line'>struct rcu_synchronize rcu;
+</span><span class='line'>
+</span><span class='line'>init_completion(&amp;rcu.completion);
+</span><span class='line'>/* Will wake me after RCU finished */
+</span><span class='line'>call_rcu(&amp;rcu.head, wakeme_after_rcu);
+</span><span class='line'>
+</span><span class='line'>/* Wait for it */
+</span><span class='line'>wait_for_completion(&amp;rcu.completion);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>我们可以看到,它初始化了一个本地变量,它的类型为struct rcu_synchronize.调用call_rcu()之后.一直等待条件变量rcu.competion的满足.
+</span><span class='line'>
+</span><span class='line'>在这里看到了RCU的另一个核心API,它就是call_run().它的定义如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void call_rcu(struct rcu_head *head,
+</span><span class='line'>            void (*func)(struct rcu_head *rcu))
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>它用来等待之前的读者操作完成之后,就会调用函数func.
+</span><span class='line'>
+</span><span class='line'>我们也可以看到,在synchronize_rcu()中,读者操作完了要调用的函数就是wakeme_after_rcu().
+</span><span class='line'>
+</span><span class='line'>另外,call_rcu()用在不可睡眠的条件中,如果中断环境,禁止抢占环境等.而synchronize_rcu()用在可睡眠的环境下.先跟踪看一下wakeme_after_rcu():
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void wakeme_after_rcu(struct rcu_head  *head)
+</span><span class='line'>{
+</span><span class='line'>struct rcu_synchronize *rcu;
+</span><span class='line'>
+</span><span class='line'>rcu = container_of(head, struct rcu_synchronize, head);
+</span><span class='line'>complete(&amp;rcu-&gt;completion);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>我们可以看到,该函数将条件变量置真,然后唤醒了在条件变量上等待的进程.
+</span><span class='line'>
+</span><span class='line'>看下call_rcu():
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void call_rcu(struct rcu_head *head,
+</span><span class='line'>            void (*func)(struct rcu_head *rcu))
+</span><span class='line'>{
+</span><span class='line'>unsigned long flags;
+</span><span class='line'>struct rcu_data *rdp;
+</span><span class='line'>
+</span><span class='line'>head-&gt;func = func;
+</span><span class='line'>head-&gt;next = NULL;
+</span><span class='line'>local_irq_save(flags);
+</span><span class='line'>rdp = &amp;__get_cpu_var(rcu_data);
+</span><span class='line'>*rdp-&gt;nxttail = head;
+</span><span class='line'>rdp-&gt;nxttail = &amp;head-&gt;next;
+</span><span class='line'>if (unlikely(++rdp-&gt;qlen &gt; qhimark)) {
+</span><span class='line'>    rdp-&gt;blimit = INT_MAX;
+</span><span class='line'>    force_quiescent_state(rdp, &amp;rcu_ctrlblk);
+</span><span class='line'>}
+</span><span class='line'>local_irq_restore(flags);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>该函数也很简单,就是将head加在了per_cpu变量rcu_data的tail链表上.
+</span><span class='line'>
+</span><span class='line'>Rcu_data定义如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;DEFINE_PER_CPU(struct rcu_data, rcu_data) = { 0L };</span></code></pre></td></tr></table></div></figure>
+由此,我们可以得知,每一个CPU都有一个rcu_data.每个调用call_rcu()/synchronize_rcu()进程所代表的head都会挂到rcu_data的tail链表上.</p>
+
+<p>那究竟怎么去判断当前的写者已经操作完了呢?我们在之前看到,不是读者在调用rcu_read_lock()的时候要禁止抢占么?因此,我们只需要判断如有的CPU都进过了一次上下文切换,就说明所有读者已经退出了.</p>
+
+<blockquote><blockquote><p><a href="http://www.ibm.com/developerworks/cn/linux/l-rcu/">http://www.ibm.com/developerworks/cn/linux/l-rcu/</a>  中有关这个过程的描述:</p>
+
+<p>“等待适当时机的这一时期称为grace period，而CPU发生了上下文切换称为经历一个quiescent state，grace period就是所有CPU都经历一次quiescent state所需要的等待的时间。垃圾收集器就是在grace period之后调用写者注册的回调函数来完成真正的数据修改或数据释放操作的”</p></blockquote></blockquote>
+
+<p>要彻底弄清楚这个问题,我们得从RCU的初始化说起.</p>
+
+<h4>四:从RCU的初始化说起</h4>
+
+<p>RCU的初始化位于start_kernel()àrcu_init().代码如下:</p>
+
+<pre><code>    void __init rcu_init(void)
+    {
+        __rcu_init();
+    }
+
+    void __init __rcu_init(void)
+    {
+        rcu_cpu_notify(&amp;rcu_nb, CPU_UP_PREPARE,
+                (void *)(long)smp_processor_id());
+        /* Register notifier for non-boot CPUs */
+        register_cpu_notifier(&amp;rcu_nb);
+    }
+</code></pre>
+
+<p>Reqister_cpu_notifier()是关于通知链表的操作,可以忽略不看.</p>
+
+<p>跟进rcu_cpu_notify():</p>
+
+<pre><code>    static int __cpuinit rcu_cpu_notify(struct notifier_block *self,
+                unsigned long action, void *hcpu)
+    {
+        long cpu = (long)hcpu;
+
+        switch (action) {
+        case CPU_UP_PREPARE:
+        case CPU_UP_PREPARE_FROZEN:
+            rcu_online_cpu(cpu);
+            break;
+        case CPU_DEAD:
+        case CPU_DEAD_FROZEN:
+            rcu_offline_cpu(cpu);
+            break;
+        default:
+            break;
+        }
+        return NOTIFY_OK;
+    }
+</code></pre>
+
+<p>注意到,在__rcu_init()中是以CPU_UP_PREPARE为参数调用此函数,对应流程转入rcu_online_cpu中:</p>
+
+<pre><code>    static void __cpuinit rcu_online_cpu(int cpu)
+    {
+        struct rcu_data *rdp = &amp;per_cpu(rcu_data, cpu);
+        struct rcu_data *bh_rdp = &amp;per_cpu(rcu_bh_data, cpu);
+
+        rcu_init_percpu_data(cpu, &amp;rcu_ctrlblk, rdp);
+        rcu_init_percpu_data(cpu, &amp;rcu_bh_ctrlblk, bh_rdp);
+        open_softirq(RCU_SOFTIRQ, rcu_process_callbacks, NULL);
+    }
+</code></pre>
+
+<p>我们从这里又看到了另一个per_cpu变量,rcu_bh_data.有关bh的部份之后再来分析.在这里略过这些部份.</p>
+
+<p>Rcu_init_percpu_data()如下:</p>
+
+<pre><code>    static void rcu_init_percpu_data(int cpu, struct rcu_ctrlblk *rcp,
+                            struct rcu_data *rdp)
+    {
+        memset(rdp, 0, sizeof(*rdp));
+        rdp-&gt;curtail = &amp;rdp-&gt;curlist;
+        rdp-&gt;nxttail = &amp;rdp-&gt;nxtlist;
+        rdp-&gt;donetail = &amp;rdp-&gt;donelist;
+        rdp-&gt;quiescbatch = rcp-&gt;completed;
+        rdp-&gt;qs_pending = 0;
+        rdp-&gt;cpu = cpu;
+        rdp-&gt;blimit = blimit;
+    }
+</code></pre>
+
+<p>调用这个函数的第二个参数是一个全局变量rcu_ctlblk.定义如下:</p>
+
+<pre><code>    static struct rcu_ctrlblk rcu_ctrlblk = {
+        .cur = -300,
+        .completed = -300,
+        .lock = __SPIN_LOCK_UNLOCKED(&amp;rcu_ctrlblk.lock),
+        .cpumask = CPU_MASK_NONE,
+    };
+    static struct rcu_ctrlblk rcu_bh_ctrlblk = {
+        .cur = -300,
+        .completed = -300,
+        .lock = __SPIN_LOCK_UNLOCKED(&amp;rcu_bh_ctrlblk.lock),
+        .cpumask = CPU_MASK_NONE,
+    };
+</code></pre>
+
+<p>在rcu_init_percpu_data中,初始化了三个链表,分别是taillist,curlist和donelist.另外, 将rdp->quiescbatch 赋值为 rcp->completed.这个是一个很重要的操作.</p>
+
+<p>Rdp-> quiescbatch表示rcu_data已经完成的grace period序号(在代码中也被称为了batch),rcp->completed表示全部变量rcu_ctrlblk计数已经完成的grace period序号.将rdp->quiescbatch = rcp->completed;,表示不需要等待grace period.</p>
+
+<p>回到rcu_online_cpu()中:
 <code>
-    2016  union thread_union {
-    2017          struct thread_info thread_info;
-    2018          unsigned long stack[THREAD_SIZE/sizeof(long)];
-    2019     };        
+    open_softirq(RCU_SOFTIRQ, rcu_process_callbacks, NULL);
 </code></p>
 
-<p>其中thread_info结构的定义如下：</p>
+<p>初始化了RCU_SOFTIRQ类型的软中断.但这个软中断什么时候被打开,还需要之后来分析.</p>
 
-<p>3.3内核 /arch/x86/include/asm/thread_info.h文件第26行：
-<code>
-     26 　　struct thread_info {
-     27         struct task_struct      *task;          /* main task structure */
-     28         struct exec_domain      *exec_domain;   /* execution domain */
-     29         __u32                   flags;          /* low level flags */
-     30         __u32                   status;         /* thread synchronous flags */
-     31         __u32                   cpu;            /* current CPU */
-     32         int                     preempt_count;  /* 0 =&gt; preemptable,
-     33                                                    &lt;0 =&gt; BUG */
-     34         mm_segment_t            addr_limit;
-     35         struct restart_block    restart_block;
-     36         void __user             *sysenter_return;
-     37 #ifdef CONFIG_X86_32
-     38         unsigned long           previous_esp;   /* ESP of the previous stack in
-     39                                                    case of nested (IRQ) stacks
-     40                                                 */
-     41         __u8                    supervisor_stack[0];
-     42 #endif
-     43         unsigned int            sig_on_uaccess_error:1;
-     44         unsigned int            uaccess_err:1;  /* uaccess failed */
-     45 };
-</code></p>
+<p>之后,每个CPU的初始化都会经过start_kernel()->rcu_init().相应的,也为每个CPU初始化了RCU的相关结构.</p>
 
-<p>它们的结构图大致如下：</p>
+<h4>五:等待RCU读者操作完成</h4>
 
-<p><img src="/images/kernel/2015-06-02.png" alt="" /></p>
+<p>之前,我们看完了RCU的初始化,现在可以来看一下RCU如何来判断当前的RCU读者已经退出了.</p>
 
-<p>  esp寄存器是CPU栈指针，存放内核栈栈顶地址。在X86体系中，栈开始于末端，并朝内存区开始的方向增长。从用户态刚切换到内核态时，进程的内核栈总是空的，此时esp指向这个栈的顶端。</p>
+<p>在每一次进程切换的时候,都会调用rcu_qsctr_inc().如下代码片段如示:</p>
 
-<p>  在X86中调用int指令型系统调用后会把用户栈的%esp的值及相关寄存器压入内核栈中，系统调用通过iret指令返回，在返回之前会从内核栈弹出用户栈的%esp和寄存器的状态，然后进行恢复。所以在进入内核态之前要保存进程的上下文，中断结束后恢复进程上下文，那靠的就是内核栈。</p>
+<pre><code>    asmlinkage void __sched schedule(void)
+    {
+        ．．．．．．
+        ．．．．．．
+        rcu_qsctr_inc(cpu);
+        ......
+    }
+</code></pre>
 
-<p>  这里有个细节问题，就是要想在内核栈保存用户态的esp,eip等寄存器的值，首先得知道内核栈的栈指针，那在进入内核态之前，通过什么才能获得内核栈的栈指针呢？答案是：TSS</p>
+<p>Rcu_qsctr_inc()代码如下:</p>
 
-<h4>三、TSS</h4>
+<pre><code>    static inline void rcu_qsctr_inc(int cpu)
+    {
+        struct rcu_data *rdp = &amp;per_cpu(rcu_data, cpu);
+        rdp-&gt;passed_quiesc = 1;
+    }
+</code></pre>
 
-<p>X86体系结构中包括了一个特殊的段类型：任务状态段（TSS），用它来存放硬件上下文。TSS反映了CPU上的当前进程的特权级。</p>
+<p>该函数将对应CPU上的rcu_data的passed_quiesc成员设为了1.</p>
 
-<p>linux为每一个cpu提供一个tss段，并且在tr寄存器中保存该段。</p>
+<p>或许你已经发现了,这个过程就标识该CPU经过了一次quiescent state.没错:-)</p>
 
-<p>在从用户态切换到内核态时，可以通过获取TSS段中的esp0来获取当前进程的内核栈 栈顶指针，从而可以保存用户态的cs,esp,eip等上下文。</p>
-
-<p>注：linux中之所以为每一个cpu提供一个tss段，而不是为每个进程提供一个tss段，主要原因是tr寄存器永远指向它，在任务切换的适合不必切换tr寄存器，从而减小开销。</p>
-
-<p>下面我们看下在X86体系中Linux内核对TSS的具体实现：</p>
-
-<p>内核代码中TSS结构的定义：</p>
-
-<p>3.3内核中：/arch/x86/include/asm/processor.h文件的第248行处：
-<code>
-    248   struct tss_struct {
-    249         /*
-    250          * The hardware state:
-    251          */
-    252         struct x86_hw_tss       x86_tss;
-    253
-    254         /*
-    255          * The extra 1 is there because the CPU will access an
-    256          * additional byte beyond the end of the IO permission
-    257          * bitmap. The extra byte must be all 1 bits, and must
-    258          * be within the limit.
-    259          */
-    260         unsigned long           io_bitmap[IO_BITMAP_LONGS + 1];
-    261
-    262         /*
-    263          * .. and then another 0x100 bytes for the emergency kernel stack:
-    264          */
-    265         unsigned long           stack[64];
-    266
-    267 } ____cacheline_aligned;    
-</code></p>
-
-<p>其中主要的内容是：<br/>
-  硬件状态结构:     x86_hw_tss<br/>
-  IO权位图: 　　　　io_bitmap<br/>
-  备用内核栈: 　　  stack</p>
-
-<p>其中硬件状态结构：其中在32位X86系统中x86_hw_tss的具体定义如下：</p>
-
-<p>/arch/x86/include/asm/processor.h文件中第190行处：
-<code>
-    190#ifdef CONFIG_X86_32
-    191 /* This is the TSS defined by the hardware. */
-    192 struct x86_hw_tss {
-    193         unsigned short          back_link, __blh;
-    194         unsigned long           sp0;　　            //当前进程的内核栈顶指针
-    195         unsigned short          ss0, __ss0h;       //当前进程的内核栈段描述符
-    196         unsigned long           sp1;
-    197         /* ss1 caches MSR_IA32_SYSENTER_CS: */
-    198         unsigned short          ss1, __ss1h;
-    199         unsigned long           sp2;
-    200         unsigned short          ss2, __ss2h;
-    201         unsigned long           __cr3;
-    202         unsigned long           ip;
-    203         unsigned long           flags;
-    204         unsigned long           ax;
-    205         unsigned long           cx;
-    206         unsigned long           dx;
-    207         unsigned long           bx;
-    208         unsigned long           sp;      　　　　　　//当前进程用户态栈顶指针
-    209         unsigned long           bp;
-    210         unsigned long           si;
-    211         unsigned long           di;
-    212         unsigned short          es, __esh;
-    213         unsigned short          cs, __csh;
-    214         unsigned short          ss, __ssh;
-    215         unsigned short          ds, __dsh;
-    216         unsigned short          fs, __fsh;
-    217         unsigned short          gs, __gsh;
-    218         unsigned short          ldt, __ldth;
-    219         unsigned short          trace;
-    220         unsigned short          io_bitmap_base;
-    221
-    222 } __attribute__((packed));
-</code></p>
-
-<p>linux的tss段中只使用esp0和iomap等字段，并且不用它的其他字段来保存寄存器，在一个用户进程被中断进入内核态的时候，从tss中的硬件状态结构中取出esp0（即内核栈栈顶指针），然后切到esp0，其它的寄存器则保存在esp0指的内核栈上而不保存在tss中。</p>
-
-<p>每个CPU定义一个TSS段的具体实现代码：</p>
-
-<p>3.3内核中/arch/x86/kernel/init_task.c第35行：
+<p>另外,在时钟中断中,会进行以下操作:
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
@@ -734,575 +1156,1227 @@
 <span class='line-number'>567</span>
 <span class='line-number'>568</span>
 <span class='line-number'>569</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> 35  * per-CPU TSS segments. Threads are completely &lsquo;soft&rsquo; on Linux,
-</span><span class='line'> 36  * no more per-task TSS&rsquo;s. The TSS size is kept cacheline-aligned
-</span><span class='line'> 37  * so they are allowed to end up in the .data..cacheline_aligned
-</span><span class='line'> 38  * section. Since TSS&rsquo;s are completely CPU-local, we want them
-</span><span class='line'> 39  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
-</span><span class='line'> 40  */&lt;/p&gt;
+<span class='line-number'>570</span>
+<span class='line-number'>571</span>
+<span class='line-number'>572</span>
+<span class='line-number'>573</span>
+<span class='line-number'>574</span>
+<span class='line-number'>575</span>
+<span class='line-number'>576</span>
+<span class='line-number'>577</span>
+<span class='line-number'>578</span>
+<span class='line-number'>579</span>
+<span class='line-number'>580</span>
+<span class='line-number'>581</span>
+<span class='line-number'>582</span>
+<span class='line-number'>583</span>
+<span class='line-number'>584</span>
+<span class='line-number'>585</span>
+<span class='line-number'>586</span>
+<span class='line-number'>587</span>
+<span class='line-number'>588</span>
+<span class='line-number'>589</span>
+<span class='line-number'>590</span>
+<span class='line-number'>591</span>
+<span class='line-number'>592</span>
+<span class='line-number'>593</span>
+<span class='line-number'>594</span>
+<span class='line-number'>595</span>
+<span class='line-number'>596</span>
+<span class='line-number'>597</span>
+<span class='line-number'>598</span>
+<span class='line-number'>599</span>
+<span class='line-number'>600</span>
+<span class='line-number'>601</span>
+<span class='line-number'>602</span>
+<span class='line-number'>603</span>
+<span class='line-number'>604</span>
+<span class='line-number'>605</span>
+<span class='line-number'>606</span>
+<span class='line-number'>607</span>
+<span class='line-number'>608</span>
+<span class='line-number'>609</span>
+<span class='line-number'>610</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void update_process_times(int user_tick)
+</span><span class='line'>{
+</span><span class='line'>    ．．．．．．
+</span><span class='line'>    ．．．．．．&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt; 41 DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (rcu_pending(cpu))
+</span><span class='line'>    rcu_check_callbacks(cpu, user_tick);
+</span><span class='line'>．．．．．．
+</span><span class='line'>．．．．．．
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;在每一次时钟中断,都会检查是否有需要更新的RCU需要处理,如果有,就会为其调用rcu_check_callbacks().
+</span><span class='line'>
+</span><span class='line'>Rcu_pending()的代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;int rcu_pending(int cpu)
+</span><span class='line'>{
+</span><span class='line'>return __rcu_pending(&amp;rcu_ctrlblk, &amp;per_cpu(rcu_data, cpu)) ||
+</span><span class='line'>    __rcu_pending(&amp;rcu_bh_ctrlblk, &amp;per_cpu(rcu_bh_data, cpu));
+</span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>INIT_TSS的定义如下:
-</span><span class='line'>
-</span><span class='line'>3.3内核中 /arch/x86/include/asm/processor.h文件的第879行：
+</span><span class='line'>同上面一样,忽略bh的部份.
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;879 #define INIT_TSS  {                                                       \
-</span><span class='line'>880         .x86_tss = {                                                      \
-</span><span class='line'>881                 .sp0            = sizeof(init_stack) + (long)&amp;init_stack, \
-</span><span class='line'>882                 .ss0            = __KERNEL_DS,                            \
-</span><span class='line'>883                 .ss1            = __KERNEL_CS,                            \
-</span><span class='line'>884                 .io_bitmap_base = INVALID_IO_BITMAP_OFFSET,               \
-</span><span class='line'>885          },                                                               \
-</span><span class='line'>886         .io_bitmap              = { [0 ... IO_BITMAP_LONGS] = ~0 },       \
-</span><span class='line'>887 }
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int __rcu_pending(struct rcu_ctrlblk *rcp, struct rcu_data *rdp)
+</span><span class='line'>{
+</span><span class='line'>/* This cpu has pending rcu entries and the grace period
+</span><span class='line'> * for them has completed.
+</span><span class='line'> */
+</span><span class='line'>if (rdp-&gt;curlist &amp;&amp; !rcu_batch_before(rcp-&gt;completed, rdp-&gt;batch))
+</span><span class='line'>    return 1;
+</span><span class='line'>
+</span><span class='line'>/* This cpu has no pending entries, but there are new entries */
+</span><span class='line'>if (!rdp-&gt;curlist &amp;&amp; rdp-&gt;nxtlist)
+</span><span class='line'>    return 1;
+</span><span class='line'>
+</span><span class='line'>/* This cpu has finished callbacks to invoke */
+</span><span class='line'>if (rdp-&gt;donelist)
+</span><span class='line'>    return 1;
+</span><span class='line'>
+</span><span class='line'>/* The rcu core waits for a quiescent state from the cpu */
+</span><span class='line'>if (rdp-&gt;quiescbatch != rcp-&gt;cur || rdp-&gt;qs_pending)
+</span><span class='line'>    return 1;
+</span><span class='line'>
+</span><span class='line'>/* nothing to do */
+</span><span class='line'>return 0;
+</span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
 </span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>其中init_stack是宏定义，指向内核栈：
+</span><span class='line'>上面有四种情况会返回1,分别对应:
+</span><span class='line'>
+</span><span class='line'>1:该CPU上有等待处理的回调函数,且已经经过了一个batch(grace period).rdp-&gt;datch表示rdp在等待的batch序号
+</span><span class='line'>
+</span><span class='line'>2:上一个等待已经处理完了,又有了新注册的回调函数.
+</span><span class='line'>
+</span><span class='line'>3:等待已经完成,但尚末调用该次等待的回调函数.
+</span><span class='line'>
+</span><span class='line'>4:在等待quiescent state.
+</span><span class='line'>
+</span><span class='line'>关于rcp和rdp结构中成员的含义,我们等用到的时候再来分析.
+</span><span class='line'>
+</span><span class='line'>如果rcu_pending返回1,就会进入到rcu_check_callbacks().代码如下:
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;61 #define init_stack              (init_thread_union.stack)
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void rcu_check_callbacks(int cpu, int user)
+</span><span class='line'>{
+</span><span class='line'>if (user ||
+</span><span class='line'>    (idle_cpu(cpu) &amp;&amp; !in_softirq() &amp;&amp;
+</span><span class='line'>            hardirq_count() 
+</span><span class='line'>    rcu_qsctr_inc(cpu);
+</span><span class='line'>    rcu_bh_qsctr_inc(cpu);
+</span><span class='line'>} else if (!in_softirq())
+</span><span class='line'>    rcu_bh_qsctr_inc(cpu);
+</span><span class='line'>raise_rcu_softirq();
+</span><span class='line'>}
 </span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;```
-</span><span class='line'>这里可以看到分别把内核栈栈顶指针、内核代码段、内核数据段赋值给TSS中的相应项。从而进程从用户态切换到内核态时，可以从TSS段中获取内核栈栈顶指针，进而保存进程上下文到内核栈中。&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;如果已经CPU中运行的进程是用户空间进程或者是CPU空闲且不处于中断环境,那么,它也已经进过了一次切换.注意,RCU只能在内核空间使用.
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;总结、有了上面的一些准备，现总结在进程从用户态到内核态切换过程中，Linux主要做的事：&lt;/h4&gt;
+</span><span class='line'>最后调用raise_rcu_softirq()打开了软中断处理.相应的,也就调用RCU的软中断处理函数.结合上面分析的初始化流程,软中断的处理函数为rcu_process_callbacks().
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  1：读取tr寄存器，访问TSS段&lt;br/&gt;
-</span><span class='line'>  2：从TSS段中的sp0获取进程内核栈的栈顶指针&lt;br/&gt;
-</span><span class='line'>  3：由控制单元在内核栈中保存当前eflags,cs,ss,eip,esp寄存器的值。&lt;br/&gt;
-</span><span class='line'>  4：由SAVE_ALL保存其寄存器的值到内核栈&lt;br/&gt;
-</span><span class='line'>  5：把内核代码选择符写入CS寄存器，内核栈指针写入ESP寄存器，把内核入口点的线性地址写入EIP寄存器&lt;/p&gt;
+</span><span class='line'>代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;此时，CPU已经切换到内核态，根据EIP中的值开始执行内核入口点的第一条指令。&lt;/p&gt;
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void rcu_process_callbacks(struct softirq_action *unused)
+</span><span class='line'>{
+</span><span class='line'>__rcu_process_callbacks(&amp;rcu_ctrlblk, &amp;__get_cpu_var(rcu_data));
+</span><span class='line'>__rcu_process_callbacks(&amp;rcu_bh_ctrlblk, &amp;__get_cpu_var(rcu_bh_data));
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;在阅读__rcu_process_callbacks()之前,先来了解一下rdp中几个链表的含义:
+</span><span class='line'>
+</span><span class='line'>每次新注册的回调函数,都会链入到rdp-&gt;taillist.
+</span><span class='line'>
+</span><span class='line'>当前等待grace period完成的函数都会链入到rdp-&gt;curlist上.
+</span><span class='line'>
+</span><span class='line'>到等待的grace period已经到来,就会将curlist上的链表移到donelist上.
+</span><span class='line'>
+</span><span class='line'>当一个grace period过了之后,就会将taillist上的数据移到rdp-&gt;curlist上.之后加册的回调函数又会将其加到rdp-&gt;taillist上.
+</span><span class='line'>
+</span><span class='line'>__rcu_process_callbacks()代码分段分析如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void __rcu_process_callbacks(struct rcu_ctrlblk *rcp,
+</span><span class='line'>                struct rcu_data *rdp)
+</span><span class='line'>{
+</span><span class='line'>if (rdp-&gt;curlist &amp;&amp; !rcu_batch_before(rcp-&gt;completed, rdp-&gt;batch)) {
+</span><span class='line'>    *rdp-&gt;donetail = rdp-&gt;curlist;
+</span><span class='line'>    rdp-&gt;donetail = rdp-&gt;curtail;
+</span><span class='line'>    rdp-&gt;curlist = NULL;
+</span><span class='line'>    rdp-&gt;curtail = &amp;rdp-&gt;curlist;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>如果有需要处理的回调函数,且已经经过了一次grace period.就将curlist上的数据移到donetlist上.
+</span><span class='line'>其中,crp-&gt;completed表示已经完成的grace period.rdp-&gt;batch表示该CPU正在等待的grace period序号.
+</span><span class='line'>
+</span><span class='line'>if (rdp-&gt;nxtlist &amp;&amp; !rdp-&gt;curlist) {
+</span><span class='line'>    local_irq_disable();
+</span><span class='line'>    rdp-&gt;curlist = rdp-&gt;nxtlist;
+</span><span class='line'>    rdp-&gt;curtail = rdp-&gt;nxttail;
+</span><span class='line'>    rdp-&gt;nxtlist = NULL;
+</span><span class='line'>    rdp-&gt;nxttail = &amp;rdp-&gt;nxtlist;
+</span><span class='line'>    local_irq_enable();
+</span><span class='line'>
+</span><span class='line'>    /*
+</span><span class='line'>     * start the next batch of callbacks
+</span><span class='line'>     */
+</span><span class='line'>
+</span><span class='line'>    /* determine batch number */
+</span><span class='line'>    rdp-&gt;batch = rcp-&gt;cur + 1;
+</span><span class='line'>    /* see the comment and corresponding wmb() in
+</span><span class='line'>     * the rcu_start_batch()
+</span><span class='line'>     */
+</span><span class='line'>    smp_rmb();
+</span><span class='line'>
+</span><span class='line'>    if (!rcp-&gt;next_pending) {
+</span><span class='line'>        /* and start it/schedule start if it's a new batch */
+</span><span class='line'>        spin_lock(&amp;rcp-&gt;lock);
+</span><span class='line'>        rcp-&gt;next_pending = 1;
+</span><span class='line'>        rcu_start_batch(rcp);
+</span><span class='line'>        spin_unlock(&amp;rcp-&gt;lock);
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>如果上一个等待的回调函数处理完了,而且又有了新注册的回调函数.就将taillist上的数据移动到curlist上.并开启新的grace period等待.
+</span><span class='line'>注意里面几个变量的赋值: 
+</span><span class='line'>rdp-&gt;batch = rcp-&gt;cur + 1表示该CPU等待的grace period置为当前已发生grace period序号的下一个.
+</span><span class='line'>每次启动一个新的grace period等待之后,就会将rcp-&gt;next_pending.在启动的过程中,也就是rcu_start_batch()的过程中,会将rcp-&gt;next_pending置为1.设置这个变量主要是防止多个写者竞争的情况
+</span><span class='line'>
+</span><span class='line'>//更新相关信息
+</span><span class='line'>rcu_check_quiescent_state(rcp, rdp);
+</span><span class='line'>//处理等待完成的回调函数
+</span><span class='line'>if (rdp-&gt;donelist)
+</span><span class='line'>    rcu_do_batch(rdp);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>接着,更新相关的信息,例如,判断当前CPU是否进行了quiescent state.或者grace period是否已经完成.
+</span><span class='line'>
+</span><span class='line'>最后再处理挂在rdp-&gt;donelist上的链表.
+</span><span class='line'>
+</span><span class='line'>这里面有几个子函数值得好好分析,分别分析如下:
+</span><span class='line'>
+</span><span class='line'>第一个要分析的是rcu_start_batch():
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void rcu_start_batch(struct rcu_ctrlblk *rcp)
+</span><span class='line'>{
+</span><span class='line'>if (rcp-&gt;next_pending &amp;&amp;
+</span><span class='line'>        rcp-&gt;completed == rcp-&gt;cur) {
+</span><span class='line'>    rcp-&gt;next_pending = 0;
+</span><span class='line'>    smp_wmb();
+</span><span class='line'>    rcp-&gt;cur++;
+</span><span class='line'>    smp_mb();
+</span><span class='line'>    cpus_andnot(rcp-&gt;cpumask, cpu_online_map, nohz_cpu_mask);
+</span><span class='line'>
+</span><span class='line'>    rcp-&gt;signaled = 0;
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>这个函数的代码虽然很简单,但隐藏了很多玄机.
+</span><span class='line'>
+</span><span class='line'>每次启动一个新的grace period等待的时候就将rcp-&gt;cur加1,将rcp-&gt;cpumask中,将存在的CPU的位置1.
+</span><span class='line'>
+</span><span class='line'>其中,if判断必须要满足二个条件:
+</span><span class='line'>
+</span><span class='line'>第一:rcp-&gt;next_pending必须为1.我们把这个函数放到__rcu_process_callbacks()这个大环境中看一下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void __rcu_process_callbacks(struct rcu_ctrlblk *rcp,
+</span><span class='line'>                struct rcu_data *rdp)
+</span><span class='line'>{
+</span><span class='line'>．．．．．．
+</span><span class='line'>．．．．．．
+</span><span class='line'>if (rdp-&gt;nxtlist &amp;&amp; !rdp-&gt;curlist) {
+</span><span class='line'>    ．．．．．．
+</span><span class='line'>    if (!rcp-&gt;next_pending) {
+</span><span class='line'>        /* and start it/schedule start if it's a new batch */
+</span><span class='line'>        spin_lock(&amp;rcp-&gt;lock);
+</span><span class='line'>        rcp-&gt;next_pending = 1;
+</span><span class='line'>        rcu_start_batch(rcp);
+</span><span class='line'>        spin_unlock(&amp;rcp-&gt;lock);
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>首先，rcp-&gt;next_pending为0才会调用rcu_start_batch()启动一个新的进程．然后，将rcp-&gt;next_pending置为1,再调用rcu_start_batch().在这里要注意中间的自旋锁.然后在rcu_start_batch()中,再次判断rcp-&gt;next_pending为1后,再进行后续操作,并将rcp-&gt;next_pending置为0.
+</span><span class='line'>
+</span><span class='line'>为什么这里需要这样的判断呢? 如果其它CPU正在开启一个新的grace period等待,那就用不着再次开启一个新的等待了,直接返回即可.
+</span><span class='line'>
+</span><span class='line'>第二: rcu_start_batch()中if要满足的第二个条件为rcp-&gt;completed == rcp-&gt;cur.也就是说前面的grace period全部都完成了.每次开启新等待的时候都会将rcp-&gt;cur加1.每一个等待完成之后,都会将rc-&gt; completed等于rcp-&gt;cur.
+</span><span class='line'>
+</span><span class='line'>第二个要分析的函数是rcu_check_quiescent_state().代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void rcu_check_quiescent_state(struct rcu_ctrlblk *rcp,
+</span><span class='line'>                struct rcu_data *rdp)
+</span><span class='line'>{
+</span><span class='line'>if (rdp-&gt;quiescbatch != rcp-&gt;cur) {
+</span><span class='line'>    /* start new grace period: */
+</span><span class='line'>    rdp-&gt;qs_pending = 1;
+</span><span class='line'>    rdp-&gt;passed_quiesc = 0;
+</span><span class='line'>    rdp-&gt;quiescbatch = rcp-&gt;cur;
+</span><span class='line'>    return;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>/* Grace period already completed for this cpu?
+</span><span class='line'> * qs_pending is checked instead of the actual bitmap to avoid
+</span><span class='line'> * cacheline trashing.
+</span><span class='line'> */
+</span><span class='line'>if (!rdp-&gt;qs_pending)
+</span><span class='line'>    return;
+</span><span class='line'>
+</span><span class='line'>/*
+</span><span class='line'> * Was there a quiescent state since the beginning of the grace
+</span><span class='line'> * period? If no, then exit and wait for the next call.
+</span><span class='line'> */
+</span><span class='line'>if (!rdp-&gt;passed_quiesc)
+</span><span class='line'>    return;
+</span><span class='line'>rdp-&gt;qs_pending = 0;
+</span><span class='line'>
+</span><span class='line'>spin_lock(&amp;rcp-&gt;lock);
+</span><span class='line'>/*
+</span><span class='line'> * rdp-&gt;quiescbatch/rcp-&gt;cur and the cpu bitmap can come out of sync
+</span><span class='line'> * during cpu startup. Ignore the quiescent state.
+</span><span class='line'> */
+</span><span class='line'>if (likely(rdp-&gt;quiescbatch == rcp-&gt;cur))
+</span><span class='line'>    cpu_quiet(rdp-&gt;cpu, rcp);
+</span><span class='line'>
+</span><span class='line'>spin_unlock(&amp;rcp-&gt;lock);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>首先,如果rdp-&gt;quiescbatch != rcp-&gt;cur.则说明又开启了一个新的等待,因此需要重新处理这个等待,首先将rdp-&gt;quiescbatch 更新为rcp-&gt;cur.然后,使rdp-&gt;qs_pending为1.表示有等待需要处理. passed_quiesc也被清成了0.
+</span><span class='line'>
+</span><span class='line'>然后,再判断rdp-&gt;passed_quiesc是否为真,记得我们在之前分析过,在每次进程切换或者进程切换的时候,都会调用rcu_qsctr_inc().该函数会将rdp-&gt;passed_quiesc置为1.
+</span><span class='line'>因此,在这里判断这个值是为了检测该CPU上是否发生了上下文切换.
+</span><span class='line'>
+</span><span class='line'>之后,就是一段被rcp-&gt;lock保护的一段区域.如果还是等待没有发生改变,就会调用cpu_quiet(rdp-&gt;cpu, rcp)将该CPU位清零.如果是一个新的等待了,就用不着清了,因为需要重新判断该CPU上是否发生了上下文切换.
+</span><span class='line'>
+</span><span class='line'>cpu_quiet()函数代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void cpu_quiet(int cpu, struct rcu_ctrlblk *rcp)
+</span><span class='line'>{
+</span><span class='line'>cpu_clear(cpu, rcp-&gt;cpumask);
+</span><span class='line'>if (cpus_empty(rcp-&gt;cpumask)) {
+</span><span class='line'>    /* batch completed ! */
+</span><span class='line'>    rcp-&gt;completed = rcp-&gt;cur;
+</span><span class='line'>    rcu_start_batch(rcp);
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>它清除当前CPU对应的位,如果CPMMASK为空,对应所有的CPU都发生了进程切换,就会将rcp-&gt;completed = rcp-&gt;cur.并且根据需要是否开始一个grace period等待.
+</span><span class='line'>
+</span><span class='line'>最后一个要分析的函数是rcu_do_batch().它进行的是清尾的工作.如果等待完成了,那就必须要处理donelist链表上挂载的数据了.代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void rcu_do_batch(struct rcu_data *rdp)
+</span><span class='line'>{
+</span><span class='line'>struct rcu_head *next, *list;
+</span><span class='line'>int count = 0;
+</span><span class='line'>
+</span><span class='line'>list = rdp-&gt;donelist;
+</span><span class='line'>while (list) {
+</span><span class='line'>    next = list-&gt;next;
+</span><span class='line'>    prefetch(next);
+</span><span class='line'>    list-&gt;func(list);
+</span><span class='line'>    list = next;
+</span><span class='line'>    if (++count &gt;= rdp-&gt;blimit)
+</span><span class='line'>        break;
+</span><span class='line'>}
+</span><span class='line'>rdp-&gt;donelist = list;
+</span><span class='line'>
+</span><span class='line'>local_irq_disable();
+</span><span class='line'>rdp-&gt;qlen -= count;
+</span><span class='line'>local_irq_enable();
+</span><span class='line'>if (rdp-&gt;blimit == INT_MAX &amp;&amp; rdp-&gt;qlen 
+</span><span class='line'>    rdp-&gt;blimit = blimit;
+</span><span class='line'>
+</span><span class='line'>if (!rdp-&gt;donelist)
+</span><span class='line'>    rdp-&gt;donetail = &amp;rdp-&gt;donelist;
+</span><span class='line'>else
+</span><span class='line'>    raise_rcu_softirq();
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>它遍历处理挂在链表上的回调函数.在这里,注意每次调用的回调函数有最大值限制.这样做主要是防止一次调用过多的回调函数而产生不必要系统负载.如果donelist中还有没处理完的数据,打开RCU软中断,在下次软中断到来的时候接着处理.
+</span><span class='line'>
+</span><span class='line'>#### 五:几种RCU情况分析
+</span><span class='line'>
+</span><span class='line'>1:如果CPU 1上有进程调用rcu_read_lock进入临界区,之后退出来,发生了进程切换,新进程又通过rcu_read&amp;shy;_lock进入临界区.由于RCU软中断中只判断一次上下文切换,因此,在调用回调函数的时候,仍然有进程处于RCU的读临界区,这样会不会有问题呢?
+</span><span class='line'>
+</span><span class='line'>这样是不会有问题的.还是上面的例子:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    spin_lock(&amp;foo_mutex);
+</span><span class='line'>old_fp = gbl_foo;
+</span><span class='line'>*new_fp = *old_fp;
+</span><span class='line'>new_fp-&gt;a = new_a;
+</span><span class='line'>rcu_assign_pointer(gbl_foo, new_fp);
+</span><span class='line'>spin_unlock(&amp;foo_mutex);
+</span><span class='line'>synchronize_rcu();
+</span><span class='line'>kfree(old_fp);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;使用synchronize_rcu ()只是为了等待持有old_fd(也就是调用rcu_assign_pointer ()更新之前的gbl_foo)的进程退出.而不需要等待所有的读者全部退出.这是因为,在rcu_assign_pointer ()之后的读取取得的保护指针,已经是更新好的新值了.
+</span><span class='line'>
+</span><span class='line'>2:上面分析的似乎是针对有挂载链表的CPU而言的,那对于只调用rcu_read_lock()的CPU,它们是怎么处理的呢?
+</span><span class='line'>
+</span><span class='line'>首先,每次启动一次等待,肯定是会更新rcp-&gt;cur的.因此,在rcu_pending()的判断中,下面语句会被满足:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;if (rdp-&gt;quiescbatch != rcp-&gt;cur || rdp-&gt;qs_pending)
+</span><span class='line'>return 1;
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>因此会进入到RCU的软中断.在软中断处理中:
+</span><span class='line'>
+</span><span class='line'>rcu_process_callbacks() -&gt; __rcu_process_callbacks() -&gt; rcu_check_quiescent_state()
+</span><span class='line'>
+</span><span class='line'>中,如果该CPU上有进程切换,就会各新rcp中的CPU 掩码数组.
+</span><span class='line'>
+</span><span class='line'>3:如果一个CPU连续调用synchronize_rcu()或者call_rcu()它们会有什么影响呢?
+</span><span class='line'>
+</span><span class='line'>如果当前有请求在等待,就会新请提交的回调函数挂到taillist上,一直到前一个等待完成,再将taillist的数据移到curlist,并开启一个新的等待,因此,也就是说,在前一个等待期间提交的请求,都会放到一起处理.也就是说,他们会共同等待所有CPU切换完成.
+</span><span class='line'>
+</span><span class='line'>举例说明如下:  
+</span><span class='line'>假设grace period时间是12ms.在12ms内,先后有A,B,C进程提交请求.  
+</span><span class='line'>那系统在等待处理完后,交A,B,C移到curlist中,开始一个新的等待.  
+</span><span class='line'>
+</span><span class='line'>#### 六:有关rcu_read_lock_bh()/rcu_read_unlock_bh()/call_rcu_bh().
+</span><span class='line'>
+</span><span class='line'>在上面的代码分析的时候,经常看到带有bh的RCU代码.现在来看一下这些带bh的RCU是什么样的.
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define rcu_read_lock_bh() __rcu_read_lock_bh()
+</span><span class='line'>#define rcu_read_unlock_bh() __rcu_read_unlock_bh()
+</span><span class='line'>
+</span><span class='line'>#define __rcu_read_lock_bh() \
+</span><span class='line'>do { \
+</span><span class='line'>    local_bh_disable(); \
+</span><span class='line'>    __acquire(RCU_BH); \
+</span><span class='line'>    rcu_read_acquire(); \
+</span><span class='line'>} while (0)
+</span><span class='line'>#define __rcu_read_unlock_bh() \
+</span><span class='line'>do { \
+</span><span class='line'>    rcu_read_release(); \
+</span><span class='line'>    __release(RCU_BH); \
+</span><span class='line'>    local_bh_enable(); \
+</span><span class='line'>} while (0)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>根据上面的分析:bh RCU跟普通的RCU相比不同的是,普通RCU是禁止内核抢占,而bh RCU是禁止下半部.
+</span><span class='line'>
+</span><span class='line'>其实,带bh的RCU一般在软中断使用,不过计算quiescent state并不是发生一次上下文切换.而是发生一次softirq.我们在后面的分析中可得到印证.
+</span><span class='line'>
+</span><span class='line'>Call_rcu_bh()代码如下:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;void call_rcu_bh(struct rcu_head *head,
+</span><span class='line'>            void (*func)(struct rcu_head *rcu))
+</span><span class='line'>{
+</span><span class='line'>unsigned long flags;
+</span><span class='line'>struct rcu_data *rdp;
+</span><span class='line'>
+</span><span class='line'>head-&gt;func = func;
+</span><span class='line'>head-&gt;next = NULL;
+</span><span class='line'>local_irq_save(flags);
+</span><span class='line'>rdp = &amp;__get_cpu_var(rcu_bh_data);
+</span><span class='line'>*rdp-&gt;nxttail = head;
+</span><span class='line'>rdp-&gt;nxttail = &amp;head-&gt;next;
+</span><span class='line'>
+</span><span class='line'>if (unlikely(++rdp-&gt;qlen &gt; qhimark)) {
+</span><span class='line'>    rdp-&gt;blimit = INT_MAX;
+</span><span class='line'>    force_quiescent_state(rdp, &amp;rcu_bh_ctrlblk);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>local_irq_restore(flags);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>它跟call_rcu()不相同的是,rcu是取per_cpu变量rcu__data和全局变量rcu_ctrlblk.而bh RCU是取rcu_bh_data,rcu_bh_ctrlblk.他们的类型都是一样的,这样做只是为了区分BH和普通RCU的等待.
+</span><span class='line'>
+</span><span class='line'>对于rcu_bh_qsctr_inc
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;static inline void rcu_bh_qsctr_inc(int cpu)
+</span><span class='line'>{
+</span><span class='line'>struct rcu_data *rdp = &amp;per_cpu(rcu_bh_data, cpu);
+</span><span class='line'>rdp-&gt;passed_quiesc = 1;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>它跟rcu_qsctr_inc()机同,也是更改对应成员.
+</span><span class='line'>
+</span><span class='line'>所不同的是,调用rcu_bh_qsctr_inc()的地方发生了变化.
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;asmlinkage void __do_softirq(void)
+</span><span class='line'>{
+</span><span class='line'>．．．．．．
+</span><span class='line'>    do {
+</span><span class='line'>    if (pending &amp; 1) {
+</span><span class='line'>        h-&gt;action(h);
+</span><span class='line'>        rcu_bh_qsctr_inc(cpu);
+</span><span class='line'>    }
+</span><span class='line'>    h++;
+</span><span class='line'>    pending &gt;&gt;= 1;
+</span><span class='line'>} while (pending);
+</span><span class='line'>．．．．．．
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;也就是说，在发生软中断的时候，才会认为是经过了一次quiescent state.&lt;/p&gt;
 </span><span class='line'>]]&gt;&lt;/content&gt;
 </span><span class='line'>  &lt;/entry&gt;
 </span><span class='line'>  
 </span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[进程切换过程分析]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-switch/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-06-02T14:10:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-switch&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/nkguohao/article/details/9187381"&gt;http://blog.csdn.net/nkguohao/article/details/9187381&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[用户态到内核态切换]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-user-to-kernel/"/&gt;
+</span><span class='line'>&lt;updated&gt;2015-06-02T14:16:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-user-to-kernel&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://www.cnblogs.com/justcxtoworld/p/3155741.html"&gt;http://www.cnblogs.com/justcxtoworld/p/3155741.html&lt;/a&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;参考《深入理解Linux内核（第三版）》&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;本文将主要研究在X86体系下Linux系统中用户态到内核态切换条件，及切换过程中内核栈和任务状态段TSS在中断机制/任务切换中的作用及相关寄存器的变化。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;进程切换&lt;/h4&gt;
+</span><span class='line'>&lt;h4&gt;一、用户态到内核态切换途径：&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;为了控制进程的执行，内核必须有能力挂起正在CPU上运行的进程，并恢复以前挂起的某个进程的执行。这种行为被称为进程切换，任务切换或上下文切换。下面几节描述在Linux中进行进程切换的主要内容。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt; 1：系统调用        2：中断 　　3：异常&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;h4&gt;硬件上下文&lt;/h4&gt;
+</span><span class='line'>&lt;p&gt;对应代码，在3.3内核中，可以在/arch/x86/kernel/entry_32.S文件中查看。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;尽管每个进程可以拥有属于自己的地址空间，但所有进程必须共享CPU寄存器。因此要恢复一个进程的执行之前，内核必须确保每个寄存器装入了挂起进程时的值。&lt;/p&gt;
+</span><span class='line'>&lt;h4&gt;二、内核栈&lt;/h4&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;进程恢复执行前必须装入寄存器的一组数据称为硬件上下文。硬件上下文是进程可执行上下文的一个子集，因为可执行上下文包含进程执行时需要的所有信息。在Linux中，进程硬件上下文的一部分存在TSS段，而剩余部分存放在内核态的堆栈中。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;内核栈：Linux中每个进程有两个栈，分别用于用户态和内核态的进程执行，其中的内核栈就是用于内核态的堆栈，它和进程的task_struct结构，更具体的是thread_info结构一起放在两个连续的页框大小的空间内。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;在下面的描述中，我们假定用prev局部变量表示切换出的进程的描述符，next表示切换进的进程的描述符。因此，我们把进程切换定义为这样的行为：保存prev硬件上下文，用next硬件上下文代替prev。因为进程切换经常发生，因此减少和装入硬件上下文所花费的时间是非常重要的。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;在内核源代码中使用C语言定义了一个联合结构方便地表示一个进程的thread_info和内核栈：&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;早期的Linux版本利用80x86体系结构所提供的硬件支持，并通过far jmp指令跳到进程TSS描述符的选择符来执行进程切换。当执行这条指令时，CPU通过自动保存原来的硬件上下文，装入新的硬件上下文来执行硬件上下文切换。但是基于以下原因，Linux2.6使用软件执行进程切换：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  通过一组mov指令逐步执行切换，这样能较好地控制所装入数据的合法性，尤其是，这使检查ds和es段寄存器的值成为可能，这些值有可能被恶意用户伪造。当用单独的farjmp指令时，不可能进行这类检查。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  旧方法和新方法所需时间大致相同。然而，尽管当前的切换代码还有改进的余地，却不能对硬件上下文切换进行优化。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;进程切换只发生在内核态。在执行进程切换之前，用户态进程所使用的所有寄存器内容已保存在内核态堆栈上，这也包括ss和esp这对寄存器的内容。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;任务状态段&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;80x86体系结构包括一个特殊的段类型，叫任务状态段（Task State Segment, TSS）来存放硬件上下文。尽管Linux并不使用硬件上下文切换，但是强制它为系统中每个不同的CPU创建一个TSS。这样做的两个主要理由为：&lt;br/&gt;
-</span><span class='line'>  当80x86的一个CPU从用户态切换到内核态时，它就从TSS中获取内核态堆栈的地址。&lt;br/&gt;
-</span><span class='line'>  当用户态进程试图通过in或out指令访问一个I/O端口时，CPU需要访问存放在TSS中的I/O许可图以检查该进程是否有访问端口的权力。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;更确切地说，当进程在用户态下执行in或out指令时，控制单元执行下列操作：&lt;br/&gt;
-</span><span class='line'>  它检查eflags寄存器中的2位IOPL字段。如果该字段值为3，控制单元就执行I/O指令。否则，执行下一个检查。&lt;br/&gt;
-</span><span class='line'>  访问tr寄存器以确定当前的TSS和相应的I/O许可权位图。&lt;br/&gt;
-</span><span class='line'>  检查I/O指令中指定的I/O端口在I/O许可权位图中对应的位。如果该位清0，这条I/O指令就执行，否则控制单元产生一个”Generalprotetion”异常。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;tss_struct结构描述TSS的格式。正如第二章(《深入理解Linux内核（第三版）》)所提到的，init_tss数组为系统上每个不同的CPU存放一个TSS。在每次进程切换时，内核都更新TSS的某些字段以便相应的CPU控制单元可以安全地检索到它需要的信息。因此，TSS反映了CPU上的当前进程的特权级，但不必为没有在运行的进程保留TSS。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;每个TSS有它自己8字节的任务状态段描述符。这个描述符包括指向TSS起始地址的32位Base字段，20位Limit字段。TSSD的S标志被清0，以表示相应的TSS是系统段的事实。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Type字段置为11或9以表示这个段实际上是TSS。在Intel的原始设计中，系统中的每个进程都应当指向自己的TSS；Type字段的第二个有效位叫做Busy位；如果进程正由CPU执行，则该位置为1，否则置为0。在Linux的设计中，每个CPU只有一个TSS，因此，Busy位总置为1。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;由linux创建的TSSD存放在全局描述符表中。GDT的基地址存放在每个CPU的gdtr寄存器中。每个CPU的tr寄存器包含相应TSS的TSSD选择符，也包括了两个隐藏了非编程字段；TSSD的Base字段和Limit字段。这样，处理器就能直接对TSS寻址而不用从GDT中检索TSS的地址。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Thread字段&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;在每次进程切换时，被替换进程的硬件上下文必须保存在别处。不能像Intel原始设计那样把它保存在TSS中，因为Linux为每个处理器而不是为每个进程使用TSS。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;因此，每个进程描述符包含一个类型为thread_struct的thread字段，只要进程被切换出去，内核就把其硬件上下文保存在这个结构中。随后我们会看到，这个数据结构包含的字段涉及大部分CPU寄存器，但不包括诸如exa、ebx等等这些通用寄存器，它们的值保留在内核堆栈中。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;执行进程切换&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;进程切换可能只发生在精心定义的点：schedule()函数（《深入理解Linux内核（第三版）》第七章有详细讨论）。这里，我们仅关注内核如何执行一个进程切换。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;从本质上说，每个进程切换由两步组成：&lt;br/&gt;
-</span><span class='line'>  切换页全局目录以安装一个新的地址空间；将在第九章（《深入理解Linux内核（第三版）》）描述这一步。&lt;br/&gt;
-</span><span class='line'>  切换内核态堆栈和硬件上下文，因为硬件上下文提供了内核执行新进程所需要的所有信息，包含CPU寄存器。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;我们又一次假定prev指向被替换进程的描述符，而next指向被激活进程的描述符。prev和next是schedule()函数的局部变量。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;switch_to宏&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;进程切换的第二步由switch_to宏执行。它是内核中与硬件关系最密切的例程之一，要理解它到低做了些什么我们必须下些功夫。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;首先，该宏有三个参数，它们是prev,next和last。你可能很容易猜到prev和next的作用：它们仅是局部变量prev和next的占位符，即它们是输入参数，分别表示被替换进程和新进程描述符的地址在内存中的位置。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;那第三个参数last呢？在任何进程切换中，涉及到三个进程而不是两个。假设内核决定暂停进程A而激活里程B。在schedule()函数中，prev指向A的描述符而next指向B的描述符。switch_to宏一但使A暂停，A的执行流就冻结。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;随后，当内核想再次此激活A，就必须暂停另一个进程C，于是就要用prev指向C而next指向A来执行另一个swithch_to宏。当A恢复它的执行流时，就会找到它原来的内核栈，于是prev局部变量还是指向A的描述符而next指向B的描述符。此时，代表进程A执行的内核就失去了对C的任何引用。但是，事实表明这个引用对于完成进程切换是很有用的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描述符地址写在内存的什么位置了。在进程切换之前，宏把第一个输入参数prev表示的变量的内容存入CPU的eax寄存器。在完成进程切换，A已经恢复执行时，宏把CPU的eax寄存器的内容写入由第三个输出参数&mdash;&mdash;-last所指示的A在内存中的位置。因为CPU寄存器不会在切换点发生变化，所以C的描述符地址也存在内存的这个位置。在schedule()执行过程中，参数last指向A的局部变量prev，所以prev被C的地址覆盖。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;图3-7显示了进程A，B，C内核堆栈的内容以及eax寄存器的内容。必须注意的是：图中显示的是在被eax寄存器的内容覆盖以前的prev局部变量的值。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define switch_to(prev, next, last)                 \
-</span><span class='line'>32do {                                  \
-</span><span class='line'>33  /*                              \
-</span><span class='line'>34   * Context-switching clobbers all registers, so we clobber  \
-</span><span class='line'>35   * them explicitly, via unused output variables.        \
-</span><span class='line'>36   * (EAX and EBP is not listed because EBP is saved/restored \
-</span><span class='line'>37   * explicitly for wchan access and EAX is the return value of   \
-</span><span class='line'>38   * __switch_to())                       \
-</span><span class='line'>39   */                             \
-</span><span class='line'>40  unsigned long ebx, ecx, edx, esi, edi;              \
-</span><span class='line'>41                                  \
-</span><span class='line'>42  asm volatile("pushfl\n\t"       /* save    flags */ \
-</span><span class='line'>43           "pushl %%ebp\n\t"      /* save    EBP   */ \
-</span><span class='line'>44           "movl %%esp,%[prev_sp]\n\t"    /* save    ESP   */ \
-</span><span class='line'>45           "movl %[next_sp],%%esp\n\t"    /* restore ESP   */ \
-</span><span class='line'>46           "movl $1f,%[prev_ip]\n\t"  /* save    EIP   */ \
-</span><span class='line'>47           "pushl %[next_ip]\n\t" /* restore EIP   */ \
-</span><span class='line'>48           __switch_canary                    \
-</span><span class='line'>49           "jmp __switch_to\n"    /* regparm call  */ \
-</span><span class='line'>50           "1:\t"                     \
-</span><span class='line'>51           "popl %%ebp\n\t"       /* restore EBP   */ \
-</span><span class='line'>52           "popfl\n"          /* restore flags */ \
-</span><span class='line'>53                                  \
-</span><span class='line'>54           /* output parameters */                \
-</span><span class='line'>55           : [prev_sp] "=m" (prev-&gt;thread.sp),     \
-</span><span class='line'>56             [prev_ip] "=m" (prev-&gt;thread.ip),     \
-</span><span class='line'>57             "=a" (last),                 \
-</span><span class='line'>58                                  \
-</span><span class='line'>59             /* clobbered output registers: */        \
-</span><span class='line'>60             "=b" (ebx), "=c" (ecx), "=d" (edx),      \
-</span><span class='line'>61             "=S" (esi), "=D" (edi)               \
-</span><span class='line'>62                                      \
-</span><span class='line'>63             __switch_canary_oparam               \
-</span><span class='line'>64                                  \
-</span><span class='line'>65             /* input parameters: */              \
-</span><span class='line'>66           : [next_sp]  "m" (next-&gt;thread.sp),     \
-</span><span class='line'>67             [next_ip]  "m" (next-&gt;thread.ip),     \
-</span><span class='line'>68                                      \
-</span><span class='line'>69             /* regparm parameters for __switch_to(): */  \
-</span><span class='line'>70             [prev]     "a" (prev),               \
-</span><span class='line'>71             [next]     "d" (next)                \
-</span><span class='line'>72                                  \
-</span><span class='line'>73             __switch_canary_iparam               \
-</span><span class='line'>74                                  \
-</span><span class='line'>75           : /* reloaded segment registers */         \
-</span><span class='line'>76          "memory");                  \
-</span><span class='line'>77} while (0)
-</span><span class='line'>78
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;由于switch_to宏采用扩展的内联汇编语言编码，所以可读性比较差：实际上这段代码通过特殊位置记数法使用寄存器，而实际使用的通用寄存器由编译器自由选择。我们将采用标准汇编语言而不是麻烦的内联汇编语言来描述switch_to宏在80x86微处理器上所完成的典型工作。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在eax和edx寄存器中分别保存prev和next的值。
+</span><span class='line'>&lt;p&gt;此结构在3.3内核版本中的定义在include/linux/sched.h文件的第2106行：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl prev ,%eax
-</span><span class='line'>movl next ,%edx
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  把eflags和ebp寄存器的内容保存在prev内核栈中。必須保存它们的原因是编译器认为在switch_to结束之前它们的值应当保持不变。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>pushf1
-</span><span class='line'>push %ebp
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  把esp的内容保存到prev-&gt;thread.esp中以使该字段指向prev内核栈的栈顶：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl %esp, 484(%eax)
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  把next-&gt;thread.esp装入esp.此时，内核开始在next的内核栈上操作，因此这条指令实际上完成了从prev到next的切换。由于进程描述符的地址和内核栈的地址紧挨着，所以改变内核栈意味着改变进程。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl 484(%edx),%esp
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  把标记为1的地址存入prev-&gt;thread.eip。当被替换的进程重新恢复执行时，进程执行被标记为1的那条指令：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl $lf, 480(%eax)
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  宏把next-&gt;thread.eip的值压入next的内核栈。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>push1 480(%edx)
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  跳到&lt;code&gt;__switch_to()&lt;/code&gt; 函数
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>jmp __switch_to
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  这里被进程B替换的进程A再次获得CPU；它执行一些保存eflags和ebp寄存器内容的指令，这两条指令的第一条指令被标记为1。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  拷贝eax寄存器的内容到switch_to宏的第三个参数lash标识的内存区域中：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl  %eax, last
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>正如以前讨论的，eax寄存器指向刚被替换的进程描述符。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;&lt;code&gt;__switch_to()&lt;/code&gt;函数&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;code&gt;__switch_to()&lt;/code&gt;函数执行大多数开始于switch_to()宏的进程切换。这个函数作用于prev_p和next_p参数，这两个参数表示前一个进程和新进程。这个函数的调用不同于一般函数的调用，因为&lt;code&gt;__switch_to()&lt;/code&gt;从eax和edx取参数prev_p和next_p，而不像大多数函数一样从栈中取参数。为了强迫函数从寄存器取它的参数，内核利用&lt;code&gt;__attribute__&lt;/code&gt;和regparm关键字，这两个关键字是C语言非标准的扩展名，由gcc编译程序实现。在include/asm-i386/system.h头文件中，&lt;code&gt;__switch_to()&lt;/code&gt;函数的声明如下：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>__switch_to(structtask_struct *prev_p,struct tast_struct *next_p)__attribute_(regparm(2));
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>函数执行的步骤如下：&lt;br/&gt;
-</span><span class='line'>  1、执行由&lt;code&gt;__unlazy_fpu()&lt;/code&gt;宏产生的代码，以有选择地保存prev_p进程的FPU、MMX及XMM寄存器的内容。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>__unlazy_fpu(prev_p);
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  2、执行smp_processor_id()宏获得本地(local)CPU的下标，即执行代码的CPU。该宏从当前进程的thread_info结构的cpu字段获得下标将它保存到cpu局部变量。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  3、把next_p-&gt;thread.esp0装入对应于本地CPU的TSS的esp0字段；将在通过sysenter指令发生系统调用一节看到，以后任何由sysenter汇编指令产生的从用户态到内核态的特权级转换将把这个地址拷贝到esp寄存器中：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>init_tss[cpu].esp0= next_p-&gt;thread.esp0;
+</span><span class='line'>2016  union thread_union {
+</span><span class='line'>2017          struct thread_info thread_info;
+</span><span class='line'>2018          unsigned long stack[THREAD_SIZE/sizeof(long)];
+</span><span class='line'>2019     };        
 </span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  4、把next_p进程使用的线程局部存储段装入本地CPU的全局描述符表；三个段选择符保存在进程描述符内的tls_array数组中
+</span><span class='line'>&lt;p&gt;其中thread_info结构的定义如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3.3内核 /arch/x86/include/asm/thread_info.h文件第26行：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>cpu_gdt_table[cpu][6]= next_p-&gt;thread.tls_array[0];
-</span><span class='line'>cpu_gdt_table[cpu][7]= next_p-&gt;thread.tls_array[1];
-</span><span class='line'>cpu_gdt_table[cpu][8]= next_p-&gt;thread.tls_array[2];
+</span><span class='line'> 26 　　struct thread_info {
+</span><span class='line'> 27         struct task_struct      *task;          /* main task structure */
+</span><span class='line'> 28         struct exec_domain      *exec_domain;   /* execution domain */
+</span><span class='line'> 29         __u32                   flags;          /* low level flags */
+</span><span class='line'> 30         __u32                   status;         /* thread synchronous flags */
+</span><span class='line'> 31         __u32                   cpu;            /* current CPU */
+</span><span class='line'> 32         int                     preempt_count;  /* 0 =&gt; preemptable,
+</span><span class='line'> 33                                                    &lt;0 =&gt; BUG */
+</span><span class='line'> 34         mm_segment_t            addr_limit;
+</span><span class='line'> 35         struct restart_block    restart_block;
+</span><span class='line'> 36         void __user             *sysenter_return;
+</span><span class='line'> 37 #ifdef CONFIG_X86_32
+</span><span class='line'> 38         unsigned long           previous_esp;   /* ESP of the previous stack in
+</span><span class='line'> 39                                                    case of nested (IRQ) stacks
+</span><span class='line'> 40                                                 */
+</span><span class='line'> 41         __u8                    supervisor_stack[0];
+</span><span class='line'> 42 #endif
+</span><span class='line'> 43         unsigned int            sig_on_uaccess_error:1;
+</span><span class='line'> 44         unsigned int            uaccess_err:1;  /* uaccess failed */
+</span><span class='line'> 45 };
 </span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  5、把fs和gs段寄存器的内容分别存放在prev_p-&gt;thread.fs和prev_p-&gt;thread.gs中，对应的汇编语言指令是：
+</span><span class='line'>&lt;p&gt;它们的结构图大致如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-06-02.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  esp寄存器是CPU栈指针，存放内核栈栈顶地址。在X86体系中，栈开始于末端，并朝内存区开始的方向增长。从用户态刚切换到内核态时，进程的内核栈总是空的，此时esp指向这个栈的顶端。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  在X86中调用int指令型系统调用后会把用户栈的%esp的值及相关寄存器压入内核栈中，系统调用通过iret指令返回，在返回之前会从内核栈弹出用户栈的%esp和寄存器的状态，然后进行恢复。所以在进入内核态之前要保存进程的上下文，中断结束后恢复进程上下文，那靠的就是内核栈。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  这里有个细节问题，就是要想在内核栈保存用户态的esp,eip等寄存器的值，首先得知道内核栈的栈指针，那在进入内核态之前，通过什么才能获得内核栈的栈指针呢？答案是：TSS&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;三、TSS&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;X86体系结构中包括了一个特殊的段类型：任务状态段（TSS），用它来存放硬件上下文。TSS反映了CPU上的当前进程的特权级。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;linux为每一个cpu提供一个tss段，并且在tr寄存器中保存该段。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;在从用户态切换到内核态时，可以通过获取TSS段中的esp0来获取当前进程的内核栈 栈顶指针，从而可以保存用户态的cs,esp,eip等上下文。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;注：linux中之所以为每一个cpu提供一个tss段，而不是为每个进程提供一个tss段，主要原因是tr寄存器永远指向它，在任务切换的适合不必切换tr寄存器，从而减小开销。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下面我们看下在X86体系中Linux内核对TSS的具体实现：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;内核代码中TSS结构的定义：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;3.3内核中：/arch/x86/include/asm/processor.h文件的第248行处：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl%fs,40(%esi)
-</span><span class='line'>movl%gs,44(%esi)
+</span><span class='line'>248   struct tss_struct {
+</span><span class='line'>249         /*
+</span><span class='line'>250          * The hardware state:
+</span><span class='line'>251          */
+</span><span class='line'>252         struct x86_hw_tss       x86_tss;
+</span><span class='line'>253
+</span><span class='line'>254         /*
+</span><span class='line'>255          * The extra 1 is there because the CPU will access an
+</span><span class='line'>256          * additional byte beyond the end of the IO permission
+</span><span class='line'>257          * bitmap. The extra byte must be all 1 bits, and must
+</span><span class='line'>258          * be within the limit.
+</span><span class='line'>259          */
+</span><span class='line'>260         unsigned long           io_bitmap[IO_BITMAP_LONGS + 1];
+</span><span class='line'>261
+</span><span class='line'>262         /*
+</span><span class='line'>263          * .. and then another 0x100 bytes for the emergency kernel stack:
+</span><span class='line'>264          */
+</span><span class='line'>265         unsigned long           stack[64];
+</span><span class='line'>266
+</span><span class='line'>267 } ____cacheline_aligned;    
 </span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  6、如果fs或gs段寄存器已经被prev_p或next_p进程中的任意一个使用，则将next_p进程的thread_struct描述符中保存的值装入这些寄存器中。这一步在逻辑上补充了前一步中执行的操作。主要的汇编语言指令如下：
+</span><span class='line'>&lt;p&gt;其中主要的内容是：&lt;br/&gt;
+</span><span class='line'>  硬件状态结构:     x86_hw_tss&lt;br/&gt;
+</span><span class='line'>  IO权位图: 　　　　io_bitmap&lt;br/&gt;
+</span><span class='line'>  备用内核栈: 　　  stack&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;其中硬件状态结构：其中在32位X86系统中x86_hw_tss的具体定义如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;/arch/x86/include/asm/processor.h文件中第190行处：
 </span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl40(%ebx),%fs
-</span><span class='line'>movl44(%edb),%gs
+</span><span class='line'>190#ifdef CONFIG_X86_32
+</span><span class='line'>191 /* This is the TSS defined by the hardware. */
+</span><span class='line'>192 struct x86_hw_tss {
+</span><span class='line'>193         unsigned short          back_link, __blh;
+</span><span class='line'>194         unsigned long           sp0;　　            //当前进程的内核栈顶指针
+</span><span class='line'>195         unsigned short          ss0, __ss0h;       //当前进程的内核栈段描述符
+</span><span class='line'>196         unsigned long           sp1;
+</span><span class='line'>197         /* ss1 caches MSR_IA32_SYSENTER_CS: */
+</span><span class='line'>198         unsigned short          ss1, __ss1h;
+</span><span class='line'>199         unsigned long           sp2;
+</span><span class='line'>200         unsigned short          ss2, __ss2h;
+</span><span class='line'>201         unsigned long           __cr3;
+</span><span class='line'>202         unsigned long           ip;
+</span><span class='line'>203         unsigned long           flags;
+</span><span class='line'>204         unsigned long           ax;
+</span><span class='line'>205         unsigned long           cx;
+</span><span class='line'>206         unsigned long           dx;
+</span><span class='line'>207         unsigned long           bx;
+</span><span class='line'>208         unsigned long           sp;      　　　　　　//当前进程用户态栈顶指针
+</span><span class='line'>209         unsigned long           bp;
+</span><span class='line'>210         unsigned long           si;
+</span><span class='line'>211         unsigned long           di;
+</span><span class='line'>212         unsigned short          es, __esh;
+</span><span class='line'>213         unsigned short          cs, __csh;
+</span><span class='line'>214         unsigned short          ss, __ssh;
+</span><span class='line'>215         unsigned short          ds, __dsh;
+</span><span class='line'>216         unsigned short          fs, __fsh;
+</span><span class='line'>217         unsigned short          gs, __gsh;
+</span><span class='line'>218         unsigned short          ldt, __ldth;
+</span><span class='line'>219         unsigned short          trace;
+</span><span class='line'>220         unsigned short          io_bitmap_base;
+</span><span class='line'>221
+</span><span class='line'>222 } __attribute__((packed));
 </span><span class='line'>&lt;/code&gt;&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  7、ebx寄存器指向next_p-&gt;thread结构。代码实际上更复杂，因为当它检测到一个无效的段寄存器值时，CPU可能产生一个异常。&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;linux的tss段中只使用esp0和iomap等字段，并且不用它的其他字段来保存寄存器，在一个用户进程被中断进入内核态的时候，从tss中的硬件状态结构中取出esp0（即内核栈栈顶指针），然后切到esp0，其它的寄存器则保存在esp0指的内核栈上而不保存在tss中。&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  8、用next_p-&gt;thread.debugreg数组的内容装载dr0,&hellip;,dr7中的6个调试寄存器。只有在next_p被挂起时正在使用调试寄存器，这种操作才能进行。这些寄存器不需要被保存，因为只有当一个调试器想要监控prev时prev_p-&gt;thread.debugreg才会修改。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>if(next_p-&gt;thread.debugreg[7]){
-</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,0);
-</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,1);
-</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,2);
-</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,3);
-</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,6);
-</span><span class='line'>loaddebug(&amp;next_p-&gt;thread,7);
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>&lt;p&gt;每个CPU定义一个TSS段的具体实现代码：&lt;/p&gt;
 </span><span class='line'>
-</span><span class='line'>&lt;p&gt;  8、如果必要，更新TSS中的I/O位图。当next_p或prev_p有其自己的定制I/O权限位图时必须这么做：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>if(prev_p-&gt;thread.io_bitmap_ptr|| next_p-&gt;thread.io_bitmap_ptr )
-</span><span class='line'>handle_io_bitmap(&amp;next_p-&gt;thread,&amp;init_tss[cpu]);
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;因为进程很修改I/O权限位图，所以该位图在“懒”模式中被处理；当且仅当一个进程在当前时间片内实际访问I/O端口时，真实位图才被拷贝到本地CPU的TSS中。进程的定制I/O权限位图被保存在thread_info结构的io_bitmap_ptr字段指向的缓冲区中。handle_io_bitmap()函数为next_p进程设置本地CPU使用的TSS的in_bitmap字段如下：&lt;br/&gt;
-</span><span class='line'>  (a)如果next_p进程不拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x8000.&lt;br/&gt;
-</span><span class='line'>  (b) 如果next_p进程拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x9000。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;TSS的io_bitmap字段应当包含一个在TSS中的偏移量，其中存放实际位图。无论何时用户态进程试图访问一个I/O端口，0x8000和0x9000指向TSS界限之外并将因此引起”Generalprotection”异常。do_general_protection()异常处理程序将检查保存在io_bitmap字段的值：如果是0x8000，函数发送一个SIGSEGV信号给用户态进程；如果是0x9000，函数把进程位图拷贝拷贝到本地CPU的TSS中，把io_bitmap字段为实际位图的偏移(104)，并强制再一次执行有缺陷的汇编指令。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  9、终止。
-</span><span class='line'>&lt;code&gt;__switch_to()&lt;/code&gt;函数通过使用下列声明结束：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>return prev_p;
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  由编译器产生的相应汇编语言指令是：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>movl %edl,%eax
-</span><span class='line'>ret
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>  prev_p参数被拷贝到eax，因为缺省情况下任何C函数的返回值被传递给eax寄存器。注意eax的值因此在调用&lt;code&gt;__switch_to()&lt;/code&gt;的过程中被保护起来；这非常重要，因为调用switch_to宏时会假定eax总是用来存放被替换的进程描述符的地址。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  汇编语言指令ret把栈顶保存的返回地址装入eip程序计数器。不过，通过简单地跳转到&lt;code&gt;__switch_to()&lt;/code&gt;函数来调用该函数。因此，ret汇编指令在栈中找到标号为1的指令的地址，其中标号为1的地址是由switch_to()宏推入栈中的。如果因为next_p第一次执行而以前从未被挂起，&lt;code&gt;__switch_to()&lt;/code&gt;就找到ret_from_fork()函数的起始地址。&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[字符设备驱动和等待队列样例]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-05-21T15:58:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;前两篇的样例&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;a href="/blog/2015/05/21/kernel-base-chardev/"&gt;字符设备驱动程序&lt;/a&gt;&lt;br/&gt;
-</span><span class='line'>&lt;a href="/blog/2015/05/21/kernel-sched-waitqueue/"&gt;Linux内核中的等待队列&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;waitqueue.c&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt;
-</span><span class='line'>#include &lt;linux/fs.h&gt;
-</span><span class='line'>#include &lt;asm/uaccess.h&gt;
-</span><span class='line'>#include &lt;linux/wait.h&gt;
-</span><span class='line'>#include &lt;linux/semaphore.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/socket.h&gt;
-</span><span class='line'>#include &lt;linux/tcp.h&gt;
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;net/net_namespace.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;net/tcp.h&gt;
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>static ssize_t globalvar_read(struct file *, char *, size_t, loff_t*);
-</span><span class='line'>static ssize_t globalvar_write(struct file *, const char *, size_t, loff_t*);
-</span><span class='line'>
-</span><span class='line'>struct file_operations globalvar_fops =
-</span><span class='line'>{
-</span><span class='line'>    .owner   = THIS_MODULE,
-</span><span class='line'>    .read = globalvar_read,
-</span><span class='line'>    .write = globalvar_write,
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>#define LEN 1024
-</span><span class='line'>static char global_var[LEN];
-</span><span class='line'>static int read_index = 0;
-</span><span class='line'>static int write_index = 0;
-</span><span class='line'>static spinlock_t var_lock;
-</span><span class='line'>static wait_queue_head_t waitq;
-</span><span class='line'>static int flag = 0;
-</span><span class='line'>static int major;
-</span><span class='line'>
-</span><span class='line'>static const char procname[] = "testvar";
-</span><span class='line'>
-</span><span class='line'>static int __init globalvar_init(void)
-</span><span class='line'>{
-</span><span class='line'>    init_waitqueue_head(&amp;waitq);
-</span><span class='line'>    spin_lock_init(&amp;var_lock);
-</span><span class='line'>//  if (!proc_net_fops_create(&amp;init_net, procname, S_IRUSR, &amp;globalvar_fops)) {
-</span><span class='line'>    if (!(major = register_chrdev(0, "globalvar", &amp;globalvar_fops))) {
-</span><span class='line'>        printk("globalvar register failure\n");
-</span><span class='line'>        return -1;
-</span><span class='line'>    }
-</span><span class='line'>    printk("major = %d\n", major);
-</span><span class='line'>    return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __exit globalvar_exit(void)
-</span><span class='line'>{
-</span><span class='line'>//  proc_net_remove(&amp;init_net, procname);
-</span><span class='line'>    unregister_chrdev(major, "globalvar");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static ssize_t globalvar_read(struct file *filp, char *buf, size_t len, loff_t *off)
-</span><span class='line'>{
-</span><span class='line'>    int read_len;
-</span><span class='line'>    //等待数据可获得
-</span><span class='line'>    if (wait_event_interruptible(waitq, flag != 0))
-</span><span class='line'>        return -ERESTARTSYS;
-</span><span class='line'>
-</span><span class='line'>    spin_lock(&amp;var_lock);
-</span><span class='line'>    read_len = write_index - read_index;
-</span><span class='line'>    if (copy_to_user(buf, global_var+read_index, read_len)) {
-</span><span class='line'>        spin_unlock(&amp;var_lock);
-</span><span class='line'>        return -EFAULT;
-</span><span class='line'>    }
-</span><span class='line'>    read_index = write_index;
-</span><span class='line'>    flag = 0;
-</span><span class='line'>    spin_unlock(&amp;var_lock);
-</span><span class='line'>    return read_len;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static ssize_t globalvar_write(struct file *filp, const char *buf, size_t len, loff_t *off)
-</span><span class='line'>{
-</span><span class='line'>    spin_lock(&amp;var_lock);
-</span><span class='line'>    if (copy_from_user(global_var+write_index, buf, len)) {
-</span><span class='line'>        spin_unlock(&amp;var_lock);
-</span><span class='line'>        return -EFAULT;
-</span><span class='line'>    }
-</span><span class='line'>    write_index += len;
-</span><span class='line'>    spin_unlock(&amp;var_lock);
-</span><span class='line'>
-</span><span class='line'>    flag = 1;
-</span><span class='line'>    //通知数据可获得
-</span><span class='line'>    wake_up_interruptible(&amp;waitq);
-</span><span class='line'>    return len;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(globalvar_init);
-</span><span class='line'>module_exit(globalvar_exit);
-</span><span class='line'>MODULE_LICENSE("GPL");
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Makefile&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    obj-m += waitqueue.o
-</span><span class='line'>
-</span><span class='line'>PWD = $(shell pwd)
-</span><span class='line'>KERNEL := /lib/modules/`uname -r`/build
-</span><span class='line'>
-</span><span class='line'>all:
-</span><span class='line'>    make -C $(KERNEL) M=$(PWD) modules
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;安装模块&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    insmod ./waitqueue.ko
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;查看对应的设备号&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    $ cat /proc/devices | grep globalvar
-</span><span class='line'>$ 249 globalvar
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;建立文件&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    mknod /dev/globalvar c 249 0
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;终端1: cat文件&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    cat /dev/globalvar
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;终端2: echo数据到文件&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    echo 123 &gt; /dev/globalvar
-</span><span class='line'>echo 1234567 &gt; /dev/globalvar
-</span><span class='line'>echo 123 &gt; /dev/globalvar
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这时就能看见终端1读到了内容。&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux内核中的等待队列]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-05-21T15:58:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.sina.com.cn/s/blog_49d5604e010008bn.html"&gt;http://blog.sina.com.cn/s/blog_49d5604e010008bn.html&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;等待队列可以参考net/ipv4/tcp_probe.c的实现&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/"&gt;简单样例&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Linux内核中的等待队列&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  Linux内核的等待队列是以双循环链表为基础数据结构，与进程调度机制紧密结合，能够用于实现核心的异步事件通知机制。在Linux2.4.21中，等待队列在源代码树include/linux/wait.h中，这是一个通过list_head连接的典型双循环链表，&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;如下图所示。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-05-21.jpg" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  在这个链表中，有两种数据结构：等待队列头（wait_queue_head_t）和等待队列项（wait_queue_t）。等待队列头和等待队列项中都包含一个list_head类型的域作为"连接件"。由于我们只需要对队列进行添加和删除操作，并不会修改其中的对象（等待队列项），因此，我们只需要提供一把保护整个基础设施和所有对象的锁，这把锁保存在等待队列头中，为wq_lock_t类型。在实现中，可以支持读写锁（rwlock）或自旋锁（spinlock）两种类型，通过一个宏定义来切换。如果使用读写锁，将wq_lock_t定义为rwlock_t类型；如果是自旋锁，将wq_lock_t定义为spinlock_t类型。无论哪种情况，分别相应设置wq_read_lock、wq_read_unlock、wq_read_lock_irqsave、wq_read_unlock_irqrestore、wq_write_lock_irq、wq_write_unlock、wq_write_lock_irqsave和wq_write_unlock_irqrestore等宏。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;等待队列头&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct __wait_queue_head {
-</span><span class='line'>    wq_lock_t lock;
-</span><span class='line'>    struct list_head task_list;
-</span><span class='line'>};
-</span><span class='line'>typedef struct __wait_queue_head wait_queue_head_t;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  前面已经说过，等待队列的主体是进程，这反映在每个等待队列项中，是一个任务结构指针（struct task_struct * task）。flags为该进程的等待标志，当前只支持互斥。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;等待队列项&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct __wait_queue {
-</span><span class='line'>    unsigned int flags;
-</span><span class='line'>#define WQ_FLAG_EXCLUSIVE 0x01
-</span><span class='line'>    struct task_struct * task;
-</span><span class='line'>    struct list_head task_list;
-</span><span class='line'>};
-</span><span class='line'>typedef struct __wait_queue wait_queue_t;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;声明和初始化&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define DECLARE_WAITQUEUE(name, tsk)            \
-</span><span class='line'>    wait_queue_t name = __WAITQUEUE_INITIALIZER(name, tsk)
-</span><span class='line'>#define __WAITQUEUE_INITIALIZER(name, tsk) {    \
-</span><span class='line'>    task:  tsk,                                 \
-</span><span class='line'>    task_list: { NULL, NULL },                  \
-</span><span class='line'>    __WAITQUEUE_DEBUG_INIT(name)}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  通过DECLARE_WAITQUEUE宏将等待队列项初始化成对应的任务结构，并且用于连接的相关指针均设置为空。其中加入了调试相关代码。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>#define DECLARE_WAIT_QUEUE_HEAD(name)                    \
-</span><span class='line'>    wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
-</span><span class='line'>#define __WAIT_QUEUE_HEAD_INITIALIZER(name) {            \
-</span><span class='line'>    lock:  WAITQUEUE_RW_LOCK_UNLOCKED,                   \
-</span><span class='line'>    task_list: { &amp;(name).task_list, &amp;(name).task_list }, \
-</span><span class='line'>    __WAITQUEUE_HEAD_DEBUG_INIT(name)}
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  通过DECLARE_WAIT_QUEUE_HEAD宏初始化一个等待队列头，使得其所在链表为空，并设置链表为"未上锁"状态。其中加入了调试相关代码。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>static inline void init_waitqueue_head(wait_queue_head_t *q)
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;该函数初始化一个已经存在的等待队列头，它将整个队列设置为"未上锁"状态，并将链表指针prev和next指向它自身。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>{
-</span><span class='line'>    q-&gt;lock = WAITQUEUE_RW_LOCK_UNLOCKED;
-</span><span class='line'>    INIT_LIST_HEAD(&amp;q-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void init_waitqueue_entry(wait_queue_t *q, struct task_struct *p)
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;该函数初始化一个已经存在的等待队列项，它设置对应的任务结构，同时将标志位清0。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>{
-</span><span class='line'>    q-&gt;flags = 0;
-</span><span class='line'>    q-&gt;task = p;
-</span><span class='line'>}
-</span><span class='line'>static inline int waitqueue_active(wait_queue_head_t *q)
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>该函数检查等待队列是否为空。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>{
-</span><span class='line'>    return !list_empty(&amp;q-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;将指定的等待队列项new添加到等待队列头head所在的链表头部，该函数假设已经获得锁。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>{
-</span><span class='line'>    list_add(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;将指定的等待队列项new添加到等待队列头head所在的链表尾部，该函数假设已经获得锁。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>{
-</span><span class='line'>    list_add_tail(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>static inline void __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>将函数从等待队列头head所在的链表中删除指定等待队列项old，该函数假设已经获得锁，并且old在head所在链表中。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>{
-</span><span class='line'>    list_del(&amp;old-&gt;task_list);
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;睡眠和唤醒操作&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;对等待队列的操作包括睡眠和唤醒（相关函数保存在源代码树的/kernel/sched.c和include/linux/sched.h中）。思想是更改当前进程（CURRENT）的任务状态，并要求重新调度，因为这时这个进程的状态已经改变，不再在调度表的就绪队列中，因此无法再获得执行机会，进入"睡眠"状态，直至被"唤醒"，即其任务状态重新被修改回就绪态。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;常用的睡眠操作有interruptible_sleep_on和sleep_on。两个函数类似，只不过前者将进程的状态从就绪态（TASK_RUNNING）设置为TASK_INTERRUPTIBLE，允许通过发送signal唤醒它（即可中断的睡眠状态）；而后者将进程的状态设置为TASK_UNINTERRUPTIBLE，在这种状态下，不接收任何singal。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;以interruptible_sleep_on为例，其展开后的代码是：</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&lt;p&gt;3.3内核中/arch/x86/kernel/init_task.c第35行：</span></code></pre></td></tr></table></div></figure>
+     35  * per-CPU TSS segments. Threads are completely &lsquo;soft&rsquo; on Linux,
+     36  * no more per-task TSS&rsquo;s. The TSS size is kept cacheline-aligned
+     37  * so they are allowed to end up in the .data..cacheline_aligned
+     38  * section. Since TSS&rsquo;s are completely CPU-local, we want them
+     39  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
+     40  */</p>
+
+<pre><code> 41 DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss) = INIT_TSS;
+</code></pre>
+
+<pre><code>
+INIT_TSS的定义如下:
+
+3.3内核中 /arch/x86/include/asm/processor.h文件的第879行：
+</code></pre>
+
+<pre><code>879 #define INIT_TSS  {                                                       \
+880         .x86_tss = {                                                      \
+881                 .sp0            = sizeof(init_stack) + (long)&amp;init_stack, \
+882                 .ss0            = __KERNEL_DS,                            \
+883                 .ss1            = __KERNEL_CS,                            \
+884                 .io_bitmap_base = INVALID_IO_BITMAP_OFFSET,               \
+885          },                                                               \
+886         .io_bitmap              = { [0 ... IO_BITMAP_LONGS] = ~0 },       \
+887 }
+</code></pre>
+
+<pre><code>
+其中init_stack是宏定义，指向内核栈：
+</code></pre>
+
+<pre><code>61 #define init_stack              (init_thread_union.stack)
+</code></pre>
+
+<p>```
+这里可以看到分别把内核栈栈顶指针、内核代码段、内核数据段赋值给TSS中的相应项。从而进程从用户态切换到内核态时，可以从TSS段中获取内核栈栈顶指针，进而保存进程上下文到内核栈中。</p>
+
+<h4>总结、有了上面的一些准备，现总结在进程从用户态到内核态切换过程中，Linux主要做的事：</h4>
+
+<p>  1：读取tr寄存器，访问TSS段<br/>
+  2：从TSS段中的sp0获取进程内核栈的栈顶指针<br/>
+  3：由控制单元在内核栈中保存当前eflags,cs,ss,eip,esp寄存器的值。<br/>
+  4：由SAVE_ALL保存其寄存器的值到内核栈<br/>
+  5：把内核代码选择符写入CS寄存器，内核栈指针写入ESP寄存器，把内核入口点的线性地址写入EIP寄存器</p>
+
+<p>此时，CPU已经切换到内核态，根据EIP中的值开始执行内核入口点的第一条指令。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[进程切换过程分析]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-switch/"/>
+    <updated>2015-06-02T14:10:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/06/02/kernel-sched-switch</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/nkguohao/article/details/9187381">http://blog.csdn.net/nkguohao/article/details/9187381</a></p>
+
+<p>参考《深入理解Linux内核（第三版）》</p>
+
+<h4>进程切换</h4>
+
+<p>为了控制进程的执行，内核必须有能力挂起正在CPU上运行的进程，并恢复以前挂起的某个进程的执行。这种行为被称为进程切换，任务切换或上下文切换。下面几节描述在Linux中进行进程切换的主要内容。</p>
+
+<h4>硬件上下文</h4>
+
+<p>尽管每个进程可以拥有属于自己的地址空间，但所有进程必须共享CPU寄存器。因此要恢复一个进程的执行之前，内核必须确保每个寄存器装入了挂起进程时的值。</p>
+
+<p>进程恢复执行前必须装入寄存器的一组数据称为硬件上下文。硬件上下文是进程可执行上下文的一个子集，因为可执行上下文包含进程执行时需要的所有信息。在Linux中，进程硬件上下文的一部分存在TSS段，而剩余部分存放在内核态的堆栈中。</p>
+
+<p>在下面的描述中，我们假定用prev局部变量表示切换出的进程的描述符，next表示切换进的进程的描述符。因此，我们把进程切换定义为这样的行为：保存prev硬件上下文，用next硬件上下文代替prev。因为进程切换经常发生，因此减少和装入硬件上下文所花费的时间是非常重要的。</p>
+
+<p>早期的Linux版本利用80x86体系结构所提供的硬件支持，并通过far jmp指令跳到进程TSS描述符的选择符来执行进程切换。当执行这条指令时，CPU通过自动保存原来的硬件上下文，装入新的硬件上下文来执行硬件上下文切换。但是基于以下原因，Linux2.6使用软件执行进程切换：</p>
+
+<p>  通过一组mov指令逐步执行切换，这样能较好地控制所装入数据的合法性，尤其是，这使检查ds和es段寄存器的值成为可能，这些值有可能被恶意用户伪造。当用单独的farjmp指令时，不可能进行这类检查。</p>
+
+<p>  旧方法和新方法所需时间大致相同。然而，尽管当前的切换代码还有改进的余地，却不能对硬件上下文切换进行优化。</p>
+
+<p>进程切换只发生在内核态。在执行进程切换之前，用户态进程所使用的所有寄存器内容已保存在内核态堆栈上，这也包括ss和esp这对寄存器的内容。</p>
+
+<h4>任务状态段</h4>
+
+<p>80x86体系结构包括一个特殊的段类型，叫任务状态段（Task State Segment, TSS）来存放硬件上下文。尽管Linux并不使用硬件上下文切换，但是强制它为系统中每个不同的CPU创建一个TSS。这样做的两个主要理由为：<br/>
+  当80x86的一个CPU从用户态切换到内核态时，它就从TSS中获取内核态堆栈的地址。<br/>
+  当用户态进程试图通过in或out指令访问一个I/O端口时，CPU需要访问存放在TSS中的I/O许可图以检查该进程是否有访问端口的权力。</p>
+
+<p>更确切地说，当进程在用户态下执行in或out指令时，控制单元执行下列操作：<br/>
+  它检查eflags寄存器中的2位IOPL字段。如果该字段值为3，控制单元就执行I/O指令。否则，执行下一个检查。<br/>
+  访问tr寄存器以确定当前的TSS和相应的I/O许可权位图。<br/>
+  检查I/O指令中指定的I/O端口在I/O许可权位图中对应的位。如果该位清0，这条I/O指令就执行，否则控制单元产生一个”Generalprotetion”异常。</p>
+
+<p>tss_struct结构描述TSS的格式。正如第二章(《深入理解Linux内核（第三版）》)所提到的，init_tss数组为系统上每个不同的CPU存放一个TSS。在每次进程切换时，内核都更新TSS的某些字段以便相应的CPU控制单元可以安全地检索到它需要的信息。因此，TSS反映了CPU上的当前进程的特权级，但不必为没有在运行的进程保留TSS。</p>
+
+<p>每个TSS有它自己8字节的任务状态段描述符。这个描述符包括指向TSS起始地址的32位Base字段，20位Limit字段。TSSD的S标志被清0，以表示相应的TSS是系统段的事实。</p>
+
+<p>Type字段置为11或9以表示这个段实际上是TSS。在Intel的原始设计中，系统中的每个进程都应当指向自己的TSS；Type字段的第二个有效位叫做Busy位；如果进程正由CPU执行，则该位置为1，否则置为0。在Linux的设计中，每个CPU只有一个TSS，因此，Busy位总置为1。</p>
+
+<p>由linux创建的TSSD存放在全局描述符表中。GDT的基地址存放在每个CPU的gdtr寄存器中。每个CPU的tr寄存器包含相应TSS的TSSD选择符，也包括了两个隐藏了非编程字段；TSSD的Base字段和Limit字段。这样，处理器就能直接对TSS寻址而不用从GDT中检索TSS的地址。</p>
+
+<h4>Thread字段</h4>
+
+<p>在每次进程切换时，被替换进程的硬件上下文必须保存在别处。不能像Intel原始设计那样把它保存在TSS中，因为Linux为每个处理器而不是为每个进程使用TSS。</p>
+
+<p>因此，每个进程描述符包含一个类型为thread_struct的thread字段，只要进程被切换出去，内核就把其硬件上下文保存在这个结构中。随后我们会看到，这个数据结构包含的字段涉及大部分CPU寄存器，但不包括诸如exa、ebx等等这些通用寄存器，它们的值保留在内核堆栈中。</p>
+
+<h4>执行进程切换</h4>
+
+<p>进程切换可能只发生在精心定义的点：schedule()函数（《深入理解Linux内核（第三版）》第七章有详细讨论）。这里，我们仅关注内核如何执行一个进程切换。</p>
+
+<p>从本质上说，每个进程切换由两步组成：<br/>
+  切换页全局目录以安装一个新的地址空间；将在第九章（《深入理解Linux内核（第三版）》）描述这一步。<br/>
+  切换内核态堆栈和硬件上下文，因为硬件上下文提供了内核执行新进程所需要的所有信息，包含CPU寄存器。</p>
+
+<p>我们又一次假定prev指向被替换进程的描述符，而next指向被激活进程的描述符。prev和next是schedule()函数的局部变量。</p>
+
+<h4>switch_to宏</h4>
+
+<p>进程切换的第二步由switch_to宏执行。它是内核中与硬件关系最密切的例程之一，要理解它到低做了些什么我们必须下些功夫。</p>
+
+<p>首先，该宏有三个参数，它们是prev,next和last。你可能很容易猜到prev和next的作用：它们仅是局部变量prev和next的占位符，即它们是输入参数，分别表示被替换进程和新进程描述符的地址在内存中的位置。</p>
+
+<p>那第三个参数last呢？在任何进程切换中，涉及到三个进程而不是两个。假设内核决定暂停进程A而激活里程B。在schedule()函数中，prev指向A的描述符而next指向B的描述符。switch_to宏一但使A暂停，A的执行流就冻结。</p>
+
+<p>随后，当内核想再次此激活A，就必须暂停另一个进程C，于是就要用prev指向C而next指向A来执行另一个swithch_to宏。当A恢复它的执行流时，就会找到它原来的内核栈，于是prev局部变量还是指向A的描述符而next指向B的描述符。此时，代表进程A执行的内核就失去了对C的任何引用。但是，事实表明这个引用对于完成进程切换是很有用的。</p>
+
+<p>switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描述符地址写在内存的什么位置了。在进程切换之前，宏把第一个输入参数prev表示的变量的内容存入CPU的eax寄存器。在完成进程切换，A已经恢复执行时，宏把CPU的eax寄存器的内容写入由第三个输出参数&mdash;&mdash;-last所指示的A在内存中的位置。因为CPU寄存器不会在切换点发生变化，所以C的描述符地址也存在内存的这个位置。在schedule()执行过程中，参数last指向A的局部变量prev，所以prev被C的地址覆盖。</p>
+
+<p>图3-7显示了进程A，B，C内核堆栈的内容以及eax寄存器的内容。必须注意的是：图中显示的是在被eax寄存器的内容覆盖以前的prev局部变量的值。</p>
+
+<pre><code>    #define switch_to(prev, next, last)                 \
+    32do {                                  \
+    33  /*                              \
+    34   * Context-switching clobbers all registers, so we clobber  \
+    35   * them explicitly, via unused output variables.        \
+    36   * (EAX and EBP is not listed because EBP is saved/restored \
+    37   * explicitly for wchan access and EAX is the return value of   \
+    38   * __switch_to())                       \
+    39   */                             \
+    40  unsigned long ebx, ecx, edx, esi, edi;              \
+    41                                  \
+    42  asm volatile("pushfl\n\t"       /* save    flags */ \
+    43           "pushl %%ebp\n\t"      /* save    EBP   */ \
+    44           "movl %%esp,%[prev_sp]\n\t"    /* save    ESP   */ \
+    45           "movl %[next_sp],%%esp\n\t"    /* restore ESP   */ \
+    46           "movl $1f,%[prev_ip]\n\t"  /* save    EIP   */ \
+    47           "pushl %[next_ip]\n\t" /* restore EIP   */ \
+    48           __switch_canary                    \
+    49           "jmp __switch_to\n"    /* regparm call  */ \
+    50           "1:\t"                     \
+    51           "popl %%ebp\n\t"       /* restore EBP   */ \
+    52           "popfl\n"          /* restore flags */ \
+    53                                  \
+    54           /* output parameters */                \
+    55           : [prev_sp] "=m" (prev-&gt;thread.sp),     \
+    56             [prev_ip] "=m" (prev-&gt;thread.ip),     \
+    57             "=a" (last),                 \
+    58                                  \
+    59             /* clobbered output registers: */        \
+    60             "=b" (ebx), "=c" (ecx), "=d" (edx),      \
+    61             "=S" (esi), "=D" (edi)               \
+    62                                      \
+    63             __switch_canary_oparam               \
+    64                                  \
+    65             /* input parameters: */              \
+    66           : [next_sp]  "m" (next-&gt;thread.sp),     \
+    67             [next_ip]  "m" (next-&gt;thread.ip),     \
+    68                                      \
+    69             /* regparm parameters for __switch_to(): */  \
+    70             [prev]     "a" (prev),               \
+    71             [next]     "d" (next)                \
+    72                                  \
+    73             __switch_canary_iparam               \
+    74                                  \
+    75           : /* reloaded segment registers */         \
+    76          "memory");                  \
+    77} while (0)
+    78
+</code></pre>
+
+<p>由于switch_to宏采用扩展的内联汇编语言编码，所以可读性比较差：实际上这段代码通过特殊位置记数法使用寄存器，而实际使用的通用寄存器由编译器自由选择。我们将采用标准汇编语言而不是麻烦的内联汇编语言来描述switch_to宏在80x86微处理器上所完成的典型工作。</p>
+
+<p>  在eax和edx寄存器中分别保存prev和next的值。
+<code>
+    movl prev ,%eax
+    movl next ,%edx
+</code>
+  把eflags和ebp寄存器的内容保存在prev内核栈中。必須保存它们的原因是编译器认为在switch_to结束之前它们的值应当保持不变。
+<code>
+    pushf1
+    push %ebp
+</code>
+  把esp的内容保存到prev->thread.esp中以使该字段指向prev内核栈的栈顶：
+<code>
+    movl %esp, 484(%eax)
+</code>
+  把next->thread.esp装入esp.此时，内核开始在next的内核栈上操作，因此这条指令实际上完成了从prev到next的切换。由于进程描述符的地址和内核栈的地址紧挨着，所以改变内核栈意味着改变进程。
+<code>
+    movl 484(%edx),%esp
+</code>
+  把标记为1的地址存入prev->thread.eip。当被替换的进程重新恢复执行时，进程执行被标记为1的那条指令：
+<code>
+    movl $lf, 480(%eax)
+</code>
+  宏把next->thread.eip的值压入next的内核栈。
+<code>
+    push1 480(%edx)
+</code>
+  跳到<code>__switch_to()</code> 函数
+<code>
+    jmp __switch_to
+</code>
+  这里被进程B替换的进程A再次获得CPU；它执行一些保存eflags和ebp寄存器内容的指令，这两条指令的第一条指令被标记为1。</p>
+
+<p>  拷贝eax寄存器的内容到switch_to宏的第三个参数lash标识的内存区域中：
+<code>
+    movl  %eax, last
+</code>
+正如以前讨论的，eax寄存器指向刚被替换的进程描述符。</p>
+
+<h4><code>__switch_to()</code>函数</h4>
+
+<p><code>__switch_to()</code>函数执行大多数开始于switch_to()宏的进程切换。这个函数作用于prev_p和next_p参数，这两个参数表示前一个进程和新进程。这个函数的调用不同于一般函数的调用，因为<code>__switch_to()</code>从eax和edx取参数prev_p和next_p，而不像大多数函数一样从栈中取参数。为了强迫函数从寄存器取它的参数，内核利用<code>__attribute__</code>和regparm关键字，这两个关键字是C语言非标准的扩展名，由gcc编译程序实现。在include/asm-i386/system.h头文件中，<code>__switch_to()</code>函数的声明如下：
+<code>
+    __switch_to(structtask_struct *prev_p,struct tast_struct *next_p)__attribute_(regparm(2));
+</code>
+函数执行的步骤如下：<br/>
+  1、执行由<code>__unlazy_fpu()</code>宏产生的代码，以有选择地保存prev_p进程的FPU、MMX及XMM寄存器的内容。
+<code>
+    __unlazy_fpu(prev_p);
+</code>
+  2、执行smp_processor_id()宏获得本地(local)CPU的下标，即执行代码的CPU。该宏从当前进程的thread_info结构的cpu字段获得下标将它保存到cpu局部变量。</p>
+
+<p>  3、把next_p->thread.esp0装入对应于本地CPU的TSS的esp0字段；将在通过sysenter指令发生系统调用一节看到，以后任何由sysenter汇编指令产生的从用户态到内核态的特权级转换将把这个地址拷贝到esp寄存器中：
+<code>
+    init_tss[cpu].esp0= next_p-&gt;thread.esp0;
+</code></p>
+
+<p>  4、把next_p进程使用的线程局部存储段装入本地CPU的全局描述符表；三个段选择符保存在进程描述符内的tls_array数组中
+<code>
+    cpu_gdt_table[cpu][6]= next_p-&gt;thread.tls_array[0];
+    cpu_gdt_table[cpu][7]= next_p-&gt;thread.tls_array[1];
+    cpu_gdt_table[cpu][8]= next_p-&gt;thread.tls_array[2];
+</code></p>
+
+<p>  5、把fs和gs段寄存器的内容分别存放在prev_p->thread.fs和prev_p->thread.gs中，对应的汇编语言指令是：
+<code>
+    movl%fs,40(%esi)
+    movl%gs,44(%esi)
+</code></p>
+
+<p>  6、如果fs或gs段寄存器已经被prev_p或next_p进程中的任意一个使用，则将next_p进程的thread_struct描述符中保存的值装入这些寄存器中。这一步在逻辑上补充了前一步中执行的操作。主要的汇编语言指令如下：
+<code>
+    movl40(%ebx),%fs
+    movl44(%edb),%gs
+</code></p>
+
+<p>  7、ebx寄存器指向next_p->thread结构。代码实际上更复杂，因为当它检测到一个无效的段寄存器值时，CPU可能产生一个异常。</p>
+
+<p>  8、用next_p->thread.debugreg数组的内容装载dr0,&hellip;,dr7中的6个调试寄存器。只有在next_p被挂起时正在使用调试寄存器，这种操作才能进行。这些寄存器不需要被保存，因为只有当一个调试器想要监控prev时prev_p->thread.debugreg才会修改。
+<code>
+    if(next_p-&gt;thread.debugreg[7]){
+    loaddebug(&amp;next_p-&gt;thread,0);
+    loaddebug(&amp;next_p-&gt;thread,1);
+    loaddebug(&amp;next_p-&gt;thread,2);
+    loaddebug(&amp;next_p-&gt;thread,3);
+    loaddebug(&amp;next_p-&gt;thread,6);
+    loaddebug(&amp;next_p-&gt;thread,7);
+</code></p>
+
+<p>  8、如果必要，更新TSS中的I/O位图。当next_p或prev_p有其自己的定制I/O权限位图时必须这么做：
+<code>
+    if(prev_p-&gt;thread.io_bitmap_ptr|| next_p-&gt;thread.io_bitmap_ptr )
+    handle_io_bitmap(&amp;next_p-&gt;thread,&amp;init_tss[cpu]);
+</code></p>
+
+<p>因为进程很修改I/O权限位图，所以该位图在“懒”模式中被处理；当且仅当一个进程在当前时间片内实际访问I/O端口时，真实位图才被拷贝到本地CPU的TSS中。进程的定制I/O权限位图被保存在thread_info结构的io_bitmap_ptr字段指向的缓冲区中。handle_io_bitmap()函数为next_p进程设置本地CPU使用的TSS的in_bitmap字段如下：<br/>
+  (a)如果next_p进程不拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x8000.<br/>
+  (b) 如果next_p进程拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x9000。</p>
+
+<p>TSS的io_bitmap字段应当包含一个在TSS中的偏移量，其中存放实际位图。无论何时用户态进程试图访问一个I/O端口，0x8000和0x9000指向TSS界限之外并将因此引起”Generalprotection”异常。do_general_protection()异常处理程序将检查保存在io_bitmap字段的值：如果是0x8000，函数发送一个SIGSEGV信号给用户态进程；如果是0x9000，函数把进程位图拷贝拷贝到本地CPU的TSS中，把io_bitmap字段为实际位图的偏移(104)，并强制再一次执行有缺陷的汇编指令。</p>
+
+<p>  9、终止。
+<code>__switch_to()</code>函数通过使用下列声明结束：
+<code>
+    return prev_p;
+</code>
+  由编译器产生的相应汇编语言指令是：
+<code>
+    movl %edl,%eax
+    ret
+</code>
+  prev_p参数被拷贝到eax，因为缺省情况下任何C函数的返回值被传递给eax寄存器。注意eax的值因此在调用<code>__switch_to()</code>的过程中被保护起来；这非常重要，因为调用switch_to宏时会假定eax总是用来存放被替换的进程描述符的地址。</p>
+
+<p>  汇编语言指令ret把栈顶保存的返回地址装入eip程序计数器。不过，通过简单地跳转到<code>__switch_to()</code>函数来调用该函数。因此，ret汇编指令在栈中找到标号为1的指令的地址，其中标号为1的地址是由switch_to()宏推入栈中的。如果因为next_p第一次执行而以前从未被挂起，<code>__switch_to()</code>就找到ret_from_fork()函数的起始地址。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[字符设备驱动和等待队列样例]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample/"/>
+    <updated>2015-05-21T15:58:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue-sample</id>
+    <content type="html"><![CDATA[<p>前两篇的样例</p>
+
+<p><a href="/blog/2015/05/21/kernel-base-chardev/">字符设备驱动程序</a><br/>
+<a href="/blog/2015/05/21/kernel-sched-waitqueue/">Linux内核中的等待队列</a></p>
+
+<h4>waitqueue.c</h4>
+
+<pre><code>    #include &lt;linux/module.h&gt;
+    #include &lt;linux/init.h&gt;
+    #include &lt;linux/fs.h&gt;
+    #include &lt;asm/uaccess.h&gt;
+    #include &lt;linux/wait.h&gt;
+    #include &lt;linux/semaphore.h&gt;
+    #include &lt;linux/kernel.h&gt;
+    #include &lt;linux/proc_fs.h&gt;
+
+    #include &lt;linux/socket.h&gt;
+    #include &lt;linux/tcp.h&gt;
+    #include &lt;linux/proc_fs.h&gt;
+    #include &lt;net/net_namespace.h&gt;
+
+    #include &lt;net/tcp.h&gt;
+
+
+    static ssize_t globalvar_read(struct file *, char *, size_t, loff_t*);
+    static ssize_t globalvar_write(struct file *, const char *, size_t, loff_t*);
+
+    struct file_operations globalvar_fops =
+    {
+        .owner   = THIS_MODULE,
+        .read = globalvar_read,
+        .write = globalvar_write,
+    };
+
+    #define LEN 1024
+    static char global_var[LEN];
+    static int read_index = 0;
+    static int write_index = 0;
+    static spinlock_t var_lock;
+    static wait_queue_head_t waitq;
+    static int flag = 0;
+    static int major;
+
+    static const char procname[] = "testvar";
+
+    static int __init globalvar_init(void)
+    {
+        init_waitqueue_head(&amp;waitq);
+        spin_lock_init(&amp;var_lock);
+    //  if (!proc_net_fops_create(&amp;init_net, procname, S_IRUSR, &amp;globalvar_fops)) {
+        if (!(major = register_chrdev(0, "globalvar", &amp;globalvar_fops))) {
+            printk("globalvar register failure\n");
+            return -1;
+        }
+        printk("major = %d\n", major);
+        return 0;
+    }
+
+    static void __exit globalvar_exit(void)
+    {
+    //  proc_net_remove(&amp;init_net, procname);
+        unregister_chrdev(major, "globalvar");
+    }
+
+    static ssize_t globalvar_read(struct file *filp, char *buf, size_t len, loff_t *off)
+    {
+        int read_len;
+        //等待数据可获得
+        if (wait_event_interruptible(waitq, flag != 0))
+            return -ERESTARTSYS;
+
+        spin_lock(&amp;var_lock);
+        read_len = write_index - read_index;
+        if (copy_to_user(buf, global_var+read_index, read_len)) {
+            spin_unlock(&amp;var_lock);
+            return -EFAULT;
+        }
+        read_index = write_index;
+        flag = 0;
+        spin_unlock(&amp;var_lock);
+        return read_len;
+    }
+
+    static ssize_t globalvar_write(struct file *filp, const char *buf, size_t len, loff_t *off)
+    {
+        spin_lock(&amp;var_lock);
+        if (copy_from_user(global_var+write_index, buf, len)) {
+            spin_unlock(&amp;var_lock);
+            return -EFAULT;
+        }
+        write_index += len;
+        spin_unlock(&amp;var_lock);
+
+        flag = 1;
+        //通知数据可获得
+        wake_up_interruptible(&amp;waitq);
+        return len;
+    }
+
+    module_init(globalvar_init);
+    module_exit(globalvar_exit);
+    MODULE_LICENSE("GPL");
+</code></pre>
+
+<h4>Makefile</h4>
+
+<pre><code>    obj-m += waitqueue.o
+
+    PWD = $(shell pwd)
+    KERNEL := /lib/modules/`uname -r`/build
+
+    all:
+        make -C $(KERNEL) M=$(PWD) modules
+</code></pre>
+
+<h5>安装模块</h5>
+
+<pre><code>    insmod ./waitqueue.ko
+</code></pre>
+
+<h5>查看对应的设备号</h5>
+
+<pre><code>    $ cat /proc/devices | grep globalvar
+    $ 249 globalvar
+</code></pre>
+
+<h5>建立文件</h5>
+
+<pre><code>    mknod /dev/globalvar c 249 0
+</code></pre>
+
+<h5>终端1: cat文件</h5>
+
+<pre><code>    cat /dev/globalvar
+</code></pre>
+
+<h5>终端2: echo数据到文件</h5>
+
+<pre><code>    echo 123 &gt; /dev/globalvar
+    echo 1234567 &gt; /dev/globalvar
+    echo 123 &gt; /dev/globalvar
+</code></pre>
+
+<p>这时就能看见终端1读到了内容。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux内核中的等待队列]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue/"/>
+    <updated>2015-05-21T15:58:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/05/21/kernel-sched-waitqueue</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.sina.com.cn/s/blog_49d5604e010008bn.html">http://blog.sina.com.cn/s/blog_49d5604e010008bn.html</a></p>
+
+<p>等待队列可以参考net/ipv4/tcp_probe.c的实现</p>
+
+<p><a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/">简单样例</a></p>
+
+<h4>Linux内核中的等待队列</h4>
+
+<p>  Linux内核的等待队列是以双循环链表为基础数据结构，与进程调度机制紧密结合，能够用于实现核心的异步事件通知机制。在Linux2.4.21中，等待队列在源代码树include/linux/wait.h中，这是一个通过list_head连接的典型双循环链表，</p>
+
+<p>如下图所示。</p>
+
+<p><img src="/images/kernel/2015-05-21.jpg" alt="" /></p>
+
+<p>  在这个链表中，有两种数据结构：等待队列头（wait_queue_head_t）和等待队列项（wait_queue_t）。等待队列头和等待队列项中都包含一个list_head类型的域作为"连接件"。由于我们只需要对队列进行添加和删除操作，并不会修改其中的对象（等待队列项），因此，我们只需要提供一把保护整个基础设施和所有对象的锁，这把锁保存在等待队列头中，为wq_lock_t类型。在实现中，可以支持读写锁（rwlock）或自旋锁（spinlock）两种类型，通过一个宏定义来切换。如果使用读写锁，将wq_lock_t定义为rwlock_t类型；如果是自旋锁，将wq_lock_t定义为spinlock_t类型。无论哪种情况，分别相应设置wq_read_lock、wq_read_unlock、wq_read_lock_irqsave、wq_read_unlock_irqrestore、wq_write_lock_irq、wq_write_unlock、wq_write_lock_irqsave和wq_write_unlock_irqrestore等宏。</p>
+
+<h5>等待队列头</h5>
+
+<pre><code>    struct __wait_queue_head {
+        wq_lock_t lock;
+        struct list_head task_list;
+    };
+    typedef struct __wait_queue_head wait_queue_head_t;
+</code></pre>
+
+<p>  前面已经说过，等待队列的主体是进程，这反映在每个等待队列项中，是一个任务结构指针（struct task_struct * task）。flags为该进程的等待标志，当前只支持互斥。</p>
+
+<h5>等待队列项</h5>
+
+<pre><code>    struct __wait_queue {
+        unsigned int flags;
+    #define WQ_FLAG_EXCLUSIVE 0x01
+        struct task_struct * task;
+        struct list_head task_list;
+    };
+    typedef struct __wait_queue wait_queue_t;
+</code></pre>
+
+<h5>声明和初始化</h5>
+
+<pre><code>    #define DECLARE_WAITQUEUE(name, tsk)            \
+        wait_queue_t name = __WAITQUEUE_INITIALIZER(name, tsk)
+    #define __WAITQUEUE_INITIALIZER(name, tsk) {    \
+        task:  tsk,                                 \
+        task_list: { NULL, NULL },                  \
+        __WAITQUEUE_DEBUG_INIT(name)}
+</code></pre>
+
+<p>  通过DECLARE_WAITQUEUE宏将等待队列项初始化成对应的任务结构，并且用于连接的相关指针均设置为空。其中加入了调试相关代码。
+<code>
+    #define DECLARE_WAIT_QUEUE_HEAD(name)                    \
+        wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
+    #define __WAIT_QUEUE_HEAD_INITIALIZER(name) {            \
+        lock:  WAITQUEUE_RW_LOCK_UNLOCKED,                   \
+        task_list: { &amp;(name).task_list, &amp;(name).task_list }, \
+        __WAITQUEUE_HEAD_DEBUG_INIT(name)}
+</code></p>
+
+<p>  通过DECLARE_WAIT_QUEUE_HEAD宏初始化一个等待队列头，使得其所在链表为空，并设置链表为"未上锁"状态。其中加入了调试相关代码。
+<code>
+    static inline void init_waitqueue_head(wait_queue_head_t *q)
+</code></p>
+
+<p>该函数初始化一个已经存在的等待队列头，它将整个队列设置为"未上锁"状态，并将链表指针prev和next指向它自身。
+<code>
+    {
+        q-&gt;lock = WAITQUEUE_RW_LOCK_UNLOCKED;
+        INIT_LIST_HEAD(&amp;q-&gt;task_list);
+    }
+    static inline void init_waitqueue_entry(wait_queue_t *q, struct task_struct *p)
+</code></p>
+
+<p>该函数初始化一个已经存在的等待队列项，它设置对应的任务结构，同时将标志位清0。
+<code>
+    {
+        q-&gt;flags = 0;
+        q-&gt;task = p;
+    }
+    static inline int waitqueue_active(wait_queue_head_t *q)
+</code>
+该函数检查等待队列是否为空。
+<code>
+    {
+        return !list_empty(&amp;q-&gt;task_list);
+    }
+    static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)
+</code></p>
+
+<p>将指定的等待队列项new添加到等待队列头head所在的链表头部，该函数假设已经获得锁。
+<code>
+    {
+        list_add(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
+    }
+    static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)
+</code></p>
+
+<p>将指定的等待队列项new添加到等待队列头head所在的链表尾部，该函数假设已经获得锁。
+<code>
+    {
+        list_add_tail(&amp;new-&gt;task_list, &amp;head-&gt;task_list);
+    }
+    static inline void __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)
+</code>
+将函数从等待队列头head所在的链表中删除指定等待队列项old，该函数假设已经获得锁，并且old在head所在链表中。
+<code>
+    {
+        list_del(&amp;old-&gt;task_list);
+    }
+</code></p>
+
+<h4>睡眠和唤醒操作</h4>
+
+<p>对等待队列的操作包括睡眠和唤醒（相关函数保存在源代码树的/kernel/sched.c和include/linux/sched.h中）。思想是更改当前进程（CURRENT）的任务状态，并要求重新调度，因为这时这个进程的状态已经改变，不再在调度表的就绪队列中，因此无法再获得执行机会，进入"睡眠"状态，直至被"唤醒"，即其任务状态重新被修改回就绪态。</p>
+
+<p>常用的睡眠操作有interruptible_sleep_on和sleep_on。两个函数类似，只不过前者将进程的状态从就绪态（TASK_RUNNING）设置为TASK_INTERRUPTIBLE，允许通过发送signal唤醒它（即可中断的睡眠状态）；而后者将进程的状态设置为TASK_UNINTERRUPTIBLE，在这种状态下，不接收任何singal。</p>
+
+<p>以interruptible_sleep_on为例，其展开后的代码是：
+```
     void interruptible_sleep_on(wait_queue_head_t <em>q)
     {
         unsigned long flags;
@@ -1452,85 +2526,6 @@ wake_up_interruptible( &amp;wq );
 </code></pre>
 
 <p>```</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[linux进程调度之FIFO和RR调度策略]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/03/13/kernel-sched-rt/"/>
-    <updated>2015-03-13T00:00:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/03/13/kernel-sched-rt</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-24774106-id-3379478.html">http://blog.chinaunix.net/uid-24774106-id-3379478.html</a></p>
-
-<p>严格地说，对于优先级对于实时进程和普通进程的意义是不一样的。</p>
-
-<p>1、在一定程度上，实时进程优先级高，实时进程存在，就没有普通进程占用CPU的机会，（但是前一篇博文也讲过了，实时组调度出现在内核以后，允许普通进程占用少量的CPU时间,取决于配置)。</p>
-
-<p>2、对于实时进程而言，高优先级的进程存在，低优先级的进程是轮不上的，没机会跑在CPU上，所谓实时进程的调度策略,指的是相同优先级之间的调度策略。如果是FIFO实时进程在占用CPU，除非出现以下事情，否则FIFO一条道跑到黑。<br/>
-  a）FIFO进程良心发现，调用了系统调用sched_yield 自愿让出CPU<br/>
-  b) 更高优先级的进程横空出世，抢占FIFO进程的CPU。有些人觉得很奇怪，怎么FIFO占着CPU，为啥还能有更高优先级的进程出现呢。别忘记，我们是多核多CPU ,如果其他CPU上出现了一个比FIFO优先级高的进程，可能会push到FIFO进程所在的CPU上。<br/>
-  c) FIFO进程停止（TASK_STOPPED or TASK_TRACED状态）或者被杀死（EXIT_ZOMBIE or EXIT_DEAD状态）<br/>
-  d) FIFO进程执行了阻塞调用并进入睡眠（TASK_INTERRUPTIBLE OR TASK_UNINTERRUPTIBLE）。</p>
-
-<p>  如果是进程的调度策略是时间片轮转RR，那么，除了前面提到的abcd，RR实时进程耗尽自己的时间片后，自动退到对应优先级实时队列的队尾，重新调度。</p>
-
-<pre><code>    struct sched_param {
-        /* ... */
-        int sched_priority;
-        /* ... */
-    };
-    int sched_setscheduler (pid_t pid,
-                            int policy,
-                            const struct sched_param *sp);
-</code></pre>
-
-<p>  sched_setscheduler函数的第二个参数调度方法 ：
-<code>
-    #define SCHED_OTHER 0
-    #define SCHED_FIFO 1
-    #define SCHED_RR 2
-    #ifdef __USE_GNU
-    # define SCHED_BATCH 3
-    #endif
-</code>
-  SCHED_OTHER表示普通进程，对于普通进程，第三个参数sp->sched_priority只能是0<br/>
-  SCHED_FIFO 和SCHED_RR表示实时进程的调度策略，第三个参数的取值范围为[1,99]。<br/>
-  如果sched_setscheduler 优先级设置的值和调度策略不符合的话，会返回失败的。</p>
-
-<p>应用层和内核层的优先级含义是不同的：<br/>
-  首先说实时进程：实时进程的优先级设置可以通过sched_setsheduler设置，也可以通过sched_setparam设置优先级的大小。
-int sched_setparam (pid_t pid, const struct sched_param *sp);</p>
-
-<p>  在用户层或者应用层，1表示优先级最低，99表示优先级最高。但是在内核中，[0,99]表示的实时进程的优先级，0最高，99最低。[100,139]是普通进程折腾的范围。应用层比较天真率直，就看大小，数字大，则优先级高。ps查看进程的优先级也是如此。有意思的是，应用层实时进程最高优先级的99，在ps看进程优先级的时候，输出的是139.</p>
-
-<p>  对于普通进程，是通过nice系统调用来调整优先级的。从内核角度讲[100,139]是普通进程的优先级的范围，100最高，139最低，默认是120。普通进程的优先级的作用和实时进程不同，普通进程优先级表示的是占的CPU时间。深入linux内核架构中提到，普通优先级越高（100最高，139最低），享受的CPU time越多，相邻的两个优先级，高一级的进程比低一级的进程多占用10%的CPU，比如内核优先级数值为120的进程要比数值是121的进程多占用10%的CPU。</p>
-
-<p>  内核中有一个数组：prio_to_weight[20]表示的是默认优先级120的权重，数值为1024，prio_to_weight[21]表示nice值为1，优先级为121的进程的权重，数值为820。这就到了CFS的原理了
-<code>
-    static const int prio_to_weight[40] = {
-     /* -20 */ 88761, 71755, 56483, 46273, 36291,
-     /* -15 */ 29154, 23254, 18705, 14949, 11916,
-     /* -10 */ 9548, 7620, 6100, 4904, 3906,
-     /* -5 */ 3121, 2501, 1991, 1586, 1277,
-     /* 0 */ 1024, 820, 655, 526, 423,
-     /* 5 */ 335, 272, 215, 172, 137,
-     /* 10 */ 110, 87, 70, 56, 45,
-     /* 15 */ 36, 29, 23, 18, 15,
-    };
-</code>
-  假如有1台电脑，10个人玩，怎么才公平。<br/>
-  1 约定好时间片，每人玩1小时，玩完后记账，张XX 1小时，谁玩的时间短，谁去玩<br/>
-  2 引入优先级的概念，李四有紧急情况，需要提高他玩电脑的时间，怎么办，玩1个小时，记账半小时，那么同等情况下，李四会比其他人被选中玩电脑的频率要高，就体现了这个优先级的概念。<br/>
-  3  王五也有紧急情况，但是以考察，不如李四的紧急，好吧，玩1个小时，记账45分钟。<br/>
-  4  情况有变化，听说这里有电脑，突然又来了10个人，如果按照每人玩1小时的时间片，排在最后的那哥们早就开始骂人了，怎么办？时间片动态变化，根据人数来确定时间片。人越多，每个人玩的时间越少，防止哥们老捞不着玩，耐心耗尽，开始骂人。</p>
-
-<p>  这个记账就是我们prio_to_weight的作用。我就不多说了，prio_to_weight[20]就是基准，玩一小时，记账一小时，数组20以前的值是特权一级，玩1小时记账20分钟之类的享有特权的，数组20之后是倒霉蛋，玩1小时，记账1.5小时之类的倒霉蛋。 CFS这种调度好在大家都能捞着玩。</p>
-
-<p>对于FIFO而言，一旦sleep过后，高优先级运行，低优先级是没戏运行的，同等优先级的进程，先运行的不运行完，后运行的也没戏。<br/>
-对于RR而言，高优先级的先运行，同等优先级的进程过家家，你玩完，我玩，我玩完你再玩，每个进程耗费一个时间片的时间。对于Linux，RR时间片是100ms：
-<code>
-    #define DEF_TIMESLICE        (100 * HZ / 1000)
-</code></p>
 ]]></content>
   </entry>
   

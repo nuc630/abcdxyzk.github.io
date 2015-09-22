@@ -4,7 +4,7 @@
   <title><![CDATA[Category: tools~haproxy | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/tools~haproxy/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-07-27T18:24:50+08:00</updated>
+  <updated>2015-09-22T11:40:38+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,282 +14,1039 @@
 
   
   <entry>
-    <title type="html"><![CDATA[haproxy splice]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/07/24/tools-haproxy-splice/"/>
-    <updated>2015-07-24T16:45:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/07/24/tools-haproxy-splice</id>
-    <content type="html"><![CDATA[<p>www.haproxy.org/download/1.5/doc/configuration.txt 或 <a href="/download/tools/haproxy-1.5-configuration.txt">configuration.txt</a></p>
+    <title type="html"><![CDATA[HAProxy 研究笔记 -- epoll 事件的处理]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src6/"/>
+    <updated>2015-07-29T16:12:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src6</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-10167808-id-3825388.html">http://blog.chinaunix.net/uid-10167808-id-3825388.html</a></p>
 
-<p>旧版编译加
+<p> 本文介绍 HAProxy 中 epoll 事件的处理机制，版本为 1.5-dev17。</p>
+
+<pre><code>    1. 背景知识
+        1.1. fd 更新列表
+        1.2. fdtab 数据结构
+        1.3. fd event 的设置
+    2. _do_poll() 代码分析
+        2.1. 检测 fd 更新列表
+        2.2. 获取活动的 fd
+        2.3. 处理活动的 fd
+</code></pre>
+
+<p>HAProxy 支持多种异步机制，有 select，poll，epoll，kqueue 等。本文介绍 epoll 的 相关实现，epoll 的代码在源文件 ev_epoll.c 中。epoll 的关键处理逻辑集中在函数 _do_poll() 中，下面会详细的分析该函数。</p>
+
+<h4>1. 背景知识</h4>
+
+<p>在分析 _do_poll() 实现之前，有一些关联的设计需要简单介绍一下，以便于理解该函数中 的一些代码。</p>
+
+<h5>1.1. fd 更新列表</h5>
+
+<p>见 fd.c 中的全局变量：
 <code>
-    USE_TCPSPLICE=1
+    /* FD status is defined by the poller's status and by the speculative I/O list */
+    int fd_nbupdt = 0;             // number of updates in the list
+    unsigned int *fd_updt = NULL;  // FD updates list
 </code></p>
 
-<p>比较新的加
-<code>
-    USE_LINUX_SPLICE=1
-</code>
-默认编译会加入</p>
+<p>这两个全局变量用来记录状态需要更新的 fd 的数量及具体的 fd。_do_poll() 中会根据 这些信息修改对应 fd 的 epoll 设置。</p>
 
-<p>编译加入了也要在配置文件中开启才有效
-<code>
-    option splice-auto
-    option splice-request
-    option splice-response
-</code></p>
+<h5>1.2. fdtab 数据结构</h5>
 
-<p>在global中关闭splice功能
-<code>
-    nosplice
-</code></p>
+<p>struct fdtab 数据结构在 include/types/fd.h 中定义，内容如下：</p>
+
+<pre><code>    /* info about one given fd */
+    struct fdtab {
+        int (*iocb)(int fd);                 /* I/O handler, returns FD_WAIT_* */
+        void *owner;                         /* the connection or listener associated with this fd, NULL if closed */
+        unsigned int  spec_p;                /* speculative polling: position in spec list+1. 0=not in list. */
+        unsigned char spec_e;                /* speculative polling: read and write events status. 4 bits */
+        unsigned char ev;                    /* event seen in return of poll() : FD_POLL_* */
+        unsigned char new:1;                 /* 1 if this fd has just been created */
+        unsigned char updated:1;             /* 1 if this fd is already in the update list */
+    };
+</code></pre>
+
+<p>该结构的成员基本上都有注释，除了前两个成员，其余的都是和 fd IO 处理相关的。后面 分析代码的时候再具体的解释。</p>
+
+<p>src/fd.c 中还有一个全局变量：</p>
+
+<pre><code>    struct fdtab *fdtab = NULL;     /* array of all the file descriptors */
+</code></pre>
+
+<p>fdtab[] 记录了 HAProxy 所有 fd 的信息，数组的每个成员都是一个 struct fdtab， 而且成员的 index 正是 fd 的值，这样相当于 hash，可以高效的定位到某个 fd 对应的 信息。</p>
+
+<h5>1.3. fd event 的设置</h5>
+
+<p>include/proto/fd.h 中定义了一些设置 fd event 的函数：</p>
+
+<pre><code>    /* event manipulation primitives for use by I/O callbacks */
+    static inline void fd_want_recv(int fd)
+    static inline void fd_stop_recv(int fd)
+    static inline void fd_want_send(int fd)
+    static inline void fd_stop_send(int fd)
+    static inline void fd_stop_both(int fd)
+</code></pre>
+
+<p>这些函数见名知义，就是用来设置 fd 启动或停止接收以及发送的。这些函数底层调用的 是一系列 fd_ev_XXX() 的函数真正的设置 fd。这里简单介绍一下 fd_ev_set() 的代码：</p>
+
+<pre><code>    static inline void fd_ev_set(int fd, int dir)
+    {
+        unsigned int i = ((unsigned int)fdtab[fd].spec_e) &amp; (FD_EV_STATUS &lt;&lt; dir);
+        ...
+        if (i &amp; (FD_EV_ACTIVE &lt;&lt; dir))
+            return; /* already in desired state */
+        fdtab[fd].spec_e |= (FD_EV_ACTIVE &lt;&lt; dir);
+        updt_fd(fd); /* need an update entry to change the state */
+    }
+</code></pre>
+
+<p>该函数会判断一下 fd 的对应 event 是否已经设置了。没有设置的话，才重新设置。设置 的结果记录在 struct fdtab 结构的 spec_e 成员上，而且只是低 4 位上。然后调用 updt_fd() 将该 fd 放到 update list 中：</p>
+
+<pre><code>    static inline void updt_fd(const int fd)
+    {
+        if (fdtab[fd].updated)
+            /* already scheduled for update */
+            return;
+        fdtab[fd].updated = 1;
+        fd_updt[fd_nbupdt++] = fd;
+    }
+</code></pre>
+
+<p>从上面代码可以看出， struct fdtab 中的 updated 成员用来标记当前 fd 是否已经被放 到 update list 中了。没有的话，则更新设置 updated 成员，并且记录到 fd_updt[] 中， 并且增加需要跟新的 fd 的计数 fd_nbupdt。</p>
+
+<p>至此，用于分析 _do_poll() 的一些背景知识介绍完毕。</p>
+
+<h4>2. _do_poll() 代码分析</h4>
+
+<p>这里将会重点的分析 _do_poll() 的实现。该函数可以粗略分为三部分：</p>
+
+<pre><code>    检查 fd 更新列表，获取各个 fd event 的变化情况，并作 epoll 的设置
+    计算 epoll_wait 的 delay 时间，并调用 epoll_wait，获取活动的 fd
+    逐一处理所有有 IO 事件的 fd
+</code></pre>
+
+<p>以下将按顺序介绍这三部分的代码。</p>
+
+<h5>2.1. 检测 fd 更新列表</h5>
+
+<p>代码如下，后面会按行分析：</p>
+
+<pre><code>     43 /*
+     44  * speculative epoll() poller
+     45  */
+     46 REGPRM2 static void _do_poll(struct poller *p, int exp)
+     47 {
+     ..     ..
+     53 
+     54     /* first, scan the update list to find changes */
+     55     for (updt_idx = 0; updt_idx &lt; fd_nbupdt; updt_idx++) {
+     56         fd = fd_updt[updt_idx];
+     57         en = fdtab[fd].spec_e &amp; 15;  /* new events */
+     58         eo = fdtab[fd].spec_e &gt;&gt; 4;  /* previous events */
+     59 
+     60         if (fdtab[fd].owner &amp;&amp; (eo ^ en)) {
+     61             if ((eo ^ en) &amp; FD_EV_POLLED_RW) {
+     62                 /* poll status changed */
+     63                 if ((en &amp; FD_EV_POLLED_RW) == 0) {
+     64                     /* fd removed from poll list */
+     65                     opcode = EPOLL_CTL_DEL;
+     66                 }
+     67                 else if ((eo &amp; FD_EV_POLLED_RW) == 0) {
+     68                     /* new fd in the poll list */
+     69                     opcode = EPOLL_CTL_ADD;
+     70                 }
+     71                 else {
+     72                     /* fd status changed */
+     73                     opcode = EPOLL_CTL_MOD;     
+     74                 }
+     75 
+     76                 /* construct the epoll events based on new state */
+     77                 ev.events = 0;
+     78                 if (en &amp; FD_EV_POLLED_R)
+     79                     ev.events |= EPOLLIN;
+     80 
+     81                 if (en &amp; FD_EV_POLLED_W)
+     82                     ev.events |= EPOLLOUT;
+     83 
+     84                 ev.data.fd = fd;
+     85                 epoll_ctl(epoll_fd, opcode, fd, &amp;ev);
+     86             }
+     87 
+     88             fdtab[fd].spec_e = (en &lt;&lt; 4) + en;  /* save new events */
+     89 
+     90             if (!(en &amp; FD_EV_ACTIVE_RW)) {
+     91                 /* This fd doesn't use any active entry anymore, we can
+     92                  * kill its entry.
+     93                  */
+     94                 release_spec_entry(fd);
+     95             }
+     96             else if ((en &amp; ~eo) &amp; FD_EV_ACTIVE_RW) {
+     97                 /* we need a new spec entry now */
+     98                 alloc_spec_entry(fd);
+     99             }
+    100                                                             
+    101         }
+    102         fdtab[fd].updated = 0;
+    103         fdtab[fd].new = 0;
+    104     }
+    105     fd_nbupdt = 0;
+</code></pre>
+
+<p>haproxy 就是一个大的循环。每一轮循环，都顺序执行几个不同的功能。其中调用当前 poller 的 poll 方法便是其中一个环节。</p>
+
+<p>55 - 56 行： 获取 fd 更新列表中的每一个 fd。 fd_updt[] 就是前面背景知识中介绍 的。haproxy 运行的不同阶段，都有可能通过调用背景知识中介绍的一些 fd event 设置函数 来更改 fd 的状态，最终会更新 fd_updt[] 和 fd_nbupdt。这里集中处理一下所有需要更新 的 fd。</p>
+
+<p>57 - 58 行： 获取当前 fd 的最新事件，以及保存的上一次的事件。前面提到了，fd 的事 设置仅用 4 个 bit 就可以了。sturct fdtab 的 spec_e 成员是 unsigned char, 8 bit， 低 4 bit 保存 fd 当前最新的事件，高 4 bit 保存上一次的事件。这个做法就是为了判断 fd 的哪些事件上前面的处理中发生了变化，以便于更新。至于 fd 前一次的事件是什么时 后保存的，看后面的分析就知道了。</p>
+
+<p>60 行： 主要判断 fd 记录的事件是否发生了变化。如果没有变化，就直接到 102-103 行 的处理了。这里有个小疑问，还没来及深入分析，就是哪些情况会使 fd 处于更新列表中， 但是 fd 上的事件有没有任何变化。</p>
+
+<p>63 - 74 行：检测 fd 的 epoll operation 是否需要更改，比如ADD/DEL/MOD 等操作。</p>
+
+<p>77 - 85 行：检测 fd 的 epoll events 的设置，并调用 epoll_ctl 设置 op 和 event</p>
+
+<p>88 行：这里就是记录下 fd events 设置的最新状态。高低 4 位记录的结果相同。而在 程序运行过程中，仅修改低 4 位，这样和高 4 位一比较，就知道发生了哪些变化。</p>
+
+<p>90 - 99 行：这里主要根据 fd 的新旧状态，更新 speculative I/O list。这个地方在 haproxy 的大循环中有独立的处理流程，这里不作分析。</p>
+
+<p>102 - 103 行：清除 fd 的 new 和 updated 状态。new 状态通常是在新建一个 fd 时调 用 fd_insert 设置的，这里已经完成了 fd 状态的更新，因此两个成员均清零。</p>
+
+<p>105 行： 整个 update list 都处理完了，fd_nbupdt 清零。haproxy 的其他处理流程会 继续更新 update list。下一次调用 _do_poll() 的时候继续处理。当然，这么说也说是 不全面的，因为接下来的处理流程也会有可能处理 fd 的 update list。但主要的处理还 是这里分析的代码块。</p>
+
+<p>至此，fd 更新列表中的所有 fd 都处理完毕，该设置的也都设置了。下面就需要调用 epoll_wait 获得所有活动的 fd 了。
+2.2. 获取活动的 fd</p>
+
+<p>代码如下：</p>
+
+<pre><code>    107     /* compute the epoll_wait() timeout */
+    108 
+    109     if (fd_nbspec || run_queue || signal_queue_len) {
+    ...         ...
+    115         wait_time = 0;
+    116     }
+    117     else {
+    118         if (!exp)
+    119             wait_time = MAX_DELAY_MS;
+    120         else if (tick_is_expired(exp, now_ms))
+    121             wait_time = 0;
+    122         else {
+    123             wait_time = TICKS_TO_MS(tick_remain(now_ms, exp)) + 1;
+    124             if (wait_time &gt; MAX_DELAY_MS)
+    125                 wait_time = MAX_DELAY_MS;
+    126         }
+    127     }
+    128 
+    129     /* now let's wait for polled events */
+    130 
+    131     fd = MIN(maxfd, global.tune.maxpollevents);
+    132     gettimeofday(&amp;before_poll, NULL);
+    133     status = epoll_wait(epoll_fd, epoll_events, fd, wait_time);
+    134     tv_update_date(wait_time, status);
+    135     measure_idle();
+</code></pre>
+
+<p>107 - 127 行：主要是用来计算调用 epoll_wait 时的 timeout 参数。如果 fd_nbspec 不为 0，或 run_queue 中有任务需要运行，或者信号处理 queue 中有需要处理的，都设置 timeout 为 0，目的是希望 epoll_wait 尽快返回，程序好及时处理其他的任务。</p>
+
+<p>131 - 135 行： 计算当前最多可以处理的 event 数目。这个数目也是可配置的。然后调用 epoll_wait, 所有活动 fd 的信息都保存在 epoll_events[] 数组中。</p>
+
+<p>这部分代码逻辑比较简单，接下来就是处理所有活动的 fd 了。
+2.3. 处理活动的 fd</p>
+
+<p>逐一处理活动的 fd。这段代码也可以划分为若干个小代码，分别介绍如下：</p>
+
+<pre><code>    139     for (count = 0; count &lt; status; count++) {
+    140         unsigned char n;
+    141         unsigned char e = epoll_events[count].events;
+    142         fd = epoll_events[count].data.fd;
+    143 
+    144         if (!fdtab[fd].owner)
+    145             continue;
+    146 
+    147         /* it looks complicated but gcc can optimize it away when constants
+    148          * have same values... In fact it depends on gcc :-(
+    149          */
+    150         fdtab[fd].ev &amp;= FD_POLL_STICKY;
+    151         if (EPOLLIN == FD_POLL_IN &amp;&amp; EPOLLOUT == FD_POLL_OUT &amp;&amp;
+    152             EPOLLPRI == FD_POLL_PRI &amp;&amp; EPOLLERR == FD_POLL_ERR &amp;&amp;
+    153             EPOLLHUP == FD_POLL_HUP) {
+    154             n = e &amp; (EPOLLIN|EPOLLOUT|EPOLLPRI|EPOLLERR|EPOLLHUP);
+    155         }
+    156         else {
+    157             n = ((e &amp; EPOLLIN ) ? FD_POLL_IN  : 0) |
+    158                 ((e &amp; EPOLLPRI) ? FD_POLL_PRI : 0) |
+    159                 ((e &amp; EPOLLOUT) ? FD_POLL_OUT : 0) |
+    160                 ((e &amp; EPOLLERR) ? FD_POLL_ERR : 0) |
+    161                 ((e &amp; EPOLLHUP) ? FD_POLL_HUP : 0);
+    162         }
+    163 
+    164         if (!n)
+    165             continue;
+    166 
+    167         fdtab[fd].ev |= n;    
+    168
+</code></pre>
+
+<p>139 - 142 行： 从 epoll_events[] 中取出一个活动 fd 及其对应的 event。</p>
+
+<p>150 行： fdtab[fd].ev 仅保留 FD_POLL_STICKY 设置，即 FD_POLL_ERR | FD_POLL_HUP， 代表仅保留 fd 原先 events 设置中的错误以及 hang up 的标记位，不管 epoll_wait 中 是否设置了该 fd 的这两个 events。</p>
+
+<p>151 - 162 行： 这段代码的功能主要就是根据 epoll_wait 返回的 fd 的 events 设置情 况，正确的设置 fdtab[fd].ev。之所以代码还要加上条件判断，是因为 haproxy 自己也 用了一套标记 fd 的 events 的宏定义 FD_POLL_XXX，而 epoll_wait 返回的则是系统中 的 EPOLLXXX。因此，这里就涉及到系统标准的 events 转换到 haproxy 自定义 events 的过程。其中，151-154 行代表 haproxy 自定义的关于 fd 的 events 和系统标准的 完全一致，157-161 行代表 haproxy 自定义的和系统标准的不一致，因此需要一个一个 标记位判断，然后转换成 haproxy 自定义的。</p>
+
+<p>167 行： 将转换后的 events 记录到 fdtab[fd].ev。因此，haproxy 中对于 fd events 的记录，始终是采用 haproxy 自定义的。</p>
+
+<pre><code>    169         if (fdtab[fd].iocb) {
+    170             int new_updt, old_updt;
+    171 
+    172             /* Mark the events as speculative before processing
+    173              * them so that if nothing can be done we don't need
+    174              * to poll again.
+    175              */
+    176             if (fdtab[fd].ev &amp; FD_POLL_IN)
+    177                 fd_ev_set(fd, DIR_RD);
+    178 
+    179             if (fdtab[fd].ev &amp; FD_POLL_OUT)
+    180                 fd_ev_set(fd, DIR_WR);
+    181 
+    182             if (fdtab[fd].spec_p) {
+    183                 /* This fd was already scheduled for being called as a speculative I/O */
+    184                 continue;
+    185             }
+    186 
+    187             /* Save number of updates to detect creation of new FDs. */
+    188             old_updt = fd_nbupdt;
+    189             fdtab[fd].iocb(fd);
+</code></pre>
+
+<p>169 行： 正常情况下， fdtab[fd] 的 iocb 方法指向 conn_fd_handler，该函数负责处 理 fd 上的 IO 事件。</p>
+
+<p>176 - 180 行： 根据前面设置的 fd 的 events，通过调用 fd_ev_set() 更新 fdtab 结构 的 spec_e 成员。也就是说，在调用 fd_ev_clr() 清理对应 event 之前，就不需要再次设 置 fd 的 event。因为 haproxy 认为仍然需要处理 fd 的 IO。fdtab 的 ev 成员是从 epoll_wait 返回的 events 转换后的结果，而 spec_e 成员则是 haproxy 加入了一些对 fd IO 事件可能性判断的结果。</p>
+
+<p>188 - 189 行： 保存一下当前的 fd update list 的数目，接着调用 fd 的 iocb 方法， 也就是 conn_fd_handler()。之所以要保存当前的 fd update list 数目，是因为 conn_fd_handler() 执行时，如果接受了新的连接，则会有新的 fd 生成，这时也会更新 fd_nbupdt。记录下旧值，就是为了方便知道在 conn_fd_handler 执行之后，有哪些 fd 是新生成的。</p>
+
+<pre><code>    ...             ...
+    200             for (new_updt = fd_nbupdt; new_updt &gt; old_updt; new_updt--) {
+    201                 fd = fd_updt[new_updt - 1];
+    202                 if (!fdtab[fd].new)
+    203                     continue;
+    204 
+    205                 fdtab[fd].new = 0;
+    206                 fdtab[fd].ev &amp;= FD_POLL_STICKY;
+    207 
+    208                 if ((fdtab[fd].spec_e &amp; FD_EV_STATUS_R) == FD_EV_ACTIVE_R)
+    209                     fdtab[fd].ev |= FD_POLL_IN;
+    210 
+    211                 if ((fdtab[fd].spec_e &amp; FD_EV_STATUS_W) == FD_EV_ACTIVE_W)
+    212                     fdtab[fd].ev |= FD_POLL_OUT;
+    213 
+    214                 if (fdtab[fd].ev &amp;&amp; fdtab[fd].iocb &amp;&amp; fdtab[fd].owner)
+    215                     fdtab[fd].iocb(fd);
+    216 
+    217                 /* we can remove this update entry if it's the last one and is
+    218                  * unused, otherwise we don't touch anything.
+    219                  */
+    220                 if (new_updt == fd_nbupdt &amp;&amp; fdtab[fd].spec_e == 0) {
+    221                     fdtab[fd].updated = 0;
+    222                     fd_nbupdt--;
+    223                 }
+    224             }
+    225         }
+    226     }
+    227 
+    228     /* the caller will take care of speculative events */
+    229 }  
+</code></pre>
+
+<p>上面这段代码就是执行完毕当前活动 fd 的 iocb 之后，发现有若干个新的 fd 生成，通常 发生在接收新建连接的情况。这种情况，haproxy 认为有必要立即执行这些新的 fd 的 iocb 方法。因为通常一旦客户端新建连接的话，都会尽快发送数据的。这么做就不必等到 下次 epoll_wait 返回之后才处理新的 fd，提高了效率。</p>
+
+<p>至此，haproxy epoll 的事件处理机制粗略分析完毕。这里还有一个 speculative events 的逻辑，本文分析中全都跳过了，随后再完善。</p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[haproxy log]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/07/24/tools-haproxy-log/"/>
-    <updated>2015-07-24T16:39:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/07/24/tools-haproxy-log</id>
-    <content type="html"><![CDATA[<p><a href="http://sharadchhetri.com/2013/10/16/how-to-enable-logging-of-haproxy-in-rsyslog/">http://sharadchhetri.com/2013/10/16/how-to-enable-logging-of-haproxy-in-rsyslog/</a></p>
+    <title type="html"><![CDATA[HAProxy 研究笔记 -- HTTP请求处理-2-解析]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src5/"/>
+    <updated>2015-07-29T16:07:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src5</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-10167808-id-3819702.html">http://blog.chinaunix.net/uid-10167808-id-3819702.html</a></p>
 
-<p>  After installing the HAproxy 1.4 in CentOS 6.4 bydefault logging of haproxy was not enable.To enable the logging of HAProxy you have to enable it in rsyslog(In CentOS 6.4 minimal installation,rsyslog version 5.2 is shipped).
-To setup logging in HAproxy,follow the given below steps</p>
+<p> 本文继续分析 1.5-dev17 中接收到 client 数据之后的处理。</p>
 
-<h4>Step 1:</h4>
+<p>haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP请求处理-1-接收</p>
 
-<p>In Global Section of haproxy.cfg put the value log 127.0.0.1 local0 .Like given below
-<code>
-    global
-        log 127.0.0.1   local0
-</code></p>
+<h4>1. haproxy 主循环的处理流程</h4>
 
-<h4>Step 2:</h4>
+<p>主循环处理流程见文档 主循环简介</p>
 
-<p>Create new haproxy configuration file in /etc/rsyslog.d . Here we are keeping the log in localhost or in other words we should say HAproxy server</p>
+<p>请求数据的解析工作在主循环 process_runnable_tasks() 中执行。</p>
 
-<h4>Note:</h4>
+<h4>2. 执行 run queue 中的任务</h4>
 
-<p>local0.=info -/var/log/haproxy.log defines the http log will be saved in haproxy.log</p>
+<p> HTTP请求处理-1-接收 中分析到 session 建立之后，一来会将 session 的 task 放入 runqueue，该 task 会 在下一轮遍历可以运行的 task 中出现，并得到执行。二是立即调用 conn_fd_handler 去 接收 client 发送的数据。</p>
 
-<p>local0.notice -/var/log/haproxy-status.log defines the Server status like start,stop,restart,down,up etc. will be saved in haproxy-status.log</p>
+<p>数据接收流程结束后（注意，这并不代表接收到了完整的 client 请求，因为也可能暂时 读取不到 client 的数据退出接收），haproxy 调度执行下一轮循环，调用 process_runnable_tasks() 处理所有在 runqueue 中的 task：</p>
 
-<p>UDPServerRun 514 means opening UDP port no. 514 to listen haproxy messages</p>
+<pre><code>    void process_runnable_tasks(int *next)
+    {
+        ...
+        eb = eb32_lookup_ge(&amp;rqueue, rqueue_ticks - TIMER_LOOK_BACK);
+        while (max_processed--) {
+            ...
+            t = eb32_entry(eb, struct task, rq);
+            eb = eb32_next(eb);
+            __task_unlink_rq(t);
 
-<pre><code>    vi /etc/rsyslog.d/haproxy.conf
-
-    $ModLoad imudp
-    $UDPServerRun 514 
-    $template Haproxy,"%msg%\n"
-    local0.=info -/var/log/haproxy.log;Haproxy
-    local0.notice -/var/log/haproxy-status.log;Haproxy
-    ### keep logs in localhost ##
-    local0.* ~ 
+            t-&gt;state |= TASK_RUNNING;
+            /* This is an optimisation to help the processor's branch
+             * predictor take this most common call.
+             */
+            t-&gt;calls++;
+            if (likely(t-&gt;process == process_session))
+                t = process_session(t);
+            else
+                t = t-&gt;process(t);
+            ...
+        }
+    }
 </code></pre>
 
-<h4>Step 3:</h4>
+<p>大多数情况下，task 的 proecss 都指向 process_session() 函数。该函数就是负责解析 已接收到的数据，选择 backend server，以及 session 状态的变化等等。</p>
 
-<p>Now restart the HAproxy service
+<h4>3. session 的处理：process_session()</h4>
+
+<p>下面介绍 process_session() 函数的实现。该函数代码比较庞大，超过一千行，这里仅 介绍与 HTTP 请求处理的逻辑，采用代码块的逻辑介绍。</p>
+
+<p>处理 HTTP 请求的逻辑代码集中在 label resync_request 处。</p>
+
+<pre><code>    struct task *process_session(struct task *t)
+    {
+        ...
+     resync_request:
+        /* Analyse request */
+        if (((s-&gt;req-&gt;flags &amp; ~rqf_last) &amp; CF_MASK_ANALYSER) ||
+            ((s-&gt;req-&gt;flags ^ rqf_last) &amp; CF_MASK_STATIC) ||
+            s-&gt;si[0].state != rq_prod_last ||
+            s-&gt;si[1].state != rq_cons_last) {
+            unsigned int flags = s-&gt;req-&gt;flags;
+
+            if (s-&gt;req-&gt;prod-&gt;state &gt;= SI_ST_EST) {
+                ana_list = ana_back = s-&gt;req-&gt;analysers;
+                while (ana_list &amp;&amp; max_loops--) {
+                    /* 这段代码中逐一的列举出了所有的 analysers 对应的处理函数
+                     * 这里不一一列出，等待下文具体分析
+                     */
+                    ...
+                }
+            }
+            rq_prod_last = s-&gt;si[0].state;
+            rq_cons_last = s-&gt;si[1].state;
+            s-&gt;req-&gt;flags &amp;= ~CF_WAKE_ONCE;
+            rqf_last = s-&gt;req-&gt;flags;
+
+            if ((s-&gt;req-&gt;flags ^ flags) &amp; CF_MASK_STATIC)
+                goto resync_request;
+        }
+</code></pre>
+
+<p>首先要判断 s->req->prod->state 的状态是否已经完成建连，根据之前的初始化动作， se->req->prod 指向 s->si[0]，即标识与 client 端连接的相关信息。正确建连成功之 后，会更改 si 的状态的，具体代码在 session_complete() 中：</p>
+
+<pre><code>    s-&gt;si[0].state     = s-&gt;si[0].prev_state = SI_ST_EST;
+    ...
+    s-&gt;req-&gt;prod = &amp;s-&gt;si[0];
+    s-&gt;req-&gt;cons = &amp;s-&gt;si[1];
+</code></pre>
+
+<p>只有 frontend 连接建立成功，才具备处理 client 发送请求数据的基础。上一篇文章中 已经接收到了 client 发送的数据。这里就是需要根据 s->req->analysers 的值，确定 while 循环中哪些函数处理当前的数据。</p>
+
+<p>补充介绍一下 s->req->analysers 的赋值。 同样是在 session_complete 中初始化的</p>
+
+<pre><code>    /* activate default analysers enabled for this listener */
+    s-&gt;req-&gt;analysers = l-&gt;analysers;
+</code></pre>
+
+<p>可见，其直接使用 session 所在的 listener 的 analyser。 listener 中该数值的初始化 是在 check_config_validity() 中完成的：
 <code>
-    /etc/init.d/haproxy restart
+            listener-&gt;analysers |= curproxy-&gt;fe_req_ana;
 </code>
-After restarting the haproxy service two logs will be created itself i.e haproxy.log and haproxy-status.log</p>
+而归根结蒂还是来源于 listener 所在的 proxy 上的 fe_req_ana， proxy 上的 fe_req_ana 的初始化同样是在 check_config_validity()，且是在给 listener->analysers 赋值之前</p>
 
-<h4>Step 4:</h4>
+<pre><code>        if (curproxy-&gt;cap &amp; PR_CAP_FE) {
+            if (!curproxy-&gt;accept)
+                curproxy-&gt;accept = frontend_accept;
 
-<p>Check your logrotae file for haproxy also so that logs keep on rotating and compress itself. If bydefault it is not present in /etc/logrotate.d directory then create a new file called haproxy and paste the given below code.</p>
+            if (curproxy-&gt;tcp_req.inspect_delay ||
+                !LIST_ISEMPTY(&amp;curproxy-&gt;tcp_req.inspect_rules))
+                curproxy-&gt;fe_req_ana |= AN_REQ_INSPECT_FE;
 
-<p>Here I am keeping the logs upto 120 days hence rotate 120 and daily is written in file.
-```
-    cat /etc/logrotate.d/haproxy</p>
+            if (curproxy-&gt;mode == PR_MODE_HTTP) {
+                curproxy-&gt;fe_req_ana |= AN_REQ_WAIT_HTTP | AN_REQ_HTTP_PROCESS_FE;
+                curproxy-&gt;fe_rsp_ana |= AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_FE;
+            }
 
-<pre><code>/var/log/haproxy.log {
-    missingok
-    notifempty
-    sharedscripts
-    rotate 120
-    daily
-    compress
-    postrotate
-        reload rsyslog &gt;/dev/null 2&gt;&amp;1 || true
-    endscript
-}
+            /* both TCP and HTTP must check switching rules */
+            curproxy-&gt;fe_req_ana |= AN_REQ_SWITCHING_RULES;
+        }
 </code></pre>
 
-<p>```</p>
+<p>从上面代码可以看出，一个 HTTP 模式的 proxy，至少有三个标记位会被置位： AN_REQ_WAIT_HTTP, AN_REQ_HTTP_PROCESS_FE, AN_REQ_SWITCHING_RULES。也就是说， s->req->analysers 由以上三个标记置位。那么随后处理 HTTP REQ 的循环中，就要经过 这三个标记位对应的 analyser 的处理。</p>
+
+<p>接着回到 resync_request 标签下的那个 while 循环，就是逐个判断 analysers 的设置， 并调用对应的函数处理。需要启用那些 analysers，是和 haproxy 的配置相对应的。本文 使用最简单的配置，下面仅列出配置所用到的几个处理函数：</p>
+
+<pre><code>            while (ana_list &amp;&amp; max_loops--) {
+                /* Warning! ensure that analysers are always placed in ascending order! */
+
+                if (ana_list &amp; AN_REQ_INSPECT_FE) {
+                    if (!tcp_inspect_request(s, s-&gt;req, AN_REQ_INSPECT_FE))
+                        break;
+                    UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_INSPECT_FE);
+                }
+
+                if (ana_list &amp; AN_REQ_WAIT_HTTP) {
+                    if (!http_wait_for_request(s, s-&gt;req, AN_REQ_WAIT_HTTP))
+                        break;
+                    UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_WAIT_HTTP);
+                }
+
+                if (ana_list &amp; AN_REQ_HTTP_PROCESS_FE) {
+                    if (!http_process_req_common(s, s-&gt;req, AN_REQ_HTTP_PROCESS_FE, s-&gt;fe))
+                        break;
+                    UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_HTTP_PROCESS_FE);
+                }
+
+                if (ana_list &amp; AN_REQ_SWITCHING_RULES) {
+                    if (!process_switching_rules(s, s-&gt;req, AN_REQ_SWITCHING_RULES))
+                        break;
+                    UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_SWITCHING_RULES);
+                }
+                ...
+            }
+</code></pre>
+
+<p>analysers 的处理也是有顺序的。其中处理请求的第一个函数是 tcp_inspect_request()。 该函数主要是在于如果配置了这里先介绍 http_wait_for_request() 函数的实现。 顾名思义，该函数主要是配置中启用 inspect_rules 时，会调用到该函数。否则的话， 处理 HTTP Req 的第一个函数就是 http_wait_for_request().</p>
+
+<p>顾名思义，http_wait_for_request() 该函数分析所解析的 HTTP Requset 不一定是一个 完整的请求。上篇文章分析读取 client 请求数据的实现中，已经提到，只要不能从 socket 读到更多的数据，就会结束数据的接收。一个请求完全完全有可能因为一些异常原因，或者 请求长度本身就比较大而被拆分到不同的 IP 报文中，一次 read 系统调用可能只读取到其 中的一部分内容。因此，该函数会同时分析已经接收到的数据，并确认是否已经接收到了 完整的 HTTP 请求。只有接收到了完整的 HTTP 请求，该函数处理完，才会交给下一个 analyser 处理，否则只能结束请求的处理，等待接收跟多的数据，解析出一个完成的 HTTP 请求才行。</p>
+
+<h4>4. 解析接收到的 http 请求数据： http_wait_for_request()</h4>
+
+<p>以下是 http_wait_for_request() 的简要分析：</p>
+
+<p>1.调用 http_msg_analyzer，解析 s->req->buf 中新读取到的数据。该函数会按照 HTTP 协议， 解析 HTTP request 和 response 的头部数据，并记录到数据结构 struct http_msg 中。</p>
+
+<p>2.如果开启了 debug，并且已经完整的解析了 header，则 header 内容打印出来</p>
+
+<p>3.尚未读取到完整的 request 的处理，分作以下几种情形处理：</p>
+
+<pre><code>    if (unlikely(msg-&gt;msg_state &lt; HTTP_MSG_BODY)) {
+        /*
+         * First, let's catch bad requests.
+         */
+
+    解析到 header 内容中有不符合 HTTP 协议的情形 HTTP_MSG_ERROR，应答 400 bad request 处理
+    req-&gt;buf 满了，甚至加入 maxrewrite 的空间仍然不够用，应答 400 bad request
+    读取错误 CF_READ_ERROR 发生，比如 client 发送 RST 断开连接， 应答 400 bad request
+    读取超时，client 超时未发送完整的请求，应答 408 Request Timeout
+    client 主动关闭，发送 FIN 包，实际上是所谓的 half-close，同样应答 400 bad request
+    如果以上情况都不满足，则意味着还可以继续尝试读取新数据，设置一下超时
+
+        /* just set the request timeout once at the beginning of the request */
+        if (!tick_isset(req-&gt;analyse_exp)) {
+            if ((msg-&gt;msg_state == HTTP_MSG_RQBEFORE) &amp;&amp;
+                (txn-&gt;flags &amp; TX_WAIT_NEXT_RQ) &amp;&amp;
+                tick_isset(s-&gt;be-&gt;timeout.httpka))
+                req-&gt;analyse_exp = tick_add(now_ms, s-&gt;be-&gt;timeout.httpka);
+            else
+                req-&gt;analyse_exp = tick_add_ifset(now_ms, s-&gt;be-&gt;timeout.httpreq);
+        }
+</code></pre>
+
+<p>根据以上代码，在等待 http request 期间，有两种 timeout 可以设置： 当是http 连接 Keep-Alive 时，并且处理完了头一个请求之后，等待第二个请求期间，设置 httpka 的超 时，超过设定时间不发送新的请求，将会超时；否则，将设置 http 的 request timeout。</p>
+
+<p>因此，在不启用 http ka timeout 时，http request 同时承担起 http ka timeout 的 功能。在有 http ka timeout 时，这两者各自作用的时间段没有重叠。</p>
+
+<p>满足该环节的请求都终止处理，不再继续了。</p>
+
+<h5>4.2. 处理完整的 http request</h5>
+
+<p>这里处理的都是已经解析到完整 http request header 的情况，并且所有 header 都被 索引化了，便于快速查找。根据已经得到的 header 的信息，设置 session 和 txn 的 相关成员，相当于汇总一下 header 的摘要信息，便于随后处理之用。流程如下：</p>
+
+<pre><code>    更新 session 和 proxy 的统计计数
+    删除 http ka timeout 的超时处理。可能在上一个请求处理完之后，设置了 http ka 的 timeout，因为这里已经得到完整的请求，因此需要停止该 timeout 的处理逻辑
+    确认 METHOD，并设置 session 的标记位 s-&gt;flags |= SN_REDIRECTABLE，只有 GET 和 HEAD 请求可以被重定向
+    检测 URI 是否是配置的要做 monitor 的 URI，是的话，则执行对应 ACL，并设置应答
+    检测如果开启 log 功能的话，要给 txn-&gt;uri 分配内存，用于记录 URI
+    检测 HTTP version
+        将 0.9 版本的升级为 1.0
+        1.1 及其以上的版本都当做 1.1 处理
+    初始化用于标识 Connection header 的标记位
+    如果启用了 capture header 配置，调用 capture_headers() 记录下对应的 header
+    处理 Transfer-Encoding/Content-Length 等 header
+    最后一步，清理 req-&gt;analysers 的标记位 AN_REQ_WAIT_HTTP，因为本函数已经成功处理完毕，可以进行下一个 analyser 的处理了。
+</code></pre>
+
+<p>至此，http_wait_for_request() 的处理已经结束。</p>
+
+<h4>5. 其他对 HTTP 请求的处理逻辑</h4>
+
+<p>按照我们前面分析的，随后应该还有两个 analyser 要处理，简单介绍一下：</p>
+
+<pre><code>    AN_REQ_HTTP_PROCESS_FE 对应的 http_process_req_common()
+        对 frontend 中 req 配置的常见处理，比如 block ACLs, filter, reqadd 等
+        设置 Connection mode， 主要是 haproxy 到 server 采用什么连接方式，tunnel 或者 按照 transcation 处理的短连接
+    AN_REQ_SWITCHING_RULES 对应的 process_switching_rules()
+        如果配置了选择 backend 的 rules，比如用 use_backend，则查询规则为 session 分配一个 backend
+        处理 persist_rules，一旦设置了 force-persist, 则不管 server 是否 down，都要保证 session 分配给 persistence 中记录的 server。
+</code></pre>
+
+<p>以上两个函数，不再具体分析。待以后需要时再完善。</p>
+
+<p>至此，client 端 http 请求已经完成解析和相关设置，并且给 session 指定了将来选择 server 所属的 backend。</p>
+
+<p>下一篇文章就分析选择 server 的流程。</p>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[haproxy安装配置]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/07/23/tools-haproxy/"/>
-    <updated>2015-07-23T15:47:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/07/23/tools-haproxy</id>
-    <content type="html"><![CDATA[<p>HAProxy提供高可用性、负载均衡以及基于TCP和HTTP应用的代理，支持虚拟主机，它是免费、快速并且可靠的一种解决方案。HAProxy特别适用于那些负载特大的web站点，这些站点通常又需要会话保持或七层处理。HAProxy运行在当前的硬件上，完全可以支持数以万计的并发连接。并且它的运行模式使得它可以很简单安全的整合进您当前的架构中，同时可以保护你的web服务器不被暴露到网络上.</p>
+    <title type="html"><![CDATA[HAProxy 研究笔记 -- 主循环处理流程]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src4/"/>
+    <updated>2015-07-29T16:05:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src4</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-10167808-id-3807412.html">http://blog.chinaunix.net/uid-10167808-id-3807412.html</a></p>
 
-<p>haproxy 配置中分成五部分内容，分别如下：</p>
+<p>本文简单介绍 HAProxy 主循环的处理逻辑，版本为 1.5-dev17.</p>
 
-<p>1、global：参数是进程级的，通常是和操作系统相关。这些参数一般只设置一次，如果配置无误，就不需要再次进行修改</p>
+<h4>0. 主循环 run_poll_loop</h4>
 
-<p>2、defaults：配置默认参数，这些参数可以被用到frontend，backend，Listen组件</p>
+<p>HAproxy 的主循环在 haproxy.c 中的 run_poll_loop() 函数，代码如下：</p>
 
-<p>3、frontend：接收请求的前端虚拟节点，Frontend可以更加规则直接指定具体使用后端的backend</p>
+<pre><code>    /* Runs the polling loop */
+    void run_poll_loop()
+    {
+        int next;
 
-<p>4、backend：后端服务集群的配置，是真实服务器，一个Backend对应一个或者多个实体服务器</p>
+        tv_update_date(0,1);
+        while (1) {
+            /* check if we caught some signals and process them */
+            signal_process_queue();
 
-<p>5、Listen Fronted和backend的组合体</p>
+            /* Check if we can expire some tasks */
+            wake_expired_tasks(&amp;next);
 
-<h4>一、安装HAProxy</h4>
+            /* Process a few tasks */
+            process_runnable_tasks(&amp;next);
 
-<h5>1.下载最新haproxy安装包</h5>
+            /* stop when there's nothing left to do */
+            if (jobs == 0)
+                break;
 
-<p>官网：<a href="http://www.haproxy.org">http://www.haproxy.org</a> ,如果不能访问，可以使用在线代理访问下载。下载：<a href="http://fossies.org/linux/misc/haproxy-1.5.14.tar.gz">http://fossies.org/linux/misc/haproxy-1.5.14.tar.gz</a> 或 <a href="/download/tools/haproxy-1.5.14.tar.gz">haproxy-1.5.14.tar.gz</a></p>
-
-<h5>2.上传到linux的haproxy用户根目录下，并解压：</h5>
-
-<pre><code>    tar -zxvf haproxy-1.5.14.tar.gz 
+            /* The poller will ensure it returns around  */
+            cur_poller.poll(&amp;cur_poller, next);
+            fd_process_spec_events();
+        }
+    }
 </code></pre>
 
-<p>创建目录/home/haproxy/haproxy</p>
+<p>主循环的结构比较清晰，就是循环的调用几个函数，并在适当的时候结束循环并退出：</p>
 
-<h5>3.安装</h5>
-
-<p>CentOS5编译新的haproxy需要在Makefile中禁掉USE_ACCEPT4</p>
-
-<pre><code>    cd haproxy-1.5.14
-    make  TARGET=linux26 ARCH=x86_64 PREFIX=/home/haproxy/haproxy   #将haproxy安装到/home/haproxy/haproxy ,TARGET是指定内核版本
-    make install PREFIX=/home/haproxy/haproxy  
+<pre><code>    1. 处理信号队列
+    2. 超时任务
+    3. 处理可运行的任务
+    4. 检测是否可以结束循环
+    5. 执行 poll 处理 fd 的 IO 事件
+    6. 处理可能仍有 IO 事件的 fd
 </code></pre>
 
-<p>进入/home/haproxy/haproxy  目录创建/home/haproxy/haproxy/conf目录，复制配置examples
+<h4>1. signal_process_queue - 处理信号队对列</h4>
+
+<p>haproxy 实现了自己的信号处理机制。接受到信号之后，将该信号放到信号队列中。在程序 运行到 signal_process_queue() 时处理所有位于信号队列中的信号。</p>
+
+<h4>2. wake_expired_tasks - 唤醒超时任务</h4>
+
+<p>haproxy 的顶层处理逻辑是 task，task 上存储着要处理的任务的全部信息。task 的管理 是采用队列方式，同时分为 wait queue 和 run queue。顾名思义，wait queue 是需要等 待一定时间的 task 的集合，而 run queue 则代表需要立即执行的 task 的集合。</p>
+
+<p>该函数就是检查 wait queue 中那些超时的任务，并将其放到 run queue 中。haproxy 在 执行的过程中，会因为一些情况导致需要将当前的任务通过调用 task_queue 等接口放到 wait queue 中。</p>
+
+<h4>3. process_runnable_tasks - 处理可运行的任务</h4>
+
+<p>处理位于 run queue 中的任务。</p>
+
+<p>前面提到，wake_expired_tasks 可能将一些超时的任务放到 run queue 中。此外，haproxy 执行的过程中，还有可能通过调用 task_wakeup 直接讲某个 task 放到 run queue 中，这代表程序希望该任务下次尽可能快的被执行。</p>
+
+<p>对于 TCP 或者 HTTP 业务流量的处理，该函数最终通过调用 process_session 来完成，包括解析已经接收到的数据， 并执行一系列 load balance 的特性，但不负责从 socket 收发数据。</p>
+
+<h4>4. jobs == 0 - 无任务可执行，结束循环</h4>
+
+<p>haproxy 中用 jobs 记录当前要处理的任务总数，一个 listener 也会被计算在内。因此， 如果 jobs 为 0 的话，通常意味着 haproxy 要退出了，因为连 listener 都要释放了。 jobs 的数值通常在 process_session 时更新。因此，是否可以退出循环，就放在了所有 任务的 process_session 执行之后。</p>
+
+<h4>5. cur_poller.poll() - 执行 poll 处理 fd 的 IO 事件</h4>
+
+<p>haproxy 启动阶段，会检测当前系统可以启用那种异步处理的机制，比如 select、poll、 epoll、kqueue 等，并注册对应 poller 的 poll 方法。epoll 的相关函数接口在 ev_epoll.c 中。</p>
+
+<p>这里就是执行已经注册的 poller 的 poll 方法，主要功能就是获取所有活动的 fd，并 调用对应的 handler，完成接受新建连接、数据收发等功能。</p>
+
+<h4>6. 处理可能仍有 IO 事件的 fd</h4>
+
+<p>poller 的 poll 方法执行时，程序会将某些符合条件以便再次执行 IO 处理的的 fd 放到 fd_spec list[] 中，fd_process_spec_events() 函数会再次执行这些 fd 的 io handler。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[HAProxy 研究笔记 -- HTTP请求处理-1-接收]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src3/"/>
+    <updated>2015-07-29T16:03:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src3</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-10167808-id-3795082.html">http://blog.chinaunix.net/uid-10167808-id-3795082.html</a></p>
+
+<p>这里继续分析 http req 的处理。当前分析的代码为 1.5-dev17。</p>
+
+<h4>1. 初始化 session 数据处理相关的设置</h4>
+
+<p>建连的处理基本上就是 _do_poll ->listener_accept ->session_accept ->fronend_accept()</p>
+
+<p>其中 session_accept() 会设置新建 fd 的 io handler</p>
+
+<pre><code>    /* Add the various callbacks. Right now the transport layer is present
+     * but not initialized. Also note we need to be careful as the stream
+     * int is not initialized yet.
+     */
+    conn_prepare(s-&gt;si[0].conn, &amp;sess_conn_cb, l-&gt;proto, l-&gt;xprt, s);
+
+    fdtab[cfd].owner = s-&gt;si[0].conn; /*fd 对应的 owner 为 connection 结构*/
+    fdtab[cfd].iocb = conn_fd_handler;
+    conn_data_want_recv(s-&gt;si[0].conn);
+    if (conn_xprt_init(s-&gt;si[0].conn) &lt; 0)
+        goto out_free_task;
+</code></pre>
+
+<p>IPv4 http 对应的 listener 的 xprt 和proto 分别被初始化为</p>
+
+<pre><code>    l-&gt;xprt = &amp;raw_sock;
+    l-&gt;proto = &amp;proto_tcpv4;
+</code></pre>
+
+<p>conn_prepare() 就是将相关数据收发以及连接处理的函数都赋值到 connection 结构体上：</p>
+
+<pre><code>    /* Assigns a connection with the appropriate data, ctrl, transport layers, and owner. */
+    static inline void conn_assign(struct connection *conn, const struct data_cb *data,
+                                   const struct protocol *ctrl, const struct xprt_ops *xprt,
+                                   void *owner)
+    {
+        conn-&gt;data = data;
+        conn-&gt;ctrl = ctrl;
+        conn-&gt;xprt = xprt;
+        conn-&gt;owner = owner;
+    }
+
+    /* prepares a connection with the appropriate data, ctrl, transport layers, and
+     * owner. The transport state and context are set to 0.
+     */
+    static inline void conn_prepare(struct connection *conn, const struct data_cb *data,
+                                    const struct protocol *ctrl, const struct xprt_ops *xprt,
+                                    void *owner)
+    {
+        conn_assign(conn, data, ctrl, xprt, owner);
+        conn-&gt;xprt_st = 0;
+        conn-&gt;xprt_ctx = NULL;
+    }
+</code></pre>
+
+<p>经过初始化， session client 端的 connection 结构体初始化完成：</p>
+
+<pre><code>    conn-&gt;data 指向 sess_conn_cb。 后面调用 session_complete() 会被再次赋值
+    conn-&gt;ctrl 指向 l-&gt;proto, IPv4 下为 proto_tcpv4
+    conn-&gt;xprt 执向 l-&gt;xprt, 不启用 SSL 时为 raw_sock，启用 SSL 时为 ssl_sock
+    conn-&gt;owner 指向 session
+</code></pre>
+
+<p>接着调用 session_complete 完成建立一个 session 所需要的最后的初始化工作，其中 包含调用 frontend_accept，并将当前 session 对应的 task 放入runqueue 中以待下 次执行：</p>
+
+<pre><code>    ...
+    si_takeover_conn(&amp;s-&gt;si[0], l-&gt;proto, l-&gt;xprt);
+    ...
+    t-&gt;process = l-&gt;handler;
+    ...
+    if (p-&gt;accept &amp;&amp; (ret = p-&gt;accept(s)) &lt;= 0) {
+        /* Either we had an unrecoverable error (&lt;0) or work is
+         * finished (=0, eg: monitoring), in both situations,
+         * we can release everything and close.
+         */
+        goto out_free_rep_buf;
+    }
+    ...
+    task_wakeup(t, TASK_WOKEN_INIT);
+</code></pre>
+
+<p>其中 si_takeover_conn 完成为 si 分配连接的处理函数，实现如下：</p>
+
+<pre><code>    static inline void si_takeover_conn(struct stream_interface *si, const struct protocol *ctrl, const struct xprt_ops *xprt)
+    {
+        si-&gt;ops = &amp;si_conn_ops;
+        conn_assign(si-&gt;conn, &amp;si_conn_cb, ctrl, xprt, si);
+    }
+
+    si_conn_cb 的定义如下：
+
+    struct data_cb si_conn_cb = {
+        .recv    = si_conn_recv_cb,
+        .send    = si_conn_send_cb,
+        .wake    = si_conn_wake_cb,
+    };
+</code></pre>
+
+<p>因此，si->conn->data 指向了 si_conn_cb。这个结构用在随后的 recv/send 中。</p>
+
+<p>此外，session 所对应的任务 task 在 session_complete 的最后通过调用 task_wakeup() 是在随后的循环中被执行。task 的处理函数初始化为 l->handler 即 process_session().</p>
+
+<p>至此，一个新建 session 的 client fd 的 io 处理函数 conn_fd_handler() 及 session 的处理函数 process_session() 都已经正确初始化好了。</p>
+
+<p>以后基本上就是这两个函数分别负责数据的读取，以及业务的处理。</p>
+
+<h4>2. 接收 client 发送的请求数据</h4>
+
+<p>epoll 中考虑的新建连接通常会尽可能快的传输数据，因此对于新建的 fd，通常会尽快的 执行 io handler，即调用 conn_fd_handler</p>
+
+<p>是在 ev_epoll.c 中的 _do_poll() 中进行：</p>
+
+<pre><code>    gettimeofday(&amp;before_poll, NULL);
+    status = epoll_wait(epoll_fd, epoll_events, global.tune.maxpollevents, wait_time);
+    tv_update_date(wait_time, status);
+    measure_idle();
+
+    /* process polled events */
+
+    for (count = 0; count &lt; status; count++) {
+        unsigned int n;
+        unsigned int e = epoll_events[count].events;
+        fd = epoll_events[count].data.fd;
+        ...
+        /* Save number of updates to detect creation of new FDs. */
+        old_updt = fd_nbupdt;
+        fdtab[fd].iocb(fd);
+        ...
+        for (new_updt = fd_nbupdt; new_updt &gt; old_updt; new_updt--) {
+            fd = fd_updt[new_updt - 1];
+            ...
+            if (fdtab[fd].ev &amp;&amp; fdtab[fd].iocb &amp;&amp; fdtab[fd].owner)
+                fdtab[fd].iocb(fd);
+            ...
+        }
+</code></pre>
+
+<p>上面代码中第一处执行 iocb() 的是由 epoll_wait() 返回的 fd 触发的。而第二次的 iocb() 则就是在前面 iocb 的执行过程中新建的 fd，为了提高效率，则直接调用该 fd 的 iocb()，也 就是 conn_fd_handler() 函数。</p>
+
+<pre><code>    int conn_fd_handler(int fd) 
+    {
+        struct connection *conn = fdtab[fd].owner;
+        ...
+        if ((fdtab[fd].ev &amp; (FD_POLL_IN | FD_POLL_HUP | FD_POLL_ERR)) &amp;&amp;
+            conn-&gt;xprt &amp;&amp;
+            !(conn-&gt;flags &amp; (CO_FL_WAIT_RD|CO_FL_WAIT_ROOM|CO_FL_ERROR|CO_FL_HANDSHAKE))) {
+            /* force detection of a flag change : it's impossible to have both
+             * CONNECTED and WAIT_CONN so we're certain to trigger a change.
+             */
+            flags = CO_FL_WAIT_L4_CONN | CO_FL_CONNECTED;
+            conn-&gt;data-&gt;recv(conn);
+        }
+        ...
+    }
+</code></pre>
+
+<p>根据的 session_complete 的初始化，上面代码 conn->data->recv 指向 si_conn_recv_cb()。 该函数就是 haproxy 中负责接收数据的入口函数。相同的，si_conn_send_cb() 就是 haproxy 中负责发送数据的入口函数。</p>
+
+<p>si_conn_recv_cb() 函数简单介绍如下：</p>
+
+<pre><code>    if (conn-&gt;xprt-&gt;rcv_pipe &amp;&amp;
+        chn-&gt;to_forward &gt;= MIN_SPLICE_FORWARD &amp;&amp; chn-&gt;flags &amp; CF_KERN_SPLICING) {
+        ...
+        ret = conn-&gt;xprt-&gt;rcv_pipe(conn, chn-&gt;pipe, chn-&gt;to_forward);
+        ...
+    }
+    ...
+    while (!chn-&gt;pipe &amp;&amp; !(conn-&gt;flags &amp; (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_DATA_RD_SH | CO_FL_WAIT_RD | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE))) {
+
+        ...
+        ret = conn-&gt;xprt-&gt;rcv_buf(conn, chn-&gt;buf, max);
+        ...
+    }
+</code></pre>
+
+<p>该函数主要根据数据的接收情况，选择调用 xprt 的 rcv_pipe 还是 rcv_buf. 前面已经 分析过， conn->xprt 指向了 listner 的 xprt，不启用 SSL 就是 raw_sock 数据结构</p>
+
+<p>因此，数据的接收最终是通过调用 raw_sock 的 raw_sock_to_pipe 或/和 raw_sock_to_buf 完成的。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[HAProxy 研究笔记 -- rules 实现]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src2/"/>
+    <updated>2015-07-29T16:00:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/07/29/tools-haproxy_src2</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-10167808-id-3775567.html">http://blog.chinaunix.net/uid-10167808-id-3775567.html</a></p>
+
+<p>本文研究 haproxy-1.5-dev17 中 rules 的相关实现。</p>
+
+<pre><code>    1. ACL
+    2. rule 的组成
+    3. rule 的执行
+    4. rule 的种类
+</code></pre>
+
+<h4>1. ACL</h4>
+
+<p>如果要实现功能丰富的 rules，需要有配套的 ACL 机制。</p>
+
+<p>ACL 的格式如下：
 <code>
-    cp  /home/haproxy/haproxy-1.5.14/examples/haproxy.cfg  /home/haproxy/haproxy/conf/
+    acl [flags] [operator] ...
 </code></p>
 
-<h5>4.修改配置</h5>
+<p>haproxy 中 ACL 数据结构的定义：</p>
 
-<p>配置说明如下：(参考:<a href="http://freehat.blog.51cto.com/1239536/1347882">http://freehat.blog.51cto.com/1239536/1347882</a>)</p>
-
-<pre><code>    ###########全局配置#########
-    global
-        log 127.0.0.1   local0          #[日志输出配置，所有日志都记录在本机，通过local0输出]
-        log 127.0.0.1   local1 notice   #定义haproxy 日志级别[error warringinfo debug]
-        daemon                          #以后台形式运行harpoxy
-        nbproc    1                     #设置进程数量
-        maxconn   4096                  #默认最大连接数,需考虑ulimit-n限制
-        #pidfile  /var/run/haproxy.pid  #haproxy 进程PID文件
-        #ulimit-n 819200                #ulimit 的数量限制
-        #chroot   /usr/share/haproxy    #chroot运行路径
-        #debug                          #haproxy 调试级别，建议只在开启单进程的时候调试
-        #quiet
-
-    ########默认配置############
-    defaults
-        log      global
-        mode     http                  #默认的模式mode { tcp|http|health }，tcp是4层，http是7层，health只会返回OK
-        option   httplog               #日志类别,采用httplog
-        option   dontlognull           #不记录健康检查日志信息
-        retries  2                     #两次连接失败就认为是服务器不可用，也可以通过后面设置
-        option   forwardfor            #如果后端服务器需要获得客户端真实ip需要配置的参数，可以从Http Header中获得客户端ip
-        option   httpclose             #每次请求完毕后主动关闭http通道,haproxy不支持keep-alive,只能模拟这种模式的实现
-        #option  redispatch            #当serverId对应的服务器挂掉后，强制定向到其他健康的服务器，以后将不支持
-        option   abortonclose          #当服务器负载很高的时候，自动结束掉当前队列处理比较久的链接
-        maxconn  4096                  #默认的最大连接数
-        timeout  connect  5000ms       #连接超时
-        timeout  client 30000ms        #客户端超时
-        timeout  server 30000ms        #服务器超时
-        #timeout check 2000            #心跳检测超时
-        #timeout http-keep-alive10s    #默认持久连接超时时间
-        #timeout http-request   10s    #默认http请求超时时间
-        #timeout queue          1m     #默认队列超时时间
-        balance  roundrobin            #设置默认负载均衡方式，轮询方式
-        #balance source                #设置默认负载均衡方式，类似于nginx的ip_hash
-        #balnace leastconn             #设置默认负载均衡方式，最小连接数
-
-    ########统计页面配置########
-    listen admin_stats
-        bind 0.0.0.0:1080               #设置Frontend和Backend的组合体，监控组的名称，按需要自定义名称
-        mode http                       #http的7层模式
-        option httplog                  #采用http日志格式
-        #log 127.0.0.1 local0 err       #错误日志记录
-        maxconn 10                      #默认的最大连接数
-        stats refresh 30s               #统计页面自动刷新时间
-        stats uri /stats                #统计页面url
-        stats realm XingCloud\ Haproxy  #统计页面密码框上提示文本
-        stats auth admin:admin          #设置监控页面的用户和密码:admin,可以设置多个用户名
-        stats auth  Frank:Frank         #设置监控页面的用户和密码：Frank
-        stats hide-version              #隐藏统计页面上HAProxy的版本信息
-        stats  admin if TRUE            #设置手工启动/禁用，后端服务器(haproxy-1.4.9以后版本)
-
-    ########设置haproxy 错误页面#####
-    errorfile 403 /home/haproxy/haproxy/errorfiles/403.http
-    errorfile 500 /home/haproxy/haproxy/errorfiles/500.http
-    errorfile 502 /home/haproxy/haproxy/errorfiles/502.http
-    errorfile 503 /home/haproxy/haproxy/errorfiles/503.http
-    errorfile 504 /home/haproxy/haproxy/errorfiles/504.http
-
-    ########frontend前端配置##############
-    bind *:80         #这里建议使用bind *:80的方式，要不然做集群高可用的时候有问题，vip切换到其他机器就不能访问了。
-        acl web hdr(host) -i www.abc.com  #acl后面是规则名称，-i是要访问的域名，如果访问www.abc.com这个域名就分发到下面的webserver 的作用域。
-        acl img hdr(host) -i img.abc.com  #如果访问img.abc.com.cn就分发到imgserver这个作用域。
-        use_backend webserver if web
-        use_backend imgserver if img
-
-    ########backend后端配置##############
-    backend webserver             #webserver作用域
-        mode http
-        balance   roundrobin                  #balance roundrobin 轮询，balance source 保存session值，支持static-rr，leastconn，first，uri等参数
-        option  httpchk /index.html HTTP/1.0  #健康检查, 检测文件，如果分发到后台index.html访问不到就不再分发给它
-        server  web1 10.16.0.9:8085  cookie 1 weight 5 check inter 2000 rise 2 fall 3
-        server  web2 10.16.0.10:8085 cookie 2 weight 3 check inter 2000 rise 2 fall 3
-        #cookie 1表示serverid为1，check inter 1500 是检测心跳频率  
-        #rise 2是2次正确认为服务器可用，fall 3是3次失败认为服务器不可用，weight代表权重
-    backend imgserver
-        mode http
-        option  httpchk /index.php
-        balance     roundrobin                          
-        server      img01 192.168.137.101:80  check inter 2000 fall 3
-        server      img02 192.168.137.102:80  check inter 2000 fall 3
-    listen tcptest  
-        bind 0.0.0.0:5222  
-        mode tcp  
-        option tcplog                  #采用tcp日志格式  
-        balance source  
-        #log 127.0.0.1 local0 debug  
-        server s1 192.168.100.204:7222    weight 1  
-        server s2 192.168.100.208:7222    weight 1
+<pre><code>    /* The acl will be linked to from the proxy where it is declared */
+    struct acl {
+        struct list list;           /* chaining */
+        char *name;         /* acl name */
+        struct list expr;       /* list of acl_exprs */
+        int cache_idx;              /* ACL index in cache */
+        unsigned int requires;      /* or'ed bit mask of all acl_expr's ACL_USE_* */
+    };
 </code></pre>
 
-<h5>5.加上日志支持</h5>
+<p>其中：</p>
 
-<pre><code>    # vim /etc/syslog.conf
-    在最下边增加
-    local1.*        /home/haproxy/haproxy/logs/haproxy.log
-    local0.*        /home/haproxy/haproxy/logs/haproxy.log
+<pre><code>    name: ACL 的名字
+    expr: ACL 定义的表达式。就是定义的 ACL 名字后面的表达式。这是一个链表结构。因此，可以定义多条表达式不同但是名字相同的 ACL。这样，多个表达式都属于同一个 ACL。
+    requires: 所有表达式中关键字对应的作用域（该关键字可以用在什么场合）的集合
+
+函数 parse_acl() 负责解析定义好的 ACL:
+
+    查找 ACL 的名字，如果不存在的话，则 alloc 一个新的 acl 结构
+    通过调用 parse_acl_expr() 对表达式进行解析，并返回 struct acl_expr 结构
+        ACL 中的表达式应该只有一个 kw
+        查找该关键字，必须是已经注册好的。并返回该关键字注册时的数据结构 struct acl_expr
+        alloc 一个 struct acl_expr 结构体，记录下返回的 kw 的数据结构，并作成员的初始化
+        调用对应 kw 的 parse 方法，将解析的结果保存在 struct acl_pattern 结构体中，并将该结构体加入到 expr-&gt;patterns 的链表中
+    将解析到的表达式插入到 acl 中的 expr 链表中
 </code></pre>
 
-<pre><code>    # vim /etc/sysconfig/syslog
-    修改： SYSLOGD_OPTIONS="-r -m 0"
-    重启日志服务 service syslog restart
+<p>总结： 一个 ACL 包含一到多个表达式。每个表达式包含一个 kw及一到多个 pattern。</p>
+
+<h4>2. rule 的组成</h4>
+
+<p>这里简要描述 rule 与 acl 之间的逻辑关系：</p>
+
+<pre><code>    rule 应该是 action + condition 组成
+        有些动作自身可能也需要记录一些信息。不同的 rule 对应动作的信息可能不同，比如 reqirep 等
+        block rules 的动作比较单一， condition 满足之后处理结果均相同
+    condition，完成 rule 检测的判断条件 对应数据结构： struct acl_cond
+
+            struct acl_cond {
+                struct list list;           /* Some specific tests may use multiple conditions */
+                struct list suites;         /* list of acl_term_suites */
+                int pol;                    /* polarity: ACL_COND_IF / ACL_COND_UNLESS */
+                unsigned int requires;      /* or'ed bit mask of all acl's ACL_USE_* */
+                const char *file;           /* config file where the condition is declared */
+                int line;                   /* line in the config file where the condition is declared */
+            };
+
+
+    condition 包含多个 ACL 组。组的分割逻辑是逻辑或（|| 或者 or），即 struct list suites 的成员，组的数据结构 struct acl_term_suite
+
+        struct acl_term_suite {
+            struct list list;           /* chaining of term suites */
+            struct list terms;          /* list of acl_terms */
+        };
+
+        该数据结构可以包含多个 ACL，以及每个 ACL 可能的一个取反标识 '!'
+        所有表达式中相邻的 ACL 且其逻辑关系为逻辑与(&amp;&amp;) 的构成一个 ACL 组
+            比如 if acl1 !acl2 or acl3 acl4，则构成两个 acl_term_suite，分别是 acl1 !acl2 和 acl3 acl4
+            每个 ACL 及其可能的取反标记对应的数据结构： struct acl_term
+
+                struct acl_term {
+                    struct list list;           /* chaining */
+                    struct acl *acl;            /* acl pointed to by this term */
+                    int neg;                    /* 1 if the ACL result must be negated */
+                };
+
+        一个 ACL 包含多个 expr
 </code></pre>
 
-<h6>6.启动服务</h6>
+<h4>3. rule 的执行</h4>
 
-<p>启动服务：
-<code>
-    # /home/haproxy/haproxy/sbin/haproxy -f /home/haproxy/haproxy/conf/haproxy.cfg
-</code>
-重启服务：
-<code>
-    # /home/haproxy/haproxy/sbin/haproxy -f /home/haproxy/haproxy/conf/haproxy.cfg -st `cat /home/haproxy/haproxy/conf/haproxy.pid`
-</code>
-停止服务：
-<code>
-    # killall haproxy
-</code></p>
+<p>概括起来很简单，执行判断条件。符合条件，然后执行对应动作。</p>
 
-<h5>7.监控</h5>
+<p>下面是 rspadd 的示例代码：</p>
 
-<p>访问：<a href="http://192.168.101.125:1080/stats">http://192.168.101.125:1080/stats</a></p>
+<pre><code>    /* add response headers from the rule sets in the same order */
+    list_for_each_entry(wl, &amp;rule_set-&gt;rsp_add, list) {
+        if (txn-&gt;status &lt; 200)
+            break;
+        if (wl-&gt;cond) {
+            int ret = acl_exec_cond(wl-&gt;cond, px, t, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
+            ret = acl_pass(ret);
+            if (((struct acl_cond *)wl-&gt;cond)-&gt;pol == ACL_COND_UNLESS)
+                ret = !ret;
+            if (!ret)
+                continue;
+        }
+        if (unlikely(http_header_add_tail(&amp;txn-&gt;rsp, &amp;txn-&gt;hdr_idx, wl-&gt;s) &lt; 0))
+            goto return_bad_resp;
+    }
+</code></pre>
+
+<p>对于同一个种类的 rules，执行逻辑如下：</p>
+
+<pre><code>    主要遍历 rule，调用 acl_exec_cond 执行该 rule 的检测条件。该检测结果只给出匹配与否。
+        逐个遍历 cond 上的 ACL 组，即cond-&gt;suites。任一 suite 匹配成功，则认为匹配成功
+        同一个 ACL 组上，遍历所有 suite-&gt;terms （ACL + 取反逻辑）。任意一个 ACL 匹配失败，则跳到下一个 ACL 组继续匹配。同一组全部 ACL 匹配成功，则认为该 ACL 组匹配
+            同一个 ACL 上的匹配，则是逐一遍历 ACL 的 expr。只要任意一个 expr 匹配成功，则认为该 ACL 匹配成功
+    结合 condition 中的条件 if/unless，确定最终匹配结果
+    如果匹配则执行对应的 action，否则检测下一条规则。
+</code></pre>
+
+<h4>4. rule 的种类</h4>
+
+<p>从 proxy 结构体可以看出 rule 的种类</p>
+
+<pre><code>    struct proxy {
+        ...
+        struct list acl;                        /* ACL declared on this proxy */
+        struct list http_req_rules;     /* HTTP request rules: allow/deny/http-auth */
+        struct list block_cond;                 /* early blocking conditions (chained) */
+        struct list redirect_rules;             /* content redirecting rules (chained) */
+        struct list switching_rules;            /* content switching rules (chained) */
+        struct list persist_rules;      /* 'force-persist' and 'ignore-persist' rules (chained) */
+        struct list sticking_rules;             /* content sticking rules (chained) */
+        struct list storersp_rules;             /* content store response rules (chained) */
+        struct list server_rules;               /* server switching rules (chained) */
+        struct {                                /* TCP request processing */
+            unsigned int inspect_delay;     /* inspection delay */
+            struct list inspect_rules;      /* inspection rules */
+            struct list l4_rules;           /* layer4 rules */
+        } tcp_req;
+        struct {                                /* TCP request processing */
+            unsigned int inspect_delay;     /* inspection delay */
+            struct list inspect_rules;      /* inspection rules */
+        } tcp_rep;
+        ...
+    }
+</code></pre>
+
+<p>其中， 函数 http_process_req_common 中处理的规则如下：</p>
+
+<pre><code>    http_process_req_common
+    {
+        ... 
+        1. process block rules
+        ...
+        2. process http req rules
+        ...
+        3. execute regular exp if any
+        ...
+        4. req add
+        ...
+        5. process redirect rules
+        ...
+    }
+</code></pre>
+
+<p>这里没有详细的介绍各种具体用途的 rules。随后具体分析代码的时候总结一下再加上。</p>
 ]]></content>
   </entry>
   
