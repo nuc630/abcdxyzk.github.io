@@ -1,0 +1,782 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>TIME_WAIT状态下对接收到的数据包如何处理 - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script>
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2>cp -rf * .</h2>
+  
+</hgroup>
+
+</header>
+  <nav role="navigation"><ul class="subscription" data-subscription="rss">
+<li>
+<form action="/search" method="get">
+    <input class="search" name="query" id="query" type="text" placeholder="search...">
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+<script type="text/javascript">
+var query = GetRequest("query");
+if (query != null) {
+	document.getElementById("query").value = query;
+}
+</script>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">TIME_WAIT状态下对接收到的数据包如何处理</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-29T17:53:00+08:00'><span class='date'>2015-09-29</span> <span class='time'>17:53:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="http://www.educity.cn/linux/1605134.html">http://www.educity.cn/linux/1605134.html</a></p>
+
+<p>正常情况下主动关闭连接的一端在连接正常终止后，会进入TIME_WAIT状态，存在这个状态有以下两个原因（参考《Unix网络编程》）：</p>
+
+<p>《UNIX网络编程.卷2：进程间通信(第2版)》[PDF]下载</p>
+
+<p>1、保证TCP连接关闭的可靠性。如果最终发送的ACK丢失，被动关闭的一端会重传最终的FIN包，如果执行主动关闭的一端没有维护这个连接的状态信息，会发送RST包响应，导致连接不正常关闭。</p>
+
+<p>2、允许老的重复分组在网络中消逝。假设在一个连接关闭后，发起建立连接的一端（客户端）立即重用原来的端口、IP地址和服务端建立新的连接。老的连接上的分组可能在新的连接建立后到达服务端，TCP必须防止来自某个连接的老的重复分组在连接终止后再现，从而被误解为同一个连接的化身。要实现这种功能，TCP不能给处于TIME_WAIT状态的连接启动新的连接。TIME_WAIT的持续时间是2MSL，保证在建立新的连接之前老的重复分组在网络中消逝。这个规则有一个例外：如果到达的SYN的序列号大于前一个连接的结束序列号，源自Berkeley的实现将给当前处于TIME_WAIT状态的连接启动新的化身。</p>
+
+<p>最初在看《Unix网络编程》 的时候看到这个状态，但是在项目中发现对这个状态的理解有误，特别是第二个理由。原本认为在TIME_WAIT状态下肯定不会再使用相同的五元组（协议类型，源目的IP、源目的端口号）建立一个新的连接，看书还是不认真啊！为了加深理解，决定结合内核代码，好好来看下内核在TIME_WAIT状态下的处理。其实TIME_WAIT存在的第二个原因的解释更多的是从被动关闭一方的角度来说明的。如果是执行主动关闭的是客户端，客户端户进入TIME_WAIT状态，假设客户端重用端口号来和服务器建立连接，内核会不会允许客户端来建立连接？内核如何来处理这种情况？书本中不会对这些点讲的那么详细，要从内核源码中来找答案。</p>
+
+<p>我们先来看服务器段进入TIME_WAIT后内核的处理，即服务器主动关闭连接。TCP层的接收函数是tcp_v4_rcv()，和TIME_WAIT状态相关的主要代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_rcv(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;......
+</span><span class='line'>
+</span><span class='line'>&#9;sk = __inet_lookup_skb(&tcp_hashinfo, skb, th-&gt;source, th-&gt;dest);
+</span><span class='line'>&#9;if (!sk)
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;
+</span><span class='line'>process:
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_TIME_WAIT)
+</span><span class='line'>&#9;&#9;goto do_time_wait;   
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>
+</span><span class='line'>discard_it:
+</span><span class='line'>&#9;/* Discard frame. */
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>&#9;......
+</span><span class='line'>do_time_wait:
+</span><span class='line'>&#9;......
+</span><span class='line'>
+</span><span class='line'>switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
+</span><span class='line'>&#9;case TCP_TW_SYN: {
+</span><span class='line'>&#9;&#9;struct sock *sk2 = inet_lookup_listener(dev_net(skb-&gt;dev),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&tcp_hashinfo,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;iph-&gt;daddr, th-&gt;dest,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;inet_iif(skb));
+</span><span class='line'>&#9;&#9;if (sk2) {
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_deschedule(inet_twsk(sk), &tcp_death_row);
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_put(inet_twsk(sk));
+</span><span class='line'>&#9;&#9;&#9;sk = sk2;
+</span><span class='line'>&#9;&#9;&#9;goto process;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/* Fall through to ACK */
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;case TCP_TW_ACK:
+</span><span class='line'>&#9;&#9;tcp_v4_timewait_ack(sk, skb);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;case TCP_TW_RST:
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;
+</span><span class='line'>&#9;case TCP_TW_SUCCESS:;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;goto discard_it;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>接收到SKb包后，会调用__inet_lookup_skb()查找对应的sock结构。如果套接字状态是TIME_WAIT状态，会跳转到do_time_wait标签处处理。从代码中可以看到，主要由tcp_timewait_state_process()函数来处理SKB包，处理后根据返回值来做相应的处理。</p>
+
+<p>在看tcp_timewait_state_process()函数中的处理之前，需要先看一看不同的返回值会对应什么样的处理。</p>
+
+<p>如果返回值是TCP_TW_SYN，则说明接收到的是一个“合法”的SYN包（也就是说这个SYN包可以接受），这时会首先查找内核中是否有对应的监听套接字，如果存在相应的监听套接字，则会释放TIME_WAIT状态的传输控制结构，跳转到process处开始处理，开始建立一个新的连接。如果没有找到监听套接字会执行到TCP_TW_ACK分支。</p>
+
+<p>如果返回值是TCP_TW_ACK，则会调用tcp_v4_timewait_ack()发送ACK，然后跳转到discard_it标签处，丢掉数据包。</p>
+
+<p>如果返回值是TCP_TW_RST，则会调用tcp_v4_send_reset()给对端发送RST包，然后丢掉数据包。</p>
+
+<p>如果返回值是TCP_TW_SUCCESS，则会直接丢掉数据包。</p>
+
+<p>接下来我们通过tcp_timewait_state_process()函数来看TIME_WAIT状态下的数据包处理。</p>
+
+<p>为了方便讨论，假设数据包中没有时间戳选项，在这个前提下，tcp_timewait_state_process()中的局部变量paws_reject的值为0。</p>
+
+<p>如果需要保持在FIN_WAIT_2状态的时间小于等于TCP_TIMEWAIT_LEN，则会从FIN_WAIT_2状态直接迁移到TIME_WAIT状态，也就是使用描述TIME_WAIT状态的sock结构代替当前的传输控制块。虽然这时的sock结构处于TIME_WAIT结构，但是还要区分内部状态，这个内部状态存储在inet_timewait_sock结构的tw_substate成员中。</p>
+
+<p>如果内部状态为FIN_WAIT_2，tcp_timewait_state_process()中处理的关键代码片段如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (tw-&gt;tw_substate == TCP_FIN_WAIT2) {
+</span><span class='line'>&#9;/* Just repeat all the checks of tcp_rcv_state_process() */
+</span><span class='line'>
+</span><span class='line'>&#9;/* Out of window, send ACK */
+</span><span class='line'>&#9;if (paws_reject ||
+</span><span class='line'>&#9;&#9;!tcp_in_window(TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq,
+</span><span class='line'>&#9;&#9;&#9;  tcptw-&gt;tw_rcv_nxt,
+</span><span class='line'>&#9;&#9;&#9;  tcptw-&gt;tw_rcv_nxt + tcptw-&gt;tw_rcv_wnd))
+</span><span class='line'>&#9;&#9;return TCP_TW_ACK;
+</span><span class='line'>
+</span><span class='line'>&#9;if (th-&gt;rst)
+</span><span class='line'>&#9;&#9;goto kill;
+</span><span class='line'>
+</span><span class='line'>&#9;if (th-&gt;syn && !before(TCP_SKB_CB(skb)-&gt;seq, tcptw-&gt;tw_rcv_nxt))
+</span><span class='line'>&#9;&#9;goto kill_with_rst;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Dup ACK? */
+</span><span class='line'>&#9;if (!th-&gt;ack ||
+</span><span class='line'>&#9;&#9;!after(TCP_SKB_CB(skb)-&gt;end_seq, tcptw-&gt;tw_rcv_nxt) ||
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq) {
+</span><span class='line'>&#9;&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;&#9;return TCP_TW_SUCCESS;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* New data or FIN. If new data arrive after half-duplex close,
+</span><span class='line'>&#9; * reset.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (!th-&gt;fin ||
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;end_seq != tcptw-&gt;tw_rcv_nxt + 1) {
+</span><span class='line'>kill_with_rst:
+</span><span class='line'>&#9;&#9;inet_twsk_deschedule(tw, &tcp_death_row);
+</span><span class='line'>&#9;&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;&#9;return TCP_TW_RST;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* FIN arrived, enter true time-wait state. */
+</span><span class='line'>&#9;tw-&gt;tw_substate      = TCP_TIME_WAIT;
+</span><span class='line'>&#9;tcptw-&gt;tw_rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;if (tmp_opt.saw_tstamp) {
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent_stamp = get_seconds();
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent      = tmp_opt.rcv_tsval;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* I am shamed, but failed to make it more elegant.
+</span><span class='line'>&#9; * Yes, it is direct reference to IP, which is impossible
+</span><span class='line'>&#9; * to generalize to IPv6. Taking into account that IPv6
+</span><span class='line'>&#9; * do not understand recycling in any case, it not
+</span><span class='line'>&#9; * a big problem in practice. --ANK 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (tw-&gt;tw_family == AF_INET &&
+</span><span class='line'>&#9;&#9;tcp_death_row.sysctl_tw_recycle && tcptw-&gt;tw_ts_recent_stamp &&
+</span><span class='line'>&#9;&#9;tcp_v4_tw_remember_stamp(tw))
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, tw-&gt;tw_timeout,
+</span><span class='line'>&#9;&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+</span><span class='line'>&#9;&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>
+</span><span class='line'>&#9;return TCP_TW_ACK;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果TCP段序号不完全在接收窗口内，则返回TCP_TW_ACK，表示需要给对端发送ACK。</p>
+
+<p>如果在FIN_WAIT_2状态下接收到的是RST包，则跳转到kill标签处处理，立即释放timewait控制块，并返回TCP_TW_SUCCESS。</p>
+
+<p>如果是SYN包，但是SYN包的序列号在要接收的序列号之前，则表示这是一个过期的SYN包，则跳转到kill_with_rst标签处处理，此时不仅会释放TIME_WAIT传输控制块，还会返回TCP_TW_RST，要给对端发送RST包。</p>
+
+<p>如果接收到DACK，则释放timewait控制块，并返回TCP_TW_SUCCESS。在这种情况下有一个判断条件是看包的结束序列号和起始序列号相同时，会作为DACK处理，所以之后的处理是在数据包中的数据不为空的情况下处理。前面的处理中已经处理了SYN包、RST包的情况，接下来就剩以下三种情况：</p>
+
+<p>1、不带FIN标志的数据包</p>
+
+<p>2、带FIN标志，但是还包含数据</p>
+
+<p>3、FIN包，不包含数据</p>
+
+<p>如果是前两种情况，则会调用inet_twsk_deschedule()释放time_wait控制块。inet_twsk_deschedule()中会调用到inet_twsk_put()减少time_wait控制块的引用，在外层函数中再次调用inet_twsk_put()函数时，就会真正释放time_wait控制块。</p>
+
+<p>如果接收的是对端的FIN包，即第3种情况，则将time_wait控制块的子状态设置为TCP_TIME_WAIT，此时才是进入真正的TIME_WAIT状态。然后根据TIME_WAIT的持续时间的长短来确定是加入到twcal_row队列还是启动一个定时器，最后会返回TCP_TW_ACK，给对端发送TCP连接关闭时最后的ACK包。</p>
+
+<p>到这里，我们看到了对FIN_WAIT_2状态（传输控制块状态为TIME_WAIT状态下，但是子状态为FIN_WAIT_2）的完整处理。</p>
+
+<p>接下来的处理才是对真正的TIME_WAIT状态的处理，即子状态也是TIME_WAIT。</p>
+
+<p>如果在TIME_WAIT状态下，接收到ACK包（不带数据）或RST包，并且包的序列号刚好是下一个要接收的序列号，由以下代码片段处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!paws_reject &&
+</span><span class='line'>&#9;(TCP_SKB_CB(skb)-&gt;seq == tcptw-&gt;tw_rcv_nxt &&
+</span><span class='line'>&#9;(TCP_SKB_CB(skb)-&gt;seq == TCP_SKB_CB(skb)-&gt;end_seq || th-&gt;rst))) {
+</span><span class='line'>&#9;/* In window segment, it may be only reset or bare ack. */
+</span><span class='line'>&#9;if (th-&gt;rst) {
+</span><span class='line'>&#9;&#9;/* This is TIME_WAIT assassination, in two flavors.
+</span><span class='line'>&#9;&#9;* Oh well... nobody has a sufficient solution to this
+</span><span class='line'>&#9;&#9;* protocol bug yet.
+</span><span class='line'>&#9;&#9;*/
+</span><span class='line'>&#9;&#9;if (sysctl_tcp_rfc1337 == 0) {
+</span><span class='line'>kill:
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_deschedule(tw, &tcp_death_row);
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;&#9;&#9;return TCP_TW_SUCCESS;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+</span><span class='line'>&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tmp_opt.saw_tstamp) {
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent      = tmp_opt.rcv_tsval;
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent_stamp = get_seconds();
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;return TCP_TW_SUCCESS;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果是RST包的话，并且系统配置sysctl_tcp_rfc1337（默认情况下为0，参见/proc/sys/net/ipv4/tcp_rfc1337）的值为0，这时会立即释放time_wait传输控制块，丢掉接收的RST包。</p>
+
+<p>如果是ACK包，则会启动TIME_WAIT定时器后丢掉接收到的ACK包。</p>
+
+<p>接下来是对SYN包的处理。前面提到了，如果在TIME_WAIT状态下接收到序列号比上一个连接的结束序列号大的SYN包，可以接受，并建立新的连接，下面这段代码就是来处理这样的情况：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (th-&gt;syn && !th-&gt;rst && !th-&gt;ack && !paws_reject &&
+</span><span class='line'>&#9;(after(TCP_SKB_CB(skb)-&gt;seq, tcptw-&gt;tw_rcv_nxt) ||
+</span><span class='line'>&#9;(tmp_opt.saw_tstamp &&
+</span><span class='line'>&#9;  (s32)(tcptw-&gt;tw_ts_recent - tmp_opt.rcv_tsval) &lt; 0))) {
+</span><span class='line'>&#9;u32 isn = tcptw-&gt;tw_snd_nxt + 65535 + 2;
+</span><span class='line'>&#9;if (isn == 0)
+</span><span class='line'>&#9;&#9;isn++;
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;when = isn;
+</span><span class='line'>&#9;return TCP_TW_SYN;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当返回TCP_TW_SYN时，在tcp_v4_rcv()中会立即释放time_wait控制块，并且开始进行正常的连接建立过程。</p>
+
+<p>如果数据包不是上述几种类型的包，可能的情况有：</p>
+
+<p>1、不是有效的SYN包。不考虑时间戳的话，就是序列号在上一次连接的结束序列号之前</p>
+
+<p>2、ACK包，起始序列号不是下一个要接收的序列号</p>
+
+<p>3、RST包，起始序列号不是下一个要接收的序列号</p>
+
+<p>4、带数据的SKB包</p>
+
+<p>这几种情况由以下代码处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!th-&gt;rst) {
+</span><span class='line'>&#9;/* In this case we must reset the TIMEWAIT timer.
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * If it is ACKless SYN it may be both old duplicate
+</span><span class='line'>&#9; * and new good SYN with random sequence number &lt;rcv_nxt.
+</span><span class='line'>&#9; * Do not reschedule in the last case.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (paws_reject || th-&gt;ack)
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+</span><span class='line'>&#9;&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Send ACK. Note, we do not put the bucket,
+</span><span class='line'>&#9; * it will be released by caller.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;return TCP_TW_ACK;
+</span><span class='line'>}
+</span><span class='line'>inet_twsk_put(tw);
+</span><span class='line'>return TCP_TW_SUCCESS;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果是RST包，即第3种情况，则直接返回TCP_TW_SUCCESS，丢掉RST包。</p>
+
+<p>如果带有ACK标志的话，则会启动TIME_WAIT定时器，然后给对端发送ACK。我们知道SYN包正常情况下不会设置ACK标志，所以如果是SYN包不会启动TIME_WAIT定时器，只会给对端发送ACK，告诉对端已经收到SYN包，避免重传，但连接应该不会继续建立。</p>
+
+<p>还有一个细节需要提醒下，就是我们看到在返回TCP_TW_ACK时，没有调用inet_twsk_put()释放对time_wait控制块的引用。这时因为在tcp_v4_rcv()中调用tcp_v4_timewait_ack()发送ACK时会用到time_wait控制块，所以需要保持对time_wait控制块的引用。在tcp_v4_timewait_ack()中发送完ACK后，会调用inet_twsk_put()释放对time_wait控制块的引用。</p>
+
+<p>OK，现在我们对TIME_WAIT状态下接收到数据包的情况有了一个了解，知道内核会如何来处理这些包。但是看到的这些更多的是以服务器端的角度来看的，如果客户端主动关闭连接的话，进入TIME_WAIT状态的是客户端。如果客户端在TIME_WAIT状态下重用端口号来和服务器建立连接，内核会如何处理呢？</p>
+
+<p>我编写了一个测试程序：创建一个套接字，设置SO_REUSEADDR选项，建立连接后立即关闭，关闭后立即又重复同样的过程，发现在第二次调用connect()的时候返回EADDRNOTAVAIL错误。这个测试程序很容易理解，写起来也很容易，就不贴出来了。</p>
+
+<p>要找到这个错误是怎么返回的，需要从TCP层的连接函数tcp_4_connect()开始。在tcp_v4_connect()中没有显示返回EADDRNOTAVAIL错误的地方，可能的地方就是在调用inet_hash_connect()返回的。为了确定是不是在inet_hash_connect()中返回的，使用systemtap编写了一个脚本，发现确实是在这个函数中返回的-99错误（EADDRNOTAVAIL的值为99）。其实这个通过代码也可以看出来，在这个函数之前会先查找目的主机的路由缓存项，调用的是ip_route_connect（）函数，跟着这个函数的调用轨迹，没有发现返回EADDRNOTAVAIL错误的地方。</p>
+
+<p>inet_hash_connect()函数只是对<code>__inet_hash_connect()</code>函数进行了简单的封装。在<code>__inet_hash_connect()</code>中如果已绑定了端口号，并且是和其他传输控制块共享绑定的端口号，则会调用check_established参数指向的函数来检查这个绑定的端口号是否可用，代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int __inet_hash_connect(struct inet_timewait_death_row *death_row,
+</span><span class='line'>&#9;&#9;struct sock *sk, u32 port_offset,
+</span><span class='line'>&#9;&#9;int (*check_established)(struct inet_timewait_death_row *,
+</span><span class='line'>&#9;&#9;&#9;struct sock *, __u16, struct inet_timewait_sock **),
+</span><span class='line'>&#9;&#9;void (*hash)(struct sock *sk))
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
+</span><span class='line'>&#9;const unsigned short snum = inet_sk(sk)-&gt;num;
+</span><span class='line'>&#9;struct inet_bind_hashbucket *head;
+</span><span class='line'>&#9;struct inet_bind_bucket *tb;
+</span><span class='line'>&#9;int ret;
+</span><span class='line'>&#9;struct net *net = sock_net(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;if (!snum) {
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;head = &hinfo-&gt;bhash[inet_bhashfn(net, snum, hinfo-&gt;bhash_size)];
+</span><span class='line'>&#9;tb  = inet_csk(sk)-&gt;icsk_bind_hash;
+</span><span class='line'>&#9;spin_lock_bh(&head-&gt;lock);
+</span><span class='line'>&#9;if (sk_head(&tb-&gt;owners) == sk && !sk-&gt;sk_bind_node.next) {
+</span><span class='line'>&#9;&#9;hash(sk);
+</span><span class='line'>&#9;&#9;spin_unlock_bh(&head-&gt;lock);
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;spin_unlock(&head-&gt;lock);
+</span><span class='line'>&#9;&#9;/* No definite answer... Walk to established hash table */
+</span><span class='line'>&#9;&#9;ret = check_established(death_row, sk, snum, NULL);
+</span><span class='line'>out:
+</span><span class='line'>&#9;&#9;local_bh_enable();
+</span><span class='line'>&#9;&#9;return ret;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>(sk_head(&amp;tb->owners) == sk &amp;&amp; !sk->sk_bind_node.next)这个判断条件就是用来判断是不是只有当前传输控制块在使用已绑定的端口，条件为false时，会执行else分支，检查是否可用。这么看来，调用bind()成功并不意味着这个端口就真的可以用。</p>
+
+<p>check_established参数对应的函数是__inet_check_established()，在inet_hash_connect()中可以看到。在上面的代码中我们还注意到调用check_established()时第三个参数为NULL，这在后面的分析中会用到。</p>
+
+<p><code>__inet_check_established()</code>函数中，会分别在TIME_WAIT传输控制块和除TIME_WIAT、LISTEN状态外的传输控制块中查找是已绑定的端口是否已经使用，代码片段如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* called with local bh disabled */
+</span><span class='line'>static int __inet_check_established(struct inet_timewait_death_row *death_row,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sock *sk, __u16 lport,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct inet_timewait_sock **twp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
+</span><span class='line'>&#9;struct inet_sock *inet = inet_sk(sk);
+</span><span class='line'>&#9;__be32 daddr = inet-&gt;rcv_saddr;
+</span><span class='line'>&#9;__be32 saddr = inet-&gt;daddr;
+</span><span class='line'>&#9;int dif = sk-&gt;sk_bound_dev_if;
+</span><span class='line'>&#9;INET_ADDR_COOKIE(acookie, saddr, daddr)
+</span><span class='line'>&#9;const __portpair ports = INET_COMBINED_PORTS(inet-&gt;dport, lport);
+</span><span class='line'>&#9;struct net *net = sock_net(sk);
+</span><span class='line'>&#9;unsigned int hash = inet_ehashfn(net, daddr, lport, saddr, inet-&gt;dport);
+</span><span class='line'>&#9;struct inet_ehash_bucket *head = inet_ehash_bucket(hinfo, hash);
+</span><span class='line'>&#9;spinlock_t *lock = inet_ehash_lockp(hinfo, hash);
+</span><span class='line'>&#9;struct sock *sk2;
+</span><span class='line'>&#9;const struct hlist_nulls_node *node;
+</span><span class='line'>&#9;struct inet_timewait_sock *tw;
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Check TIME-WAIT sockets first. */
+</span><span class='line'>&#9;sk_nulls_for_each(sk2, node, &head-&gt;twchain) {
+</span><span class='line'>&#9;&#9;tw = inet_twsk(sk2);
+</span><span class='line'>
+</span><span class='line'>&#9;if (INET_TW_MATCH(sk2, net, hash, acookie,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;saddr, daddr, ports, dif)) {
+</span><span class='line'>&#9;&#9;&#9;if (twsk_unique(sk, sk2, twp))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto unique;
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;goto not_unique;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tw = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;/* And established part... */
+</span><span class='line'>&#9;sk_nulls_for_each(sk2, node, &head-&gt;chain) {
+</span><span class='line'>&#9;&#9;if (INET_MATCH(sk2, net, hash, acookie,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;saddr, daddr, ports, dif))
+</span><span class='line'>&#9;&#9;&#9;goto not_unique;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>unique:
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>not_unique:
+</span><span class='line'>&#9;spin_unlock(lock);
+</span><span class='line'>&#9;return -EADDRNOTAVAIL;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到返回EADDRNOTVAIL错误的有两种情况：</p>
+
+<p>1、在TIME_WAIT传输控制块中找到匹配的端口，并且twsk_unique()返回true时</p>
+
+<p>2、在除TIME_WAIT和LISTEN状态外的传输块中存在匹配的端口。</p>
+
+<p>第二种情况很好容易理解了，只要状态在FIN_WAIT_1、ESTABLISHED等的传输控制块使用的端口和要查找的匹配，就会返回EADDRNOTVAIL错误。第一种情况还要取决于twsk_uniqueue()的返回值，所以接下来我们看twsk_uniqueue()中什么情况下会返回true。</p>
+
+<p>如果是TCP套接字，twsk_uniqueue()中会调用tcp_twsk_uniqueue()来判断，返回true的条件如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tcptw-&gt;tw_ts_recent_stamp &&
+</span><span class='line'>&#9;&#9;(twp == NULL || (sysctl_tcp_tw_reuse &&
+</span><span class='line'>&#9;&#9;&#9;&#9;get_seconds() - tcptw-&gt;tw_ts_recent_stamp &gt; 1))) {
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们前面提到过，<code>__inet_hash_connect()</code>函数调用check_established指向的函数时第三个参数为NULL，所以现在我们只需要关心tcptw->tw_ts_recent_stamp是否非零，只要这个值非零，tcp_twsk_unique()就会返回true， 在上层connect（）函数中就会返回EADDRNOTVAIL错误。tcptw->tw_ts_recent_stamp存储的是最近接收到段的时间戳值，所以正常情况下这个值不会为零。当然也可以通过调整系统的参数，让这个值可以为零，这不是本文讨论的重点，感兴趣的可以参考tcp_v4_connect()中的代码进行修改。</p>
+
+<p>在导致返回EADDRNOTVAIL的两种情况中，第一种情况可以有办法避免，但是如果的第二次建立连接的时间和第一次关闭连接之间的时间间隔太小的话，此时第一个连接可能处在FIN_WAIT_1、FIN_WAIT_2等状态，此时没有系统参数可以用来避免返回EADDRNOTVAIL。如果你还是想无论如何都要在很短的时间内重用客户端的端口，这样也有办法，要么是用kprobe机制，要么用systemtap脚本，改变<code>__inet_check_established()</code>函数的返回值。</p>
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2015-09-29T17:53:00+08:00'><span class='date'>2015-09-29</span> <span class='time'>17:53:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~net/'>net</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2015/09/29/kernel-net-timewait/" title="Previous Post: 内核处理time_wait状态详解">&laquo; 内核处理time_wait状态详解</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2015/09/30/lang-c-libcurl/" title="Next Post: linux c libcurl的简单使用">linux c libcurl的简单使用 &raquo;</a>
+      
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo"><p>
+  Copyright &copy; 2015 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+</p>
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>

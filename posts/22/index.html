@@ -62,7 +62,7 @@ if (query != null) {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-softirq/">中断子系统之（八）：softirq</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/15/kernel-net-ipv6/">ipv6初始化和处理流程分析</a></h2>
     
     
       <p class="meta">
@@ -71,584 +71,14 @@ if (query != null) {
 
 
 
-<time class='entry-date' datetime='2015-05-07T16:04:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>16:04:00</span></time>
+<time class='entry-date' datetime='2015-05-15T15:57:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>15:57:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.wowotech.net/linux_kenrel/soft-irq.html">http://www.wowotech.net/linux_kenrel/soft-irq.html</a></p>
-
-<h3>一、前言</h3>
-
-<p>对于中断处理而言，linux将其分成了两个部分，一个叫做中断handler（top half），是全程关闭中断的，另外一部分是deferable task（bottom half），属于不那么紧急需要处理的事情。在执行bottom half的时候，是开中断的。有多种bottom half的机制，例如：softirq、tasklet、workqueue或是直接创建一个kernel thread来执行bottom half（这在旧的kernel驱动中常见，现在，一个理智的driver厂商是不会这么做的）。本文主要讨论softirq机制。由于tasklet是基于softirq的，因此本文也会提及tasklet，但主要是从需求层面考虑，不会涉及其具体的代码实现。</p>
-
-<p>在普通的驱动中一般是不会用到softirq，但是由于驱动经常使用的tasklet是基于softirq的，因此，了解softirq机制有助于撰写更优雅的driver。softirq不能动态分配，都是静态定义的。内核已经定义了若干种softirq number，例如网络数据的收发、block设备的数据访问（数据量大，通信带宽高），timer的deferable task（时间方面要求高）。本文的第二章讨论了softirq和tasklet这两种机制有何不同，分别适用于什么样的场景。第三章描述了一些context的概念，这是要理解后续内容的基础。第四章是进入softirq的实现，对比hard irq来解析soft irq的注册、触发，调度的过程。</p>
-
-<ul>
-<li>注：本文中的linux kernel的版本是3.14</li>
-</ul>
-
-
-<h3>二、为何有softirq和tasklet</h3>
-
-<h4>1、为何有top half和bottom half</h4>
-
-<p>中断处理模块是任何OS中最重要的一个模块，对系统的性能会有直接的影响。想像一下：如果在通过U盘进行大量数据拷贝的时候，你按下一个key，需要半秒的时间才显示出来，这个场景是否让你崩溃？因此，对于那些复杂的、需要大量数据处理的硬件中断，我们不能让handler中处理完一切再恢复现场（handler是全程关闭中断的），而是仅仅在handler中处理一部分，具体包括：<br/>
-（1）有实时性要求的<br/>
-（2）和硬件相关的。例如ack中断，read HW FIFO to ram等<br/>
-（3）如果是共享中断，那么获取硬件中断状态以便判断是否是本中断发生</p>
-
-<p>除此之外，其他的内容都是放到bottom half中处理。在把中断处理过程划分成top half和bottom half之后，关中断的top half被瘦身，可以非常快速的执行完毕，大大减少了系统关中断的时间，提高了系统的性能。</p>
-
-<p>我们可以基于下面的系统进一步的进行讨论：</p>
-
-<p><img src="/images/kernel/2015-05-07-11.gif" alt="" /></p>
-
-<p>当网卡控制器的FIFO收到的来自以太网的数据的时候（例如半满的时候，可以软件设定），可以将该事件通过irq signal送达Interrupt Controller。Interrupt Controller可以把中断分发给系统中的Processor A or B。</p>
-
-<p>NIC的中断处理过程大概包括：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;handle Data in the ram---&gt;unmask interrupt controller</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们先假设Processor A处理了这个网卡中断事件，于是NIC的中断handler在Processor A上欢快的执行，这时候，Processor A的本地中断是disable的。NIC的中断handler在执行的过程中，网络数据仍然源源不断的到来，但是，如果NIC的中断handler不操作NIC的寄存器来ack这个中断的话，NIC是不会触发下一次中断的。还好，我们的NIC interrupt handler总是在最开始就会ack，因此，这不会导致性能问题。ack之后，NIC已经具体再次trigger中断的能力。当Processor A上的handler 在处理接收来自网络的数据的时候，NIC的FIFO很可能又收到新的数据，并trigger了中断，这时候，Interrupt controller还没有umask，因此，即便还有Processor B（也就是说有处理器资源），中断控制器也无法把这个中断送达处理器系统。因此，只能眼睁睁的看着NIC FIFO填满数据，数据溢出，或者向对端发出拥塞信号，无论如何，整体的系统性能是受到严重的影响。</p>
-
-<p>注意：对于新的interrupt controller，可能没有mask和umask操作，但是原理是一样的，只不过NIC的handler执行完毕要发生EOI而已。</p>
-
-<p>要解决上面的问题，最重要的是尽快的执行完中断handler，打开中断，unmask IRQ（或者发送EOI），方法就是把耗时的handle Data in the ram这个步骤踢出handler，让其在bottom half中执行。</p>
-
-<h4>2、为何有softirq和tasklet</h4>
-
-<p>OK，linux kernel已经把中断处理分成了top half和bottom half，看起来已经不错了，那为何还要提供softirq、tasklet和workqueue这些bottom half机制，linux kernel本来就够复杂了，bottom half还来添乱。实际上，在早期的linux kernel还真是只有一个bottom half机制，简称BH，简单好用，但是性能不佳。后来，linux kernel的开发者开发了task queue机制，试图来替代BH，当然，最后task queue也消失在内核代码中了。现在的linux kernel提供了三种bottom half的机制，来应对不同的需求。</p>
-
-<p>workqueue和softirq、tasklet有本质的区别：workqueue运行在process context，而softirq和tasklet运行在interrupt context。因此，出现workqueue是不奇怪的，在有sleep需求的场景中，defering task必须延迟到kernel thread中执行，也就是说必须使用workqueue机制。softirq和tasklet是怎么回事呢？从本质上将，bottom half机制的设计有两方面的需求，一个是性能，一个是易用性。设计一个通用的bottom half机制来满足这两个需求非常的困难，因此，内核提供了softirq和tasklet两种机制。softirq更倾向于性能，而tasklet更倾向于易用性。</p>
-
-<p>我们还是进入实际的例子吧，还是使用上一节的系统图。在引入softirq之后，网络数据的处理如下：</p>
-
-<p>关中断：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;raise softirq---&gt;unmask interrupt controller</span></code></pre></td></tr></table></div></figure>
-
-
-<p>开中断：在softirq上下文中进行handle Data in the ram的动作</p>
-
-<p>同样的，我们先假设Processor A处理了这个网卡中断事件，很快的完成了基本的HW操作后，raise softirq。在返回中断现场前，会检查softirq的触发情况，因此，后续网络数据处理的softirq在processor A上执行。在执行过程中，NIC硬件再次触发中断，Interrupt controller将该中断分发给processor B，执行动作和Processor A是类似的，因此，最后，网络数据处理的softirq在processor B上执行。</p>
-
-<p>为了性能，同一类型的softirq有可能在不同的CPU上并发执行，这给使用者带来了极大的痛苦，因为驱动工程师在撰写softirq的回调函数的时候要考虑重入，考虑并发，要引入同步机制。但是，为了性能，我们必须如此。</p>
-
-<p>当网络数据处理的softirq同时在Processor A和B上运行的时候，网卡中断又来了（可能是10G的网卡吧）。这时候，中断分发给processor A，这时候，processor A上的handler仍然会raise softirq，但是并不会调度该softirq。也就是说，softirq在一个CPU上是串行执行的。这种情况下，系统性能瓶颈是CPU资源，需要增加更多的CPU来解决该问题。</p>
-
-<p>如果是tasklet的情况会如何呢？为何tasklet性能不如softirq呢？如果一个tasklet在processor A上被调度执行，那么它永远也不会同时在processor B上执行，也就是说，tasklet是串行执行的（注：不同的tasklet还是会并发的），不需要考虑重入的问题。我们还是用网卡这个例子吧（注意：这个例子仅仅是用来对比，实际上，网络数据是使用softirq机制的），同样是上面的系统结构图。假设使用tasklet，网络数据的处理如下：</p>
-
-<p>关中断：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mask and ack interrupt controller---&gt;ack NIC---&gt;copy FIFO to ram---&gt;schedule tasklet---&gt;unmask interrupt controller</span></code></pre></td></tr></table></div></figure>
-
-
-<p>开中断：在softirq上下文中（一般使用TASKLET_SOFTIRQ这个softirq）进行handle Data in the ram的动作</p>
-
-<p>同样的，我们先假设Processor A处理了这个网卡中断事件，很快的完成了基本的HW操作后，schedule tasklet（同时也就raise TASKLET_SOFTIRQ softirq）。在返回中断现场前，会检查softirq的触发情况，因此，在TASKLET_SOFTIRQ softirq的handler中，获取tasklet相关信息并在processor A上执行该tasklet的handler。在执行过程中，NIC硬件再次触发中断，Interrupt controller将该中断分发给processor B，执行动作和Processor A是类似的，虽然TASKLET_SOFTIRQ softirq在processor B上可以执行，但是，在检查tasklet的状态的时候，如果发现该tasklet在其他processor上已经正在运行，那么该tasklet不会被处理，一直等到在processor A上的tasklet处理完，在processor B上的这个tasklet才能被执行。这样的串行化操作虽然对驱动工程师是一个福利，但是对性能而言是极大的损伤。</p>
-
-<h3>三、理解softirq需要的基础知识（各种context）</h3>
-
-<h4>1、preempt_count</h4>
-
-<p>为了更好的理解下面的内容，我们需要先看看一些基础知识：一个task的thread info数据结构定义如下（只保留和本场景相关的内容）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct thread_info { 
-</span><span class='line'>&#9;......
-</span><span class='line'>&#9;int preempt_count;    /* 0 =&gt; preemptable, &lt;0 =&gt; bug */
-</span><span class='line'>&#9;......
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>preempt_count这个成员被用来判断当前进程是否可以被抢占。如果preempt_count不等于0（可能是代码调用preempt_disable显式的禁止了抢占，也可能是处于中断上下文等），说明当前不能进行抢占，如果preempt_count等于0，说明已经具备了抢占的条件（当然具体是否要抢占当前进程还是要看看thread info中的flag成员是否设定了_TIF_NEED_RESCHED这个标记，可能是当前的进程的时间片用完了，也可能是由于中断唤醒了优先级更高的进程）。 具体preempt_count的数据格式可以参考下图：</p>
-
-<p><img src="/images/kernel/2015-05-07-12.gif" alt="" /></p>
-
-<p>preemption count用来记录当前被显式的禁止抢占的次数，也就是说，每调用一次preempt_disable，preemption count就会加一，调用preempt_enable，该区域的数值会减去一。preempt_disable和preempt_enable必须成对出现，可以嵌套，最大嵌套的深度是255。</p>
-
-<p>hardirq count描述当前中断handler嵌套的深度。对于ARM平台的linux kernel，其中断部分的代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void handle_IRQ(unsigned int irq, struct pt_regs *regs)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct pt_regs *old_regs = set_irq_regs(regs);
-</span><span class='line'>
-</span><span class='line'>&#9;irq_enter(); 
-</span><span class='line'>&#9;generic_handle_irq(irq);
-</span><span class='line'>
-</span><span class='line'>&#9;irq_exit();
-</span><span class='line'>&#9;set_irq_regs(old_regs);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>通用的IRQ handler被irq_enter和irq_exit这两个函数包围。irq_enter说明进入到IRQ context，而irq_exit则说明退出IRQ context。在irq_enter函数中会调用preempt_count_add(HARDIRQ_OFFSET)，为hardirq count的bit field增加1。在irq_exit函数中，会调用preempt_count_sub(HARDIRQ_OFFSET)，为hardirq count的bit field减去1。hardirq count占用了4个bit，说明硬件中断handler最大可以嵌套15层。在旧的内核中，hardirq count占用了12个bit，支持4096个嵌套。当然，在旧的kernel中还区分fast interrupt handler和slow interrupt handler，中断handler最大可以嵌套的次数理论上等于系统IRQ的个数。在实际中，这个数目不可能那么大（内核栈就受不了），因此，即使系统支持了非常大的中断个数，也不可能各个中断依次嵌套，达到理论的上限。基于这样的考虑，后来内核减少了hardirq count占用bit数目，改成了10个bit（在general arch的代码中修改为10，实际上，各个arch可以redefine自己的hardirq count的bit数）。但是，当内核大佬们决定废弃slow interrupt handler的时候，实际上，中断的嵌套已经不会发生了。因此，理论上，hardirq count要么是0，要么是1。不过呢，不能总拿理论说事，实际上，万一有写奇葩或者老古董driver在handler中打开中断，那么这时候中断嵌套还是会发生的，但是，应该不会太多（一个系统中怎么可能有那么多奇葩呢？呵呵），因此，目前hardirq count占用了4个bit，应付15个奇葩driver是妥妥的。</p>
-
-<p>对softirq count进行操作有两个场景：</p>
-
-<p>（1）也是在进入soft irq handler之前给 softirq count加一，退出soft irq handler之后给 softirq count减去一。由于soft irq handler在一个CPU上是不会并发的，总是串行执行，因此，这个场景下只需要一个bit就够了，也就是上图中的bit 8。通过该bit可以知道当前task是否在sofirq context。</p>
-
-<p>（2）由于内核同步的需求，进程上下文需要禁止softirq。这时候，kernel提供了local_bf_enable和local_bf_disable这样的接口函数。这部分的概念是和preempt disable/enable类似的，占用了bit9～15，最大可以支持127次嵌套。</p>
-
-<h4>2、一个task的各种上下文</h4>
-
-<p>看完了preempt_count之后，我们来介绍各种context：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define in_irq()        (hardirq_count())
-</span><span class='line'>#define in_softirq()        (softirq_count())
-</span><span class='line'>#define in_interrupt()        (irq_count())
-</span><span class='line'>
-</span><span class='line'>#define in_serving_softirq()    (softirq_count() & SOFTIRQ_OFFSET)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里首先要介绍的是一个叫做IRQ context的术语。这里的IRQ context其实就是hard irq context，也就是说明当前正在执行中断handler（top half），只要preempt_count中的hardirq count大于0（＝1是没有中断嵌套，如果大于1，说明有中断嵌套），那么就是IRQ context。</p>
-
-<p>softirq context并没有那么的直接，一般人会认为当sofirq handler正在执行的时候就是softirq context。这样说当然没有错，sofirq handler正在执行的时候，会增加softirq count，当然是softirq context。不过，在其他context的情况下，例如进程上下文中，有有可能因为同步的要求而调用local_bh_disable，这时候，通过local_bh_disable/enable保护起来的代码也是执行在softirq context中。当然，这时候其实并没有正在执行softirq handler。如果你确实想知道当前是否正在执行softirq handler，in_serving_softirq可以完成这个使命，这是通过操作preempt_count的bit 8来完成的。</p>
-
-<p>所谓中断上下文，就是IRQ context ＋ softirq context＋NMI context。</p>
-
-<h3>四、softirq机制</h3>
-
-<p>softirq和hardirq（就是硬件中断啦）是对应的，因此softirq的机制可以参考hardirq对应理解，当然softirq是纯软件的，不需要硬件参与。</p>
-
-<h4>1、softirq number</h4>
-
-<p>和IRQ number一样，对于软中断，linux kernel也是用一个softirq number唯一标识一个softirq，具体定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>enum
-</span><span class='line'>{
-</span><span class='line'>&#9;HI_SOFTIRQ=0,
-</span><span class='line'>&#9;TIMER_SOFTIRQ,
-</span><span class='line'>&#9;NET_TX_SOFTIRQ,
-</span><span class='line'>&#9;NET_RX_SOFTIRQ,
-</span><span class='line'>&#9;BLOCK_SOFTIRQ,
-</span><span class='line'>&#9;BLOCK_IOPOLL_SOFTIRQ,
-</span><span class='line'>&#9;TASKLET_SOFTIRQ,
-</span><span class='line'>&#9;SCHED_SOFTIRQ,
-</span><span class='line'>&#9;HRTIMER_SOFTIRQ,
-</span><span class='line'>&#9;RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
-</span><span class='line'>
-</span><span class='line'>&#9;NR_SOFTIRQS
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>HI_SOFTIRQ用于高优先级的tasklet，TASKLET_SOFTIRQ用于普通的tasklet。TIMER_SOFTIRQ是for software timer的（所谓software timer就是说该timer是基于系统tick的）。NET_TX_SOFTIRQ和NET_RX_SOFTIRQ是用于网卡数据收发的。BLOCK_SOFTIRQ和BLOCK_IOPOLL_SOFTIRQ是用于block device的。SCHED_SOFTIRQ用于多CPU之间的负载均衡的。HRTIMER_SOFTIRQ用于高精度timer的。RCU_SOFTIRQ是处理RCU的。这些具体使用情景分析会在各自的子系统中分析，本文只是描述softirq的工作原理。</p>
-
-<h4>2、softirq描述符</h4>
-
-<p>我们前面已经说了，softirq是静态定义的，也就是说系统中有一个定义softirq描述符的数组，而softirq number就是这个数组的index。这个概念和早期的静态分配的中断描述符概念是类似的。具体定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct softirq_action
-</span><span class='line'>{
-</span><span class='line'>&#9;void    (*action)(struct softirq_action *);
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>系统支持多少个软中断，静态定义的数组就会有多少个entry。<code>____cacheline_aligned</code>保证了在SMP的情况下，softirq_vec是对齐到cache line的。softirq描述符非常简单，只有一个action成员，表示如果触发了该softirq，那么应该调用action回调函数来处理这个soft irq。对于硬件中断而言，其mask、ack等都是和硬件寄存器相关并封装在irq chip函数中，对于softirq，没有硬件寄存器，只有“软件寄存器”，定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>typedef struct {
-</span><span class='line'>&#9;unsigned int __softirq_pending;
-</span><span class='line'>#ifdef CONFIG_SMP
-</span><span class='line'>&#9;unsigned int ipi_irqs[NR_IPI];
-</span><span class='line'>#endif
-</span><span class='line'>} ____cacheline_aligned irq_cpustat_t;
-</span><span class='line'>
-</span><span class='line'>irq_cpustat_t irq_stat[NR_CPUS] ____cacheline_aligned;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ipi_irqs这个成员用于处理器之间的中断，我们留到下一个专题来描述。<code>__softirq_pending</code>就是这个“软件寄存器”。softirq采用谁触发，谁负责处理的。例如：当一个驱动的硬件中断被分发给了指定的CPU，并且在该中断handler中触发了一个softirq，那么该CPU负责调用该softirq number对应的action callback来处理该软中断。因此，这个“软件寄存器”应该是每个CPU拥有一个（专业术语叫做banked register）。为了性能，irq_stat中的每一个entry被定义对齐到cache line。</p>
-
-<h4>3、如何注册一个softirq</h4>
-
-<p>通过调用open_softirq接口函数可以注册softirq的action callback函数，具体如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void open_softirq(int nr, void (*action)(struct softirq_action *))
-</span><span class='line'>{
-</span><span class='line'>&#9;softirq_vec[nr].action = action;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>softirq_vec是一个多CPU之间共享的数据，不过，由于所有的注册都是在系统初始化的时候完成的，那时候，系统是串行执行的。此外，softirq是静态定义的，每个entry（或者说每个softirq number）都是固定分配的，因此，不需要保护。</p>
-
-<h4>4、如何触发softirq？</h4>
-
-<p>在linux kernel中，可以调用raise_softirq这个接口函数来触发本地CPU上的softirq，具体如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void raise_softirq(unsigned int nr)
-</span><span class='line'>{
-</span><span class='line'>&#9;unsigned long flags;
-</span><span class='line'>
-</span><span class='line'>&#9;local_irq_save(flags);
-</span><span class='line'>&#9;raise_softirq_irqoff(nr);
-</span><span class='line'>&#9;local_irq_restore(flags);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>虽然大部分的使用场景都是在中断handler中（也就是说关闭本地CPU中断）来执行softirq的触发动作，但是，这不是全部，在其他的上下文中也可以调用raise_softirq。因此，触发softirq的接口函数有两个版本，一个是raise_softirq，有关中断的保护，另外一个是raise_softirq_irqoff，调用者已经关闭了中断，不需要关中断来保护“soft irq status register”。</p>
-
-<p>所谓trigger softirq，就是在<code>__softirq_pending</code>（也就是上面说的soft irq status register）的某个bit置一。从上面的定义可知，<code>__softirq_pending</code>是per cpu的，因此不需要考虑多个CPU的并发，只要disable本地中断，就可以确保对，<code>__softirq_pending</code>操作的原子性。</p>
-
-<p>具体raise_softirq_irqoff的代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>inline void raise_softirq_irqoff(unsigned int nr)
-</span><span class='line'>{
-</span><span class='line'>&#9;__raise_softirq_irqoff(nr); ---------- （1）
-</span><span class='line'>
-</span><span class='line'>&#9;if (!in_interrupt())
-</span><span class='line'>&#9;&#9;wakeup_softirqd();      ---------- （2）
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>（1）<code>__raise_softirq_irqoff</code>函数设定本CPU上的<code>__softirq_pending</code>的某个bit等于1，具体的bit是由soft irq number（nr参数）指定的。</p>
-
-<p>（2）如果在中断上下文，我们只要set <code>__softirq_pending</code>的某个bit就OK了，在中断返回的时候自然会进行软中断的处理。但是，如果在context上下文调用这个函数的时候，我们必须要调用wakeup_softirqd函数用来唤醒本CPU上的softirqd这个内核线程。具体softirqd的内容请参考下一个章节。</p>
-
-<h4>5、disable/enable softirq</h4>
-
-<p>在linux kernel中，可以使用local_irq_disable和local_irq_enable来disable和enable本CPU中断。和硬件中断一样，软中断也可以disable，接口函数是local_bh_disable和local_bh_enable。虽然和想像的local_softirq_enable/disable有些出入，不过bh这个名字更准确反应了该接口函数的意涵，因为local_bh_disable/enable函数就是用来disable/enable bottom half的，这里就包括softirq和tasklet。</p>
-
-<p>先看disable吧，毕竟禁止bottom half比较简单：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void local_bh_disable(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;__local_bh_disable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static __always_inline void __local_bh_disable_ip(unsigned long ip, unsigned int cnt)
-</span><span class='line'>{
-</span><span class='line'>&#9;preempt_count_add(cnt);
-</span><span class='line'>&#9;barrier();
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>看起来disable bottom half比较简单，就是讲current thread info上的preempt_count成员中的softirq count的bit field9～15加上一就OK了。barrier是优化屏障（Optimization barrier），会在内核同步系列文章中描述。</p>
-
-<p>enable函数比较复杂，如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void local_bh_enable(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;__local_bh_enable_ip(_THIS_IP_, SOFTIRQ_DISABLE_OFFSET);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void __local_bh_enable_ip(unsigned long ip, unsigned int cnt)
-</span><span class='line'>{
-</span><span class='line'>&#9;WARN_ON_ONCE(in_irq() || irqs_disabled()); --------- （1）
-</span><span class='line'>
-</span><span class='line'>&#9;preempt_count_sub(cnt - 1);                --------- （2）
-</span><span class='line'>
-</span><span class='line'>&#9;if (unlikely(!in_interrupt() && local_softirq_pending())) {  ------- （3）
-</span><span class='line'>&#9;&#9;do_softirq();
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;preempt_count_dec();                       --------- （4）
-</span><span class='line'>&#9;preempt_check_resched();
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>（1）disable/enable bottom half是一种内核同步机制。在硬件中断的handler（top half）中，不应该调用disable/enable bottom half函数来保护共享数据，因为bottom half其实是不可能抢占top half的。同样的，soft irq也不会抢占另外一个soft irq的执行，也就是说，一旦一个softirq handler被调度执行（无论在哪一个processor上），那么，本地的softirq handler都无法抢占其运行，要等到当前的softirq handler运行完毕后，才能执行下一个soft irq handler。注意：上面我们说的是本地，是local，softirq handler是可以在多个CPU上同时运行的，但是，linux kernel中没有disable all softirq的接口函数（就好像没有disable all CPU interrupt的接口一样，注意体会local_bh_enable/disable中的local的含义）。</p>
-
-<p>说了这么多，一言以蔽之，local_bh_enable/disable是给进程上下文使用的，用于防止softirq handler抢占local_bh_enable/disable之间的临界区的。</p>
-
-<p>irqs_disabled接口函数可以获知当前本地CPU中断是否是disable的，如果返回1，那么当前是disable 本地CPU的中断的。如果irqs_disabled返回1，有可能是下面这样的代码造成的：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>local_irq_disable();
-</span><span class='line'>......
-</span><span class='line'>local_bh_disable();
-</span><span class='line'>
-</span><span class='line'>......
-</span><span class='line'>
-</span><span class='line'>local_bh_enable();
-</span><span class='line'>......
-</span><span class='line'>local_irq_enable();</span></code></pre></td></tr></table></div></figure>
-
-
-<p>本质上，关本地中断是一种比关本地bottom half更强劲的锁，关本地中断实际上是禁止了top half和bottom half抢占当前进程上下文的运行。也许你会说：这也没有什么，就是有些浪费，至少代码逻辑没有问题。但事情没有这么简单，在<code>local_bh_enable---&gt;do_softirq---&gt;__do_softirq</code>中，有一条无条件打开当前中断的操作，也就是说，原本想通过local_irq_disable/local_irq_enable保护的临界区被破坏了，其他的中断handler可以插入执行，从而无法保证local_irq_disable/local_irq_enable保护的临界区的原子性，从而破坏了代码逻辑。</p>
-
-<p>in_irq()这个函数如果不等于0的话，说明local_bh_enable被irq_enter和irq_exit包围，也就是说在中断handler中调用了local_bh_enable/disable。这道理是和上面类似的，这里就不再详细描述了。</p>
-
-<p>（2）在local_bh_disable中我们为preempt_count增加了SOFTIRQ_DISABLE_OFFSET，在local_bh_enable函数中应该减掉同样的数值。这一步，我们首先减去了（SOFTIRQ_DISABLE_OFFSET-1），为何不一次性的减去SOFTIRQ_DISABLE_OFFSET呢？考虑下面运行在进程上下文的代码场景：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>......
-</span><span class='line'>
-</span><span class='line'>local_bh_disable
-</span><span class='line'>
-</span><span class='line'>...需要被保护的临界区...
-</span><span class='line'>
-</span><span class='line'>local_bh_enable
-</span><span class='line'>......</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在临界区内，有进程context 和softirq共享的数据，因此，在进程上下文中使用local_bh_enable/disable进行保护。假设在临界区代码执行的时候，发生了中断，由于代码并没有阻止top half的抢占，因此中断handler会抢占当前正在执行的thread。在中断handler中，我们raise了softirq，在返回中断现场的时候，由于disable了bottom half，因此虽然触发了softirq，但是不会调度执行。因此，代码返回临界区继续执行，直到local_bh_enable。一旦enable了bottom half，那么之前raise的softirq就需要调度执行了，因此，这也是为什么在local_bh_enable会调用do_softirq函数。</p>
-
-<p>调用do_softirq函数来处理pending的softirq的时候，当前的task是不能被抢占的，因为一旦被抢占，下一次该task被调度运行的时候很可能在其他的CPU上去了（还记得吗？softirq的pending 寄存器是per cpu的）。因此，我们不能一次性的全部减掉，那样的话有可能preempt_count等于0，那样就允许抢占了。因此，这里减去了（SOFTIRQ_DISABLE_OFFSET-1），既保证了softirq count的bit field9~15被减去了1，又保持了preempt disable的状态。</p>
-
-<p>（3）如果当前不是interrupt context的话，并且有pending的softirq，那么调用do_softirq函数来处理软中断。</p>
-
-<p>（4）该来的总会来，在step 2中我们少减了1，这里补上，其实也就是preempt count-1。</p>
-
-<p>（5）在softirq handler中很可能wakeup了高优先级的任务，这里最好要检查一下，看看是否需要进行调度，确保高优先级的任务得以调度执行。</p>
-
-<h4>5、如何处理一个被触发的soft irq</h4>
-
-<p>我们说softirq是一种defering task的机制，也就是说top half没有做的事情，需要延迟到bottom half中来执行。那么具体延迟到什么时候呢？这是本节需要讲述的内容，也就是说soft irq是如何调度执行的。</p>
-
-<p>在上一节已经描述一个softirq被调度执行的场景，本节主要关注在中断返回现场时候调度softirq的场景。我们来看中断退出的代码，具体如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void irq_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;......
-</span><span class='line'>&#9;if (!in_interrupt() && local_softirq_pending())
-</span><span class='line'>&#9;&#9;invoke_softirq();
-</span><span class='line'>
-</span><span class='line'>&#9;......
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>代码中“!in_interrupt()”这个条件可以确保下面的场景不会触发sotfirq的调度：</p>
-
-<p>（1）中断handler是嵌套的。也就是说本次irq_exit是退出到上一个中断handler。当然，在新的内核中，这种情况一般不会发生，因为中断handler都是关中断执行的。</p>
-
-<p>（2）本次中断是中断了softirq handler的执行。也就是说本次irq_exit是不是退出到进程上下文，而是退出到上一个softirq context。这一点也保证了在一个CPU上的softirq是串行执行的（注意：多个CPU上还是有可能并发的）</p>
-
-<p>我们继续看invoke_softirq的代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void invoke_softirq(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (!force_irqthreads) {
-</span><span class='line'>#ifdef CONFIG_HAVE_IRQ_EXIT_ON_IRQ_STACK
-</span><span class='line'>&#9;&#9;__do_softirq();
-</span><span class='line'>#else
-</span><span class='line'>&#9;&#9;do_softirq_own_stack();
-</span><span class='line'>#endif
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;wakeup_softirqd();
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>force_irqthreads是和强制线程化相关的，主要用于interrupt handler的调试（一般而言，在线程环境下比在中断上下文中更容易收集调试数据）。如果系统选择了对所有的interrupt handler进行线程化处理，那么softirq也没有理由在中断上下文中处理（中断handler都在线程中执行了，softirq怎么可能在中断上下文中执行）。本身invoke_softirq这个函数是在中断上下文中被调用的，如果强制线程化，那么系统中所有的软中断都在sofirq的daemon进程中被调度执行。</p>
-
-<p>如果没有强制线程化，softirq的处理也分成两种情况，主要是和softirq执行的时候使用的stack相关。如果arch支持单独的IRQ STACK，这时候，由于要退出中断，因此irq stack已经接近全空了（不考虑中断栈嵌套的情况，因此新内核下，中断不会嵌套），因此直接调用<code>__do_softirq()</code>处理软中断就OK了，否则就调用do_softirq_own_stack函数在softirq自己的stack上执行。当然对ARM而言，softirq的处理就是在当前的内核栈上执行的，因此do_softirq_own_stack的调用就是调用<code>__do_softirq()</code>，代码如下（删除了部分无关代码）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>asmlinkage void __do_softirq(void)
-</span><span class='line'>{
-</span><span class='line'>......
-</span><span class='line'>&#9;pending = local_softirq_pending();  ----------- 获取softirq pending的状态
-</span><span class='line'>&#9;__local_bh_disable_ip(_RET_IP_, SOFTIRQ_OFFSET); ---- 标识下面的代码是正在处理softirq
-</span><span class='line'>&#9;cpu = smp_processor_id();
-</span><span class='line'>restart:
-</span><span class='line'>&#9;set_softirq_pending(0);  ------------- 清除pending标志
-</span><span class='line'>&#9;local_irq_enable();      ------------- 打开中断，softirq handler是开中断执行的
-</span><span class='line'>&#9;h = softirq_vec;         ------------- 获取软中断描述符指针
-</span><span class='line'>
-</span><span class='line'>&#9;while ((softirq_bit = ffs(pending))) { --------- 寻找pending中第一个被设定为1的bit
-</span><span class='line'>&#9;&#9;unsigned int vec_nr;
-</span><span class='line'>&#9;&#9;int prev_count;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;h += softirq_bit - 1; ----------- 指向pending的那个软中断描述符
-</span><span class='line'>&#9;&#9;vec_nr = h - softirq_vec; ------- 获取soft irq number
-</span><span class='line'>&#9;&#9;h-&gt;action(h);         ----------- 指向softirq handler
-</span><span class='line'>&#9;&#9;h++;
-</span><span class='line'>&#9;&#9;pending &gt;&gt;= softirq_bit;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;local_irq_disable();      ----------- 打开中断
-</span><span class='line'>
-</span><span class='line'>&#9;pending = local_softirq_pending(); ------ （注1）
-</span><span class='line'>&#9;if (pending) {
-</span><span class='line'>&#9;&#9;if (time_before(jiffies, end) && !need_resched() &&
-</span><span class='line'>&#9;&#9;&#9;--max_restart)
-</span><span class='line'>&#9;&#9;&#9;goto restart;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;wakeup_softirqd();
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;__local_bh_enable(SOFTIRQ_OFFSET); ----------- 标识softirq处理完毕
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>（注1）再次检查softirq pending，有可能上面的softirq handler在执行过程中，发生了中断，又raise了softirq。如果的确如此，那么我们需要跳转到restart那里重新处理soft irq。当然，也不能总是在这里不断的loop，因此linux kernel设定了下面的条件：</p>
-
-<p>（1）softirq的处理时间没有超过2个ms</p>
-
-<p>（2）上次的softirq中没有设定TIF_NEED_RESCHED，也就是说没有有高优先级任务需要调度</p>
-
-<p>（3）loop的次数小于 10次</p>
-
-<p>因此，只有同时满足上面三个条件，程序才会跳转到restart那里重新处理soft irq。否则wakeup_softirqd就OK了。这样的设计也是一个平衡的方案。一方面照顾了调度延迟：本来，发生一个中断，系统期望在限定的时间内调度某个进程来处理这个中断，如果softirq handler不断触发，其实linux kernel是无法保证调度延迟时间的。另外一方面，也照顾了硬件的thoughput：已经预留了一定的时间来处理softirq。</p>
+  <div class="entry-content"><p><a href="/download/kernel/ipv6%E5%88%9D%E5%A7%8B%E5%8C%96%E5%92%8C%E5%A4%84%E7%90%86%E6%B5%81%E7%A8%8B%E5%88%86%E6%9E%90.pdf">ipv6初始化和处理流程分析.pdf</a></p>
 </div>
   
   
@@ -661,7 +91,7 @@ if (query != null) {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-stack2/">内核源码分析之linux内核栈</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/15/kernel-net-tcp_urg/">TCP的URG标志和内核实现</a></h2>
     
     
       <p class="meta">
@@ -670,655 +100,67 @@ if (query != null) {
 
 
 
-<time class='entry-date' datetime='2015-05-07T15:54:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:54:00</span></time>
+<time class='entry-date' datetime='2015-05-15T13:51:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>13:51:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/liangning/p/3879177.html">http://www.cnblogs.com/liangning/p/3879177.html</a></p>
-
-<p>基于3.16-rc4</p>
-
-<p>在3.16-rc4内核源码中，内核给每个进程分配的内核栈大小为8KB。这个内核栈被称为异常栈，在进程的内核空间运行时或者执行异常处理程序时，使用的都是异常栈，看下异常栈的代码（include/linux/sched.h）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>union thread_union {
-</span><span class='line'>&#9;struct thread_info thread_info;
-</span><span class='line'>&#9;unsigned long stack[THREAD_SIZE/sizeof(long)];
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>THREAD_SIZE值为8KB，因此内核为进程的异常栈（内核栈）分配了两个页框大小（页框大小4KB）。另外，进程的thread_info结构体保存在栈顶部。</p>
-
-<p>此外，内核为每个cpu分配一个硬中断栈和一个软中断栈（这两个栈也是内核栈），用来执行中断服务例程和下半部（软中断），看看代码（arch/x86/kernel/irq_32.c）。这两个栈属于cpu，不属于进程，这和异常栈是有区别的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_PER_CPU(struct irq_stack *, hardirq_stack);
-</span><span class='line'>DEFINE_PER_CPU(struct irq_stack *, softirq_stack);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>定义了两个数组hardirq_stack和softirq_stack，每个数组元素对应一个cpu，指向了该cpu的硬中断栈或者软中断栈。再来看下struct irq_stack结构体（arch/x86/include/asm/processor.h）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct irq_stack {
-</span><span class='line'>&#9;u32                     stack[THREAD_SIZE/sizeof(u32)];
-</span><span class='line'>} __aligned(THREAD_SIZE);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可见，硬中断栈和软中断栈的大小均为8KB。</p>
-
-<p>内核在执行中断处理程序时，在do_IRQ函数中会调用handle_irq函数，在handle_irq函数中要进行堆栈切换，代码如下（arch/x86/kernel/irq_32.c）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>bool handle_irq(unsigned irq, struct pt_regs *regs)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct irq_desc *desc;
-</span><span class='line'>&#9;int overflow;
-</span><span class='line'>
-</span><span class='line'>&#9;overflow = check_stack_overflow();
-</span><span class='line'>
-</span><span class='line'>&#9;desc = irq_to_desc(irq);
-</span><span class='line'>&#9;if (unlikely(!desc))
-</span><span class='line'>&#9;return false;
-</span><span class='line'>
-</span><span class='line'>&#9;if (user_mode_vm(regs) || !execute_on_irq_stack(overflow, desc, irq)) {
-</span><span class='line'>&#9;&#9;if (unlikely(overflow))
-</span><span class='line'>&#9;&#9;&#9;print_stack_overflow();
-</span><span class='line'>&#9;&#9;desc-&gt;handle_irq(irq, desc);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;return true;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第12行中执行execute_on_irq_stack函数来判断是否需要堆栈切换，如果不需要，则执行if体的中断服务例程，即在当前堆栈中执行中断服务例程，如果需要切换堆栈，则在execute_on_irq_stack函数中切换堆栈并在该函数中（新堆栈中）执行中断服务例程。下面看下execute_on_irq_stack代码（arch/x86/kernel/irq_32.c）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int
-</span><span class='line'>execute_on_irq_stack(int overflow, struct irq_desc *desc, int irq)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct irq_stack *curstk, *irqstk;
-</span><span class='line'>&#9;u32 *isp, *prev_esp, arg1, arg2;
-</span><span class='line'>
-</span><span class='line'>&#9;curstk = (struct irq_stack *) current_stack();
-</span><span class='line'>&#9;irqstk = __this_cpu_read(hardirq_stack);
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * this is where we switch to the IRQ stack. However, if we are
-</span><span class='line'>&#9; * already using the IRQ stack (because we interrupted a hardirq
-</span><span class='line'>&#9; * handler) we can't do that and just have to keep using the
-</span><span class='line'>&#9; * current stack (which is the irq stack already after all)
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (unlikely(curstk == irqstk))
-</span><span class='line'>&#9;    return 0;
-</span><span class='line'>
-</span><span class='line'>&#9;isp = (u32 *) ((char *)irqstk + sizeof(*irqstk));
-</span><span class='line'>
-</span><span class='line'>&#9;/* Save the next esp at the bottom of the stack */
-</span><span class='line'>&#9;prev_esp = (u32 *)irqstk;
-</span><span class='line'>&#9;*prev_esp = current_stack_pointer;
-</span><span class='line'>
-</span><span class='line'>&#9;if (unlikely(overflow))
-</span><span class='line'>&#9;    call_on_stack(print_stack_overflow, isp);
-</span><span class='line'>
-</span><span class='line'>&#9;asm volatile("xchgl    %%ebx,%%esp    \n"
-</span><span class='line'>&#9;         "call    *%%edi        \n"
-</span><span class='line'>&#9;         "movl    %%ebx,%%esp    \n"
-</span><span class='line'>&#9;         : "=a" (arg1), "=d" (arg2), "=b" (isp)
-</span><span class='line'>&#9;         :  "0" (irq),   "1" (desc),  "2" (isp),
-</span><span class='line'>&#9;        "D" (desc-&gt;handle_irq)
-</span><span class='line'>&#9;         : "memory", "cc", "ecx");
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第7行获取当前堆栈的指针，第8行获取本地cpu的硬中断栈指针，第16行对二者进行比较，如果相等，则不需要切换堆栈（说明当前堆栈就是硬中断栈，也说明是在中断处理程序中时又发生了中断）。如果不相等，就要进行堆栈切换，第22-23行将当前堆栈指针保存在将要切换到的堆栈中（用于返回）。第28行，交换ebx和esp寄存器的值（实现了堆栈切换，将中断栈指针给了esp），第29行跳转到相应的中断服务例程，第30行从中断服务例程返回后，又将原来的堆栈指针赋给esp，切换到原先堆栈。第33行将中断服务例程函数名存放在%edi中。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-stack/">中断栈溢出后的结果</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-07T15:54:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:54:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a></p>
-
-<p>说一下上文中最开始提到的“某个问题”：如果一台主机网卡比较多，然后每个网卡分队列又比较多，总之结果就是系统里的网卡设备的中断号比较多（关于超过256个中断数的情况，请见参考1，2，3），一旦所有这些中断都绑定到同一个CPU，那么如果网卡收到数据包进而触发中断，而众多硬中断一嵌套就非常容易出现中断栈溢出。一旦中断栈溢出，那么将会导致怎样的结果，这曾在之前的文章里隐含的提到过，这里再重新整理一遍。</p>
-
-<p>在继续下面的描述之前，先看两个知识点：</p>
-
-<h5>1，Linux 2.4.x的中断栈：</h5>
-
-<p>a)，由硬中断/软中断共同使用同一个中断栈<br/>
-b)，中断栈与内核栈共享一个栈<br/>
-c)，中断执行的时候使用的栈就是当前进程的内核栈</p>
-
-<h5>2，Linux 2.6.x的中断栈：</h5>
-
-<p>a)，硬中断与软中断分离使用不同的中断栈<br/>
-b)，中断栈与内核栈分离<br/>
-c)，X86_64 double fault、NMI还可以有额外的栈（64bit特性：IST(Interrupt Stack Table)）</p>
-
-<p>可以看到，对于Linux 2.4.x内核而言，因为中断处理函数使用内核栈作为中断栈，所以导致更加容易发生内核栈溢出（因内核函数本身用栈过多导致溢出，或内核函数本身还未导致内核栈溢出，但此时来了一个中断，因中断函数使用栈而导致溢出，即中断函数成了压死骆驼的最后一根稻草），而内核栈溢出的直接结果就是踩坏task结构体，从而无法正常执行对应的task进程而出现oops宕机。</p>
-
-<p>由于“中断执行的时候使用的栈就是当前进程的内核栈”，所以如果是执行到中断函数后才溢出，那么导致oops里提示的进程信息可能每次都不一样，因此如果出现这种情况，需要考虑是中断函数导致内核栈溢出，否则需怀疑普通的内核函数导致栈溢出即可。</p>
-
-<p>对于Linux 2.6.x内核而言，因为其中断/内核栈分离、软/硬中断栈分离，即每个CPU私有两个栈（见下面注释）分别处理软中断和硬中断，因此出现内核栈溢出，特别是中断栈溢出的概率大大降低。</p>
-
-<p>注释：这个说法来之书本《Understanding.the.Linux.Kernel.3rd.Edition》4.6.1.4. Multiple Kernel Mode stacks，而这本书针对的内核版本是2.6.11，且主要是指32位架构，所以与现在的新版内核源码有些许出入（比如现在情况的栈大小可能是占用2页），但这些细微改变与本文的具体问题相关不大（无非是溢出的难易程度问题），这里不再深入研究，具体情况请参考源代码自行斟酌。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>The hard IRQ stack is used when handling interrupts. There is one hard IRQ stack for each CPU in the system, and each stack is contained in a single page frame.
-</span><span class='line'>
-</span><span class='line'>The soft IRQ stack is used when handling deferrable functions (softirqs or tasklets; see the later section “Softirqs and Tasklets”). There is one soft IRQ stack for each CPU in the system, and each stack is contained in a single page frame. </span></code></pre></td></tr></table></div></figure>
-
-
-<p>回到本文的主题，在之前的文章里提到过，即如果中断/异常处理函数本身在处理的过程中出现异常，那么就有可能发生double fault，比如中断栈溢出。中断栈溢出导致的最终结果有两种情况，这由所使用的具体Linux内核版本来决定，更具体点说是由double fault异常的栈是否单独来决定（见参考1）。</p>
-
-<p>1，double fault的栈被单独出来<br/>
-这意味着double fault的处理函数还能正常执行，因此打印oops，宕机。</p>
-
-<p>2，double fault的栈没有被单独出来<br/>
-这意味着double fault的处理函数也无法正常执行，进而触发triple fault，机器直接重启。</p>
-
-<p>对于86-64架构下的Linux 2.6.x内核，因为IST(Interrupt Stack Table)的帮助，所以中断栈溢出导致的最终结果就是打印oops，宕机。</p>
-
-<p>下面来看内核源码文档kernel-stacks，<br/>
-1，每一个活动线程都有一个内核栈，大小为2页。<br/>
-2，每一个cpu有一些专门的栈，只有当cpu执行在内核态时，这些栈才有用；一旦cpu回退到用户态，这些特定栈就不再包含任何有用数据。<br/>
-3，主要的特定栈有：<br/>
-a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提供给中断处理函数更多的栈空间。<br/>
-这里还提到，在2.6.x-i386下，如果设置内核栈只有4K，即CONFIG_4KSTACKS，那么中断栈也是单独开的。备注：这个已有修改，2010-06-29 x86: Always use irq stacks，即不管设置的内核栈是否只有4K，中断栈都是独立的了。</p>
-
-<p>另外，这里有个说法与前面的引用有点出入：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>The interrupt stack is also used when processing a softirq. </span></code></pre></td></tr></table></div></figure>
-
-
-<p>即软中断和硬中断一样，也是使用这个中断栈。</p>
-
-<p>b，x86_64所特有的（也就是i386没有，即同时2.6.30.8内核，32位的Linux就不具备下面所说的这个特性），为double fault或NMI单独准备的栈，这个特性被称为Interrupt Stack Table(IST)。每个cpu最多支持7个IST。关于IST的具体原理与实现暂且不说，直接来看当前已经分配的IST独立栈：</p>
-
-<ul>
-<li><p>STACKFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
-12号中断Stack Fault Exception (#SS)使用</p></li>
-<li><p>DOUBLEFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
-8号中断Double Fault Exception (#DF)使用</p></li>
-<li><p>NMI_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
-2号中断non-maskable interrupts (NMI)使用</p></li>
-<li><p>DEBUG_STACK. DEBUG_STKSZ<br/>
-1号中断硬件调试和3号中断软件调试使用</p></li>
-<li><p>MCE_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
-18号中断Machine Check Exception (#MC)使用</p></li>
-</ul>
-
-
-<p>正因为double fault异常处理函数所使用的栈被单独了出来，所以在出现中断栈溢出时，double fault异常的处理函数还能正常执行，顺利打印出oops信息。</p>
-
-<p>最后的最后，有补丁移除IST功能（貌似是因为如果没有IST功能，那么kvm可以得到更好的优化，具体请见参考5），但通过对比补丁修改与实际源码（2.6.30.8以及3.6.11）来看，这个补丁并没有合入mainline主线。</p>
-
-<h4>参考资料：</h4>
-
-<p>1，where is hardware timer interrupt?<br/>
-<a href="http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt">http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt</a></p>
-
-<p>2，The MSI Driver Guide HOWTO<br/>
-<a href="https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  ">https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8  </a>
-对应的翻译版：<a href="http://blog.csdn.net/reviver/article/details/6802347">http://blog.csdn.net/reviver/article/details/6802347</a></p>
-
-<p>3，[PATCH] x86: 64bit support more than 256 irq v2<br/>
-<a href="http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html">http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html</a></p>
-
-<p>4，How is an Interrupt handled in Linux?<br/>
-<a href="http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux">http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux</a></p>
-
-<p>5，Remove interrupt stack table usage from x86_64 kernel (v2)<br/>
-<a href="http://lwn.net/Articles/313029/  ">http://lwn.net/Articles/313029/  </a>
-<a href="http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741">http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741</a></p>
-
-<p>6，Interrupt Descriptor Table<br/>
-<a href="http://wiki.osdev.org/IDT">http://wiki.osdev.org/IDT</a></p>
-
-<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a> 或 <a href="http://lenky.info/?p=2247">http://lenky.info/?p=2247</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-irq/">对Linux x86-64架构上硬中断的重新认识</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-07T15:48:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:48:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a></p>
-
-<p>对于x86硬中断的概念，一直都落在理论的认识之上，直到这两天才（因某个问题）发现Linux的实现却并非如此，这里纠正一下（注意：Linux内核源码更新太快，一个说法的时效性太短，所以需注意我提到的香草内核版本，并且以x86-64架构为基准）。</p>
-
-<p>以前的认识：Linux对硬中断（本文如无特殊说明，都是指普通意义上的可屏蔽硬件中断）的处理有优先级概念，高优先级硬中断可以打断低优先级硬中断。</p>
-
-<h4>重新认识：</h4>
-
-<p>1，对于x86硬件而言，在文档325462.pdf卷3章节6.9 PRIORITY AMONG SIMULTANEOUS EXCEPTIONS AND INTERRUPTS 提到一个表格，是指如果在同一时刻有多个异常或中断到达，那么CPU会按照一个指定的优先级顺序对它们进行响应和服务，而并不是我之前所想的判断是否可相互打断执行的高低级别。</p>
-
-<p>2，对于Linux系统而言，硬中断之间并没有优先级的概念（虽然Intel CPU提供支持，请参考文档325462.pdf卷3章节10.8.3 Interrupt, Task, and Processor Priority），或者说优先级只有两个，全部关闭或全部开启，如下：</p>
-
-<blockquote><blockquote><p>Regardless of what the hardware might support, typical UNIX-type systems only make use of two levels: the minimum (all interrupts enabled) and the maximum (all interrupts disabled).</p></blockquote></blockquote>
-
-<p>这意味着，如果一个硬中断处理函数正在执行，只要当前是处于开启中断的情况，那么此时发生的任何另外一个中断都可以打断当前处理函数，从而出现中断嵌套的情况。
-值得注意的是，Linux提供对单个中断开启/禁止的接口（以软件实现为主，比如给对应中断描述符desc的status打上IRQ_DISABLED旗标）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void disable_irq(unsigned int irq)
-</span><span class='line'>void enable_irq(unsigned int irq)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面来看看Linux的实际处理，其硬中断的一般处理流程（具体可见参考1、2、3以及源代码，以2.6.30.8为例）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>硬件中断 -&gt; common_interrupt -&gt; do_IRQ -&gt; handle_irq -&gt; generic_handle_irq_desc -&gt; desc-&gt;handle_irq或__do_IRQ。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中desc->handle_irq是一个回调函数，会根据不同中断类型（I/O APIC、MSI）有不同的指向，比如：handle_fasteoi_irq()、handle_edge_irq()，这可以参考设置函数ioapic_register_intr()和setup_msi_irq()。通过/proc/interrupts可以看到各个中断的具体类型：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost ~]# cat /proc/interrupts
-</span><span class='line'>&#9;       CPU0       CPU1      
-</span><span class='line'>  0:        888          0   IO-APIC-edge      timer
-</span><span class='line'>  1:         96        112   IO-APIC-edge      i8042
-</span><span class='line'>  3:          1          0   IO-APIC-edge   
-</span><span class='line'>  4:          1          0   IO-APIC-edge   
-</span><span class='line'>  7:          0          0   IO-APIC-edge      parport0
-</span><span class='line'>  8:          1          0   IO-APIC-edge      rtc0
-</span><span class='line'>  9:          0          0   IO-APIC-fasteoi   acpi
-</span><span class='line'> 12:        204          0   IO-APIC-edge      i8042
-</span><span class='line'> 14:          0          0   IO-APIC-edge      ata_piix
-</span><span class='line'> 15:     460641        900   IO-APIC-edge      ata_piix
-</span><span class='line'> 16:          0          0   IO-APIC-fasteoi   Ensoniq AudioPCI
-</span><span class='line'> 17:     118347          0   IO-APIC-fasteoi   ehci_hcd:usb1, ioc0
-</span><span class='line'> 18:         70          0   IO-APIC-fasteoi   uhci_hcd:usb2
-</span><span class='line'> 19:     115143          0   IO-APIC-fasteoi   eth0
-</span><span class='line'> 24:          0          0   PCI-MSI-edge      pciehp
-</span><span class='line'> 25:          0          0   PCI-MSI-edge      pciehp
-</span><span class='line'> 26:          0          0   PCI-MSI-edge      pciehp
-</span><span class='line'> 27:          0          0   PCI-MSI-edge      pciehp
-</span><span class='line'> 28:          0          0   PCI-MSI-edge      pciehp
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>不管是desc->handle_irq还是__do_IRQ，它们都会调入到另外一个函数handle_IRQ_event()。重点：从CPU接收到中断信号并开始处理，到这个函数为止，都是处于中断禁止状态。为什么？很简单，因为Intel开发者手册上是这么说的，在文档325462.pdf卷3章节6.8.1 Masking Maskable Hardware Interrupts提到：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>When an interrupt is handled through an interrupt gate, the IF flag is automati-
-</span><span class='line'>cally cleared, which disables maskable hardware interrupts. (If an interrupt is
-</span><span class='line'>handled through a trap gate, the IF flag is not cleared.)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在CPU开始处理一个硬中断到进入函数handle_IRQ_event()为止的这段时间里，因为处于中断禁止状态，所以不会出现被其它中断打断的情况。但是，在进入到函数handle_IRQ_event()后，立马有了这么两句：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
-</span><span class='line'>{
-</span><span class='line'>&#9;irqreturn_t ret, retval = IRQ_NONE;
-</span><span class='line'>&#9;unsigned int status = 0;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (!(action-&gt;flags & IRQF_DISABLED))
-</span><span class='line'>&#9;    local_irq_enable_in_hardirq();
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>函数local_irq_enable_in_hardirq()的定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_LOCKDEP
-</span><span class='line'># define local_irq_enable_in_hardirq()  do { } while (0)
-</span><span class='line'>#else
-</span><span class='line'># define local_irq_enable_in_hardirq()  local_irq_enable()
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>宏CONFIG_LOCKDEP用于表示当前是否开启内核Lockdep功能，这是一个调试功能，用于检测潜在的死锁类风险，如果开启，那么函数local_irq_enable_in_hardirq()为空，即继续保持中断禁止状态，为什么Lockdep功能需要保持中断禁止待后文再述，这里考虑一般情况，即不开启Lockdep功能，那么执行函数local_irq_enable_in_hardirq()就会开启中断。
-看函数handle_IRQ_event()里的代码，如果没有带上IRQF_DISABLED旗标，那么就会执行函数local_irq_enable_in_hardirq()，从而启用中断。旗标IRQF_DISABLED可在利用函数request_irq()注册中断处理回调时设置，比如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (request_irq(uart-&gt;port.irq, bfin_serial_rx_int, IRQF_DISABLED,
-</span><span class='line'>&#9; "BFIN_UART_RX", uart)) {</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果没有设置，那么到函数handle_IRQ_event()这里的代码后，因为中断已经开启，当前中断的后续处理就可能被其它中断打断，从而出现中断嵌套的情况。</p>
-
-<p>3，如果新来的中断类型与当前正在执行的中断类型相同，那么会暂时挂起。主要实现代码在函数__do_IRQ()（handle_fasteoi_irq()、handle_edge_irq()类似）内：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * If the IRQ is disabled for whatever reason, we cannot
-</span><span class='line'> * use the action we have.
-</span><span class='line'> */
-</span><span class='line'>action = NULL;
-</span><span class='line'>if (likely(!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))) {
-</span><span class='line'>&#9;action = desc-&gt;action;
-</span><span class='line'>&#9;status &= ~IRQ_PENDING; /* we commit to handling */
-</span><span class='line'>&#9;status |= IRQ_INPROGRESS; /* we are handling it */
-</span><span class='line'>}
-</span><span class='line'>desc-&gt;status = status;
-</span><span class='line'> 
-</span><span class='line'>/*
-</span><span class='line'> * If there is no IRQ handler or it was disabled, exit early.
-</span><span class='line'> * Since we set PENDING, if another processor is handling
-</span><span class='line'> * a different instance of this same irq, the other processor
-</span><span class='line'> * will take care of it.
-</span><span class='line'> */
-</span><span class='line'>if (unlikely(!action))
-</span><span class='line'>&#9;goto out;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>逻辑很简单，如果当前中断被禁止（IRQ_DISABLED）或正在执行（IRQ_INPROGRESS），那么goto cot，所以同种类型中断不会相互嵌套。</p>
-
-<p>4，从这个补丁开始，Linux内核已经全面禁止硬中断嵌套了，即从2.6.35开始，默认就是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>run the irq handlers with interrupts disabled.</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为这个补丁，所以旗标IRQF_DISABLED没用了，mainline内核在逐步删除它。</p>
-
-<p>我仔细检查了一下，对于2.6.34以及以前的内核，如果要合入这个补丁，那么有略微影响的主要是两个慢速驱动，分别为rtc-twl4030和twl4030-usb，需要按照类似开启Lockdep功能一样：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_LOCKDEP
-</span><span class='line'>/* WORKAROUND for lockdep forcing IRQF_DISABLED on us, which
-</span><span class='line'> * we don't want and can't tolerate.  Although it might be
-</span><span class='line'> * friendlier not to borrow this thread context...
-</span><span class='line'> */
-</span><span class='line'>local_irq_enable();
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进行主动启用中断。还有另个一个慢速驱动IDE，其驱动中调用的是函数local_irq_enable_in_hardirq()，即它在开启Lockdep功能的情况下并没有明确要求启用中断，所以它应该不受补丁合入影响。嘛，我只是理论分析研究一下，仅供参考，如有风险，请实际操作者自行承担，:)。其它请看参考4，5，6。</p>
-
-<h4>参考：</h4>
-
-<p>1，Linux下386中断处理<br/>
-2，Linux中断基础构架<br/>
-3，linux源码entry_32.S中interrupt数组的分析<br/>
-4，<a href="http://lwn.net/Articles/321663/  ">http://lwn.net/Articles/321663/  </a>
-5，<a href="http://lwn.net/Articles/380931/  ">http://lwn.net/Articles/380931/  </a>
-6，<a href="http://thread.gmane.org/gmane.linux.kernel/801267">http://thread.gmane.org/gmane.linux.kernel/801267</a></p>
-
-<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a> 或 <a href="http://lenky.info/?p=2245">http://lenky.info/?p=2245</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-mm-splice/">Linux 中的零拷贝技术 splice</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-07T15:26:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:26:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415">http://hi.baidu.com/renguihuashi/item/ef71f8e28d74f5f22b09a415</a></p>
-
-<p>linux下如何实现文件对拷呢？</p>
-
-<p>最容易想到的方法就是，申请一份内存buf，read 源文件一段数据到buf，然后将此buf write到目标文件，示例代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>char buf[max_read];
-</span><span class='line'>off_t size = stat_buf.st_size;
-</span><span class='line'>while ( off_in &lt; size ) {
-</span><span class='line'>&#9;int len = size - off_in &gt; max_read ? max_read : size - off_in;
-</span><span class='line'>&#9;len = read(f_in, buf, len);
-</span><span class='line'>&#9;off_in += len;
-</span><span class='line'>&#9;write(f_out, buf, len);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>还有一种大家都知道的方式，就是通过mmap实现，示例代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>size_t filesize = stat_buf.st_size;
-</span><span class='line'>source = mmap(0, filesize, PROT_READ, MAP_SHARED, f_in, 0);
-</span><span class='line'>target = mmap(0, filesize, PROT_WRITE, MAP_SHARED, f_out, 0);
-</span><span class='line'>memcpy(target, source, filesize);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为mmap不需要内核态和用户态的内存拷贝，效率大大提高。</p>
-
-<p>本文还想介绍另外一种，是今天无意google到的，就是如标题所述，基于splice实现，splice是Linux 2.6.17新加入的系统调用，官方文档的描述是，用于在两个文件间移动数据，而无需内核态和用户态的内存拷贝，但需要借助管道（pipe）实现。大概原理就是通过pipe buffer实现一组内核内存页（pages of kernel memory）的引用计数指针（reference-counted pointers），数据拷贝过程中并不真正拷贝数据，而是创建一个新的指向内存页的指针。也就是说拷贝过程实质是指针的拷贝。示例代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int pipefd[2];
-</span><span class='line'>pipe( pipefd );
-</span><span class='line'>int max_read = 4096;
-</span><span class='line'>off_t size = stat_buf.st_size;
-</span><span class='line'>while ( off_in &lt; size ) {
-</span><span class='line'>&#9;int len = size - off_in &gt; max_read ? max_read : size - off_in;
-</span><span class='line'>&#9;len = splice(f_in, &off_in, pipefd[1], NULL, len, SPLICE_F_MORE |SPLICE_F_MOVE);
-</span><span class='line'>&#9;splice(pipefd[0], NULL, f_out, &off_out, len, SPLICE_F_MORE |SPLICE_F_MOVE);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用splice一定要注意，因为其借助管道实现，而管道有众所周知的空间限制问题，超过了限制就会hang住，所以每次写入管道的数据量好严格控制，保守的建议值是一个内存页大小，即4k。另外，off_in和off_out传递的是指针，其值splice会做一定变动，使用时应注意。</p>
-
-<p>splice kernel bug: <a href="https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae">https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=baff42ab1494528907bf4d5870359e31711746ae</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/phenix_lord/article/details/42012931">TCP的URG标志和内核实现之一：协议</a><br/>
+<a href="http://blog.csdn.net/phenix_lord/article/details/42046125">TCP的URG标志和内核实现之二：发送的实现</a><br/>
+<a href="http://blog.csdn.net/phenix_lord/article/details/42065897">TCP的URG标志和内核实现之三：接收的实现</a></p>
 
 <hr />
 
-<p><a href="http://ogris.de/howtos/splice.html">http://ogris.de/howtos/splice.html</a></p>
+<h3>TCP的URG标志和内核实现之一：协议</h3>
 
-<p><a href="http://blog.csdn.net/eroswang/article/details/1999034">http://blog.csdn.net/eroswang/article/details/1999034</a></p>
+<p>定义urgent数据的目的：<br/>
+urgent机制，是用于通知应用层需要接收urgent data，在urgent data接收完成后，通知应用层urgent data数据接收完毕。相关协议文本RFC793 RFC1122 RFC6093</p>
 
-<p><a href="http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file">http://stackoverflow.com/questions/1580923/how-can-i-use-linuxs-splice-function-to-copy-a-file-to-another-file</a></p>
+<h4>哪些数据是urgent data？</h4>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>EINVAL Target  file  system  doesn't  support  splicing; target file is
-</span><span class='line'>&#9;opened in append mode; neither of the descriptors  refers  to  a
-</span><span class='line'>&#9;pipe; or offset given for non-seekable device.</span></code></pre></td></tr></table></div></figure>
+<h5>协议规定</h5>
 
+<p>在TCP报头的URG位有效的时候，通过TCP报头中的urgent pointer来标识urgent data的位置，但是在urgent pointer的解析方式上各个协议文本的描述有差异：</p>
+
+<p>解读一：RFC793  P17，描述是“The urgent pointer points to the sequence number of the octet following the urgent data.”，在P41有描述“This mechanism permits a point in the data stream to be designated as the end of urgent information. Whenever this point is in advance of the receive sequence number (RCV.NXT) at the receiving TCP, that TCP must tell the user to go into &ldquo;urgent mode&rdquo;; when the receive sequence number catches up to the urgent pointer, the TCP must tell user to go”，可以认为是：当前接收的报文中SEQ在SEG.SEQ+Urgent Pointer之前的都是,而urgent pointer是第一个非urgent data（ TCP已经接受，但是还没有提交给应用的数据是不是呢？）</p>
+
+<p>解读二：在P56的描述是“If the urgent flag is set, then SND.UP &lt;-SND.NXT-1 and set the urgent pointer in the outgoing segments”，也就是urgent pointer是最后一个urgent data字节。而在RFC1122中消除了这一歧义：在P84中说明“the urgent pointer points to the sequence number of the LAST octet (not LAST+1) in a sequence of urgent data”</p>
+
+<h5>linux实现</h5>
+
+<p>虽然在RFC1122中消除了这一歧义，linux仍然使用了解读一的解析方式，如果要使用解读二定义的方式，需要使用tcp_stdurg这个配置项。</p>
+
+<h4>urgent data数据能有多长？</h4>
+
+<h5>协议规定</h5>
+
+<p>按照RFC793 P41的描述，长度不受限，RFC1122 P84中，更是明确了“A TCP MUST support a sequence of urgent data of any length”</p>
+
+<h5>linux实现</h5>
+
+<p>其实，linux只支持1BYTE的urgent data</p>
+
+<h4>urgent data与OOB数据</h4>
+
+<p>OOB数据说的是带外数据，也就是这些数据不是放到TCP流供读取的，而是通过额外的接口来获取，linux默认把urgent data实现为OOB数据；而按照协议的规定，urgent data不是out of band data</p>
+
+<p>由于OOB数据的协议和实现上存在很多不确定因素，因此现在已经不建议使用了</p>
 
 <hr />
 
-<h4>file to file sample</h4>
+<h3>TCP的URG标志和内核实现之二：发送的实现</h3>
+
+<p>Linxu内核在默认情况下，把urgent data实现为OOB数据</p>
+
+<h4>发送URG数据的接口</h4>
+
+<p>在内核态，使用kernel_sendmsg/kernel_sendpage完成发送，只不过需要加上MSG_OOB标志，表示要发送的URG数据。</p>
+
+<h4>URG数据发送接口的实现</h4>
+
+<p>分片主要在kernel_sendmsg中完成，在OOB数据的处理上，它和kernel_sendpage是一致</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1366,62 +208,1691 @@ a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提�
 <span class='line-number'>44</span>
 <span class='line-number'>45</span>
 <span class='line-number'>46</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define _GNU_SOURCE
-</span><span class='line'>#include &lt;fcntl.h&gt;
-</span><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>#include &lt;errno.h&gt;
-</span><span class='line'>#include &lt;string.h&gt;
-</span><span class='line'>#include &lt;time.h&gt;
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,  
+</span><span class='line'>&#9;&#9;size_t size)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;。。。。。。。。。。。。。。  
+</span><span class='line'>&#9;/*如果flags设置了MSG_OOB该接口其实返回的mss_now关闭了TSO功能*/  
+</span><span class='line'>&#9;mss_now = tcp_send_mss(sk, &size_goal, flags);  
+</span><span class='line'>&#9;。。。。。。。。。。。。。。  
+</span><span class='line'>&#9;while (--iovlen &gt;= 0) {  
+</span><span class='line'>&#9;&#9;size_t seglen = iov-&gt;iov_len;  
+</span><span class='line'>&#9;&#9;unsigned char __user *from = iov-&gt;iov_base;  
 </span><span class='line'>
-</span><span class='line'>int main(int argc, char **argv)
+</span><span class='line'>&#9;&#9;iov++;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;while (seglen &gt; 0) {  
+</span><span class='line'>&#9;&#9;&#9;int copy = 0;  
+</span><span class='line'>&#9;&#9;&#9;int max = size_goal;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;skb = tcp_write_queue_tail(sk);  
+</span><span class='line'>&#9;&#9;&#9;if (tcp_send_head(sk)) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (skb-&gt;ip_summed == CHECKSUM_NONE)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;max = mss_now;  
+</span><span class='line'>&#9;&#9;&#9;&#9;copy = max - skb-&gt;len;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (copy &lt;= 0) {  
+</span><span class='line'>new_segment:  
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Allocate new segment. If the interface is SG, 
+</span><span class='line'>&#9;&#9;&#9;&#9; * allocate skb fitting to single page. 
+</span><span class='line'>&#9;&#9;&#9;&#9; */  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!sk_stream_memory_free(sk))  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto wait_for_sndbuf;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;skb = sk_stream_alloc_skb(sk,  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;  select_size(sk, sg),  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;  sk-&gt;sk_allocation);  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!skb)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto wait_for_memory;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;/* 
+</span><span class='line'>&#9;&#9;&#9;&#9; * Check whether we can use HW checksum. 
+</span><span class='line'>&#9;&#9;&#9;&#9; */  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (sk-&gt;sk_route_caps & NETIF_F_ALL_CSUM)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_PARTIAL;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_entail(sk, skb);  
+</span><span class='line'>&#9;&#9;&#9;&#9;copy = size_goal;  
+</span><span class='line'>&#9;&#9;&#9;&#9;max = size_goal;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Try to append data to the end of skb. */  
+</span><span class='line'>&#9;&#9;&#9;if (copy &gt; seglen)  
+</span><span class='line'>&#9;&#9;&#9;&#9;copy = seglen;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Where to copy to? */  
+</span><span class='line'>&#9;&#9;&#9;if (skb_availroom(skb) &gt; 0) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;/* We have some space in skb head. Superb! */  
+</span><span class='line'>&#9;&#9;&#9;&#9;copy = min_t(int, copy, skb_availroom(skb));  
+</span><span class='line'>&#9;&#9;&#9;&#9;err = skb_add_data_nocache(sk, skb, from, copy);  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (err)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto do_fault;  
+</span><span class='line'>&#9;&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;&#9;int merge = 0;  
+</span><span class='line'>&#9;&#9;&#9;&#9;int i = skb_shinfo(skb)-&gt;nr_frags;  
+</span><span class='line'>&#9;&#9;&#9;&#9;struct page *page = sk-&gt;sk_sndmsg_page;  
+</span><span class='line'>&#9;&#9;&#9;&#9;int off;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;if (page && page_count(page) == 1)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_off = 0;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;off = sk-&gt;sk_sndmsg_off;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;if (skb_can_coalesce(skb, i, page, off) &&  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;off != PAGE_SIZE) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* We can extend the last page 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * fragment. */  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;merge = 1;  
+</span><span class='line'>&#9;&#9;&#9;&#9;} else if (i == MAX_SKB_FRAGS || !sg) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Need to add new fragment and cannot 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * do this because interface is non-SG, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * or because all the page slots are 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * busy. */  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_mark_push(tp, skb);  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto new_segment;  
+</span><span class='line'>&#9;&#9;&#9;&#9;} else if (page) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (off == PAGE_SIZE) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;put_page(page);  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_page = page = NULL;  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;off = 0;  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;&#9;&#9;} else  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;off = 0;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;if (copy &gt; PAGE_SIZE - off)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;copy = PAGE_SIZE - off;  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!sk_wmem_schedule(sk, copy))  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto wait_for_memory;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!page) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Allocate new cache page. */  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!(page = sk_stream_alloc_page(sk)))  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;goto wait_for_memory;  
+</span><span class='line'>&#9;&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Time to copy data. We are close to 
+</span><span class='line'>&#9;&#9;&#9;&#9; * the end! */  
+</span><span class='line'>&#9;&#9;&#9;&#9;err = skb_copy_to_page_nocache(sk, from, skb,  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;   page, off, copy);  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (err) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* If this page was new, give it to the 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * socket so it does not get leaked. 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; */  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!sk-&gt;sk_sndmsg_page) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_page = page;  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_off = 0;  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto do_error;  
+</span><span class='line'>&#9;&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Update the skb. */  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (merge) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb_frag_size_add(&skb_shinfo(skb)-&gt;frags[i - 1], copy);  
+</span><span class='line'>&#9;&#9;&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb_fill_page_desc(skb, i, page, off, copy);  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (sk-&gt;sk_sndmsg_page) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;get_page(page);  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;} else if (off + copy &lt; PAGE_SIZE) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;get_page(page);  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_page = page;  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_off = off + copy;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (!copied)  
+</span><span class='line'>&#9;&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;tcp_flags &= ~TCPHDR_PSH;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;write_seq += copy;  
+</span><span class='line'>&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;end_seq += copy;  
+</span><span class='line'>&#9;&#9;&#9;skb_shinfo(skb)-&gt;gso_segs = 0;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;from += copy;  
+</span><span class='line'>&#9;&#9;&#9;copied += copy;  
+</span><span class='line'>&#9;&#9;&#9;if ((seglen -= copy) == 0 && iovlen == 0)  
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;  
+</span><span class='line'>&#9;&#9;&#9;/*对于OOB数据，即使一个分片用光，如果还有 
+</span><span class='line'>&#9;&#9;&#9;send_buff和OOB数据，就继续积累分片*/  
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;len &lt; max || (flags & MSG_OOB))  
+</span><span class='line'>&#9;&#9;&#9;&#9;continue;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (forced_push(tp)) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;tcp_mark_push(tp, skb);  
+</span><span class='line'>&#9;&#9;&#9;&#9;__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);  
+</span><span class='line'>&#9;&#9;&#9;} else if (skb == tcp_send_head(sk))  
+</span><span class='line'>&#9;&#9;&#9;&#9;tcp_push_one(sk, mss_now);  
+</span><span class='line'>&#9;&#9;&#9;continue;  
+</span><span class='line'>
+</span><span class='line'>wait_for_sndbuf:  
+</span><span class='line'>&#9;&#9;&#9;set_bit(SOCK_NOSPACE, &sk-&gt;sk_socket-&gt;flags);  
+</span><span class='line'>wait_for_memory:  
+</span><span class='line'>&#9;&#9;&#9;if (copied)  
+</span><span class='line'>&#9;&#9;&#9;&#9;tcp_push(sk, flags & ~MSG_MORE, mss_now, TCP_NAGLE_PUSH);  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if ((err = sk_stream_wait_memory(sk, &timeo)) != 0)  
+</span><span class='line'>&#9;&#9;&#9;&#9;goto do_error;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;mss_now = tcp_send_mss(sk, &size_goal, flags);  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;}  
+</span><span class='line'>
+</span><span class='line'>out:  
+</span><span class='line'>&#9;if (copied)  
+</span><span class='line'>&#9;&#9;tcp_push(sk, flags, mss_now, tp-&gt;nonagle);  
+</span><span class='line'>&#9;release_sock(sk);  
+</span><span class='line'>&#9;return copied;  
+</span><span class='line'>
+</span><span class='line'>do_fault:  
+</span><span class='line'>&#9;if (!skb-&gt;len) {  
+</span><span class='line'>&#9;&#9;tcp_unlink_write_queue(skb, sk);  
+</span><span class='line'>&#9;&#9;/* It is the one place in all of TCP, except connection 
+</span><span class='line'>&#9;&#9; * reset, where we can be unlinking the send_head. 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;tcp_check_send_head(sk, skb);  
+</span><span class='line'>&#9;&#9;sk_wmem_free_skb(sk, skb);  
+</span><span class='line'>&#9;}  
+</span><span class='line'>
+</span><span class='line'>do_error:  
+</span><span class='line'>&#9;if (copied)  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>out_err:  
+</span><span class='line'>&#9;err = sk_stream_error(sk, flags, err);  
+</span><span class='line'>&#9;release_sock(sk);  
+</span><span class='line'>&#9;return err;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_sendmsg中，涉及对OOB数据的处理主要有：</p>
+
+<h5>1、在调用tcp_send_mss确定分片大小的时候：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_send_mss(struct sock *sk,int *size_goal, int flags)
 </span><span class='line'>{
-</span><span class='line'>&#9;int pipefd[2];
-</span><span class='line'>&#9;int result;
-</span><span class='line'>&#9;FILE *in_file;
-</span><span class='line'>&#9;FILE *out_file;
-</span><span class='line'>&#9;char buff[65537];
+</span><span class='line'>&#9;intmss_now;
+</span><span class='line'>&#9;mss_now= tcp_current_mss(sk);
 </span><span class='line'>
-</span><span class='line'>&#9;if (argc != 3) {
-</span><span class='line'>&#9;&#9;printf("usage: ./client infile outfile\n");
-</span><span class='line'>&#9;&#9;exit(0);
+</span><span class='line'>&#9;/*如果是OOB数据，large_allowed=0，关闭TSO*/
+</span><span class='line'>&#9;*size_goal= tcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
+</span><span class='line'>&#9;returnmss_now;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果是OOB数据，其实是关闭了TSO功能，这样做的原因是：天知道各个网卡芯片在执行分片的时候咋个处理TCP报头中的URG标志和urgent point</p>
+
+<h5>2、在确定何时开始执行分片的发送的时候：</h5>
+
+<p>如果是OOB数据，即使当前已经积累了一整个分片，也不会想普通的数据一样执行发送(tcp_push)，而是继续积累直到用户下发的数据全部分片或者snd_buf/内存用尽。</p>
+
+<h5>3、执行tcp_push的时候：</h5>
+
+<p>在用户下发的数据全部分片或者snd_buf/内存用尽后，进入tcp_push执行发送操作(所有的OOB数据，都会通过这个接口来执行发送)</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void tcp_push(struct sock*sk, int flags, int mss_now,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; int nonagle)
+</span><span class='line'>{
+</span><span class='line'>&#9;if(tcp_send_head(sk)) {
+</span><span class='line'>&#9;&#9;structtcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;&#9;if(!(flags & MSG_MORE) || forced_push(tp))
+</span><span class='line'>&#9;&#9;&#9;tcp_mark_push(tp,tcp_write_queue_tail(sk));      
+</span><span class='line'>&#9;&#9;&#9;  /*tcp_mark_urg设置tp-&gt;snd_up，标识进入OOB数据发送模式，设置urgent point
+</span><span class='line'>&#9;&#9;&#9;  指向urgentdata接受后的第一个字符*/
+</span><span class='line'>&#9;&#9;tcp_mark_urg(tp,flags);
+</span><span class='line'>&#9;&#9;__tcp_push_pending_frames(sk,mss_now,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  (flags & MSG_MORE) ? TCP_NAGLE_CORK :nonagle);
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;result = pipe(pipefd);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>发送处理</h4>
+
+<p>使用struct tcp_sock中的snd_up来标识当前的urgent point，同时也使用该数据来判断当前是否处于urgent data发送模式，在普通数据的发送模式中tcp_sock::snd_up总是和tcp_sock::snd_una相等，只有在有urgent data发送的时候，才在tcp_push&mdash;>tcp_mark_urg中设置为urgentpoint，进入到urgent data的处理模式</p>
+
+<p>在tcp_transmit_skb中的以下代码段负责urgent data相关的处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(tcp_urg_mode(tp) && before(tcb-&gt;seq, tp-&gt;snd_up))) {  
+</span><span class='line'>&#9;if (before(tp-&gt;snd_up, tcb-&gt;seq + 0x10000)) {  
+</span><span class='line'>&#9;&#9;th-&gt;urg_ptr = htons(tp-&gt;snd_up - tcb-&gt;seq);  
+</span><span class='line'>&#9;&#9;th-&gt;urg = 1;  
+</span><span class='line'>&#9;} else if (after(tcb-&gt;seq + 0xFFFF, tp-&gt;snd_nxt)) {  
+</span><span class='line'>&#9;&#9;th-&gt;urg_ptr = htons(0xFFFF);  
+</span><span class='line'>&#9;&#9;th-&gt;urg = 1;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>只要当前待发送的skb的seq在tcp_sock记录的urgent point前面，就需要在报头中对URG标志置位，同时如果tcp_sock记录的urgent point。如果该报文的seq距离大于16为能表示的最大值，就置TCP报头中的urgent point为65535。</p>
+
+<h4>切换回普通模式：</h4>
+
+<p>在收到对方ACK的处理流程tcp_ack&mdash;>tcp_clean_rtx_queue中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (likely(between(tp-&gt;snd_up, prior_snd_una, tp-&gt;snd_una)))  
+</span><span class='line'>&#9;tp-&gt;snd_up = tp-&gt;snd_una;  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>报文体现</h4>
+
+<p>根据对发送代码的分析，可以看到：如果用户使用MSG_OOB数据发送一段比较长(若干个MSS)的数据，那么线路上的报文应该是分成了若干组，每组由若干个长度为MSS的报文构成，组内的每个报文有一样的urgent pointer，指向下一组报文的起始seq，每一组的长度最长为65535。</p>
+
+<hr />
+
+<h3>TCP的URG标志和内核实现之三：接收的实现</h3>
+
+<p>大致的处理过程</p>
+
+<p>TCP的接收流程：在tcp_v4_do_rcv中的相关处理(网卡收到报文触发)中，会首先通过tcp_check_urg设置tcp_sock的urg_data为TCP_URG_NOTYET(urgent point指向的可能不是本报文，而是后续报文或者前面收到的乱序报文)，并保存最新的urgent data的sequence和对于的1 BYTE urgent data到tcp_sock的urg_data (如果之前的urgent data没有读取，就会被覆盖)。</p>
+
+<p>用户接收流程：在tcp_recvmsg流程中，如果发现当前的skb的数据中有urgent data，首先拷贝urgent data之前的数据，然后tcp_recvmsg退出，提示用户来接收OOB数据；在用户下一次调用tcp_recvmsg来接收数据的时候，会跳过urgent data，并设置urgent data数据接收完成。
+相关的数据结构和定义</p>
+
+<p>tcp_sock结构：</p>
+
+<p>1、 urg_data成员，其高8bit为urgent data的接收状态；其低8位为保存的1BYTE urgent数据。urgent data的接收状态对应的宏的含义描述：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#defineTCP_URG_VALID 0x0100  /*urgent data已经读到了tcp_sock::urg_data*/
 </span><span class='line'>
-</span><span class='line'>&#9;in_file = fopen(argv[1], "rb");
-</span><span class='line'>&#9;out_file = fopen(argv[2], "wb");
+</span><span class='line'>#defineTCP_URG_NOTYET   0x0200  /*已经发现有urgent data，还没有读取到tcp_sock::urg_data*/
 </span><span class='line'>
-</span><span class='line'>&#9;off_t off_in = 0, off_out = 0;
-</span><span class='line'>&#9;int len = 1024*1024*30;
-</span><span class='line'>&#9;while (len &gt; 0) {
-</span><span class='line'>&#9;&#9;int size = 65536;
-</span><span class='line'>&#9;&#9;if (len &lt; size) size = len;
-</span><span class='line'>&#9;&#9;len -= size;
+</span><span class='line'>#defineTCP_URG_READ       0x0400  /*urgent data已经被用户通过MSG_OOB读取了*/</span></code></pre></td></tr></table></div></figure>
+
+
+<p>2、 urg_seq成员，为当前的urgent data的sequence</p>
+
+<p>流程详情</p>
+
+<h4>TCP的接收过程</h4>
+
+<p>在tcp_rcv_established的slow_path中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>slow_path:  
+</span><span class='line'>&#9;if (len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete_user(sk, skb))  
+</span><span class='line'>&#9;&#9;goto csum_error;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; *  Standard slow path. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (!tcp_validate_incoming(sk, skb, th, 1))  
+</span><span class='line'>&#9;&#9;return 0;  
+</span><span class='line'>step5:  
+</span><span class='line'>&#9;if (th-&gt;ack &&  
+</span><span class='line'>&#9;&#9;tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT) &lt; 0)  
+</span><span class='line'>&#9;&#9;goto discard;  
+</span><span class='line'>&#9;tcp_rcv_rtt_measure_ts(sk, skb);  
+</span><span class='line'>&#9;/* 处理紧急数据. */  
+</span><span class='line'>&#9;tcp_urg(sk, skb, th);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>也就是在报文的CRC验证和sequence验证完成后，就会通过tcp_urg来处理接收到的urgent data ：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_urg(struct sock *sk, struct sk_buff *skb, const struct tcphdr *th)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/*收到了urgent data,则检查和设置urg_data和urg_seq成员*/  
+</span><span class='line'>&#9;if (th-&gt;urg)  
+</span><span class='line'>&#9;&#9;tcp_check_urg(sk, th);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Do we wait for any urgent data? - normally not... 
+</span><span class='line'>&#9;发现了有urgent data，但是还没有保存到tp-&gt;urg_data*/  
+</span><span class='line'>&#9;if (tp-&gt;urg_data == TCP_URG_NOTYET) {  
+</span><span class='line'>&#9;&#9;u32 ptr = tp-&gt;urg_seq - ntohl(th-&gt;seq) + (th-&gt;doff * 4) -  
+</span><span class='line'>&#9;&#9;&#9;  th-&gt;syn;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* Is the urgent pointer pointing into this packet? */  
+</span><span class='line'>&#9;&#9;if (ptr &lt; skb-&gt;len) {  
+</span><span class='line'>&#9;&#9;&#9;u8 tmp;  
+</span><span class='line'>&#9;&#9;&#9;if (skb_copy_bits(skb, ptr, &tmp, 1))  
+</span><span class='line'>&#9;&#9;&#9;&#9;BUG();  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = TCP_URG_VALID | tmp;  
+</span><span class='line'>&#9;&#9;&#9;if (!sock_flag(sk, SOCK_DEAD))  
+</span><span class='line'>&#9;&#9;&#9;&#9;sk-&gt;sk_data_ready(sk, 0);  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;}  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>检查和设置urg_data和urg_seq成员的处理函数tcp_check_urg的具体流程</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_check_urg(struct sock *sk, const struct tcphdr *th)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>&#9;u32 ptr = ntohs(th-&gt;urg_ptr);  
+</span><span class='line'>&#9;/*两种urgent point的解析方式: 
+</span><span class='line'>&#9;一是指向urgent data之后的第一个字节 
+</span><span class='line'>&#9;二是执行urgent data的结束字节(RFC1122) 
+</span><span class='line'>&#9;sysctl_tcp_stdurg被设置表示当前采用的是第二种模式 
+</span><span class='line'>&#9;不需要把urgent point -1来指向urgent data的结束字节*/  
+</span><span class='line'>&#9;if (ptr && !sysctl_tcp_stdurg)  
+</span><span class='line'>&#9;&#9;ptr--;  
+</span><span class='line'>&#9;ptr += ntohl(th-&gt;seq);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Ignore urgent data that we've already seen and read.  
+</span><span class='line'>&#9;如果copied_seq已经大于urgent point，那么对于从tcp_rcv_established 
+</span><span class='line'>&#9;来执行的，前面的tcp_validate_incoming已经拒绝了这种报文( 
+</span><span class='line'>&#9;接收窗口外)，这里要处理的是哪种情形?*/  
+</span><span class='line'>&#9;if (after(tp-&gt;copied_seq, ptr))  
+</span><span class='line'>&#9;&#9;return;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Do not replay urg ptr. 
+</span><span class='line'>&#9; * 
+</span><span class='line'>&#9; * NOTE: interesting situation not covered by specs. 
+</span><span class='line'>&#9; * Misbehaving sender may send urg ptr, pointing to segment, 
+</span><span class='line'>&#9; * which we already have in ofo queue. We are not able to fetch 
+</span><span class='line'>&#9; * such data and will stay in TCP_URG_NOTYET until will be eaten 
+</span><span class='line'>&#9; * by recvmsg(). Seems, we are not obliged to handle such wicked 
+</span><span class='line'>&#9; * situations. But it is worth to think about possibility of some 
+</span><span class='line'>&#9; * DoSes using some hypothetical application level deadlock. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;/*  这种情况什么时候发生?没搞明白*/  
+</span><span class='line'>&#9;if (before(ptr, tp-&gt;rcv_nxt))  
+</span><span class='line'>&#9;&#9;return;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Do we already have a newer (or duplicate) urgent pointer?  
+</span><span class='line'>&#9;如果当前已经进入urg数据读取模式，且urgent point不大于当前 
+</span><span class='line'>&#9;保存的值，那么之前已经开始了读取tp-&gt;urg_seq对应的 
+</span><span class='line'>&#9;urgent 数据，无需重复处理了*/  
+</span><span class='line'>&#9;if (tp-&gt;urg_data && !after(ptr, tp-&gt;urg_seq))  
+</span><span class='line'>&#9;&#9;return;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Tell the world about our new urgent pointer.*/  
+</span><span class='line'>&#9;sk_send_sigurg(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* We may be adding urgent data when the last byte read was 
+</span><span class='line'>&#9; * urgent. To do this requires some care. We cannot just ignore 
+</span><span class='line'>&#9; * tp-&gt;copied_seq since we would read the last urgent byte again 
+</span><span class='line'>&#9; * as data, nor can we alter copied_seq until this data arrives 
+</span><span class='line'>&#9; * or we break the semantics of SIOCATMARK (and thus sockatmark()) 
+</span><span class='line'>&#9; * 
+</span><span class='line'>&#9; * NOTE. Double Dutch. Rendering to plain English: author of comment 
+</span><span class='line'>&#9; * above did something sort of  send("A", MSG_OOB); send("B", MSG_OOB); 
+</span><span class='line'>&#9; * and expect that both A and B disappear from stream. This is _wrong_. 
+</span><span class='line'>&#9; * Though this happens in BSD with high probability, this is occasional. 
+</span><span class='line'>&#9; * Any application relying on this is buggy. Note also, that fix "works" 
+</span><span class='line'>&#9; * only in this artificial test. Insert some normal data between A and B and we will 
+</span><span class='line'>&#9; * decline of BSD again. Verdict: it is better to remove to trap 
+</span><span class='line'>&#9; * buggy users. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9; /*用户下一次要读取的数据就是用户还没有读取的urgent数据 
+</span><span class='line'>&#9;且当前存在新的用户未读取数据*/  
+</span><span class='line'>&#9;if (tp-&gt;urg_seq == tp-&gt;copied_seq && tp-&gt;urg_data &&  
+</span><span class='line'>&#9;&#9;!sock_flag(sk, SOCK_URGINLINE) && tp-&gt;copied_seq != tp-&gt;rcv_nxt) {  
+</span><span class='line'>&#9;&#9;struct sk_buff *skb = skb_peek(&sk-&gt;sk_receive_queue);  
+</span><span class='line'>&#9;&#9;tp-&gt;copied_seq++;  
+</span><span class='line'>&#9;&#9;if (skb && !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq)) {  
+</span><span class='line'>&#9;&#9;&#9;__skb_unlink(skb, &sk-&gt;sk_receive_queue);  
+</span><span class='line'>&#9;&#9;&#9;__kfree_skb(skb);  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;tp-&gt;urg_data = TCP_URG_NOTYET;  
+</span><span class='line'>&#9;tp-&gt;urg_seq = ptr;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Disable header prediction. */  
+</span><span class='line'>&#9;tp-&gt;pred_flags = 0;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>用户接收数据接口</h4>
+
+<h5>用户接收URG数据的接口</h5>
+
+<p>在用户接收数据的tcp_recvmsg函数中，如果用户通过MSG_OOB来接收数据，会进入tcp_recv_urg处理</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_recv_urg(struct sock *sk, struct msghdr *msg, int len, int flags)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* No URG data to read.  
+</span><span class='line'>&#9;用户已经读取过了*/  
+</span><span class='line'>&#9;if (sock_flag(sk, SOCK_URGINLINE) || !tp-&gt;urg_data ||  
+</span><span class='line'>&#9;&#9;tp-&gt;urg_data == TCP_URG_READ)  
+</span><span class='line'>&#9;&#9;return -EINVAL; /* Yes this is right ! */  
+</span><span class='line'>  
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE && !sock_flag(sk, SOCK_DONE))  
+</span><span class='line'>&#9;&#9;return -ENOTCONN;  
+</span><span class='line'>&#9;/*当前的tp-&gt;urg_data为合法的数据，可以读取*/  
+</span><span class='line'>&#9;if (tp-&gt;urg_data & TCP_URG_VALID) {  
+</span><span class='line'>&#9;&#9;int err = 0;  
+</span><span class='line'>&#9;&#9;char c = tp-&gt;urg_data;  
+</span><span class='line'>&#9;&#9;/*标识urgent data已读*/  
+</span><span class='line'>&#9;&#9;if (!(flags & MSG_PEEK))  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = TCP_URG_READ;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* Read urgent data. */  
+</span><span class='line'>&#9;&#9;msg-&gt;msg_flags |= MSG_OOB;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;if (len &gt; 0) {  
+</span><span class='line'>&#9;&#9;&#9;if (!(flags & MSG_TRUNC))  
+</span><span class='line'>&#9;&#9;&#9;&#9;err = memcpy_toiovec(msg-&gt;msg_iov, &c, 1);  
+</span><span class='line'>&#9;&#9;&#9;len = 1;  
+</span><span class='line'>&#9;&#9;} else  
+</span><span class='line'>&#9;&#9;&#9;msg-&gt;msg_flags |= MSG_TRUNC;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;return err ? -EFAULT : len;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE || (sk-&gt;sk_shutdown & RCV_SHUTDOWN))  
+</span><span class='line'>&#9;&#9;return 0;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Fixed the recv(..., MSG_OOB) behaviour.  BSD docs and 
+</span><span class='line'>&#9; * the available implementations agree in this case: 
+</span><span class='line'>&#9; * this call should never block, independent of the 
+</span><span class='line'>&#9; * blocking state of the socket. 
+</span><span class='line'>&#9; * Mike &lt;pall@rz.uni-karlsruhe.de&gt; 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;return -EAGAIN;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>用户接收普通数据的接口中的相关处理</h5>
+
+<p>在用户接收数据的tcp_recvmsg函数中，在查找到待拷贝的skb后，首先拷贝urgent data数据前的数据，然后退出接收过程，在用户下一次执行tcp_recvmsg的时候跳过urgent data，设置urgent data读取结束</p>
+
+<p>查找到准备拷贝的skb后的处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>found_ok_skb:  
+</span><span class='line'>/* Ok so how much can we use? */  
+</span><span class='line'>used = skb-&gt;len - offset;  
+</span><span class='line'>if (len &lt; used)  
+</span><span class='line'>&#9;used = len;  
+</span><span class='line'>  
+</span><span class='line'>/* 当前有urg_data数据*/  
+</span><span class='line'>if (tp-&gt;urg_data) {  
+</span><span class='line'>&#9;u32 urg_offset = tp-&gt;urg_seq - *seq;  
+</span><span class='line'>&#9;/*urgent data在当前待拷贝的数据范围内*/  
+</span><span class='line'>&#9;if (urg_offset &lt; used) {  
+</span><span class='line'>&#9;&#9;if (!urg_offset) {/*待拷贝的数据就是urgent data，跨过该urgent data， 
+</span><span class='line'>&#9;&#9;只给用户读取后面的数据*/  
+</span><span class='line'>&#9;&#9;&#9;if (!sock_flag(sk, SOCK_URGINLINE)) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;++*seq;  
+</span><span class='line'>&#9;&#9;&#9;&#9;urg_hole++;  
+</span><span class='line'>&#9;&#9;&#9;&#9;offset++;  
+</span><span class='line'>&#9;&#9;&#9;&#9;used--;  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!used)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto skip_copy;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;}   
+</span><span class='line'>&#9;&#9;} else/*指定只拷贝urgent data数据之前的，完成后在下一次循环 
+</span><span class='line'>&#9;&#9;开始的位置，会退出循环，返回用户；下一次用户调用tcp_recvmsg 
+</span><span class='line'>&#9;&#9;就进入到上面的分支了*/  
+</span><span class='line'>&#9;&#9;&#9;used = urg_offset;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>}   </span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>skip_copy:  
+</span><span class='line'>&#9;&#9;/*用户读取的数据跨过了urgent point，设置读取结束 
+</span><span class='line'>&#9;&#9;开启fast path*/  
+</span><span class='line'>&#9;&#9;if (tp-&gt;urg_data && after(tp-&gt;copied_seq, tp-&gt;urg_seq)) {  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = 0;  
+</span><span class='line'>&#9;&#9;&#9;tcp_fast_path_check(sk);  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;&#9;if (used + offset &lt; skb-&gt;len)  
+</span><span class='line'>&#9;&#9;&#9;continue;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>在接收完urgent data数据前的所有数据之后， tcp_recvmsg的以下代码片段得到执行，这段代码退出当前接收过程，提示用户有urgent data数据到来，需要用MSG_OOB来接收</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (tp-&gt;urg_data && tp-&gt;urg_seq == *seq) {  
+</span><span class='line'>&#9;if (copied)  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>&#9;if (signal_pending(current)) {  
+</span><span class='line'>&#9;&#9;copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h3>后记</h3>
+
+<p>TCP的urg数据，由于定义和实现上的混乱，当前已经不建议使用，但是为了兼容之前已经已经存在的实现，该机制会长期在内核中存在，如果不了解该机制及其内核行为，有可能就很难解释一些奇怪的问题：比如某段代码不小心地造成send接口事实上设置了MSG_OOB，就会造成接收端少了一个BYTE。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/05/15/debug-mark-tcp_collapse-bug/">tcp_collapse do not copy headers</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-15T10:08:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>10:08:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>commit b3d6cb92fd190d720a01075c4d20cdca896663fc
+</span><span class='line'>Author: Eric Dumazet &lt;edumazet@google.com&gt;
+</span><span class='line'>Date:   Mon Sep 15 04:19:53 2014 -0700
 </span><span class='line'>
-</span><span class='line'>&#9;&#9;result = splice(fileno(in_file), &off_in, pipefd[1], NULL, size, SPLICE_F_MORE | SPLICE_F_MOVE);
-</span><span class='line'>&#9;&#9;result = splice(pipefd[0], NULL, fileno(out_file), &off_out, size, SPLICE_F_MORE | SPLICE_F_MOVE);
-</span><span class='line'>&#9;&#9;//printf("%d\n", result);
+</span><span class='line'>    tcp: do not copy headers in tcp_collapse()
 </span><span class='line'>
-</span><span class='line'>//          read(fileno(in_file), buff, size);
-</span><span class='line'>//          write(fileno(out_file), buff, size);
+</span><span class='line'>    tcp_collapse() wants to shrink skb so that the overhead is minimal.
+</span><span class='line'>
+</span><span class='line'>    Now we store tcp flags into TCP_SKB_CB(skb)-&gt;tcp_flags, we no longer
+</span><span class='line'>    need to keep around full headers.
+</span><span class='line'>    Whole available space is dedicated to the payload.
+</span><span class='line'>
+</span><span class='line'>    Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
+</span><span class='line'>    Acked-by: Neal Cardwell &lt;ncardwell@google.com&gt;
+</span><span class='line'>    Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+</span><span class='line'>index 228bf0c..ea92f23 100644
+</span><span class='line'>--- a/net/ipv4/tcp_input.c
+</span><span class='line'>+++ b/net/ipv4/tcp_input.c
+</span><span class='line'>@@ -4535,26 +4535,13 @@ restart:
+</span><span class='line'>      return;
+</span><span class='line'> 
+</span><span class='line'>  while (before(start, end)) {
+</span><span class='line'>+     int copy = min_t(int, SKB_MAX_ORDER(0, 0), end - start);
+</span><span class='line'>      struct sk_buff *nskb;
+</span><span class='line'>-     unsigned int header = skb_headroom(skb);
+</span><span class='line'>-     int copy = SKB_MAX_ORDER(header, 0);
+</span><span class='line'> 
+</span><span class='line'>-     /* Too big header? This can happen with IPv6. */
+</span><span class='line'>-     if (copy &lt; 0)
+</span><span class='line'>-         return;
+</span><span class='line'>-     if (end - start &lt; copy)
+</span><span class='line'>-         copy = end - start;
+</span><span class='line'>-     nskb = alloc_skb(copy + header, GFP_ATOMIC);
+</span><span class='line'>+     nskb = alloc_skb(copy, GFP_ATOMIC);
+</span><span class='line'>      if (!nskb)
+</span><span class='line'>          return;
+</span><span class='line'> 
+</span><span class='line'>-     skb_set_mac_header(nskb, skb_mac_header(skb) - skb-&gt;head);
+</span><span class='line'>-     skb_set_network_header(nskb, (skb_network_header(skb) -
+</span><span class='line'>-                       skb-&gt;head));
+</span><span class='line'>-     skb_set_transport_header(nskb, (skb_transport_header(skb) -
+</span><span class='line'>-                     skb-&gt;head));
+</span><span class='line'>-     skb_reserve(nskb, header);
+</span><span class='line'>-     memcpy(nskb-&gt;head, skb-&gt;head, header);
+</span><span class='line'>      memcpy(nskb-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));
+</span><span class='line'>      TCP_SKB_CB(nskb)-&gt;seq = TCP_SKB_CB(nskb)-&gt;end_seq = start;
+</span><span class='line'>      __skb_queue_before(list, skb, nskb);</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>这个改进无形中修了一个BUG，但是这BUG正常情况下不会触发，除非我们对skb进行改动导致skb->data - skb->head = 4k时，如果此时内存紧张，且满足tcp_collapse合并条件才触发。</p>
+
+<p>BUG：
+tcp_collapse代码中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;while (before(start, end)) {
+</span><span class='line'>&#9;&#9;struct sk_buff *nskb;
+</span><span class='line'>&#9;&#9;unsigned int header = skb_headroom(skb);
+</span><span class='line'>&#9;&#9;int copy = SKB_MAX_ORDER(header, 0);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Too big header? This can happen with IPv6. */
+</span><span class='line'>&#9;&#9;if (copy &lt; 0) 
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Copy data, releasing collapsed skbs. */
+</span><span class='line'>&#9;&#9;while (copy &gt; 0) { 
+</span><span class='line'>&#9;&#9;&#9;int offset = start - TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>&#9;&#9;&#9;int size = TCP_SKB_CB(skb)-&gt;end_seq - start;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>也就是说如果header = 4k，那么copy = 0，那么会一直申请len=0的skb插入到receive队列，直到申请skb失败。这样就会造成tcp_recvmsg出错</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;skb_queue_walk(&sk-&gt;sk_receive_queue, skb) {
+</span><span class='line'>&#9;&#9;&#9;/* Now that we have two receive queues this
+</span><span class='line'>&#9;&#9;&#9; * shouldn't happen.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;if (WARN(before(*seq, TCP_SKB_CB(skb)-&gt;seq),
+</span><span class='line'>&#9;&#9;&#9;&#9; KERN_INFO "recvmsg bug: copied %X "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   "seq %X rcvnxt %X fl %X\n", *seq,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   flags))
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;offset = *seq - TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;syn)
+</span><span class='line'>&#9;&#9;&#9;&#9;offset--;
+</span><span class='line'>&#9;&#9;&#9;if (offset &lt; skb-&gt;len)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto found_ok_skb;
+</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;fin)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto found_fin_ok;
+</span><span class='line'>&#9;&#9;&#9;WARN(!(flags & MSG_PEEK), KERN_INFO "recvmsg bug 2: "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"copied %X seq %X rcvnxt %X fl %X\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;*seq, TCP_SKB_CB(skb)-&gt;seq,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt, flags);
+</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为offset = 0, len = 0, if (offset &lt; skb->len)就不符合，报WARN。而且如果申请的len=0的skb过多，会导致一直在这里循环，因为WARN有打印堆栈，执行很慢。</p>
+
+<p>错误如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G    W  ---------------   )
+</span><span class='line'>Hardware name: PowerEdge R620
+</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
+</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
+</span><span class='line'>Call Trace:
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
+</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
+</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
+</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
+</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
+</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
+</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
+</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
+</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
+</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
+</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
+</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
+</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
+</span><span class='line'>---[ end trace ef9663ba0fc61730 ]---
+</span><span class='line'>------------[ cut here ]------------
+</span><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G        W  ---------------   )
+</span><span class='line'>Hardware name: PowerEdge R620
+</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
+</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
+</span><span class='line'>Call Trace:
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
+</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
+</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
+</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
+</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
+</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
+</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
+</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
+</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
+</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
+</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
+</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
+</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
+</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
+</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
+</span><span class='line'>---[ end trace ef9663ba0fc61731 ]---
+</span><span class='line'>------------[ cut here ]------------
+</span><span class='line'>
+</span><span class='line'>.......
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果skb申请的不多，很快就能看到tcp_cleanup_rbuf的WARN，仔细观察会发现，这里打印的end_seq和上面的seq是一样的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_cleanup_rbuf(struct sock *sk, int copied)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int time_to_ack = 0;
+</span><span class='line'>
+</span><span class='line'>#if TCP_DEBUG
+</span><span class='line'>&#9;struct sk_buff *skb = skb_peek(&sk-&gt;sk_receive_queue);
+</span><span class='line'>
+</span><span class='line'>&#9;WARN(skb && !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq),
+</span><span class='line'>&#9;&#9; KERN_INFO "cleanup rbuf bug: copied %X seq %X rcvnxt %X\n",
+</span><span class='line'>&#9;&#9; tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;rcv_nxt);
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/05/11/kernel-net-tcp_queue/">tcp三个接收队列</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-11T15:46:00+08:00'><span class='date'>2015-05-11</span> <span class='time'>15:46:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/alreadyskb/p/4386565.html">http://www.cnblogs.com/alreadyskb/p/4386565.html</a></p>
+
+<h4>三个接收队列</h4>
+
+<ul>
+<li>tcp协议栈数据接收实现了三个接收缓存分别是prequeue、sk_write_queue、sk_backlog。</li>
+</ul>
+
+
+<p>之所以需要三个接收缓存的原因如下：<br/>
+tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者中断上下文占用：</p>
+
+<p>  1、如果处于进程上下文sk_lock.owned=1，软中断因为sk_lock.owned=1，所以数据只能暂存在后备队列中（backlog），当进程上下文逻辑处理完成后会回调tcp_v4_do_rcv处理backlog队列作为补偿，具体看tcp_sendmsg 函数 release_sock的实现。</p>
+
+<p>  2、如果当前处于中断上下文，sk_lock.owned=0，那么数据可能被放置到receive_queue或者prequeue，数据优先放置到prequeue中，如果prequeue满了则会放置到receive_queue中，理论上这里有一个队列就行了，但是TCP协议栈为什么要设计两个呢？其实是为了快点结束软中断数据处理流程，软中断处理函数中禁止了进程抢占和其他软中断发生，效率应该是很低下的，如果数据被放置到prequeue中，那么软中断流程很快就结束了，如果放置到receive_queue那么会有很复杂的逻辑需要处理。receive_queue队列的处理在软中断中，prequeue队列的处理则是在进程上下文中。总的来说就是为了提高TCP协议栈的效率。</p>
+
+<h4>后备队列的处理逻辑</h4>
+
+<h5>1、什么时候使用后备队列</h5>
+
+<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
+
+<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么接收到的skb则只能先放置到后备队列中sk_backlog中。如果是软中断上下文则可以放置到prequeue和sk_write_queue中。</p>
+
+<p>代码片段如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;bh_lock_sock_nested(sk);               // 获取第一把锁。
+</span><span class='line'>&#9;ret = 0;
+</span><span class='line'>&#9;if (!sock_owned_by_user(sk)) {         // 判断第二把锁，区分是处于进程上下文还是软中断上下文。
+</span><span class='line'>#ifdef CONFIG_NET_DMA
+</span><span class='line'>&#9;&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;&#9;if (!tp-&gt;ucopy.dma_chan && tp-&gt;ucopy.pinned_list)
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
+</span><span class='line'>&#9;&#9;if (tp-&gt;ucopy.dma_chan)
+</span><span class='line'>&#9;&#9;&#9;ret = tcp_v4_do_rcv(sk, skb);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>#endif
+</span><span class='line'>&#9;&#9;{
+</span><span class='line'>&#9;&#9;&#9;if (!tcp_prequeue(sk, skb))    // 如果处于中断上下文，则优先放置到prequeue中，如果prequeue满则放置到sk_write_queue中。
+</span><span class='line'>&#9;&#9;&#9;&#9;ret = tcp_v4_do_rcv(sk, skb);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;} else if (unlikely(sk_add_backlog(sk, skb,  // 如果是处于进程上下文则直接放置到后备队列中(sk_backlog中)。
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_rcvbuf + sk-&gt;sk_sndbuf))) {
+</span><span class='line'>&#9;&#9;bh_unlock_sock(sk);
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
+</span><span class='line'>&#9;&#9;goto discard_and_relse;
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;close(pipefd[0]);
-</span><span class='line'>&#9;close(pipefd[1]);
-</span><span class='line'>&#9;fclose(in_file);
-</span><span class='line'>&#9;fclose(out_file);
+</span><span class='line'>&#9;bh_unlock_sock(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2、skb怎么add到sk_backlog中</h5>
+
+<p>sk_add_backlog函数用于add sbk到sk_backlog中，所以下面我们分析次函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* The per-socket spinlock must be held here. */
+</span><span class='line'>static inline __must_check int sk_add_backlog(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;   unsigned int limit)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sk_rcvqueues_full(sk, skb, limit))  // 判断接收缓存是否已经用完了，很明显sk_backlog的缓存大小也算在了总接收缓存中。
+</span><span class='line'>&#9;&#9;return -ENOBUFS;
 </span><span class='line'>
+</span><span class='line'>&#9;__sk_add_backlog(sk, skb);              // 将skb添加到sk_backlog队列中。
+</span><span class='line'>&#9;sk_extended(sk)-&gt;sk_backlog.len += skb-&gt;truesize;  // 更新sk_backlog中已经挂载的数据量。
 </span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>more sample</h4>
 
-<p><a href="/download/kernel/splice_sample.tar.gz">splice sample</a></p>
 
-<p>like:<br/>
-file to socket<br/>
-socket to file<br/>
-socket to socket</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* OOB backlog add */
+</span><span class='line'>static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (!sk-&gt;sk_backlog.tail) {   // 如果当前sk_backlog为NULL，此时head和tail都指向skb。
+</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = skb;
+</span><span class='line'>&#9;} else {                      // 分支表示sk_backlog中已经有数据了，那么skb直接挂在tail的尾部，之后tail指针后移到skb。
+</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.tail-&gt;next = skb;
+</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.tail = skb;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;skb-&gt;next = NULL;             // 这种很重要，在sk_backlog处理时会用来判断skb是否处理完毕。
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3、sk_backlog中skb的处理</h5>
+
+<p>很明显sk_backlog的处理必然中进程上下文进行，对于数据接收，进程上下文的接口是tcp_recvmmsg，所以sk_backlog肯定要在tcp_recvmmsg中处理。</p>
+
+<p>tcp_recvmmsg sk_backlog的代码处理片段如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_cleanup_rbuf(sk, copied);
+</span><span class='line'>TCP_CHECK_TIMER(sk);
+</span><span class='line'>release_sock(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>release_sock(sk)涉及到sk_backlog处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9;* The sk_lock has mutex_unlock() semantics:
+</span><span class='line'>&#9;*/
+</span><span class='line'>&#9;mutex_release(&sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);   // 获取第一把锁。
+</span><span class='line'>&#9;if (sk-&gt;sk_backlog.tail)            // 如果后备队列不为NULL，则开始处理。
+</span><span class='line'>&#9;&#9;__release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;if (proto_has_rhel_ext(sk-&gt;sk_prot, RHEL_PROTO_HAS_RELEASE_CB) &&
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_prot-&gt;release_cb)
+</span><span class='line'>&#9;&#9;sk-&gt;sk_prot-&gt;release_cb(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 0;              // 进成上下文skb处理完了，释放第二把锁。
+</span><span class='line'>&#9;if (waitqueue_active(&sk-&gt;sk_lock.wq))
+</span><span class='line'>&#9;&#9;wake_up(&sk-&gt;sk_lock.wq);
+</span><span class='line'>&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock); // 释放第一把锁。
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p><code>__release_sock(sk)</code>是后备队列的真正处理函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sk_buff *skb = sk-&gt;sk_backlog.head;
+</span><span class='line'>
+</span><span class='line'>&#9;do {
+</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = NULL;
+</span><span class='line'>&#9;&#9;bh_unlock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;do {
+</span><span class='line'>&#9;&#9;&#9;struct sk_buff *next = skb-&gt;next;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;skb-&gt;next = NULL;
+</span><span class='line'>&#9;&#9;&#9;sk_backlog_rcv(sk, skb);    // skb的处理函数，其实调用的是tcp_v4_do_rcv函数。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/*
+</span><span class='line'>&#9;&#9;&#9; * We are in process context here with softirqs
+</span><span class='line'>&#9;&#9;&#9; * disabled, use cond_resched_softirq() to preempt.
+</span><span class='line'>&#9;&#9;&#9; * This is safe to do because we've taken the backlog
+</span><span class='line'>&#9;&#9;&#9; * queue private:
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;cond_resched_softirq();
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;skb = next;
+</span><span class='line'>&#9;&#9;} while (skb != NULL);          // 如果skb=NULL，那么说明之前的sk_backlog已经处理完了。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;bh_lock_sock(sk);
+</span><span class='line'>&#9;} while ((skb = sk-&gt;sk_backlog.head) != NULL); // 在处理上一个sk_backlog时，可能被软中断中断了，建立了新的sk_backlog，新建立的sk_backlog也将一并被处理。
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9;* Doing the zeroing here guarantee we can not loop forever
+</span><span class='line'>&#9;* while a wild producer attempts to flood us.
+</span><span class='line'>&#9;*/
+</span><span class='line'>&#9;sk_extended(sk)-&gt;sk_backlog.len = 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  一开始重置sk->sk_backlog.head ，sk->sk_backlog.tail为NULL。sk_backlog是一个双链表，head指向了链表头部的skb，而tail则指向了链表尾部的skb。这里之所以置NULL head 和tail，是因为struct sk_buff *skb = sk->sk_backlog.head 提前取到了head指向的skb，之后就可以通过skb->next来获取下一个skb处理，结束的条件是skb->next=NULL，这个是在<code>__sk_add_backlog</code>函数中置位的，也就说对于sk_backlog的处理head和tail指针已经没有用了。</p>
+
+<p>  为什么要置NULLsk->sk_backlog.head ，sk->sk_backlog.tail呢？第一想法是它可能要被重新使用了。那么在什么情况下会被重新使用呢？试想一下当前是在进程上下文，并且sk->sk_lock.slock没有被锁住，那是不是可能被软中断打断呢？如果被软中断打断了是不是要接收数据呢，tcp协议栈为了效率考虑肯定是要接收数据的，前面分析道这种情况的数据必须放置到后备队列中(sk_backlog)，所以可以肯定置NULL sk->sk_backlog.head ，sk->sk_backlog.tail是为了在处理上一个sk_backlog时，能重用sk_backlog，建立一条新的sk_backlog，或许有人会问为什么不直接添加到原先的sk_backlog tail末尾呢？这个问题我也没有想太清楚，或许是同步不好做吧。</p>
+
+<h5>4、skb被处理到哪去了</h5>
+
+<p>  很明显接收的数据最终都将被传递到应用层，在传递到应用层前必须要保证三个接收队列中的数据有序，那么这三个队列是怎么保证数据字节流有序的被递交给应用层呢？三个队列都会调用tcp_v4_do_rcv函数，prequeue和sk_backlog是在tcp_recvmsg中调用tcp_v4_do_rcv函数，也就是进程上下文中调用tcp_v4_do_rcv函数，但会local_bh_disable禁止软中断。如果在tcp_rcv_established, tcp_data_queue中如果刚好数据可以直接copy到用户空间，又会短暂开始软中断local_bh_enable。</p>
+
+<p>  但在tcp_checksum_complete_user、tcp_rcv_established、tcp_data_queue函数中开启软中断将来容易出问题，进入软中断:softirq()+=1; local_bh_enable:softirq()-=2; 所以现在只是软中断中softirq()统计不准，进程中还是准的。但如果以后在软中断中在local_bh_enable之前给softirq()+=1了，那么就会导致软中断被打断，导致软中断执行途中被切走而且永远切不回来。tcp_checksum_complete_user被切走导致收包不成功，tcp_rcv_established、tcp_data_queue函数中如果在tp->copied_seq+=chunk后被切走就会导致tp->copied_seq>tp->rcv_nxt，那么下次收包后就有可能出现tp->copied_seq > sk_write_queue.first.end_seq, 等异常。</p>
+
+<p>  如果仔细分析tcp_v4_do_rcv函数能发现，这个函数能保证数据有序的排列在一起，所以无论是在处理sk_backlog还是prequeue，最终都会调用tcp_v4_do_rcv函数将数据有效地插入到sk_write_queue中，最后被应用层取走。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/05/11/debug-mark-tcp_read_sock_bug/">tcp_read_sock BUG</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-11T10:17:00+08:00'><span class='date'>2015-05-11</span> <span class='time'>10:17:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>commit baff42ab1494528907bf4d5870359e31711746ae
+</span><span class='line'>Author: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+</span><span class='line'>Date:   Tue Mar 30 13:56:01 2010 -0700
+</span><span class='line'>
+</span><span class='line'>&#9;net: Fix oops from tcp_collapse() when using splice()
+</span><span class='line'>
+</span><span class='line'>&#9;tcp_read_sock() can have a eat skbs without immediately advancing copied_seq.
+</span><span class='line'>&#9;This can cause a panic in tcp_collapse() if it is called as a result
+</span><span class='line'>&#9;of the recv_actor dropping the socket lock.
+</span><span class='line'>
+</span><span class='line'>&#9;A userspace program that splices data from a socket to either another
+</span><span class='line'>&#9;socket or to a file can trigger this bug.
+</span><span class='line'>
+</span><span class='line'>&#9;Signed-off-by: Steven J. Magnani &lt;steve@digidescorp.com&gt;
+</span><span class='line'>&#9;Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;</span></code></pre></td></tr></table></div></figure>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+</span><span class='line'>index 6afb6d8..2c75f89 100644
+</span><span class='line'>--- a/net/ipv4/tcp.c
+</span><span class='line'>+++ b/net/ipv4/tcp.c
+</span><span class='line'>@@ -1368,6 +1368,7 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
+</span><span class='line'>      sk_eat_skb(sk, skb, 0);
+</span><span class='line'>      if (!desc-&gt;count)
+</span><span class='line'>          break;
+</span><span class='line'>+     tp-&gt;copied_seq = seq;
+</span><span class='line'>  }
+</span><span class='line'>  tp-&gt;copied_seq = seq;
+</span><span class='line'> </span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果在tcp_read_sock中sk_eat_skb时copied_seq没有及时一起修改的话，就会出现copied_seq小于sk_write_queue队列第一个包的seq。<br/>
+tcp_read_sock的recv_actor指向的函数(比如tcp_splice_data_recv)是有可能释放sk锁的，如果这时进入收包软中断且内存紧张调用tcp_collapse，<br/>
+tcp_collapse中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>start = copied_seq
+</span><span class='line'>...
+</span><span class='line'>int offset = start - TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>
+</span><span class='line'>BUG_ON(offset &lt; 0);</span></code></pre></td></tr></table></div></figure>
+
+
+
 </div>
   
   
@@ -1448,8 +1919,8 @@ socket to socket</p>
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(38)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>21</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(39)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>22</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -1538,10 +2009,14 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(144)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(151)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/kernel~fs/?opendiv=kernel'>fs</a><a href='##' onmousedown=showDiv('kernel~fs') id='aexp_kernel~fs'><span class='exp_style' id='exp_kernel~fs'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('kernel~fs')) document.getElementById('aexp_kernel~fs').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/kernel~irq/?opendiv=kernel'>irq</a><a href='##' onmousedown=showDiv('kernel~irq') id='aexp_kernel~irq'><span class='exp_style' id='exp_kernel~irq'>[+]</span></a><span class='right_span'>10</span></li>
 <script language='javascript' type='text/javascript'>
@@ -1551,11 +2026,11 @@ if (!document.getElementById('kernel~irq')) document.getElementById('aexp_kernel
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kernel~kexec').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~mm/?opendiv=kernel'>mm</a><a href='##' onmousedown=showDiv('kernel~mm') id='aexp_kernel~mm'><span class='exp_style' id='exp_kernel~mm'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/kernel~mm/?opendiv=kernel'>mm</a><a href='##' onmousedown=showDiv('kernel~mm') id='aexp_kernel~mm'><span class='exp_style' id='exp_kernel~mm'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>66</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>69</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1586,7 +2061,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(65)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(66)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -1611,7 +2086,7 @@ if (!document.getElementById('debug~kgdb')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~kprobe')) document.getElementById('aexp_debug~kprobe').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~mark/?opendiv=debug'>mark</a><a href='##' onmousedown=showDiv('debug~mark') id='aexp_debug~mark'><span class='exp_style' id='exp_debug~mark'>[+]</span></a><span class='right_span'>15</span></li>
+<li><a href='/blog/cats/debug~mark/?opendiv=debug'>mark</a><a href='##' onmousedown=showDiv('debug~mark') id='aexp_debug~mark'><span class='exp_style' id='exp_debug~mark'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~mark')) document.getElementById('aexp_debug~mark').style.visibility = 'hidden';
 </script>
@@ -1679,8 +2154,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(183)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~09/?opendiv=2015'>2015-09</a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(192)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~09/?opendiv=2015'>2015-09</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2015~08/?opendiv=2015'>2015-08</a><span class='right_span'>25</span></li>
 <li><a href='/blog/cats/2015~07/?opendiv=2015'>2015-07</a><span class='right_span'>31</span></li>
 <li><a href='/blog/cats/2015~06/?opendiv=2015'>2015-06</a><span class='right_span'>24</span></li>
@@ -1766,23 +2241,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2015/09/18/kernel-mm-swappiness/">Linux内核页回收 swappiness参数</a>
+        <a href="/blog/2015/09/30/kernel-mm-oom/">kernel 3.10内核源码分析--Out of Memory(OOM)处理流程</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/09/18/kernel-mm-swap/">Linux swap实现</a>
+        <a href="/blog/2015/09/30/kernel-mm-init/">kernel 3.10内核源码分析--内核页表创建</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/09/18/kernel-mm-cache-base/">Linux Cache 机制探究</a>
+        <a href="/blog/2015/09/30/kernel-net-keepalive/">TCP的定时器系列 — 保活定时器</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/09/11/kernel-mm-mmap/">linux mmap 详解</a>
+        <a href="/blog/2015/09/30/debug-loop_ack/">ack loop</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2015/09/11/kernel-mm-vma-base/">linux进程地址空间--vma的基本操作</a>
+        <a href="/blog/2015/09/30/lang-c-libcurl/">linux c libcurl的简单使用</a>
       </li>
     
   </ul>
