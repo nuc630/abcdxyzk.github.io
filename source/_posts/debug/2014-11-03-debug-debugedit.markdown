@@ -36,8 +36,44 @@ debugedit 会在.debug_info .debug_abbrev .debug_line .debug_str中将base_dir�
 * 需要注意，如果base_dir是路径中除文件名的部分，则.debug_line中的The Directory Table的目录和.debug_info中的DW_AT_comp_dir(指向.debug_str的内容)不会替换。  
 如：  
 .debug_line中的Table中有一个目录为`/root/Desktop`，如果用 `-b /root/Desktop`则匹配不上这条。  
-* 因为：debugedit在匹配的时候在base_dir后面加了一个'/'  
+* 因为：debugedit在匹配的时候在base_dir和dest_dir后面加了一个'/'  
 其他部分能替换是因为他们存的是文件路径，不是文件夹路径  
+
+--------
+
+内核处理debuginfo的时候，只会替换DW_AT_comp_dir。因为DW_AT_name是一个相对地址
+
+--------
+
+#### 可以修改debugedit源码，base_dir、dest_dir后面不再默认添加'/'，只是单纯的把base_dir替换成dest_dir
+
+http://vault.centos.org/6.7/os/Source/SPackages/rpm-4.8.0-47.el6.src.rpm
+
+http://vault.centos.org/5.11/updates/SRPMS/rpm-4.4.2.3-36.el5_11.src.rpm
+
+删除tool/debugedit.c中的下面代码即可
+```
+  if (base_dir != NULL && base_dir[strlen (base_dir)-1] != '/')
+    {
+      p = malloc (strlen (base_dir) + 2);
+      strcpy (p, base_dir);
+      strcat (p, "/");
+      free (base_dir);
+      base_dir = p;
+    }
+  if (dest_dir != NULL && dest_dir[strlen (dest_dir)-1] != '/')
+    {
+      p = malloc (strlen (dest_dir) + 2);
+      strcpy (p, dest_dir);
+      strcat (p, "/");
+      free (dest_dir);
+      dest_dir = p;
+    }
+```
+
+[debugedit_el6](/download/debug/debugedit_el6)
+
+[debugedit_el5](/download/debug/debugedit_el5)
 
 --------
 
