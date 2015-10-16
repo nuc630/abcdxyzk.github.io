@@ -71,6 +71,27 @@ http://vault.centos.org/5.11/updates/SRPMS/rpm-4.4.2.3-36.el5_11.src.rpm
     }
 ```
 
+debugedit -l在输出.debug_line的时候会去除base_dir、dest_dir前缀，由于他们不是以`/`结尾，所以输出的文件会以`/`开头，类似`/net/ipv4/tcp_input.c`，下一步按这个目录去copy文件时就copy不到。所以应该把开头的`/`去掉。
+
+```
+	diff --git a/tools/debugedit.c b/tools/debugedit.c
+	index 064ac0a..bda05db 100644
+	--- a/tools/debugedit.c
+	+++ b/tools/debugedit.c
+	@@ -588,9 +588,9 @@ edit_dwarf2_line (DSO *dso, uint_32 off, char *comp_dir, int phase)
+	          if (base_dir == NULL)
+	            p = s;
+	          else if (has_prefix (s, base_dir))
+	-           p = s + strlen (base_dir);
+	+           { p = s + strlen (base_dir); if (*p == '/') p++; }
+	          else if (has_prefix (s, dest_dir))
+	-           p = s + strlen (dest_dir);
+	+           { p = s + strlen (dest_dir); if (*p == '/') p++; }
+
+	          if (p)
+	            {
+```
+
 [debugedit_el6](/download/debug/debugedit_el6)
 
 [debugedit_el5](/download/debug/debugedit_el5)
