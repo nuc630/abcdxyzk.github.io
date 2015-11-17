@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-10-31T23:58:56+08:00</updated>
+  <updated>2015-11-17T15:30:21+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,772 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[ixgbe]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-ixgbe/"/>
+    <updated>2015-11-17T15:16:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-ixgbe</id>
+    <content type="html"><![CDATA[<p><a href="http://www.pagefault.info/?p=403">http://www.pagefault.info/?p=403</a></p>
+
+<p>这里分析的驱动代码是给予linux kernel 3.4.4</p>
+
+<p>对应的文件在drivers/net/ethernet/intel 目录下，这个分析不涉及到很细节的地方，主要目的是理解下数据在协议栈和驱动之间是如何交互的。</p>
+
+<p>首先我们知道网卡都是pci设备，因此这里每个网卡驱动其实就是一个pci驱动。并且intel这里是把好几个万兆网卡(82599/82598/x540)的驱动做在一起的。</p>
+
+<p>首先我们来看对应的pci_driver的结构体，这里每个pci驱动都是一个pci_driver的结构体，而这里是多个万兆网卡共用这个结构体ixgbe_driver.</p>
+
+<pre><code>    static struct pci_driver ixgbe_driver = {
+        .name     = ixgbe_driver_name,
+        .id_table = ixgbe_pci_tbl,
+        .probe    = ixgbe_probe,
+        .remove   = __devexit_p(ixgbe_remove),
+    #ifdef CONFIG_PM
+        .suspend  = ixgbe_suspend,
+        .resume   = ixgbe_resume,
+    #endif
+        .shutdown = ixgbe_shutdown,
+        .err_handler = &amp;ixgbe_err_handler
+    };
+</code></pre>
+
+<p>然后是模块初始化方法,这里其实很简单，就是调用pci的驱动注册方法，把ixgbe挂载到pci设备链中。 这里不对pci设备的初始化做太多介绍，我以前的blog有这方面的介绍，想了解的可以去看看。这里我们只需要知道最终内核会调用probe回调来初始化ixgbe。</p>
+
+<pre><code>    char ixgbe_driver_name[] = "ixgbe";
+    static const char ixgbe_driver_string[] =
+                    "Intel(R) 10 Gigabit PCI Express Network Driver";
+
+    static int __init ixgbe_init_module(void)
+    {
+        int ret;
+        pr_info("%s - version %s\n", ixgbe_driver_string, ixgbe_driver_version);
+        pr_info("%s\n", ixgbe_copyright);
+
+    #ifdef CONFIG_IXGBE_DCA
+        dca_register_notify(&amp;dca_notifier);
+    #endif
+
+        ret = pci_register_driver(&amp;ixgbe_driver);
+        return ret;
+    }
+</code></pre>
+
+<p>这里不去追究具体如何调用probe的细节，我们直接来看probe函数，这个函数中通过硬件的信息来确定需要初始化那个驱动(82598/82599/x540),然后核心的驱动结构就放在下面的这个数组中。</p>
+
+<pre><code>    static const struct ixgbe_info *ixgbe_info_tbl[] = {
+        [board_82598] = &amp;ixgbe_82598_info,
+        [board_82599] = &amp;ixgbe_82599_info,
+        [board_X540] = &amp;ixgbe_X540_info,
+    };
+</code></pre>
+
+<p>ixgbe_probe函数很长，我们这里就不详细分析了，因为这部分就是对网卡进行初始化。不过我们关注下面几个代码片段。</p>
+
+<p>首先是根据硬件的参数来取得对应的驱动值:</p>
+
+<pre><code>    const struct ixgbe_info *ii = ixgbe_info_tbl[ent-&gt;driver_data];
+</code></pre>
+
+<p>然后就是如何将不同的网卡驱动挂载到对应的回调中，这里做的很简单，就是通过对应的netdev的结构取得adapter，然后所有的核心操作都是保存在adapter中的，最后将ii的所有回调拷贝给adapter就可以了。我们来看代码：</p>
+
+<pre><code>        struct net_device *netdev;
+        struct ixgbe_adapter *adapter = NULL;
+        struct ixgbe_hw *hw;
+        .....................................
+
+        adapter = netdev_priv(netdev);
+        pci_set_drvdata(pdev, adapter);
+
+        adapter-&gt;netdev = netdev;
+        adapter-&gt;pdev = pdev;
+        hw = &amp;adapter-&gt;hw;
+        hw-&gt;back = adapter;
+        .......................................
+        memcpy(&amp;hw-&gt;mac.ops, ii-&gt;mac_ops, sizeof(hw-&gt;mac.ops));
+        hw-&gt;mac.type  = ii-&gt;mac;
+
+        /* EEPROM */
+        memcpy(&amp;hw-&gt;eeprom.ops, ii-&gt;eeprom_ops, sizeof(hw-&gt;eeprom.ops));
+        .....................................
+</code></pre>
+
+<p>最后需要关注的就是设置网卡属性，这些属性一般来说都是通过ethtool 可以设置的属性(比如tso/checksum等),这里我们就截取一部分:</p>
+
+<pre><code>        netdev-&gt;features = NETIF_F_SG |
+                   NETIF_F_IP_CSUM |
+                   NETIF_F_IPV6_CSUM |
+                   NETIF_F_HW_VLAN_TX |
+                   NETIF_F_HW_VLAN_RX |
+                   NETIF_F_HW_VLAN_FILTER |
+                   NETIF_F_TSO |
+                   NETIF_F_TSO6 |
+                   NETIF_F_RXHASH |
+                   NETIF_F_RXCSUM;
+
+        netdev-&gt;hw_features = netdev-&gt;features;
+
+        switch (adapter-&gt;hw.mac.type) {
+        case ixgbe_mac_82599EB:
+        case ixgbe_mac_X540:
+            netdev-&gt;features |= NETIF_F_SCTP_CSUM;
+            netdev-&gt;hw_features |= NETIF_F_SCTP_CSUM |
+                           NETIF_F_NTUPLE;
+            break;
+        default:
+            break;
+        }
+
+        netdev-&gt;hw_features |= NETIF_F_RXALL;
+        ..................................................
+
+        netdev-&gt;priv_flags |= IFF_UNICAST_FLT;
+        netdev-&gt;priv_flags |= IFF_SUPP_NOFCS;
+
+        if (adapter-&gt;flags &amp; IXGBE_FLAG_SRIOV_ENABLED)
+            adapter-&gt;flags &amp;= ~(IXGBE_FLAG_RSS_ENABLED |
+                        IXGBE_FLAG_DCB_ENABLED);
+        ...................................................................
+        if (pci_using_dac) {
+            netdev-&gt;features |= NETIF_F_HIGHDMA;
+            netdev-&gt;vlan_features |= NETIF_F_HIGHDMA;
+        }
+
+        if (adapter-&gt;flags2 &amp; IXGBE_FLAG2_RSC_CAPABLE)
+            netdev-&gt;hw_features |= NETIF_F_LRO;
+        if (adapter-&gt;flags2 &amp; IXGBE_FLAG2_RSC_ENABLED)
+            netdev-&gt;features |= NETIF_F_LRO;
+</code></pre>
+
+<p>然后我们来看下中断的注册，因为万兆网卡大部分都是多对列网卡(配合msix)，因此对于上层软件来说，就好像有多个网卡一样，它们之间的数据是相互独立的，这里读的话主要是napi驱动的poll方法，后面我们会分析这个.</p>
+
+<p>到了这里或许要问那么网卡是如何挂载回调给上层，从而上层来发送数据呢，这里是这样子的，每个网络设备都有一个回调函数表(比如ndo_start_xmit)来供上层调用，而在ixgbe中的话，就是ixgbe_netdev_ops，下面就是这个结构，不过只是截取了我们很感兴趣的几个地方.</p>
+
+<p>不过这里注意，读回调并不在里面，这是因为写是软件主动的，而读则是硬件主动的。现在ixgbe是NAPI的，因此它的poll回调是ixgbe_poll，是中断注册时候通过netif_napi_add添加进去的。</p>
+
+<pre><code>    static const struct net_device_ops ixgbe_netdev_ops = {
+        .ndo_open       = ixgbe_open,
+        .ndo_stop       = ixgbe_close,
+        .ndo_start_xmit     = ixgbe_xmit_frame,
+        .ndo_select_queue   = ixgbe_select_queue,
+        .ndo_set_rx_mode    = ixgbe_set_rx_mode,
+        .ndo_validate_addr  = eth_validate_addr,
+        .ndo_set_mac_address    = ixgbe_set_mac,
+        .ndo_change_mtu     = ixgbe_change_mtu,
+        .ndo_tx_timeout     = ixgbe_tx_timeout,
+        .................................................
+        .ndo_set_features = ixgbe_set_features,
+        .ndo_fix_features = ixgbe_fix_features,
+    };
+</code></pre>
+
+<p>这里我们最关注的其实就是ndo_start_xmit回调，这个回调就是驱动提供给协议栈的发送回调接口。我们来看这个函数.</p>
+
+<p>它的实现很简单，就是选取对应的队列，然后调用ixgbe_xmit_frame_ring来发送数据。</p>
+
+<pre><code>    static netdev_tx_t ixgbe_xmit_frame(struct sk_buff *skb,
+                        struct net_device *netdev)
+    {
+        struct ixgbe_adapter *adapter = netdev_priv(netdev);
+        struct ixgbe_ring *tx_ring;
+
+        if (skb-&gt;len &lt;= 0) {
+            dev_kfree_skb_any(skb);
+            return NETDEV_TX_OK;
+        }
+
+        /*
+         * The minimum packet size for olinfo paylen is 17 so pad the skb
+         * in order to meet this minimum size requirement.
+         */
+        if (skb-&gt;len &lt; 17) {
+            if (skb_padto(skb, 17))
+                return NETDEV_TX_OK;
+            skb-&gt;len = 17;
+        }
+        //取得对应的队列
+        tx_ring = adapter-&gt;tx_ring[skb-&gt;queue_mapping];
+        //发送数据
+        return ixgbe_xmit_frame_ring(skb, adapter, tx_ring);
+    }
+</code></pre>
+
+<p>而在ixgbe_xmit_frame_ring中，我们就关注两个地方，一个是tso(什么是TSO，请自行google)，一个是如何发送.</p>
+
+<pre><code>        tso = ixgbe_tso(tx_ring, first, &amp;hdr_len);
+        if (tso &lt; 0)
+            goto out_drop;
+        else if (!tso)
+            ixgbe_tx_csum(tx_ring, first);
+
+        /* add the ATR filter if ATR is on */
+        if (test_bit(__IXGBE_TX_FDIR_INIT_DONE, &amp;tx_ring-&gt;state))
+            ixgbe_atr(tx_ring, first);
+
+    #ifdef IXGBE_FCOE
+    xmit_fcoe:
+    #endif /* IXGBE_FCOE */
+        ixgbe_tx_map(tx_ring, first, hdr_len);
+</code></pre>
+
+<p>调用ixgbe_tso处理完tso之后，就会调用ixgbe_tx_map来发送数据。而ixgbe_tx_map所做的最主要是两步，第一步请求DMA，第二步写寄存器，通知网卡发送数据.</p>
+
+<pre><code>        dma = dma_map_single(tx_ring-&gt;dev, skb-&gt;data, size, DMA_TO_DEVICE);
+        if (dma_mapping_error(tx_ring-&gt;dev, dma))
+            goto dma_error;
+
+        /* record length, and DMA address */
+        dma_unmap_len_set(first, len, size);
+        dma_unmap_addr_set(first, dma, dma);
+
+        tx_desc-&gt;read.buffer_addr = cpu_to_le64(dma);
+
+        for (;;) {
+            while (unlikely(size &gt; IXGBE_MAX_DATA_PER_TXD)) {
+                tx_desc-&gt;read.cmd_type_len =
+                    cmd_type | cpu_to_le32(IXGBE_MAX_DATA_PER_TXD);
+
+                i++;
+                tx_desc++;
+                if (i == tx_ring-&gt;count) {
+                    tx_desc = IXGBE_TX_DESC(tx_ring, 0);
+                    i = 0;
+                }
+
+                dma += IXGBE_MAX_DATA_PER_TXD;
+                size -= IXGBE_MAX_DATA_PER_TXD;
+
+                tx_desc-&gt;read.buffer_addr = cpu_to_le64(dma);
+                tx_desc-&gt;read.olinfo_status = 0;
+            }
+
+            ...................................................
+            data_len -= size;
+
+            dma = skb_frag_dma_map(tx_ring-&gt;dev, frag, 0, size,
+                           DMA_TO_DEVICE);
+            ..........................................................
+
+            frag++;
+        }
+        .................................
+        tx_ring-&gt;next_to_use = i;
+
+        /* notify HW of packet */
+        writel(i, tx_ring-&gt;tail);
+        .................
+</code></pre>
+
+<p>上面的操作是异步的，也就是说此时内核还不能释放SKB，而是网卡硬件发送完数据之后，会再次产生中断通知内核，然后内核才能释放内存.接下来我们来看这部分代码。</p>
+
+<p>首先来看的是中断注册的代码，这里我们假设启用了MSIX,那么网卡的中断注册回调就是ixgbe_request_msix_irqs函数，这里我们可以看到调用request_irq函数来注册回调，并且每个队列都有自己的中断号。</p>
+
+<pre><code>    static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
+    {
+        struct net_device *netdev = adapter-&gt;netdev;
+        int q_vectors = adapter-&gt;num_msix_vectors - NON_Q_VECTORS;
+        int vector, err;
+        int ri = 0, ti = 0;
+
+        for (vector = 0; vector &lt; q_vectors; vector++) {
+            struct ixgbe_q_vector *q_vector = adapter-&gt;q_vector[vector];
+            struct msix_entry *entry = &amp;adapter-&gt;msix_entries[vector];
+            .......................................................................
+            err = request_irq(entry-&gt;vector, &amp;ixgbe_msix_clean_rings, 0,
+                      q_vector-&gt;name, q_vector);
+            if (err) {
+                e_err(probe, "request_irq failed for MSIX interrupt "
+                      "Error: %d\n", err);
+                goto free_queue_irqs;
+            }
+            /* If Flow Director is enabled, set interrupt affinity */
+            if (adapter-&gt;flags &amp; IXGBE_FLAG_FDIR_HASH_CAPABLE) {
+                /* assign the mask for this irq */
+                irq_set_affinity_hint(entry-&gt;vector,
+                              &amp;q_vector-&gt;affinity_mask);
+            }
+        }
+
+        ..............................................
+
+        return 0;
+
+    free_queue_irqs:
+        ...............................
+        return err;
+    }
+</code></pre>
+
+<p>而对应的中断回调是ixgbe_msix_clean_rings,而这个函数呢，做的事情很简单(需要熟悉NAPI的原理，我以前的blog有介绍),就是调用napi_schedule来重新加入软中断处理.</p>
+
+<pre><code>    static irqreturn_t ixgbe_msix_clean_rings(int irq, void *data)
+    {
+        struct ixgbe_q_vector *q_vector = data;
+
+        /* EIAM disabled interrupts (on this vector) for us */
+
+        if (q_vector-&gt;rx.ring || q_vector-&gt;tx.ring)
+            napi_schedule(&amp;q_vector-&gt;napi);
+
+        return IRQ_HANDLED;
+    }
+</code></pre>
+
+<p>而NAPI驱动我们知道，最终是会调用网卡驱动挂载的poll回调，在ixgbe中，对应的回调就是ixgbe_poll，那么也就是说这个函数要做两个工作，一个是处理读，一个是处理写完之后的清理.</p>
+
+<pre><code>    int ixgbe_poll(struct napi_struct *napi, int budget)
+    {
+        struct ixgbe_q_vector *q_vector =
+                    container_of(napi, struct ixgbe_q_vector, napi);
+        struct ixgbe_adapter *adapter = q_vector-&gt;adapter;
+        struct ixgbe_ring *ring;
+        int per_ring_budget;
+        bool clean_complete = true;
+
+    #ifdef CONFIG_IXGBE_DCA
+        if (adapter-&gt;flags &amp; IXGBE_FLAG_DCA_ENABLED)
+            ixgbe_update_dca(q_vector);
+    #endif
+        //清理写
+        ixgbe_for_each_ring(ring, q_vector-&gt;tx)
+            clean_complete &amp;= !!ixgbe_clean_tx_irq(q_vector, ring);
+
+        /* attempt to distribute budget to each queue fairly, but don't allow
+         * the budget to go below 1 because we'll exit polling */
+        if (q_vector-&gt;rx.count &gt; 1)
+            per_ring_budget = max(budget/q_vector-&gt;rx.count, 1);
+        else
+            per_ring_budget = budget;
+        //读数据，并清理已完成的
+        ixgbe_for_each_ring(ring, q_vector-&gt;rx)
+            clean_complete &amp;= ixgbe_clean_rx_irq(q_vector, ring,
+                                 per_ring_budget);
+
+        /* If all work not completed, return budget and keep polling */
+        if (!clean_complete)
+            return budget;
+
+        /* all work done, exit the polling mode */
+        napi_complete(napi);
+        if (adapter-&gt;rx_itr_setting &amp; 1)
+            ixgbe_set_itr(q_vector);
+        if (!test_bit(__IXGBE_DOWN, &amp;adapter-&gt;state))
+            ixgbe_irq_enable_queues(adapter, ((u64)1 &lt;&lt; q_vector-&gt;v_idx));
+
+        return 0;
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[cubic]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-cubic/"/>
+    <updated>2015-11-17T15:08:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-cubic</id>
+    <content type="html"><![CDATA[<p><a href="http://www.pagefault.info/?p=145">http://www.pagefault.info/?p=145</a></p>
+
+<p>这次主要来看一下内核拥塞控制算法cubic的实现，在linux kernel中实现了很多种拥塞控制算法，不过新的内核(2.6.19之后)默认是cubic(想得到当前内核使用的拥塞控制算法可以察看/proc/sys/net/ipv4/tcp_congestion_control这个值).下面是最新的redhat 6的拥塞控制算法(rh5还是bic算法):
+<code>
+    [root@rhel6 ~]# cat /proc/sys/net/ipv4/tcp_congestion_control
+    cubic
+</code>
+这个算法的paper在这里：</p>
+
+<p><a href="http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf">http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf</a></p>
+
+<p>拥塞控制算法会在tcp_ack中被调用，如果是正常的ack(比如不是重复的，不是sack等等)就会进入拥塞控制算法。</p>
+
+<p>cubic会调用tcp_slow_start这个方法(基本上每种拥塞控制算法都会调用它)，这个方法主要是处理slow start，而内核中的slow start是这样子的，接收一个ack，snd_cwnd就会加1，然后当cwnd大于设置的拥塞窗口阀值snd_ssthresh的时候，就会进入拥塞避免状态。而在发送数据包的时候，会判断in_flight(可以认为是发送还没确认的数据包，它等于发送未确认的数据包－sack的数据段－丢失的数据段＋重传的数据段，我的前面的blog有详细解释这个数据段)是否大于snd_cwnd,如果大于等于则不会发送数据，如果小于才会继续发送数据。</p>
+
+<p>而进入拥塞避免状态之后，窗口的增长速度将会减缓，</p>
+
+<p>来看一下我用jprobe hook tcp_slow_start(slow start处理函数) 和 tcp_cong_avoid_ai (拥塞避免处理)的数据。</p>
+
+<p>在下面的数据中sk表示当前socket的地址， in_flight packet表示发送还未接收的包, snd_cwnd表示发送拥塞窗口。
+然后详细解释下count后面的两个值，其中第一个是snd_cwnd_cnt，表示在当前的拥塞窗口中已经发送的数据段的个数，而第二个是struct bictcp的一个域cnt，它是cubic拥塞算法的核心，主要用来控制在拥塞避免状态的时候，什么时候才能增大拥塞窗口，具体实现是通过比较它和snd_cwnd_cnt，来决定是否增大拥塞窗口，而这个值的计算，我这里不会分析，想了解的，可以去看cubic的paper。</p>
+
+<p>还有一个需要注意的地方就是ssthresh，可以看到这个值在一开始初始化为一个最大的值，然后在进入拥塞避免状态的时候被设置为前一次拥塞窗口的大小.这个处理可以看rfc2581的这段：</p>
+
+<p>  The initial value of ssthresh may be arbitrarily high (i.e., the size of the advertised window), but it may be reduced in response to congestion. When cwnd &lt; ssthresh, the slow-start algorithm is used and when cwnd > ssthresh, the congestion avoidance algorithm is used. When cwnd and ssthresh are equal, the sender may use either of them.</p>
+
+<p>我们后面会看到这个值在cubic中是如何被设置的。
+<code>
+    //进入slow start，可以看到拥塞窗口默认初始值是3，然后每次接收到ack，都会加1.
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 2, snd_cwnd is 3, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 3, snd_cwnd is 4, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 4, snd_cwnd is 5, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 5, snd_cwnd is 6, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 4, snd_cwnd is 7, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 7, snd_cwnd is 8, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 6, snd_cwnd is 9, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 9, snd_cwnd is 10, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 10, snd_cwnd is 11, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 11, snd_cwnd is 12, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 10, snd_cwnd is 13, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 9, snd_cwnd is 14, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 15, ssthresh is 2147483647, count is [0:0]
+    //ssthresh被更新为当前拥塞窗口的大小，后面会看到为什么是16
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 16, ssthresh is 16, count is [0:0]
+    //进入拥塞避免，可以清楚的看到，此时拥塞窗口大于对应的阀值ssthresh.
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 17, ssthresh is 16, count is [0:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 15, snd_cwnd is 17, ssthresh is 16, count is [1:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 17, ssthresh is 16, count is [2:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 15, snd_cwnd is 17, ssthresh is 16, count is [3:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 17, ssthresh is 16, count is [4:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 17, ssthresh is 16, count is [5:877]
+    //这里注意，其中count的第一个值是一直线性增长的，也就是说下面省略了大概80条log，而在这80几次中拥塞窗口一直维持在17没有变化
+    ....................................................................................................................
+    //可以看到cnt变为3，也就是说明当执行完拥塞避免就会增加窗口了。
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 17, ssthresh is 16, count is [91:3]
+    //增加窗口的大小，然后将snd_cwnd_cnt reset为0.
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 11, snd_cwnd is 18, ssthresh is 16, count is [0:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 18, ssthresh is 16, count is [1:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 18, ssthresh is 16, count is [2:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 12, snd_cwnd is 18, ssthresh is 16, count is [3:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 12, snd_cwnd is 18, ssthresh is 16, count is [4:6]
+</code></p>
+
+<p>可以看到在slow start的状态，发送拥塞窗口就是很简单的每次加1，而当进入拥塞避免之后，明显的拥塞窗口的增大速度变慢很多。</p>
+
+<p>接下来来看具体的代码是如何实现的.</p>
+
+<p>首先来看bictcp_cong_avoid，也就是cubic拥塞控制算法的handler(一般来说在tcp_ack中被调用)，它有3个参数，第一个是对应的sock，第二个是对应的ack序列号，而第三个就是比较重要的一个变量，表示发送还没有被ack的数据包(在linux 内核tcp拥塞处理一中详细介绍过内核中这些变量)，这个变量是拥塞控制的核心。</p>
+
+<pre><code>    static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct bictcp *ca = inet_csk_ca(sk);
+        //判断发送拥塞窗口是否到达限制，如果到达限制则直接返回。
+        if (!tcp_is_cwnd_limited(sk, in_flight))
+            return;
+        //开始决定进入slow start还是拥塞控制状态
+        if (tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh) {
+            //是否需要reset对应的bictcp的值
+            if (hystart &amp;&amp; after(ack, ca-&gt;end_seq))
+                bictcp_hystart_reset(sk);
+            //进入slow start状态
+            tcp_slow_start(tp);
+        } else {
+            //进入拥塞避免状态，首先会更新ca-&gt;cnt.
+            bictcp_update(ca, tp-&gt;snd_cwnd);
+            //然后进入拥塞避免
+            tcp_cong_avoid_ai(tp, ca-&gt;cnt);
+        }
+    }
+</code></pre>
+
+<p>接下来就是看tcp_is_cwnd_limited，这个函数主要是实现RFC2861中对拥塞窗口的检测。它返回1说明拥塞窗口被限制，我们需要增加拥塞窗口，否则的话，就不需要增加拥塞窗口。</p>
+
+<p>然后这里还有两个判断，先来看第一个 gso的概念，gso是Generic Segmentation Offload的简写，他的主要功能就是尽量的延迟数据包的传输，以便与在最恰当的时机传输数据包，这个机制是处于数据包离开协议栈与进入驱动之间。比如如果驱动支持TSO的话，gso就会将多个unsegmented的数据段传递给驱动。而TSO是TCP Segmentation Offload的缩写，它表示驱动支持协议栈发送大的MTU的数据段，然后硬件负责来切包，然后将数据发送出去，这样子的话，就能提高系统的吞吐。这几个东西(还有GRO)，以后我会详细分析，现在只需要大概知道他们是干什么的。</p>
+
+<p>而在这里如果支持gso，就有可能是tso defer住了数据包，因此这里会进行几个相关的判断，来看需不需要增加拥塞窗口。。</p>
+
+<p>然后是burst的概念，主要用来控制网络流量的突发性增大，也就是说当left数据(还能发送的数据段数)大于burst值的时候，我们需要暂时停止增加窗口，因为此时有可能我们这边数据发送过快。</p>
+
+<pre><code>    int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
+    {
+        const struct tcp_sock *tp = tcp_sk(sk);
+        u32 left;
+        //比较发送未确认和发送拥塞窗口的大小
+        if (in_flight &gt;= tp-&gt;snd_cwnd)
+            return 1;
+        //得到还能发送的数据包的段数
+        left = tp-&gt;snd_cwnd - in_flight;
+        if (sk_can_gso(sk) &amp;&amp;
+            left * sysctl_tcp_tso_win_divisor &lt; tp-&gt;snd_cwnd &amp;&amp;
+            left * tp-&gt;mss_cache &lt; sk-&gt;sk_gso_max_size)
+            return 1;
+        //看是否还能发送的数据包是否小于等于burst
+        return left &lt;= tcp_max_burst(tp);
+    }
+</code></pre>
+
+<p>接下来来看snd_ssthresh是如何被设置的，这个值在加载cubic模块的时候可以传递一个我们制定的值给它，不过，默认是很大的值，我这里是2147483647,然后在接收ack期间(slow start)期间会调整这个值，在cubic中，默认是16（一般来说说当拥塞窗口到达16的时候，snd_ssthresh会被设置为16).</p>
+
+<p>在cubic中有两个可以设置snd_ssthresh的地方一个是hystart_update，一个是bictcp_recalc_ssthresh，后一个我这里就不介绍了，以后介绍拥塞状态机的时候会详细介绍，现在只需要知道，只有遇到拥塞的时候，需要调整snd_ssthres的时候，我们才需要调用bictcp_recalc_ssthresh。</p>
+
+<p>而hystart_update是在bictcp_acked中被调用，而bictcp_acked则是基本每次收到ack都会调用这个函数，我们来看在bictcp_acked中什么情况就会调用hystart_update：</p>
+
+<pre><code>    /* hystart triggers when cwnd is larger than some threshold */
+    if (hystart &amp;&amp; tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh &amp;&amp;
+        tp-&gt;snd_cwnd &gt;= hystart_low_window)
+        hystart_update(sk, delay);
+</code></pre>
+
+<p>其中hystart是hybrid slow start打开的标志，默认是开启，hystart_low_window是设置snd_ssthresh的最小拥塞窗口值，默认是16。而tp->snd_ssthresh默认是一个很大的值，因此这里就知道了，当拥塞窗口增大到16的时候我们就会进去hystart_update来更新snd_ssthresh.因此hystart_updat换句话来说也就是主要用于是否退出slow start。</p>
+
+<pre><code>    static void hystart_update(struct sock *sk, u32 delay)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct bictcp *ca = inet_csk_ca(sk);
+
+        if (!(ca-&gt;found &amp; hystart_detect)) {
+            .................................................................
+            /*
+             * Either one of two conditions are met,
+             * we exit from slow start immediately.
+             */
+            //found是一个是否退出slow start的标记
+            if (ca-&gt;found &amp; hystart_detect)
+                //设置snd_ssthresh
+                tp-&gt;snd_ssthresh = tp-&gt;snd_cwnd;
+        }
+    }
+</code></pre>
+
+<p>然后是slow start的处理,这里有关abc的处理，注释都很详细了，这里就不解释了，我们主要看abc关闭的部分。这里使用cnt，也是主要为了打开abc之后的slow start。</p>
+
+<p>这是abc（Appropriate Byte Counting）相关的rfc：</p>
+
+<p><a href="http://www.faqs.org/rfcs/rfc3465.html">http://www.faqs.org/rfcs/rfc3465.html</a></p>
+
+<p>Appropriate Byte Countin会导致拥塞控制算法很激进，比如打开它之后就不一定每次ack都会执行slow start，而且窗口也会增加的快很多。</p>
+
+<pre><code>    void tcp_slow_start(struct tcp_sock *tp)
+    {
+        int cnt; /* increase in packets */
+
+        /* RFC3465: ABC Slow start
+         * Increase only after a full MSS of bytes is acked
+         *
+         * TCP sender SHOULD increase cwnd by the number of
+         * previously unacknowledged bytes ACKed by each incoming
+         * acknowledgment, provided the increase is not more than L
+         */
+        if (sysctl_tcp_abc &amp;&amp; tp-&gt;bytes_acked &lt; tp-&gt;mss_cache)
+            return;
+        //限制slow start的cnt
+        if (sysctl_tcp_max_ssthresh &gt; 0 &amp;&amp; tp-&gt;snd_cwnd &gt; sysctl_tcp_max_ssthresh)
+            cnt = sysctl_tcp_max_ssthresh &gt;&gt; 1; /* limited slow start */
+        else
+            cnt = tp-&gt;snd_cwnd;         /* exponential increase */
+
+        /* RFC3465: ABC
+         * We MAY increase by 2 if discovered delayed ack
+         */
+        if (sysctl_tcp_abc &gt; 1 &amp;&amp; tp-&gt;bytes_acked &gt;= 2*tp-&gt;mss_cache)
+            cnt &lt;&lt;= 1;
+        tp-&gt;bytes_acked = 0;
+        //更新cnt，也就是当前拥塞窗口接受的段的个数.
+        tp-&gt;snd_cwnd_cnt += cnt;
+        while (tp-&gt;snd_cwnd_cnt &gt;= tp-&gt;snd_cwnd) {
+            //这里snd_cwnd_cnt是snd_cwnd的几倍，拥塞窗口就增加几。
+            tp-&gt;snd_cwnd_cnt -= tp-&gt;snd_cwnd;
+            //如果拥塞窗口没有超过最大值，则加一
+            if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
+                tp-&gt;snd_cwnd++;
+        }
+    }
+</code></pre>
+
+<p>最后是拥塞避免的处理。这里主要的步骤就是通过判断当前的拥塞窗口下已经发送的数据段的个数是否大于算法计算出来的值w，如果大于我们才能增加拥塞窗口值，否则之需要增加snd_cwnd_cnt。</p>
+
+<pre><code>    void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w)
+    {
+        //判断是否大于我们的标记值
+        if (tp-&gt;snd_cwnd_cnt &gt;= w) {
+            if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
+                tp-&gt;snd_cwnd++;
+            tp-&gt;snd_cwnd_cnt = 0;
+        } else {
+            //增加计数值
+            tp-&gt;snd_cwnd_cnt++;
+        }
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[iptables]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-iptables/"/>
+    <updated>2015-11-17T14:48:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-iptables</id>
+    <content type="html"><![CDATA[<p><a href="http://my.oschina.net/kisops/blog/150995">http://my.oschina.net/kisops/blog/150995</a></p>
+
+<p>解决：nf_conntrack: table full, dropping packet.</p>
+
+<hr />
+
+<p> “连接跟踪表已满，开始丢包”！相信不少用iptables的同学都会见过这个错误信息吧，这个问题曾经也困扰过我好长一段时间。此问题的解决办法有四种（nf_conntrack 在CentOS 5 / kernel &lt;= 2.6.19中名为 ip_conntrack ）：</p>
+
+<h4>一、关闭防火墙。 简单粗暴，直接有效</h4>
+
+<pre><code>    chkconfig iptables off
+    chkconfig ip6tables off
+    service iptables stop
+    service ip6tables stop
+</code></pre>
+
+<p>切记：在防火墙关闭状态下，不要通过iptables指令（比如 iptables -nL）来查看当前状态！因为这样会导致防火墙被启动，而且规则为空。虽然不会有任何拦截效果，但所有连接状态都会被记录，浪费资源且影响性能并可能导致防火墙主动丢包！</p>
+
+<h4>二、加大防火墙跟踪表的大小，优化对应的系统参数</h4>
+
+<h5>1、状态跟踪表的最大行数的设定，理论最大值 CONNTRACK_MAX = RAMSIZE (in bytes) / 16384 / (ARCH / 32)</h5>
+
+<p>以64G的64位操作系统为例，CONNTRACK_MAX = 64<em>1024</em>1024*1024/16384/2 = 2097152</p>
+
+<p>即时生效请执行：
+<code>
+    sysctl -w net.netfilter.nf_conntrack_max = 2097152
+</code></p>
+
+<h5>2、其哈希表大小通常为总表的1/8，最大为1/2。</h5>
+
+<p>CONNTRACK_BUCKETS = CONNTRACK_MAX / 8</p>
+
+<p>同样64G的64位操作系统，哈希最佳范围是 262144 ~ 1048576 。</p>
+
+<p>运行状态中通过 sysctl net.netfilter.nf_conntrack_buckets 进行查看，通过文件 /sys/module/nf_conntrack/parameters/hashsize 进行设置</p>
+
+<p>或者新建 /etc/modprobe.d/iptables.conf ，重新加载模块才生效：
+<code>
+    options nf_conntrack hashsize = 262144
+</code></p>
+
+<h5>3、还有些相关的系统参数<code>sysctl -a | grep nf_conntrack</code>可以调优（/etc/sysctl.conf ）：</h5>
+
+<pre><code>    net.netfilter.nf_conntrack_max  =   1048576
+    net.netfilter.ip_conntrack_tcp_timeout_established  =   3600
+    net.netfilter.nf_conntrack_tcp_timeout_close_wait  =   60
+    net.netfilter.nf_conntrack_tcp_timeout_fin_wait  =   120
+    net.netfilter.nf_conntrack_tcp_timeout_time_wait  =   120
+</code></pre>
+
+<p>三、使用祼表，添加“不跟踪”标识。如下示例更适合桌面系统或随意性强的服务器。因为它开启了连接的状态机制，方便和外部通信。修改 /etc/sysconfig/iptables 文件：
+<code>
+    *raw
+    # 对TCP连接不启用追踪，解决ip_contrack满导致无法连接的问题
+    -A PREROUTING -p tcp -m tcp --dport 80 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 22 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 21 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 11211 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 60000:60100 -j NOTRACK
+    -A PREROUTING -p tcp -s 192.168.10.1 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 80 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 22 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 21 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 11211 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 60000:60100 -j NOTRACK
+    -A OUTPUT -p tcp -s 192.168.10.1 -j NOTRACK
+    COMMIT
+    *filter
+    # 允许ping
+    -A INPUT -p icmp -j ACCEPT
+    # 对本地回路、第5张网卡放行
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -i eth4 -j ACCEPT
+    # 连接状态跟踪，已建立的连接允许传输数据
+    -A INPUT -m state --state ESTABLISHED,RELATED,INVALID,UNTRACKED -j ACCEPT
+    # filter表里存在但在raw里不存在的，默认会进行连接状态跟踪
+    -A INPUT -s 192.168.10.31 -p tcp --dport 2669 -j ACCEPT
+    -A INPUT -j REJECT --reject-with icmp-host-prohibited
+    -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+    COMMIT
+</code></p>
+
+<p>或者干脆对所有连接都关闭跟踪，不跟踪任何连接状态。不过规则就限制比较严谨，进出都需要显式申明。示例 /etc/sysconfig/iptables ：</p>
+
+<pre><code>    *raw
+    # 对TCP/UDP连接不启用追踪，解决nf_contrack满导致无法连接的问题
+    -A PREROUTING -p tcp -j NOTRACK
+    -A PREROUTING -p udp -j NOTRACK
+    -A OUTPUT -p tcp -j NOTRACK
+    -A OUTPUT -p udp -j NOTRACK
+    COMMIT
+    *filter
+    # 允许ping
+    -A INPUT -p icmp -j ACCEPT
+    # 对本地回路和eth1放行
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -i eth1 -j ACCEPT
+    # 只允许符合条件的连接进行传输数据
+    -A INPUT -p tcp --dport 22 -j ACCEPT
+    -A INPUT -p tcp --sport 80 -j ACCEPT
+    -A INPUT -p udp --sport 53 -j ACCEPT
+    -A INPUT -p udp --sport 123 -j ACCEPT
+    # 出去的包都不限制
+    -A OUTPUT -p tcp -j ACCEPT
+    -A OUTPUT -p udp -j ACCEPT
+    # 输入和转发的包不符合规则的全拦截
+    -A INPUT -j REJECT --reject-with icmp-host-prohibited
+    -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+    COMMIT
+</code></pre>
+
+<p>效果如下图：</p>
+
+<p><img src="/images/kernel/2015-11-17.png" alt="" /></p>
+
+<h4>四、删除连接跟踪模块<code>lsmod | grep nf_conntrack</code>，不使用连接状态的跟踪功能。</h4>
+
+<h5>1、删除nf_conntrack和相关的依赖模块，示例：</h5>
+
+<pre><code>    rmmod nf_conntrack_ipv4
+    rmmod nf_conntrack_ipv6
+    rmmod xt_state
+    rmmod xt_CT
+    rmmod xt_conntrack
+    rmmod iptable_nat
+    rmmod ipt_REDIRECT
+    rmmod nf_nat
+    rmmod nf_conntrack
+</code></pre>
+
+<h5>2、禁用跟踪模块，把它加到黑名单（/etc/modprobe.d/blacklist.conf ）：</h5>
+
+<pre><code>    # 禁用 nf_conntrack 模块
+    blacklist nf_conntrack
+    blacklist nf_conntrack_ipv6
+    blacklist xt_conntrack
+    blacklist nf_conntrack_ftp
+    blacklist xt_state
+    blacklist iptable_nat
+    blacklist ipt_REDIRECT
+    blacklist nf_nat
+    blacklist nf_conntrack_ipv4
+</code></pre>
+
+<h5>3、去掉防火墙里所有和状态相关的配置（比如state状态，NAT功能），示例：</h5>
+
+<pre><code>    *filter
+    # 允许ping
+    -A INPUT -p icmp -j ACCEPT
+    # 对本地回路和第2张网卡放行
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -i eth1 -j ACCEPT
+    # 对端口放行
+    -A INPUT -p tcp --dport 1331 -j ACCEPT
+    # 对IP放行
+    -A INPUT -s 192.168.10.31 -j ACCEPT
+
+    #允许本机进行DNS查询
+
+    -A INPUT -p udp --sport 53 -j ACCEPT
+    -A OUTPUT -p udp -j ACCEPT
+    -A INPUT -j REJECT --reject-with icmp-host-prohibited
+    -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+    COMMIT
+</code></pre>
+
+<p>另外，防火墙的配置文件最好也改下，不要加载任何额外模块（/etc/sysconfig/iptables-config）：</p>
+
+<pre><code>    IPTABLES_MODULES="" # 不需要任何附加模块
+    IPTABLES_MODULES_UNLOAD="no" # 避免iptables重启后sysctl中对应的参数被重置为系统默认值
+    IPTABLES_SAVE_ON_STOP="no"
+    IPTABLES_SAVE_ON_RESTART="no"
+    IPTABLES_SAVE_COUNTER="no"
+    IPTABLES_STATUS_NUMERIC="yes"
+    IPTABLES_STATUS_VERBOSE="no"
+    IPTABLES_STATUS_LINENUMBERS="no"
+</code></pre>
+
+<p>往往我们对连接的跟踪都是基于操作系统的（netstat / ss ），防火墙的连接状态完全是它自身实现产生的。</p>
+
+<p>总结：防火墙有条件还是交给上层设备完成会更好，使用防火墙一定要做调优；如果不需要防火墙的跟踪功能，规则简单的可以开启NOTRACK选项，条件允许的情况下就删除它吧！</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[tcp连接建立过程]]></title>
@@ -331,1175 +1097,6 @@
         attack(skfd, &amp;target, srcport);
     }
 </code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[kernel 3.10内核源码分析--Out of Memory(OOM)处理流程]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-oom/"/>
-    <updated>2015-09-30T15:56:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-oom</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-20671208-id-4440249.html">http://blog.chinaunix.net/uid-20671208-id-4440249.html</a></p>
-
-<p>Out Of Memory(OOM)，即内存耗尽，当系统中内存耗尽时，如果不做处理，将处于崩溃的边缘，因为无内核资源可用，而系统运行时刻都可能需要申请内存。这时，内核需要采取一定的措施来防止系统崩溃，这就是我们熟知的OOM流程，其实就是要回收一些内存，而走到OOM流程，已经基本说明其它的回收内存的手段都已经尝试过了(比如回收cache)，这里通常只能通过kill进程来回收内存了，而选择被kill进程的标准就比较简单直接了，总体就是：谁用的多，就kill谁。</p>
-
-<p>OOM处理的基本流程简单描述如下：</p>
-
-<p>1、检查是否配置了/proc/sys/kernel/panic_on_oom，如果是则直接触发panic。</p>
-
-<p>2、检查是否配置了oom_kill_allocating_task，即是否需要kill current进程来回收内存，如果是，且current进程是killable的，则kill current进程。</p>
-
-<p>3、根据既定策略选择需要kill的process，基本策略为：通过进程的内存占用情况计算“点数”，点数最高者被选中。</p>
-
-<p>4、如果没有选出来可kill的进程，那么直接panic(通常不会走到这个流程，但也有例外，比如，当被选中的进程处于D状态，或者正在被kill)</p>
-
-<p>5、kill掉被选中的进程，以释放内存。</p>
-
-<p>代码注释如下：</p>
-
-<pre><code>    /*
-      * OOM处理的主流程，上面的注释应该比较清楚了。
-      */
-    void out_of_memory(struct zonelist *zonelist, gfp_t gfp_mask,
-            int order, nodemask_t *nodemask, bool force_kill)
-    {
-        const nodemask_t *mpol_mask;
-        struct task_struct *p;
-        unsigned long totalpages;
-        unsigned long freed = 0;
-        unsigned int uninitialized_var(points);
-        enum oom_constraint constraint = CONSTRAINT_NONE;
-        int killed = 0;
-
-        // 调用block通知链oom_nofify_list中的函数
-        blocking_notifier_call_chain(&amp;oom_notify_list, 0, &amp;freed);
-
-        if (freed &gt; 0)
-            /* Got some memory back in the last second. */
-            return;
-
-        /*
-         * If current has a pending SIGKILL or is exiting, then automatically
-         * select it. The goal is to allow it to allocate so that it may
-         * quickly exit and free its memory.
-         */
-        /*
-         * 如果当前进程有pending的SIGKILL(9)信号，或者正在退出，则选择当前进程来kill,
-         * 这样可以最快的达到释放内存的目的。
-         */
-        if (fatal_signal_pending(current) || current-&gt;flags &amp; PF_EXITING) {
-            set_thread_flag(TIF_MEMDIE);
-            return;
-        }
-
-        /*
-         * Check if there were limitations on the allocation (only relevant for
-         * NUMA) that may require different handling.
-         */
-        /*
-         * 检查是否有限制，有几种不同的限制策略，仅用于NUMA场景
-         */
-        constraint = constrained_alloc(zonelist, gfp_mask, nodemask,
-                            &amp;totalpages);
-        mpol_mask = (constraint == CONSTRAINT_MEMORY_POLICY) ? nodemask : NULL;
-        // 检查是否配置了/proc/sys/kernel/panic_on_oom，如果是则直接触发panic
-        check_panic_on_oom(constraint, gfp_mask, order, mpol_mask);
-
-        /*
-         * 检查是否配置了oom_kill_allocating_task，即是否需要kill current进程来
-         * 回收内存，如果是，且current进程是killable的，则kill current进程。
-         */
-        if (sysctl_oom_kill_allocating_task &amp;&amp; current-&gt;mm &amp;&amp;
-         !oom_unkillable_task(current, NULL, nodemask) &amp;&amp;
-         current-&gt;signal-&gt;oom_score_adj != OOM_SCORE_ADJ_MIN) {
-            get_task_struct(current);
-            // kill被选中的进程。
-            oom_kill_process(current, gfp_mask, order, 0, totalpages, NULL,
-                     nodemask,
-                     "Out of memory (oom_kill_allocating_task)");
-            goto out;
-        }
-
-        // 根据既定策略选择需要kill的process。
-        p = select_bad_process(&amp;points, totalpages, mpol_mask, force_kill);
-        /* Found nothing?!?! Either we hang forever, or we panic. */
-        /*
-         * 如果没有选出来，即没有可kill的进程，那么直接panic
-         * 通常不会走到这个流程，但也有例外，比如，当被选中的进程处于D状态，或者正在被kill
-         */
-        if (!p) {
-            dump_header(NULL, gfp_mask, order, NULL, mpol_mask);
-            panic("Out of memory and no killable processes...\n");
-        }
-        // kill掉被选中的进程，以释放内存。
-        if (PTR_ERR(p) != -1UL) {
-            oom_kill_process(p, gfp_mask, order, points, totalpages, NULL,
-                     nodemask, "Out of memory");
-            killed = 1;
-        }
-    out:
-        /*
-         * Give the killed threads a good chance of exiting before trying to
-         * allocate memory again.
-         */
-        /*
-         * 在重新分配内存之前，给被kill的进程1s的时间完成exit相关处理，通常情况
-         * 下，1s应该够了。
-         */
-        if (killed)
-            schedule_timeout_killable(1);
-    }
-</code></pre>
-
-<p>out_of_memory->select_bad_process</p>
-
-<p>通过select_bad_process函数选择被kill的进程，其基本流程为：</p>
-
-<p>1、遍历系统中的所有进程，进行"点数"计算</p>
-
-<p>2、进行一些特殊情况的处理，比如: 优先选择触发OOM的进程、不处理正在exit的进程等。</p>
-
-<p>3、计算"点数"，选择点数最大的进程。通过函数oom_badness()</p>
-
-<p>代码注释和分析如下：</p>
-
-<pre><code>    /*
-      * OOM流程中，用来选择被kill的进程的函数
-      * @ppoints:点数，用来计算每个进程被"选中"可能性，点数越高，越可能被"选中"
-      */
-    static struct task_struct *select_bad_process(unsigned int *ppoints,
-            unsigned long totalpages, const nodemask_t *nodemask,
-            bool force_kill)
-    {
-        struct task_struct *g, *p;
-        struct task_struct *chosen = NULL;
-        unsigned long chosen_points = 0;
-
-        rcu_read_lock();
-        // 遍历系统中的所有进程，进行"点数"计算
-        do_each_thread(g, p) {
-            unsigned int points;
-
-            /*
-             * 进行一些特殊情况的处理，比如: 优先选择触发OOM的进程、不处理
-             * 正在exit的进程等。
-             */        
-            switch (oom_scan_process_thread(p, totalpages, nodemask,
-                            force_kill)) {
-            case OOM_SCAN_SELECT:
-                chosen = p;
-                chosen_points = ULONG_MAX;
-                /* fall through */
-            case OOM_SCAN_CONTINUE:
-                continue;
-            case OOM_SCAN_ABORT:
-                rcu_read_unlock();
-                return ERR_PTR(-1UL);
-            case OOM_SCAN_OK:
-                break;
-            };
-            // 计算"点数"，选择点数最大的进程。
-            points = oom_badness(p, NULL, nodemask, totalpages);
-            if (points &gt; chosen_points) {
-                chosen = p;
-                chosen_points = points;
-            }
-        } while_each_thread(g, p);
-        if (chosen)
-            get_task_struct(chosen);
-        rcu_read_unlock();
-
-        *ppoints = chosen_points * 1000 / totalpages;
-        return chosen;
-    }
-</code></pre>
-
-<p>out_of_memory->select_bad_process->oom_scan_process_thread</p>
-
-<p>oom_scan_process_thread函数的分析和注释如下：</p>
-
-<pre><code>    enum oom_scan_t oom_scan_process_thread(struct task_struct *task,
-            unsigned long totalpages, const nodemask_t *nodemask,
-            bool force_kill)
-    {
-        // 如果进程正在exit
-        if (task-&gt;exit_state)
-            return OOM_SCAN_CONTINUE;
-        /*
-         * 如果进程不能被kill，比如: init进程或进程在nodemask对应的节点上，
-         * 没有可以释放的内存。
-         */
-        if (oom_unkillable_task(task, NULL, nodemask))
-            return OOM_SCAN_CONTINUE;
-
-        /*
-         * This task already has access to memory reserves and is being killed.
-         * Don't allow any other task to have access to the reserves.
-         */
-        /*
-         * 如果有进程正在被OOM流程kill，那么应该有内存可以释放了，就不需要再kill
-         * 其它进程了，此时返回abort，结束oom kill流程。
-         */
-        if (test_tsk_thread_flag(task, TIF_MEMDIE)) {
-            if (unlikely(frozen(task)))
-                __thaw_task(task);
-            if (!force_kill)
-                return OOM_SCAN_ABORT;
-        }
-        // 如果不存在mm了(可能进程刚退出了)
-        if (!task-&gt;mm)
-            return OOM_SCAN_CONTINUE;
-
-        /*
-         * If task is allocating a lot of memory and has been marked to be
-         * killed first if it triggers an oom, then select it.
-         */
-        // 优先选择触发OOM的进程。
-        if (oom_task_origin(task))
-            return OOM_SCAN_SELECT;
-
-        if (task-&gt;flags &amp; PF_EXITING &amp;&amp; !force_kill) {
-            /*
-             * If this task is not being ptraced on exit, then wait for it
-             * to finish before killing some other task unnecessarily.
-             */
-            if (!(task-&gt;group_leader-&gt;ptrace &amp; PT_TRACE_EXIT))
-                return OOM_SCAN_ABORT;
-        }
-        return OOM_SCAN_OK;
-    }
-</code></pre>
-
-<p>out_of_memory->select_bad_process->oom_badness</p>
-
-<p>oom_badness用于计算进程的“点数”，点数最高者被选中，代码注释和分析如下：</p>
-
-<pre><code>    /*
-     * 计算进程"点数"(代表进程被选中的可能性)的函数，点数根据进程占用的物理内存来计算
-     * 物理内存占用越多，被选中的可能性越大。root processes有3%的bonus。
-     */
-    unsigned long oom_badness(struct task_struct *p, struct mem_cgroup *memcg,
-                 const nodemask_t *nodemask, unsigned long totalpages)
-    {
-        long points;
-        long adj;
-
-        if (oom_unkillable_task(p, memcg, nodemask))
-            return 0;
-        // 确认进程是否还存在
-        p = find_lock_task_mm(p);
-        if (!p)
-            return 0;
-
-        adj = (long)p-&gt;signal-&gt;oom_score_adj;
-        if (adj == OOM_SCORE_ADJ_MIN) {
-            task_unlock(p);
-            return 0;
-        }
-
-        /*
-         * The baseline for the badness score is the proportion of RAM that each
-         * task's rss, pagetable and swap space use.
-         */
-        // 点数=rss(驻留内存/占用物理内存)+pte数+交换分区用量
-        points = get_mm_rss(p-&gt;mm) + p-&gt;mm-&gt;nr_ptes +
-             get_mm_counter(p-&gt;mm, MM_SWAPENTS);
-        task_unlock(p);
-
-        /*
-         * Root processes get 3% bonus, just like the __vm_enough_memory()
-         * implementation used by LSMs.
-         */
-        /*
-         * root用户启动的进程，有总 内存*3% 的bonus，就是说可以使用比其它进程多3%的内存
-         * 3%=30/1000
-         */
-        if (has_capability_noaudit(p, CAP_SYS_ADMIN))
-            adj -= 30;
-
-        /* Normalize to oom_score_adj units */
-        // 归一化"点数"单位
-        adj *= totalpages / 1000;
-        points += adj;
-
-        /*
-         * Never return 0 for an eligible task regardless of the root bonus and
-         * oom_score_adj (oom_score_adj can't be OOM_SCORE_ADJ_MIN here).
-         */
-        return points &gt; 0 ? points : 1;
-    }
-</code></pre>
-
-<p>out_of_memory->oom_kill_process</p>
-
-<p>oom_kill_process()函数用于：kill被选中的进程，其实就是给指定进程发送SIGKILL信号，待被选中进程返回用户态时，进行信号处理。</p>
-
-<p>相关代码注释和分析如下：</p>
-
-<pre><code>    /*
-      * kill被选中的进程，在OOM流程中被调用
-      */
-    void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
-             unsigned int points, unsigned long totalpages,
-             struct mem_cgroup *memcg, nodemask_t *nodemask,
-             const char *message)
-    {
-        struct task_struct *victim = p;
-        struct task_struct *child;
-        struct task_struct *t = p;
-        struct mm_struct *mm;
-        unsigned int victim_points = 0;
-        static DEFINE_RATELIMIT_STATE(oom_rs, DEFAULT_RATELIMIT_INTERVAL,
-                         DEFAULT_RATELIMIT_BURST);
-
-        /*
-         * If the task is already exiting, don't alarm the sysadmin or kill
-         * its children or threads, just set TIF_MEMDIE so it can die quickly
-         */
-        /*
-         * 如果进程正在exiting，就没有必要再kill它了，直接设置TIF_MEMDIE，然后返回。
-        */
-        if (p-&gt;flags &amp; PF_EXITING) {
-            set_tsk_thread_flag(p, TIF_MEMDIE);
-            put_task_struct(p);
-            return;
-        }
-
-        if (__ratelimit(&amp;oom_rs))
-            dump_header(p, gfp_mask, order, memcg, nodemask);
-
-        task_lock(p);
-        pr_err("%s: Kill process %d (%s) score %d or sacrifice child\n",
-            message, task_pid_nr(p), p-&gt;comm, points);
-        task_unlock(p);
-
-        /*
-         * If any of p's children has a different mm and is eligible for kill,
-         * the one with the highest oom_badness() score is sacrificed for its
-         * parent. This attempts to lose the minimal amount of work done while
-         * still freeing memory.
-         */
-        /*
-         * 如果被选中的进程的子进程，不跟其共享mm(通常是这样)，且膐om_badness的
-         * 得分更高，那么重新选择该子进程为被kill的进程。
-         */
-        read_lock(&amp;tasklist_lock);
-        do {
-            // 遍历被选中进程的所有子进程
-            list_for_each_entry(child, &amp;t-&gt;children, sibling) {
-                unsigned int child_points;
-
-                // 如果不共享mm
-                if (child-&gt;mm == p-&gt;mm)
-                    continue;
-                /*
-                 * oom_badness() returns 0 if the thread is unkillable
-                 */
-                // 计算child?om_badness得分
-                child_points = oom_badness(child, memcg, nodemask,
-                                    totalpages);
-                // 如果child得分更高，则将被选中进程换成child
-                if (child_points &gt; victim_points) {
-                    put_task_struct(victim);
-                    victim = child;
-                    victim_points = child_points;
-                    get_task_struct(victim);
-                }
-            }
-        } while_each_thread(p, t);
-        read_unlock(&amp;tasklist_lock);
-
-        rcu_read_lock();
-        /*
-         * 遍历确认被选中进程的线程组，判断是否还存在task_struct-&gt;mm，如果不存在
-         * (有可能这个时候进程退出了，或释放了mm),就没必要再kill了。
-         * 如果存在则选择线程组中的进程。
-         */
-        p = find_lock_task_mm(victim);
-        if (!p) {
-            rcu_read_unlock();
-            put_task_struct(victim);
-            return;
-        // 如果新选择的进程跟之前的不是同一个，那么更新victim。
-        } else if (victim != p) {
-            get_task_struct(p);
-            put_task_struct(victim);
-            victim = p;
-        }
-
-        /* mm cannot safely be dereferenced after task_unlock(victim) */
-        mm = victim-&gt;mm;
-        pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB\n",
-            task_pid_nr(victim), victim-&gt;comm, K(victim-&gt;mm-&gt;total_vm),
-            K(get_mm_counter(victim-&gt;mm, MM_ANONPAGES)),
-            K(get_mm_counter(victim-&gt;mm, MM_FILEPAGES)));
-        task_unlock(victim);
-
-        /*
-         * Kill all user processes sharing victim-&gt;mm in other thread groups, if
-         * any. They don't get access to memory reserves, though, to avoid
-         * depletion of all memory. This prevents mm-&gt;mmap_sem livelock when an
-         * oom killed thread cannot exit because it requires the semaphore and
-         * its contended by another thread trying to allocate memory itself.
-         * That thread will now get access to memory reserves since it has a
-         * pending fatal signal.
-         */
-        /*
-         * 遍历系统中的所有进程，寻找在其它线程组中，跟被选中进程(victim)共享mm结构
-         * 的进程(内核线程除外)，共享mm结构即共享进程地址空间，比如fork后exec之前，
-         * 父子进程是共享mm的，回收内存必须要将共享mm的所有进程都kill掉。
-         */
-        for_each_process(p)
-            if (p-&gt;mm == mm &amp;&amp; !same_thread_group(p, victim) &amp;&amp;
-             !(p-&gt;flags &amp; PF_KTHREAD)) {
-                if (p-&gt;signal-&gt;oom_score_adj == OOM_SCORE_ADJ_MIN)
-                    continue;
-
-                // 进行task_struct相关操作时，通常需要获取该锁。
-                task_lock(p);    /* Protect -&gt;comm from prctl() */
-                pr_err("Kill process %d (%s) sharing same memory\n",
-                    task_pid_nr(p), p-&gt;comm);
-                task_unlock(p);
-                // 通过向被选中的进程发送kill信号，来kill进程。
-                do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
-            }
-        rcu_read_unlock();
-
-        // 进程设置TIF_MEMDIE标记，表示进程正在被oom killer终止中。
-        set_tsk_thread_flag(victim, TIF_MEMDIE);
-        /*
-         * 最终通过向被选中的进程发送kill信号，来kill进程，被kill的进程在从内核态
-         * 返回用户态时，进行信号处理。
-         * 被选中的进程可以是自己(current)，则current进程会在oom流程执行完成后，返回
-         * 用户态时，处理信号。
-         */
-        do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
-        put_task_struct(victim);
-    }
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[kernel 3.10内核源码分析--内核页表创建]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-init/"/>
-    <updated>2015-09-30T15:53:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-init</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-20671208-id-4440253.html">http://blog.chinaunix.net/uid-20671208-id-4440253.html</a></p>
-
-<p>内核页表创建基本流程：
-<code>
-    start_kernel
-        setup_arch
-            init_mem_mapping
-                init_range_memory_mapping
-                    init_memory_mapping
-                        kernel_physical_mapping_init  
-</code></p>
-
-<pre><code>    /*
-      * 创建内核页表，将内核页表中能线性映射的部分(0-896M，还要刨去ISA等区域)
-      * 进行映射，创建相应的页表项，在内核初始化的时候(setup_arch())完成。
-      */
-    unsigned long __init
-    kernel_physical_mapping_init(unsigned long start,
-                 unsigned long end,
-                 unsigned long page_size_mask)
-    {
-        int use_pse = page_size_mask == (1&lt;&lt;PG_LEVEL_2M);
-        unsigned long last_map_addr = end;
-        unsigned long start_pfn, end_pfn;
-         /*内核页表页目录所在的位置，其所占的内存是在head_32.S中预先分配好的*/
-        pgd_t *pgd_base = swapper_pg_dir;
-        int pgd_idx, pmd_idx, pte_ofs;
-        unsigned long pfn;
-        pgd_t *pgd;
-        pmd_t *pmd;
-        pte_t *pte;
-        unsigned pages_2m, pages_4k;
-        int mapping_iter;
-        /*计算欲映射区域的起始和结束pfn*/
-        start_pfn = start &gt;&gt; PAGE_SHIFT;
-        end_pfn = end &gt;&gt; PAGE_SHIFT;
-
-        /*
-         * First iteration will setup identity mapping using large/small pages
-         * based on use_pse, with other attributes same as set by
-         * the early code in head_32.S
-         *
-         * Second iteration will setup the appropriate attributes (NX, GLOBAL..)
-         * as desired for the kernel identity mapping.
-         *
-         * This two pass mechanism conforms to the TLB app note which says:
-         *
-         * "Software should not write to a paging-structure entry in a way
-         * that would change, for any linear address, both the page size
-         * and either the page frame or attributes."
-         */
-        mapping_iter = 1;
-
-        if (!cpu_has_pse)
-            use_pse = 0;
-
-    repeat:
-        pages_2m = pages_4k = 0;
-        pfn = start_pfn;
-        pgd_idx = pgd_index((pfn&lt;&lt;PAGE_SHIFT) + PAGE_OFFSET);
-        /*
-         * pgd、pmd等存放的是本级页表中对应index项的虚拟地址，页表项的内容中存放的是
-         * 下一级页表的起始物理地址
-         */
-        pgd = pgd_base + pgd_idx;
-        for (; pgd_idx &lt; PTRS_PER_PGD; pgd++, pgd_idx++) {
-            //创建pmd，如果没有pmd，则返回pgd。实际通过get_free_page接口分配，此时buddy系统已经可用?
-            pmd = one_md_table_init(pgd);
-
-            if (pfn &gt;= end_pfn)
-                continue;
-    #ifdef CONFIG_X86_PAE
-            pmd_idx = pmd_index((pfn&lt;&lt;PAGE_SHIFT) + PAGE_OFFSET);
-            pmd += pmd_idx;
-    #else
-            pmd_idx = 0;
-    #endif
-            for (; pmd_idx &lt; PTRS_PER_PMD &amp;&amp; pfn &lt; end_pfn;
-             pmd++, pmd_idx++) {
-                /*
-                 * 页框虚拟地址，就是物理地址(pfn * PAGE_SIZE)+固定偏移
-                 * 这就是线性映射的实质。
-                */
-                unsigned int addr = pfn * PAGE_SIZE + PAGE_OFFSET;
-
-                /*
-                 * Map with big pages if possible, otherwise
-                 * create normal page tables:
-                 */
-                if (use_pse) {
-                    unsigned int addr2;
-                    pgprot_t prot = PAGE_KERNEL_LARGE;
-                    /*
-                     * first pass will use the same initial
-                     * identity mapping attribute + _PAGE_PSE.
-                     */
-                    pgprot_t init_prot =
-                        __pgprot(PTE_IDENT_ATTR |
-                            _PAGE_PSE);
-
-                    pfn &amp;= PMD_MASK &gt;&gt; PAGE_SHIFT;
-                    addr2 = (pfn + PTRS_PER_PTE-1) * PAGE_SIZE +
-                        PAGE_OFFSET + PAGE_SIZE-1;
-
-                    if (is_kernel_text(addr) ||
-                     is_kernel_text(addr2))
-                        prot = PAGE_KERNEL_LARGE_EXEC;
-
-                    pages_2m++;
-                    if (mapping_iter == 1)
-                        set_pmd(pmd, pfn_pmd(pfn, init_prot));
-                    else
-                        set_pmd(pmd, pfn_pmd(pfn, prot));
-
-                    pfn += PTRS_PER_PTE;
-                    continue;
-                }
-                // 创建页表
-                pte = one_page_table_init(pmd);
-
-                pte_ofs = pte_index((pfn&lt;&lt;PAGE_SHIFT) + PAGE_OFFSET);
-                pte += pte_ofs;
-                // 填写每项页表的内容。
-                for (; pte_ofs &lt; PTRS_PER_PTE &amp;&amp; pfn &lt; end_pfn;
-                 pte++, pfn++, pte_ofs++, addr += PAGE_SIZE) {
-                    pgprot_t prot = PAGE_KERNEL;
-                    /*
-                     * first pass will use the same initial
-                     * identity mapping attribute.
-                     */
-                    pgprot_t init_prot = __pgprot(PTE_IDENT_ATTR);
-
-                    if (is_kernel_text(addr))
-                        prot = PAGE_KERNEL_EXEC;
-
-                    pages_4k++;
-                    if (mapping_iter == 1) {
-                        // 将pfn(页框号)和相关属性转换为物理地址，然后写入pte中
-                        set_pte(pte, pfn_pte(pfn, init_prot));
-                        last_map_addr = (pfn &lt;&lt; PAGE_SHIFT) + PAGE_SIZE;
-                    } else
-                        set_pte(pte, pfn_pte(pfn, prot));
-                }
-            }
-        }
-        if (mapping_iter == 1) {
-            /*
-             * update direct mapping page count only in the first
-             * iteration.
-             */
-            update_page_count(PG_LEVEL_2M, pages_2m);
-            update_page_count(PG_LEVEL_4K, pages_4k);
-
-            /*
-             * local global flush tlb, which will flush the previous
-             * mappings present in both small and large page TLB's.
-             */
-            __flush_tlb_all();
-
-            /*
-             * Second iteration will set the actual desired PTE attributes.
-             */
-            mapping_iter = 2;
-            goto repeat;
-        }
-        return last_map_addr;
-</code></pre>
-
-<p>swapper_pg_dir为内核页表页目录所在的位置，其所占的内存是在head_32.S中预先分配好的，从下面的汇编代码看，预先分配了1024*4=4k的空间，可以容纳1024个entry。</p>
-
-<pre><code>    ENTRY(swapper_pg_dir)
-        .fill 1024,4,0
-</code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[TCP的定时器系列 — 保活定时器]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-net-keepalive/"/>
-    <updated>2015-09-30T15:32:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-net-keepalive</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/44177475">http://blog.csdn.net/zhangskd/article/details/44177475</a></p>
-
-<p>主要内容：保活定时器的实现，TCP_USER_TIMEOUT选项的实现。<br/>
-内核版本：3.15.2</p>
-
-<h4>原理</h4>
-
-<p>HTTP有Keepalive功能，TCP也有Keepalive功能，虽然都叫Keepalive，但是它们的目的却是不一样的。为了说明这一点，先来看下长连接和短连接的定义。</p>
-
-<p>连接的“长短”是什么？<br/>
-短连接：建立一条连接，传输一个请求，马上关闭连接。<br/>
-长连接：建立一条连接，传输一个请求，过会儿，又传输若干个请求，最后再关闭连接。</p>
-
-<p>长连接的好处是显而易见的，多个请求可以复用一条连接，省去连接建立和释放的时间开销和系统调用，但也意味着服务器的一部分资源会被长时间占用着。</p>
-
-<p>HTTP的Keepalive，顾名思义，目的在于延长连接的时间，以便在同一条连接中传输多个HTTP请求。</p>
-
-<p>HTTP服务器一般会提供Keepalive Timeout参数，用来决定连接保持多久，什么时候关闭连接。</p>
-
-<p>当连接使用了Keepalive功能时，对于客户端发送过来的一个请求，服务器端会发送一个响应，然后开始计时，如果经过Timeout时间后，客户端没有再发送请求过来，服务器端就把连接关了，不再保持连接了。</p>
-
-<p>TCP的Keepalive，是挂羊头卖狗肉的，目的在于看看对方有没有发生异常，如果有异常就及时关闭连接。</p>
-
-<p>当传输双方不主动关闭连接时，就算双方没有交换任何数据，连接也是一直有效的。</p>
-
-<p>如果这个时候对端、中间网络出现异常而导致连接不可用，本端如何得知这一信息呢？</p>
-
-<p>答案就是保活定时器。它每隔一段时间会超时，超时后会检查连接是否空闲太久了，如果空闲的时间超过了设置时间，就会发送探测报文。然后通过对端是否响应、响应是否符合预期，来判断对端是否正常，如果不正常，就主动关闭连接，而不用等待HTTP层的关闭了。</p>
-
-<p>当服务器发送探测报文时，客户端可能处于4种不同的情况：仍然正常运行、已经崩溃、已经崩溃并重启了、由于中间链路问题不可达。在不同的情况下，服务器会得到不一样的反馈。</p>
-
-<p>(1) 客户主机依然正常运行，并且从服务器端可达</p>
-
-<p>客户端的TCP响应正常，从而服务器端知道对方是正常的。保活定时器会在两小时以后继续触发。</p>
-
-<p>(2) 客户主机已经崩溃，并且关闭或者正在重新启动</p>
-
-<p>客户端的TCP没有响应，服务器没有收到对探测包的响应，此后每隔75s发送探测报文，一共发送9次。</p>
-
-<p>socket函数会返回-1，errno设置为ETIMEDOUT，表示连接超时。</p>
-
-<p>(3) 客户主机已经崩溃，并且重新启动了</p>
-
-<p>客户端的TCP发送RST，服务器端收到后关闭此连接。</p>
-
-<p>socket函数会返回-1，errno设置为ECONNRESET，表示连接被对端复位了。</p>
-
-<p>(4) 客户主机依然正常运行，但是从服务器不可达</p>
-
-<p>双方的反应和第二种是一样的，因为服务器不能区分对端异常与中间链路异常。</p>
-
-<p>socket函数会返回-1，errno设置为EHOSTUNREACH，表示对端不可达。</p>
-
-<h4>选项</h4>
-
-<p>内核默认并不使用TCP Keepalive功能，除非用户设置了SO_KEEPALIVE选项。</p>
-
-<p>有两种方式可以自行调整保活定时器的参数：一种是修改TCP参数，一种是使用TCP层选项。</p>
-
-<p>(1) TCP参数</p>
-
-<p>tcp_keepalive_time</p>
-
-<p>最后一次数据交换到TCP发送第一个保活探测报文的时间，即允许连接空闲的时间，默认为7200s。</p>
-
-<p>tcp_keepalive_intvl</p>
-
-<p>保活探测报文的重传时间，默认为75s。</p>
-
-<p>tcp_keepalive_probes</p>
-
-<p>保活探测报文的发送次数，默认为9次。</p>
-
-<p>Q：一次完整的保活探测需要花费多长时间？</p>
-
-<p>A：tcp_keepalive_time + tcp_keepalive_intvl * tcp_keepalive_probes，默认值为7875s。如果觉得两个多小时太长了，可以自行调整上述参数。</p>
-
-<p>(2) TCP层选项</p>
-
-<p>TCP_KEEPIDLE：含义同tcp_keepalive_time。</p>
-
-<p>TCP_KEEPINTVL：含义同tcp_keepalive_intvl。</p>
-
-<p>TCP_KEEPCNT：含义同tcp_keepalive_probes。</p>
-
-<p>Q：既然有了TCP参数可供调整，为什么还增加了上述的TCP层选项？</p>
-
-<p>A：TCP参数是面向本机的所有TCP连接，一旦调整了，对所有的连接都有效。而TCP层选项是面向一条连接的，一旦调整了，只对本条连接有效。</p>
-
-<h4>激活</h4>
-
-<p>在连接建立后，可以通过设置SO_KEEPALIVE选项，来激活保活定时器。</p>
-
-<pre><code>    int keepalive = 1;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &amp;keepalive, sizeof(keepalive));
-</code></pre>
-
-<pre><code>    int sock_setsockopt(struct socket *sock, int level, int optname, char __user *optval,   
-        unsigned int optlen)  
-    {  
-        ...  
-        case SO_KEEPALIVE:  
-    #ifdef CONFIG_INET  
-            if (sk-&gt;sk_protocol == IPPROTO_TCP &amp;&amp; sk-&gt;sk_type == SOCK_STREAM)  
-                tcp_set_keepalive(sk, valbool); /* 激活或删除保活定时器 */  
-    #endif  
-            sock_valbool_flag(sk, SOCK_KEEPOPEN, valbool); /* 设置或取消SOCK_KEEPOPEN标志位 */  
-            break;  
-        ...  
-    }  
-
-    static inline void sock_valbool_flag (struct sock *sk, int bit, int valbool)  
-    {  
-        if (valbool)  
-            sock_set_flag(sk, bit);  
-        else  
-            sock_reset_flag(sk, bit);  
-    }  
-</code></pre>
-
-<pre><code>    void tcp_set_keepalive(struct sock *sk, int val)  
-    {  
-        /* 不在以下两个状态设置保活定时器： 
-         * TCP_CLOSE：sk_timer用作FIN_WAIT2定时器 
-         * TCP_LISTEN：sk_timer用作SYNACK重传定时器 
-         */  
-        if ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE | TCPF_LISTEN))  
-            return;  
-
-        /* 如果SO_KEEPALIVE选项值为1，且此前没有设置SOCK_KEEPOPEN标志， 
-         * 则激活sk_timer，用作保活定时器。 
-         */  
-        if (val &amp;&amp; !sock_flag(sk, SOCK_KEEPOPEN))  
-            inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tcp_sk(sk)));  
-        else if (!val)  
-            /* 如果SO_KEEPALIVE选项值为0，则删除保活定时器 */  
-            inet_csk_delete_keepalive_timer(sk);  
-    }  
-
-    /* 保活定时器的超时时间 */  
-    static inline int keepalive_time_when(const struct tcp_sock *tp)  
-    {  
-        return tp-&gt;keepalive_time ? : sysctl_tcp_keepalive_time;  
-    }  
-
-    void inet_csk_reset_keepalive_timer (struc sock *sk, unsigned long len)  
-    {  
-        sk_reset_timer(sk, &amp;sk-&gt;sk_timer, jiffies + len);  
-    }  
-</code></pre>
-
-<p>可以使用TCP层选项来动态调整保活定时器的参数。</p>
-
-<pre><code>    int keepidle = 600;
-    int keepintvl = 10;
-    int keepcnt = 6;
-
-    setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &amp;keepidle, sizeof(keepidle));
-    setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &amp;keepintvl, sizeof(keepintvl));
-    setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &amp;keepcnt, sizeof(keepcnt));
-</code></pre>
-
-<pre><code>    struct tcp_sock {  
-        ...  
-        /* 最后一次接收到ACK的时间 */  
-        u32 rcv_tstamp; /* timestamp of last received ACK (for keepalives) */  
-        ...  
-        /* time before keep alive takes place, 空闲多久后才发送探测报文 */  
-        unsigned int keepalive_time;  
-        /* time iterval between keep alive probes */  
-        unsigned int keepalive_intvl; /* 探测报文之间的时间间隔 */  
-        /* num of allowed keep alive probes */  
-        u8 keepalive_probes; /* 探测报文的发送次数 */  
-        ...  
-        struct {  
-            ...  
-            /* 最后一次接收到带负荷的报文的时间 */  
-            __u32 lrcvtime; /* timestamp of last received data packet */  
-            ...  
-        } icsk_ack;  
-        ...  
-    };  
-
-    #define TCP_KEEPIDLE 4 /* Start Keepalives after this period */  
-    #define TCP_KEEPINTVL 5 /* Interval between keepalives */  
-    #define TCP_KEEPCNT 6 /* Number of keepalives before death */  
-
-    #define MAX_TCP_KEEPIDLE 32767  
-    #define MAX_TCP_KEEPINTVL 32767  
-    #define MAX_TCP_KEEPCNT 127  
-</code></pre>
-
-<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,  
-        unsigned int optlen)  
-    {  
-        ...  
-        case TCP_KEEPIDLE:  
-           if (val &lt; 1 || val &gt; MAX_TCP_KEEPIDLE)  
-               err = -EINVAL;  
-            else {  
-                tp-&gt;keepalive_time = val * HZ; /* 设置新的空闲时间 */  
-
-                /* 如果有使用SO_KEEPALIVE选项，连接处于非监听非结束的状态。 
-                 * 这个时候保活定时器已经在计时了，这里设置新的超时时间。 
-                 */  
-                if (sock_flag(sk, SOCK_KEEPOPEN) &amp;&amp;   
-                    !((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE | TCPF_LISTEN))) {  
-                    u32 elapsed = keepalive_time_elapsed(tp); /* 连接已经经历的空闲时间 */  
-
-                    if (tp-&gt;keepalive_time &gt; elapsed)  
-                        elapsed = tp-&gt;keepalive_time - elapsed; /* 接着等待的时间，然后超时 */  
-                    else  
-                        elapsed = 0; /* 会导致马上超时 */  
-                    inet_csk_reset_keepalive_timer(sk, elapsed);  
-                }  
-            }  
-            break;  
-
-        case TCP_KEEPINTVL:  
-            if (val &lt; 1 || val &gt; MAX_TCP_KEEPINTVL)  
-                err = -EINVAL;  
-            else  
-                tp-&gt;keepalive_intvl = val * HZ; /* 设置新的探测报文间隔 */  
-            break;  
-
-        case TCP_KEEPCNT:  
-            if (val &lt; 1 || val &gt; MAX_TCP_KEEPCNT)  
-                err = -EINVAL;  
-            else  
-                tp-&gt;keepalive_probes = val; /* 设置新的探测次数 */  
-            break;  
-        ...  
-    }  
-</code></pre>
-
-<p>到目前为止，连接已经经历的空闲时间，即最后一次接收到报文至今的时间。</p>
-
-<pre><code>    static inline u32 keepalive_time_elapsed (const struct tcp_sock *tp)  
-    {  
-        const struct inet_connection_sock *icsk = &amp;tp-&gt;inet_conn;  
-
-        /* lrcvtime是最后一次接收到数据报的时间 
-         * rcv_tstamp是最后一次接收到ACK的时间 
-         * 返回值就是最后一次接收到报文，到现在的时间，即经历的空闲时间。 
-         */  
-        return min_t(u32, tcp_time_stamp - icsk-&gt;icsk_ack.lrcvtime,  
-            tcp_time_stamp - tp-&gt;rcv_tstamp);  
-    }  
-</code></pre>
-
-<h4>超时处理函数</h4>
-
-<p>我们知道保活定时器、SYNACK重传定时器、FIN_WAIT2定时器是共用一个定时器实例sk->sk_timer，所以它们的超时处理函数也是一样的，都为tcp_keepalive_timer()。而在函数内部，可以根据此时连接所处的状态，来判断是哪个定时器触发了超时。</p>
-
-<p>Q：什么时候判断对端为异常并关闭连接？</p>
-
-<p>A：分两种情况。</p>
-
-<ol>
-<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
-<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
-</ol>
-
-
-<pre><code>    static void tcp_keepalive_timer (unsigned long data)  
-    {  
-        struct sock *sk = (struct sock *) data;  
-        struct inet_connection_sock *icsk = inet_csk(sk);  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        u32 elapsed;  
-
-        /* Only process if socket is not in use. */  
-        bh_lock_sock(sk);  
-
-        /* 加锁以保证在此期间，连接状态不会被用户进程修改。 
-         * 如果用户进程正在使用此sock，那么过50ms再来看看。 
-         */  
-        if (sock_owned_by_user(sk)) {  
-            /* Try again later. */  
-            inet_csk_reset_keepalive_timer(sk, HZ/20);  
-            goto out;  
-        }  
-
-        /* 三次握手期间，用作SYNACK定时器 */  
-        if (sk-&gt;sk_state == TCP_LISTEN) {  
-            tcp_synack_timer(sk);  
-            goto out;  
-        }      
-
-        /* 连接释放期间，用作FIN_WAIT2定时器 */  
-        if (sk-&gt;sk_state == TCP_FIN_WAIT2 &amp;&amp; sock_flag(sk, SOCK_DEAD)) {  
-            ...  
-        }  
-
-        /* 接下来就是用作保活定时器了 */  
-        if (!sock_flag(sk, SOCK_KEEPOPEN) || sk-&gt;sk_state == TCP_CLOSE)  
-            goto out;  
-
-        elapsed = keepalive_time_when(tp); /* 连接的空闲时间超过此值，就发送保活探测报文 */  
-
-        /* It is alive without keepalive. 
-         * 如果网络中有发送且未确认的数据包，或者发送队列不为空，说明连接不是idle的？ 
-         * 既然连接不是idle的，就没有必要探测对端是否正常。 
-         * 保活定时器重新开始计时即可。 
-         *  
-         * 而实际上当网络中有发送且未确认的数据包时，对端也可能会发生异常而没有响应。 
-         * 这个时候会导致数据包的不断重传，只能依靠重传超过了允许的最大时间，来判断连接超时。 
-         * 为了解决这一问题，引入了TCP_USER_TIMEOUT，允许用户指定超时时间，可见下文：） 
-         */  
-        if (tp-&gt;packets_out || tcp_send_head(sk))  
-            goto resched; /* 保活定时器重新开始计时 */  
-
-        /* 连接经历的空闲时间，即上次收到报文至今的时间 */  
-        elapsed = keepalive_time_elapsed(tp);  
-
-        /* 如果连接空闲的时间超过了设置的时间值 */  
-        if (elapsed &gt;= keepalive_time_when(tp)) {  
-
-            /* 什么时候关闭连接？ 
-             * 1. 使用了TCP_USER_TIMEOUT选项。当连接空闲时间超过了用户设置的时间，且有发送过探测报文。 
-             * 2. 用户没有使用选项。当发送的保活探测包达到了保活探测的最大次数。 
-             */  
-            if (icsk-&gt;icsk_user_timeout != 0 &amp;&amp; elapsed &gt;= icsk-&gt;icsk_user_timeout &amp;&amp;  
-                icsk-&gt;icsk_probes_out &gt; 0) || (icsk-&gt;icsk_user_timeout == 0 &amp;&amp;  
-                icsk-&gt;icsk_probes_out &gt;= keepalive_probes(tp))) {  
-                tcp_send_active_reset(sk, GFP_ATOMIC); /* 构造一个RST包并发送 */  
-                tcp_write_err(sk); /* 报告错误，关闭连接 */  
-                goto out;  
-            }  
-
-            /* 如果还不到关闭连接的时候，就继续发送保活探测包 */  
-            if (tcp_write_wakeup(sk) &lt;= 0) {  
-                icsk-&gt;icsk_probes_out++; /* 已发送的保活探测包个数 */  
-                elapsed = keepalive_intvl_when(tp); /* 下次超时的时间，默认为75s */  
-            } else {  
-                /* If keepalive was lost due to local congestion, try harder. */  
-                elapsd = TCP_RESOURCE_PROBE_INTERVAL; /* 默认为500ms，会使超时更加频繁 */  
-            }  
-
-        } else {  
-            /* 如果连接的空闲时间，还没有超过设定值，则接着等待 */  
-            elapsed = keepalive_time_when(tp) - elapsed;  
-        }   
-
-        sk_mem_reclaim(sk);  
-
-    resched: /* 重设保活定时器 */  
-        inet_csk_reset_keepalive_timer(sk, elapsed);  
-        goto out;   
-
-    out:  
-        bh_unlock_sock(sk);  
-        sock_put(sk);  
-    }  
-</code></pre>
-
-<p>Q：TCP是如何发送Keepalive探测报文的？</p>
-
-<p>A：分两种情况。</p>
-
-<ol>
-<li><p>有新的数据段可供发送，且对端接收窗口还没被塞满。发送新的数据段，来作为探测包。</p></li>
-<li><p>没有新的数据段可供发送，或者对端的接收窗口满了。发送序号为snd_una - 1、长度为0的ACK包作为探测包。</p></li>
-</ol>
-
-
-<pre><code>    /* Initiate keepalive or window probe from timer. */  
-
-    int tcp_write_wakeup (struct sock *sk)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        struct sk_buff *skb;  
-
-        if (sk-&gt;sk_state == TCP_CLOSE)  
-            return -1;  
-
-        /* 如果还有未发送过的数据包，并且对端的接收窗口还没有满 */  
-        if ((skb = tcp_send_head(sk)) != NULL &amp;&amp; before(TCP_SKB_CB(skb)-&gt;seq, tcp_wnd_end(tp))) {  
-            int err;  
-            unsigned int mss = tcp_current_mss(sk); /* 当前的MSS */  
-            /* 对端接收窗口所允许的最大报文长度 */  
-            unsigned int seg_size = tcp_wnd_end(tp) - TCP_SKB_CB(skb)-&gt;seq;  
-
-            /* pushed_seq记录发送出去的最后一个字节的序号 */  
-            if (before(tp-&gt;pushed_seq, TCP_SKB_CB(skb)-&gt;end_seq))  
-                tp-&gt;pushed_seq = TCP_SKB_CB(skb)-&gt;end_seq;  
-
-            /* 如果对端接收窗口小于此数据段的长度，或者此数据段的长度超过了MSS，那么就要进行分段 */  
-            if (seg_size &lt; TCP_SKB_CB(skb)-&gt;end_seq - TCP_SKB_CB(skb)-&gt;seq || skb-&gt;len &gt; mss) {  
-                seg_size = min(seg_size, mss);  
-                TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH; /* 设置PSH标志，让对端马上把数据提交给程序 */  
-                if (tcp_fragment(sk, skb, seg_size, mss)) /* 进行分段 */  
-                    return -1;  
-            } else if (! tcp_skb_pcount(skb)) /* 进行TSO分片 */  
-                tcp_set_skb_tso_segs(sk, skb, mss); /* 初始化分片相关变量 */  
-
-            TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH;  
-            TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
-            err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC); /* 发送此数据段 */  
-            if (!err)  
-                tcp_event_new_data_sent(sk, skb); /* 发送了新的数据，更新相关参数 */  
-
-        } else { /* 如果没有新的数据段可用作探测报文发送，或者对端的接收窗口为0 */  
-
-           /* 处于紧急模式时，额外发送一个序号为snd_una的ACK包，告诉对端紧急指针 */  
-           if (between(tp-&gt;snd_up, tp-&gt;snd_una + 1, tp-&gt;snd_una + 0xFFFF))  
-               tcp_xmit_probe_skb(sk, 1);  
-
-            /* 发送一个序号为snd_una -1的ACK包，长度为0，这是一个序号过时的报文。 
-             * snd_una: first byte we want an ack for，所以snd_una - 1序号的字节已经被确认过了。 
-             * 对端会响应一个ACK。 
-             */  
-            return tcp_xmit_probe_skb(sk, 0);  
-        }  
-    }  
-</code></pre>
-
-<p>Q：当没有新的数据可以用作探测包、或者对端的接收窗口为0时，怎么办呢？</p>
-
-<p>A：发送一个序号为snd_una - 1、长度为0的ACK包，对端收到此包后会发送一个ACK响应。如此一来本端就能够知道对端是否还活着、接收窗口是否打开了。</p>
-
-<pre><code>    /* This routine sends a packet with an out of date sequence number. 
-     * It assumes the other end will try to ack it. 
-     *  
-     * Question: what should we make while urgent mode? 
-     * 4.4BSD forces sending single byte of data. We cannot send out of window 
-     * data, because we have SND.NXT == SND.MAX... 
-     *  
-     * Current solution: to send TWO zero-length segments in urgent mode: 
-     * one is with SEG.SEG=SND.UNA to deliver urgent pointer, another is out-of-date with 
-     * SND.UNA - 1 to probe window. 
-     */  
-
-    static int tcp_xmit_probe_skb (struct sock *sk, int urgent)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        struct sk_buff *skb;  
-
-        /* We don't queue it, tcp_transmit_skb() sets ownership. */  
-        skb = alloc_skb(MAX_TCP_HEADER, sk_gfp_atomic(sk, GFP_ATOMIC));  
-        if (skb == NULL)  
-            return -1;  
-
-        /* Reserve space for headers and set control bits. */  
-        skb_reserve(skb, MAX_TCP_HEADER);  
-
-        /* Use a previous sequence. This should cause the other end to send an ack. 
-         * Don't queue or clone SKB, just send it. 
-         */  
-        /* 如果没有设置紧急指针，那么发送的序号为snd_una - 1，否则发送的序号为snd_una */  
-        tcp_init_nondata_skb(skb, tp-&gt;snd_una - !urgent, TCPHDR_ACK);  
-        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
-        return tcp_transmit_skb(sk, skb, 0, GFP_ATOMIC); /* 发送探测包 */  
-    }  
-</code></pre>
-
-<p>发送RST包。</p>
-
-<pre><code>    /* We get here when a process closes a file descriptor (either due to an explicit close() 
-     * or as a byproduct of exit()'ing) and there was unread data in the receive queue. 
-     * This behavior is recommended by RFC 2525, section 2.17. -DaveM 
-     */  
-
-    void tcp_send_active_reset (struct sock *sk, gfp_t priority)  
-    {  
-        struct sk_buff *skb;  
-        /* NOTE: No TCP options attached and we never retransmit this. */  
-        skb = alloc_skb(MAX_TCP_HEADER, priority);  
-        if (!skb) {  
-            NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
-            return;  
-        }  
-
-        /* Reserve space for headers and prepare control bits. */  
-        skb_reserve(skb, MAX_TCP_HEADER); /* 为报文头部预留空间 */  
-        /* 初始化不携带数据的skb的一些控制字段 */  
-        tcp_init_nondata_skb(skb, tcp_acceptable_seq(sk), TCPHDR_ACK | TCPHDR_RST);  
-
-        /* Send if off，发送此RST包*/  
-        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
-        if (tcp_transmit_skb(sk, skb, 0, priority))  
-            NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
-        TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTRSTS);  
-    }  
-
-    static inline __u32 tcp_acceptable_seq (const struct sock *sk)  
-    {  
-        const struct tcp_sock *tp = tcp_sk(sk);  
-
-        /* 如果snd_nxt在对端接收窗口范围内 */  
-        if (! before(tcp_wnd_end(tp), tp-&gt;snd_nxt))  
-            return tp-&gt;snd_nxt;  
-        else  
-            return tcp_wnd_end(tp);  
-    }  
-</code></pre>
-
-<h4>TCP_USER_TIMEOUT选项</h4>
-
-<p>从上文可知同时符合以下条件时，保活定时器才会发送探测报文：</p>
-
-<ol>
-<li><p>网络中没有发送且未确认的数据包。</p></li>
-<li><p>发送队列为空。</p></li>
-<li><p>连接的空闲时间超过了设定的时间。</p></li>
-</ol>
-
-
-<p>Q：如果网络中有发送且未确认的数据包、或者发送队列不为空时，保活定时器不起作用了，岂不是不能够检测到对端的异常了？</p>
-
-<p>A：可以使用TCP_USER_TIMEOUT，显式的指定当发送数据多久后还没有得到响应，就判定连接超时，从而主动关闭连接。</p>
-
-<p>TCP_USER_TIMEOUT选项会影响到超时重传定时器和保活定时器。</p>
-
-<p>(1) 超时重传定时器</p>
-
-<p>判断连接是否超时，分3种情况：</p>
-
-<ol>
-<li><p>SYN包：当SYN包的重传次数达到上限时，判定连接超时。(默认允许重传5次，初始超时时间为1s，总共历时31s)</p></li>
-<li><p>非SYN包，用户使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过用户设置的时间时，判定连接超时。</p></li>
-<li><p>非SYN包，用户没有使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过以TCP_RTO_MIN为初始超时时间，重传boundary次所花费的时间后，判定连接超时。(boundary的最大值为tcp_retries2，默认值为15)</p></li>
-</ol>
-
-
-<p>(2) 保活定时器</p>
-
-<p>判断连接是否异常，分2种情况：</p>
-
-<ol>
-<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
-<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
-</ol>
-
 ]]></content>
   </entry>
   

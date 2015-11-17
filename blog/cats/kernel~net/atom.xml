@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~net | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~net/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2015-10-31T23:58:56+08:00</updated>
+  <updated>2015-11-17T15:30:21+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,772 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[ixgbe]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-ixgbe/"/>
+    <updated>2015-11-17T15:16:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-ixgbe</id>
+    <content type="html"><![CDATA[<p><a href="http://www.pagefault.info/?p=403">http://www.pagefault.info/?p=403</a></p>
+
+<p>这里分析的驱动代码是给予linux kernel 3.4.4</p>
+
+<p>对应的文件在drivers/net/ethernet/intel 目录下，这个分析不涉及到很细节的地方，主要目的是理解下数据在协议栈和驱动之间是如何交互的。</p>
+
+<p>首先我们知道网卡都是pci设备，因此这里每个网卡驱动其实就是一个pci驱动。并且intel这里是把好几个万兆网卡(82599/82598/x540)的驱动做在一起的。</p>
+
+<p>首先我们来看对应的pci_driver的结构体，这里每个pci驱动都是一个pci_driver的结构体，而这里是多个万兆网卡共用这个结构体ixgbe_driver.</p>
+
+<pre><code>    static struct pci_driver ixgbe_driver = {
+        .name     = ixgbe_driver_name,
+        .id_table = ixgbe_pci_tbl,
+        .probe    = ixgbe_probe,
+        .remove   = __devexit_p(ixgbe_remove),
+    #ifdef CONFIG_PM
+        .suspend  = ixgbe_suspend,
+        .resume   = ixgbe_resume,
+    #endif
+        .shutdown = ixgbe_shutdown,
+        .err_handler = &amp;ixgbe_err_handler
+    };
+</code></pre>
+
+<p>然后是模块初始化方法,这里其实很简单，就是调用pci的驱动注册方法，把ixgbe挂载到pci设备链中。 这里不对pci设备的初始化做太多介绍，我以前的blog有这方面的介绍，想了解的可以去看看。这里我们只需要知道最终内核会调用probe回调来初始化ixgbe。</p>
+
+<pre><code>    char ixgbe_driver_name[] = "ixgbe";
+    static const char ixgbe_driver_string[] =
+                    "Intel(R) 10 Gigabit PCI Express Network Driver";
+
+    static int __init ixgbe_init_module(void)
+    {
+        int ret;
+        pr_info("%s - version %s\n", ixgbe_driver_string, ixgbe_driver_version);
+        pr_info("%s\n", ixgbe_copyright);
+
+    #ifdef CONFIG_IXGBE_DCA
+        dca_register_notify(&amp;dca_notifier);
+    #endif
+
+        ret = pci_register_driver(&amp;ixgbe_driver);
+        return ret;
+    }
+</code></pre>
+
+<p>这里不去追究具体如何调用probe的细节，我们直接来看probe函数，这个函数中通过硬件的信息来确定需要初始化那个驱动(82598/82599/x540),然后核心的驱动结构就放在下面的这个数组中。</p>
+
+<pre><code>    static const struct ixgbe_info *ixgbe_info_tbl[] = {
+        [board_82598] = &amp;ixgbe_82598_info,
+        [board_82599] = &amp;ixgbe_82599_info,
+        [board_X540] = &amp;ixgbe_X540_info,
+    };
+</code></pre>
+
+<p>ixgbe_probe函数很长，我们这里就不详细分析了，因为这部分就是对网卡进行初始化。不过我们关注下面几个代码片段。</p>
+
+<p>首先是根据硬件的参数来取得对应的驱动值:</p>
+
+<pre><code>    const struct ixgbe_info *ii = ixgbe_info_tbl[ent-&gt;driver_data];
+</code></pre>
+
+<p>然后就是如何将不同的网卡驱动挂载到对应的回调中，这里做的很简单，就是通过对应的netdev的结构取得adapter，然后所有的核心操作都是保存在adapter中的，最后将ii的所有回调拷贝给adapter就可以了。我们来看代码：</p>
+
+<pre><code>        struct net_device *netdev;
+        struct ixgbe_adapter *adapter = NULL;
+        struct ixgbe_hw *hw;
+        .....................................
+
+        adapter = netdev_priv(netdev);
+        pci_set_drvdata(pdev, adapter);
+
+        adapter-&gt;netdev = netdev;
+        adapter-&gt;pdev = pdev;
+        hw = &amp;adapter-&gt;hw;
+        hw-&gt;back = adapter;
+        .......................................
+        memcpy(&amp;hw-&gt;mac.ops, ii-&gt;mac_ops, sizeof(hw-&gt;mac.ops));
+        hw-&gt;mac.type  = ii-&gt;mac;
+
+        /* EEPROM */
+        memcpy(&amp;hw-&gt;eeprom.ops, ii-&gt;eeprom_ops, sizeof(hw-&gt;eeprom.ops));
+        .....................................
+</code></pre>
+
+<p>最后需要关注的就是设置网卡属性，这些属性一般来说都是通过ethtool 可以设置的属性(比如tso/checksum等),这里我们就截取一部分:</p>
+
+<pre><code>        netdev-&gt;features = NETIF_F_SG |
+                   NETIF_F_IP_CSUM |
+                   NETIF_F_IPV6_CSUM |
+                   NETIF_F_HW_VLAN_TX |
+                   NETIF_F_HW_VLAN_RX |
+                   NETIF_F_HW_VLAN_FILTER |
+                   NETIF_F_TSO |
+                   NETIF_F_TSO6 |
+                   NETIF_F_RXHASH |
+                   NETIF_F_RXCSUM;
+
+        netdev-&gt;hw_features = netdev-&gt;features;
+
+        switch (adapter-&gt;hw.mac.type) {
+        case ixgbe_mac_82599EB:
+        case ixgbe_mac_X540:
+            netdev-&gt;features |= NETIF_F_SCTP_CSUM;
+            netdev-&gt;hw_features |= NETIF_F_SCTP_CSUM |
+                           NETIF_F_NTUPLE;
+            break;
+        default:
+            break;
+        }
+
+        netdev-&gt;hw_features |= NETIF_F_RXALL;
+        ..................................................
+
+        netdev-&gt;priv_flags |= IFF_UNICAST_FLT;
+        netdev-&gt;priv_flags |= IFF_SUPP_NOFCS;
+
+        if (adapter-&gt;flags &amp; IXGBE_FLAG_SRIOV_ENABLED)
+            adapter-&gt;flags &amp;= ~(IXGBE_FLAG_RSS_ENABLED |
+                        IXGBE_FLAG_DCB_ENABLED);
+        ...................................................................
+        if (pci_using_dac) {
+            netdev-&gt;features |= NETIF_F_HIGHDMA;
+            netdev-&gt;vlan_features |= NETIF_F_HIGHDMA;
+        }
+
+        if (adapter-&gt;flags2 &amp; IXGBE_FLAG2_RSC_CAPABLE)
+            netdev-&gt;hw_features |= NETIF_F_LRO;
+        if (adapter-&gt;flags2 &amp; IXGBE_FLAG2_RSC_ENABLED)
+            netdev-&gt;features |= NETIF_F_LRO;
+</code></pre>
+
+<p>然后我们来看下中断的注册，因为万兆网卡大部分都是多对列网卡(配合msix)，因此对于上层软件来说，就好像有多个网卡一样，它们之间的数据是相互独立的，这里读的话主要是napi驱动的poll方法，后面我们会分析这个.</p>
+
+<p>到了这里或许要问那么网卡是如何挂载回调给上层，从而上层来发送数据呢，这里是这样子的，每个网络设备都有一个回调函数表(比如ndo_start_xmit)来供上层调用，而在ixgbe中的话，就是ixgbe_netdev_ops，下面就是这个结构，不过只是截取了我们很感兴趣的几个地方.</p>
+
+<p>不过这里注意，读回调并不在里面，这是因为写是软件主动的，而读则是硬件主动的。现在ixgbe是NAPI的，因此它的poll回调是ixgbe_poll，是中断注册时候通过netif_napi_add添加进去的。</p>
+
+<pre><code>    static const struct net_device_ops ixgbe_netdev_ops = {
+        .ndo_open       = ixgbe_open,
+        .ndo_stop       = ixgbe_close,
+        .ndo_start_xmit     = ixgbe_xmit_frame,
+        .ndo_select_queue   = ixgbe_select_queue,
+        .ndo_set_rx_mode    = ixgbe_set_rx_mode,
+        .ndo_validate_addr  = eth_validate_addr,
+        .ndo_set_mac_address    = ixgbe_set_mac,
+        .ndo_change_mtu     = ixgbe_change_mtu,
+        .ndo_tx_timeout     = ixgbe_tx_timeout,
+        .................................................
+        .ndo_set_features = ixgbe_set_features,
+        .ndo_fix_features = ixgbe_fix_features,
+    };
+</code></pre>
+
+<p>这里我们最关注的其实就是ndo_start_xmit回调，这个回调就是驱动提供给协议栈的发送回调接口。我们来看这个函数.</p>
+
+<p>它的实现很简单，就是选取对应的队列，然后调用ixgbe_xmit_frame_ring来发送数据。</p>
+
+<pre><code>    static netdev_tx_t ixgbe_xmit_frame(struct sk_buff *skb,
+                        struct net_device *netdev)
+    {
+        struct ixgbe_adapter *adapter = netdev_priv(netdev);
+        struct ixgbe_ring *tx_ring;
+
+        if (skb-&gt;len &lt;= 0) {
+            dev_kfree_skb_any(skb);
+            return NETDEV_TX_OK;
+        }
+
+        /*
+         * The minimum packet size for olinfo paylen is 17 so pad the skb
+         * in order to meet this minimum size requirement.
+         */
+        if (skb-&gt;len &lt; 17) {
+            if (skb_padto(skb, 17))
+                return NETDEV_TX_OK;
+            skb-&gt;len = 17;
+        }
+        //取得对应的队列
+        tx_ring = adapter-&gt;tx_ring[skb-&gt;queue_mapping];
+        //发送数据
+        return ixgbe_xmit_frame_ring(skb, adapter, tx_ring);
+    }
+</code></pre>
+
+<p>而在ixgbe_xmit_frame_ring中，我们就关注两个地方，一个是tso(什么是TSO，请自行google)，一个是如何发送.</p>
+
+<pre><code>        tso = ixgbe_tso(tx_ring, first, &amp;hdr_len);
+        if (tso &lt; 0)
+            goto out_drop;
+        else if (!tso)
+            ixgbe_tx_csum(tx_ring, first);
+
+        /* add the ATR filter if ATR is on */
+        if (test_bit(__IXGBE_TX_FDIR_INIT_DONE, &amp;tx_ring-&gt;state))
+            ixgbe_atr(tx_ring, first);
+
+    #ifdef IXGBE_FCOE
+    xmit_fcoe:
+    #endif /* IXGBE_FCOE */
+        ixgbe_tx_map(tx_ring, first, hdr_len);
+</code></pre>
+
+<p>调用ixgbe_tso处理完tso之后，就会调用ixgbe_tx_map来发送数据。而ixgbe_tx_map所做的最主要是两步，第一步请求DMA，第二步写寄存器，通知网卡发送数据.</p>
+
+<pre><code>        dma = dma_map_single(tx_ring-&gt;dev, skb-&gt;data, size, DMA_TO_DEVICE);
+        if (dma_mapping_error(tx_ring-&gt;dev, dma))
+            goto dma_error;
+
+        /* record length, and DMA address */
+        dma_unmap_len_set(first, len, size);
+        dma_unmap_addr_set(first, dma, dma);
+
+        tx_desc-&gt;read.buffer_addr = cpu_to_le64(dma);
+
+        for (;;) {
+            while (unlikely(size &gt; IXGBE_MAX_DATA_PER_TXD)) {
+                tx_desc-&gt;read.cmd_type_len =
+                    cmd_type | cpu_to_le32(IXGBE_MAX_DATA_PER_TXD);
+
+                i++;
+                tx_desc++;
+                if (i == tx_ring-&gt;count) {
+                    tx_desc = IXGBE_TX_DESC(tx_ring, 0);
+                    i = 0;
+                }
+
+                dma += IXGBE_MAX_DATA_PER_TXD;
+                size -= IXGBE_MAX_DATA_PER_TXD;
+
+                tx_desc-&gt;read.buffer_addr = cpu_to_le64(dma);
+                tx_desc-&gt;read.olinfo_status = 0;
+            }
+
+            ...................................................
+            data_len -= size;
+
+            dma = skb_frag_dma_map(tx_ring-&gt;dev, frag, 0, size,
+                           DMA_TO_DEVICE);
+            ..........................................................
+
+            frag++;
+        }
+        .................................
+        tx_ring-&gt;next_to_use = i;
+
+        /* notify HW of packet */
+        writel(i, tx_ring-&gt;tail);
+        .................
+</code></pre>
+
+<p>上面的操作是异步的，也就是说此时内核还不能释放SKB，而是网卡硬件发送完数据之后，会再次产生中断通知内核，然后内核才能释放内存.接下来我们来看这部分代码。</p>
+
+<p>首先来看的是中断注册的代码，这里我们假设启用了MSIX,那么网卡的中断注册回调就是ixgbe_request_msix_irqs函数，这里我们可以看到调用request_irq函数来注册回调，并且每个队列都有自己的中断号。</p>
+
+<pre><code>    static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
+    {
+        struct net_device *netdev = adapter-&gt;netdev;
+        int q_vectors = adapter-&gt;num_msix_vectors - NON_Q_VECTORS;
+        int vector, err;
+        int ri = 0, ti = 0;
+
+        for (vector = 0; vector &lt; q_vectors; vector++) {
+            struct ixgbe_q_vector *q_vector = adapter-&gt;q_vector[vector];
+            struct msix_entry *entry = &amp;adapter-&gt;msix_entries[vector];
+            .......................................................................
+            err = request_irq(entry-&gt;vector, &amp;ixgbe_msix_clean_rings, 0,
+                      q_vector-&gt;name, q_vector);
+            if (err) {
+                e_err(probe, "request_irq failed for MSIX interrupt "
+                      "Error: %d\n", err);
+                goto free_queue_irqs;
+            }
+            /* If Flow Director is enabled, set interrupt affinity */
+            if (adapter-&gt;flags &amp; IXGBE_FLAG_FDIR_HASH_CAPABLE) {
+                /* assign the mask for this irq */
+                irq_set_affinity_hint(entry-&gt;vector,
+                              &amp;q_vector-&gt;affinity_mask);
+            }
+        }
+
+        ..............................................
+
+        return 0;
+
+    free_queue_irqs:
+        ...............................
+        return err;
+    }
+</code></pre>
+
+<p>而对应的中断回调是ixgbe_msix_clean_rings,而这个函数呢，做的事情很简单(需要熟悉NAPI的原理，我以前的blog有介绍),就是调用napi_schedule来重新加入软中断处理.</p>
+
+<pre><code>    static irqreturn_t ixgbe_msix_clean_rings(int irq, void *data)
+    {
+        struct ixgbe_q_vector *q_vector = data;
+
+        /* EIAM disabled interrupts (on this vector) for us */
+
+        if (q_vector-&gt;rx.ring || q_vector-&gt;tx.ring)
+            napi_schedule(&amp;q_vector-&gt;napi);
+
+        return IRQ_HANDLED;
+    }
+</code></pre>
+
+<p>而NAPI驱动我们知道，最终是会调用网卡驱动挂载的poll回调，在ixgbe中，对应的回调就是ixgbe_poll，那么也就是说这个函数要做两个工作，一个是处理读，一个是处理写完之后的清理.</p>
+
+<pre><code>    int ixgbe_poll(struct napi_struct *napi, int budget)
+    {
+        struct ixgbe_q_vector *q_vector =
+                    container_of(napi, struct ixgbe_q_vector, napi);
+        struct ixgbe_adapter *adapter = q_vector-&gt;adapter;
+        struct ixgbe_ring *ring;
+        int per_ring_budget;
+        bool clean_complete = true;
+
+    #ifdef CONFIG_IXGBE_DCA
+        if (adapter-&gt;flags &amp; IXGBE_FLAG_DCA_ENABLED)
+            ixgbe_update_dca(q_vector);
+    #endif
+        //清理写
+        ixgbe_for_each_ring(ring, q_vector-&gt;tx)
+            clean_complete &amp;= !!ixgbe_clean_tx_irq(q_vector, ring);
+
+        /* attempt to distribute budget to each queue fairly, but don't allow
+         * the budget to go below 1 because we'll exit polling */
+        if (q_vector-&gt;rx.count &gt; 1)
+            per_ring_budget = max(budget/q_vector-&gt;rx.count, 1);
+        else
+            per_ring_budget = budget;
+        //读数据，并清理已完成的
+        ixgbe_for_each_ring(ring, q_vector-&gt;rx)
+            clean_complete &amp;= ixgbe_clean_rx_irq(q_vector, ring,
+                                 per_ring_budget);
+
+        /* If all work not completed, return budget and keep polling */
+        if (!clean_complete)
+            return budget;
+
+        /* all work done, exit the polling mode */
+        napi_complete(napi);
+        if (adapter-&gt;rx_itr_setting &amp; 1)
+            ixgbe_set_itr(q_vector);
+        if (!test_bit(__IXGBE_DOWN, &amp;adapter-&gt;state))
+            ixgbe_irq_enable_queues(adapter, ((u64)1 &lt;&lt; q_vector-&gt;v_idx));
+
+        return 0;
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[cubic]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-cubic/"/>
+    <updated>2015-11-17T15:08:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-cubic</id>
+    <content type="html"><![CDATA[<p><a href="http://www.pagefault.info/?p=145">http://www.pagefault.info/?p=145</a></p>
+
+<p>这次主要来看一下内核拥塞控制算法cubic的实现，在linux kernel中实现了很多种拥塞控制算法，不过新的内核(2.6.19之后)默认是cubic(想得到当前内核使用的拥塞控制算法可以察看/proc/sys/net/ipv4/tcp_congestion_control这个值).下面是最新的redhat 6的拥塞控制算法(rh5还是bic算法):
+<code>
+    [root@rhel6 ~]# cat /proc/sys/net/ipv4/tcp_congestion_control
+    cubic
+</code>
+这个算法的paper在这里：</p>
+
+<p><a href="http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf">http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf</a></p>
+
+<p>拥塞控制算法会在tcp_ack中被调用，如果是正常的ack(比如不是重复的，不是sack等等)就会进入拥塞控制算法。</p>
+
+<p>cubic会调用tcp_slow_start这个方法(基本上每种拥塞控制算法都会调用它)，这个方法主要是处理slow start，而内核中的slow start是这样子的，接收一个ack，snd_cwnd就会加1，然后当cwnd大于设置的拥塞窗口阀值snd_ssthresh的时候，就会进入拥塞避免状态。而在发送数据包的时候，会判断in_flight(可以认为是发送还没确认的数据包，它等于发送未确认的数据包－sack的数据段－丢失的数据段＋重传的数据段，我的前面的blog有详细解释这个数据段)是否大于snd_cwnd,如果大于等于则不会发送数据，如果小于才会继续发送数据。</p>
+
+<p>而进入拥塞避免状态之后，窗口的增长速度将会减缓，</p>
+
+<p>来看一下我用jprobe hook tcp_slow_start(slow start处理函数) 和 tcp_cong_avoid_ai (拥塞避免处理)的数据。</p>
+
+<p>在下面的数据中sk表示当前socket的地址， in_flight packet表示发送还未接收的包, snd_cwnd表示发送拥塞窗口。
+然后详细解释下count后面的两个值，其中第一个是snd_cwnd_cnt，表示在当前的拥塞窗口中已经发送的数据段的个数，而第二个是struct bictcp的一个域cnt，它是cubic拥塞算法的核心，主要用来控制在拥塞避免状态的时候，什么时候才能增大拥塞窗口，具体实现是通过比较它和snd_cwnd_cnt，来决定是否增大拥塞窗口，而这个值的计算，我这里不会分析，想了解的，可以去看cubic的paper。</p>
+
+<p>还有一个需要注意的地方就是ssthresh，可以看到这个值在一开始初始化为一个最大的值，然后在进入拥塞避免状态的时候被设置为前一次拥塞窗口的大小.这个处理可以看rfc2581的这段：</p>
+
+<p>  The initial value of ssthresh may be arbitrarily high (i.e., the size of the advertised window), but it may be reduced in response to congestion. When cwnd &lt; ssthresh, the slow-start algorithm is used and when cwnd > ssthresh, the congestion avoidance algorithm is used. When cwnd and ssthresh are equal, the sender may use either of them.</p>
+
+<p>我们后面会看到这个值在cubic中是如何被设置的。
+<code>
+    //进入slow start，可以看到拥塞窗口默认初始值是3，然后每次接收到ack，都会加1.
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 2, snd_cwnd is 3, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 3, snd_cwnd is 4, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 4, snd_cwnd is 5, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 5, snd_cwnd is 6, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 4, snd_cwnd is 7, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 7, snd_cwnd is 8, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 6, snd_cwnd is 9, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 9, snd_cwnd is 10, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 10, snd_cwnd is 11, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 11, snd_cwnd is 12, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 10, snd_cwnd is 13, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 9, snd_cwnd is 14, ssthresh is 2147483647, count is [0:0]
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 15, ssthresh is 2147483647, count is [0:0]
+    //ssthresh被更新为当前拥塞窗口的大小，后面会看到为什么是16
+    enter [slow start state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 16, ssthresh is 16, count is [0:0]
+    //进入拥塞避免，可以清楚的看到，此时拥塞窗口大于对应的阀值ssthresh.
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 17, ssthresh is 16, count is [0:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 15, snd_cwnd is 17, ssthresh is 16, count is [1:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 17, ssthresh is 16, count is [2:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 15, snd_cwnd is 17, ssthresh is 16, count is [3:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 17, ssthresh is 16, count is [4:877]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 17, ssthresh is 16, count is [5:877]
+    //这里注意，其中count的第一个值是一直线性增长的，也就是说下面省略了大概80条log，而在这80几次中拥塞窗口一直维持在17没有变化
+    ....................................................................................................................
+    //可以看到cnt变为3，也就是说明当执行完拥塞避免就会增加窗口了。
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 17, ssthresh is 16, count is [91:3]
+    //增加窗口的大小，然后将snd_cwnd_cnt reset为0.
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 11, snd_cwnd is 18, ssthresh is 16, count is [0:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 18, ssthresh is 16, count is [1:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 18, ssthresh is 16, count is [2:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 12, snd_cwnd is 18, ssthresh is 16, count is [3:6]
+    enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 12, snd_cwnd is 18, ssthresh is 16, count is [4:6]
+</code></p>
+
+<p>可以看到在slow start的状态，发送拥塞窗口就是很简单的每次加1，而当进入拥塞避免之后，明显的拥塞窗口的增大速度变慢很多。</p>
+
+<p>接下来来看具体的代码是如何实现的.</p>
+
+<p>首先来看bictcp_cong_avoid，也就是cubic拥塞控制算法的handler(一般来说在tcp_ack中被调用)，它有3个参数，第一个是对应的sock，第二个是对应的ack序列号，而第三个就是比较重要的一个变量，表示发送还没有被ack的数据包(在linux 内核tcp拥塞处理一中详细介绍过内核中这些变量)，这个变量是拥塞控制的核心。</p>
+
+<pre><code>    static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct bictcp *ca = inet_csk_ca(sk);
+        //判断发送拥塞窗口是否到达限制，如果到达限制则直接返回。
+        if (!tcp_is_cwnd_limited(sk, in_flight))
+            return;
+        //开始决定进入slow start还是拥塞控制状态
+        if (tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh) {
+            //是否需要reset对应的bictcp的值
+            if (hystart &amp;&amp; after(ack, ca-&gt;end_seq))
+                bictcp_hystart_reset(sk);
+            //进入slow start状态
+            tcp_slow_start(tp);
+        } else {
+            //进入拥塞避免状态，首先会更新ca-&gt;cnt.
+            bictcp_update(ca, tp-&gt;snd_cwnd);
+            //然后进入拥塞避免
+            tcp_cong_avoid_ai(tp, ca-&gt;cnt);
+        }
+    }
+</code></pre>
+
+<p>接下来就是看tcp_is_cwnd_limited，这个函数主要是实现RFC2861中对拥塞窗口的检测。它返回1说明拥塞窗口被限制，我们需要增加拥塞窗口，否则的话，就不需要增加拥塞窗口。</p>
+
+<p>然后这里还有两个判断，先来看第一个 gso的概念，gso是Generic Segmentation Offload的简写，他的主要功能就是尽量的延迟数据包的传输，以便与在最恰当的时机传输数据包，这个机制是处于数据包离开协议栈与进入驱动之间。比如如果驱动支持TSO的话，gso就会将多个unsegmented的数据段传递给驱动。而TSO是TCP Segmentation Offload的缩写，它表示驱动支持协议栈发送大的MTU的数据段，然后硬件负责来切包，然后将数据发送出去，这样子的话，就能提高系统的吞吐。这几个东西(还有GRO)，以后我会详细分析，现在只需要大概知道他们是干什么的。</p>
+
+<p>而在这里如果支持gso，就有可能是tso defer住了数据包，因此这里会进行几个相关的判断，来看需不需要增加拥塞窗口。。</p>
+
+<p>然后是burst的概念，主要用来控制网络流量的突发性增大，也就是说当left数据(还能发送的数据段数)大于burst值的时候，我们需要暂时停止增加窗口，因为此时有可能我们这边数据发送过快。</p>
+
+<pre><code>    int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
+    {
+        const struct tcp_sock *tp = tcp_sk(sk);
+        u32 left;
+        //比较发送未确认和发送拥塞窗口的大小
+        if (in_flight &gt;= tp-&gt;snd_cwnd)
+            return 1;
+        //得到还能发送的数据包的段数
+        left = tp-&gt;snd_cwnd - in_flight;
+        if (sk_can_gso(sk) &amp;&amp;
+            left * sysctl_tcp_tso_win_divisor &lt; tp-&gt;snd_cwnd &amp;&amp;
+            left * tp-&gt;mss_cache &lt; sk-&gt;sk_gso_max_size)
+            return 1;
+        //看是否还能发送的数据包是否小于等于burst
+        return left &lt;= tcp_max_burst(tp);
+    }
+</code></pre>
+
+<p>接下来来看snd_ssthresh是如何被设置的，这个值在加载cubic模块的时候可以传递一个我们制定的值给它，不过，默认是很大的值，我这里是2147483647,然后在接收ack期间(slow start)期间会调整这个值，在cubic中，默认是16（一般来说说当拥塞窗口到达16的时候，snd_ssthresh会被设置为16).</p>
+
+<p>在cubic中有两个可以设置snd_ssthresh的地方一个是hystart_update，一个是bictcp_recalc_ssthresh，后一个我这里就不介绍了，以后介绍拥塞状态机的时候会详细介绍，现在只需要知道，只有遇到拥塞的时候，需要调整snd_ssthres的时候，我们才需要调用bictcp_recalc_ssthresh。</p>
+
+<p>而hystart_update是在bictcp_acked中被调用，而bictcp_acked则是基本每次收到ack都会调用这个函数，我们来看在bictcp_acked中什么情况就会调用hystart_update：</p>
+
+<pre><code>    /* hystart triggers when cwnd is larger than some threshold */
+    if (hystart &amp;&amp; tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh &amp;&amp;
+        tp-&gt;snd_cwnd &gt;= hystart_low_window)
+        hystart_update(sk, delay);
+</code></pre>
+
+<p>其中hystart是hybrid slow start打开的标志，默认是开启，hystart_low_window是设置snd_ssthresh的最小拥塞窗口值，默认是16。而tp->snd_ssthresh默认是一个很大的值，因此这里就知道了，当拥塞窗口增大到16的时候我们就会进去hystart_update来更新snd_ssthresh.因此hystart_updat换句话来说也就是主要用于是否退出slow start。</p>
+
+<pre><code>    static void hystart_update(struct sock *sk, u32 delay)
+    {
+        struct tcp_sock *tp = tcp_sk(sk);
+        struct bictcp *ca = inet_csk_ca(sk);
+
+        if (!(ca-&gt;found &amp; hystart_detect)) {
+            .................................................................
+            /*
+             * Either one of two conditions are met,
+             * we exit from slow start immediately.
+             */
+            //found是一个是否退出slow start的标记
+            if (ca-&gt;found &amp; hystart_detect)
+                //设置snd_ssthresh
+                tp-&gt;snd_ssthresh = tp-&gt;snd_cwnd;
+        }
+    }
+</code></pre>
+
+<p>然后是slow start的处理,这里有关abc的处理，注释都很详细了，这里就不解释了，我们主要看abc关闭的部分。这里使用cnt，也是主要为了打开abc之后的slow start。</p>
+
+<p>这是abc（Appropriate Byte Counting）相关的rfc：</p>
+
+<p><a href="http://www.faqs.org/rfcs/rfc3465.html">http://www.faqs.org/rfcs/rfc3465.html</a></p>
+
+<p>Appropriate Byte Countin会导致拥塞控制算法很激进，比如打开它之后就不一定每次ack都会执行slow start，而且窗口也会增加的快很多。</p>
+
+<pre><code>    void tcp_slow_start(struct tcp_sock *tp)
+    {
+        int cnt; /* increase in packets */
+
+        /* RFC3465: ABC Slow start
+         * Increase only after a full MSS of bytes is acked
+         *
+         * TCP sender SHOULD increase cwnd by the number of
+         * previously unacknowledged bytes ACKed by each incoming
+         * acknowledgment, provided the increase is not more than L
+         */
+        if (sysctl_tcp_abc &amp;&amp; tp-&gt;bytes_acked &lt; tp-&gt;mss_cache)
+            return;
+        //限制slow start的cnt
+        if (sysctl_tcp_max_ssthresh &gt; 0 &amp;&amp; tp-&gt;snd_cwnd &gt; sysctl_tcp_max_ssthresh)
+            cnt = sysctl_tcp_max_ssthresh &gt;&gt; 1; /* limited slow start */
+        else
+            cnt = tp-&gt;snd_cwnd;         /* exponential increase */
+
+        /* RFC3465: ABC
+         * We MAY increase by 2 if discovered delayed ack
+         */
+        if (sysctl_tcp_abc &gt; 1 &amp;&amp; tp-&gt;bytes_acked &gt;= 2*tp-&gt;mss_cache)
+            cnt &lt;&lt;= 1;
+        tp-&gt;bytes_acked = 0;
+        //更新cnt，也就是当前拥塞窗口接受的段的个数.
+        tp-&gt;snd_cwnd_cnt += cnt;
+        while (tp-&gt;snd_cwnd_cnt &gt;= tp-&gt;snd_cwnd) {
+            //这里snd_cwnd_cnt是snd_cwnd的几倍，拥塞窗口就增加几。
+            tp-&gt;snd_cwnd_cnt -= tp-&gt;snd_cwnd;
+            //如果拥塞窗口没有超过最大值，则加一
+            if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
+                tp-&gt;snd_cwnd++;
+        }
+    }
+</code></pre>
+
+<p>最后是拥塞避免的处理。这里主要的步骤就是通过判断当前的拥塞窗口下已经发送的数据段的个数是否大于算法计算出来的值w，如果大于我们才能增加拥塞窗口值，否则之需要增加snd_cwnd_cnt。</p>
+
+<pre><code>    void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w)
+    {
+        //判断是否大于我们的标记值
+        if (tp-&gt;snd_cwnd_cnt &gt;= w) {
+            if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
+                tp-&gt;snd_cwnd++;
+            tp-&gt;snd_cwnd_cnt = 0;
+        } else {
+            //增加计数值
+            tp-&gt;snd_cwnd_cnt++;
+        }
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[iptables]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-iptables/"/>
+    <updated>2015-11-17T14:48:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/11/17/kernel-net-iptables</id>
+    <content type="html"><![CDATA[<p><a href="http://my.oschina.net/kisops/blog/150995">http://my.oschina.net/kisops/blog/150995</a></p>
+
+<p>解决：nf_conntrack: table full, dropping packet.</p>
+
+<hr />
+
+<p> “连接跟踪表已满，开始丢包”！相信不少用iptables的同学都会见过这个错误信息吧，这个问题曾经也困扰过我好长一段时间。此问题的解决办法有四种（nf_conntrack 在CentOS 5 / kernel &lt;= 2.6.19中名为 ip_conntrack ）：</p>
+
+<h4>一、关闭防火墙。 简单粗暴，直接有效</h4>
+
+<pre><code>    chkconfig iptables off
+    chkconfig ip6tables off
+    service iptables stop
+    service ip6tables stop
+</code></pre>
+
+<p>切记：在防火墙关闭状态下，不要通过iptables指令（比如 iptables -nL）来查看当前状态！因为这样会导致防火墙被启动，而且规则为空。虽然不会有任何拦截效果，但所有连接状态都会被记录，浪费资源且影响性能并可能导致防火墙主动丢包！</p>
+
+<h4>二、加大防火墙跟踪表的大小，优化对应的系统参数</h4>
+
+<h5>1、状态跟踪表的最大行数的设定，理论最大值 CONNTRACK_MAX = RAMSIZE (in bytes) / 16384 / (ARCH / 32)</h5>
+
+<p>以64G的64位操作系统为例，CONNTRACK_MAX = 64<em>1024</em>1024*1024/16384/2 = 2097152</p>
+
+<p>即时生效请执行：
+<code>
+    sysctl -w net.netfilter.nf_conntrack_max = 2097152
+</code></p>
+
+<h5>2、其哈希表大小通常为总表的1/8，最大为1/2。</h5>
+
+<p>CONNTRACK_BUCKETS = CONNTRACK_MAX / 8</p>
+
+<p>同样64G的64位操作系统，哈希最佳范围是 262144 ~ 1048576 。</p>
+
+<p>运行状态中通过 sysctl net.netfilter.nf_conntrack_buckets 进行查看，通过文件 /sys/module/nf_conntrack/parameters/hashsize 进行设置</p>
+
+<p>或者新建 /etc/modprobe.d/iptables.conf ，重新加载模块才生效：
+<code>
+    options nf_conntrack hashsize = 262144
+</code></p>
+
+<h5>3、还有些相关的系统参数<code>sysctl -a | grep nf_conntrack</code>可以调优（/etc/sysctl.conf ）：</h5>
+
+<pre><code>    net.netfilter.nf_conntrack_max  =   1048576
+    net.netfilter.ip_conntrack_tcp_timeout_established  =   3600
+    net.netfilter.nf_conntrack_tcp_timeout_close_wait  =   60
+    net.netfilter.nf_conntrack_tcp_timeout_fin_wait  =   120
+    net.netfilter.nf_conntrack_tcp_timeout_time_wait  =   120
+</code></pre>
+
+<p>三、使用祼表，添加“不跟踪”标识。如下示例更适合桌面系统或随意性强的服务器。因为它开启了连接的状态机制，方便和外部通信。修改 /etc/sysconfig/iptables 文件：
+<code>
+    *raw
+    # 对TCP连接不启用追踪，解决ip_contrack满导致无法连接的问题
+    -A PREROUTING -p tcp -m tcp --dport 80 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 22 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 21 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 11211 -j NOTRACK
+    -A PREROUTING -p tcp -m tcp --dport 60000:60100 -j NOTRACK
+    -A PREROUTING -p tcp -s 192.168.10.1 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 80 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 22 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 21 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 11211 -j NOTRACK
+    -A OUTPUT -p tcp -m tcp --sport 60000:60100 -j NOTRACK
+    -A OUTPUT -p tcp -s 192.168.10.1 -j NOTRACK
+    COMMIT
+    *filter
+    # 允许ping
+    -A INPUT -p icmp -j ACCEPT
+    # 对本地回路、第5张网卡放行
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -i eth4 -j ACCEPT
+    # 连接状态跟踪，已建立的连接允许传输数据
+    -A INPUT -m state --state ESTABLISHED,RELATED,INVALID,UNTRACKED -j ACCEPT
+    # filter表里存在但在raw里不存在的，默认会进行连接状态跟踪
+    -A INPUT -s 192.168.10.31 -p tcp --dport 2669 -j ACCEPT
+    -A INPUT -j REJECT --reject-with icmp-host-prohibited
+    -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+    COMMIT
+</code></p>
+
+<p>或者干脆对所有连接都关闭跟踪，不跟踪任何连接状态。不过规则就限制比较严谨，进出都需要显式申明。示例 /etc/sysconfig/iptables ：</p>
+
+<pre><code>    *raw
+    # 对TCP/UDP连接不启用追踪，解决nf_contrack满导致无法连接的问题
+    -A PREROUTING -p tcp -j NOTRACK
+    -A PREROUTING -p udp -j NOTRACK
+    -A OUTPUT -p tcp -j NOTRACK
+    -A OUTPUT -p udp -j NOTRACK
+    COMMIT
+    *filter
+    # 允许ping
+    -A INPUT -p icmp -j ACCEPT
+    # 对本地回路和eth1放行
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -i eth1 -j ACCEPT
+    # 只允许符合条件的连接进行传输数据
+    -A INPUT -p tcp --dport 22 -j ACCEPT
+    -A INPUT -p tcp --sport 80 -j ACCEPT
+    -A INPUT -p udp --sport 53 -j ACCEPT
+    -A INPUT -p udp --sport 123 -j ACCEPT
+    # 出去的包都不限制
+    -A OUTPUT -p tcp -j ACCEPT
+    -A OUTPUT -p udp -j ACCEPT
+    # 输入和转发的包不符合规则的全拦截
+    -A INPUT -j REJECT --reject-with icmp-host-prohibited
+    -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+    COMMIT
+</code></pre>
+
+<p>效果如下图：</p>
+
+<p><img src="/images/kernel/2015-11-17.png" alt="" /></p>
+
+<h4>四、删除连接跟踪模块<code>lsmod | grep nf_conntrack</code>，不使用连接状态的跟踪功能。</h4>
+
+<h5>1、删除nf_conntrack和相关的依赖模块，示例：</h5>
+
+<pre><code>    rmmod nf_conntrack_ipv4
+    rmmod nf_conntrack_ipv6
+    rmmod xt_state
+    rmmod xt_CT
+    rmmod xt_conntrack
+    rmmod iptable_nat
+    rmmod ipt_REDIRECT
+    rmmod nf_nat
+    rmmod nf_conntrack
+</code></pre>
+
+<h5>2、禁用跟踪模块，把它加到黑名单（/etc/modprobe.d/blacklist.conf ）：</h5>
+
+<pre><code>    # 禁用 nf_conntrack 模块
+    blacklist nf_conntrack
+    blacklist nf_conntrack_ipv6
+    blacklist xt_conntrack
+    blacklist nf_conntrack_ftp
+    blacklist xt_state
+    blacklist iptable_nat
+    blacklist ipt_REDIRECT
+    blacklist nf_nat
+    blacklist nf_conntrack_ipv4
+</code></pre>
+
+<h5>3、去掉防火墙里所有和状态相关的配置（比如state状态，NAT功能），示例：</h5>
+
+<pre><code>    *filter
+    # 允许ping
+    -A INPUT -p icmp -j ACCEPT
+    # 对本地回路和第2张网卡放行
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -i eth1 -j ACCEPT
+    # 对端口放行
+    -A INPUT -p tcp --dport 1331 -j ACCEPT
+    # 对IP放行
+    -A INPUT -s 192.168.10.31 -j ACCEPT
+
+    #允许本机进行DNS查询
+
+    -A INPUT -p udp --sport 53 -j ACCEPT
+    -A OUTPUT -p udp -j ACCEPT
+    -A INPUT -j REJECT --reject-with icmp-host-prohibited
+    -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+    COMMIT
+</code></pre>
+
+<p>另外，防火墙的配置文件最好也改下，不要加载任何额外模块（/etc/sysconfig/iptables-config）：</p>
+
+<pre><code>    IPTABLES_MODULES="" # 不需要任何附加模块
+    IPTABLES_MODULES_UNLOAD="no" # 避免iptables重启后sysctl中对应的参数被重置为系统默认值
+    IPTABLES_SAVE_ON_STOP="no"
+    IPTABLES_SAVE_ON_RESTART="no"
+    IPTABLES_SAVE_COUNTER="no"
+    IPTABLES_STATUS_NUMERIC="yes"
+    IPTABLES_STATUS_VERBOSE="no"
+    IPTABLES_STATUS_LINENUMBERS="no"
+</code></pre>
+
+<p>往往我们对连接的跟踪都是基于操作系统的（netstat / ss ），防火墙的连接状态完全是它自身实现产生的。</p>
+
+<p>总结：防火墙有条件还是交给上层设备完成会更好，使用防火墙一定要做调优；如果不需要防火墙的跟踪功能，规则简单的可以开启NOTRACK选项，条件允许的情况下就删除它吧！</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[tcp连接建立过程]]></title>
@@ -331,1553 +1097,6 @@
         attack(skfd, &amp;target, srcport);
     }
 </code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[TCP的定时器系列 — 保活定时器]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-net-keepalive/"/>
-    <updated>2015-09-30T15:32:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-net-keepalive</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/44177475">http://blog.csdn.net/zhangskd/article/details/44177475</a></p>
-
-<p>主要内容：保活定时器的实现，TCP_USER_TIMEOUT选项的实现。<br/>
-内核版本：3.15.2</p>
-
-<h4>原理</h4>
-
-<p>HTTP有Keepalive功能，TCP也有Keepalive功能，虽然都叫Keepalive，但是它们的目的却是不一样的。为了说明这一点，先来看下长连接和短连接的定义。</p>
-
-<p>连接的“长短”是什么？<br/>
-短连接：建立一条连接，传输一个请求，马上关闭连接。<br/>
-长连接：建立一条连接，传输一个请求，过会儿，又传输若干个请求，最后再关闭连接。</p>
-
-<p>长连接的好处是显而易见的，多个请求可以复用一条连接，省去连接建立和释放的时间开销和系统调用，但也意味着服务器的一部分资源会被长时间占用着。</p>
-
-<p>HTTP的Keepalive，顾名思义，目的在于延长连接的时间，以便在同一条连接中传输多个HTTP请求。</p>
-
-<p>HTTP服务器一般会提供Keepalive Timeout参数，用来决定连接保持多久，什么时候关闭连接。</p>
-
-<p>当连接使用了Keepalive功能时，对于客户端发送过来的一个请求，服务器端会发送一个响应，然后开始计时，如果经过Timeout时间后，客户端没有再发送请求过来，服务器端就把连接关了，不再保持连接了。</p>
-
-<p>TCP的Keepalive，是挂羊头卖狗肉的，目的在于看看对方有没有发生异常，如果有异常就及时关闭连接。</p>
-
-<p>当传输双方不主动关闭连接时，就算双方没有交换任何数据，连接也是一直有效的。</p>
-
-<p>如果这个时候对端、中间网络出现异常而导致连接不可用，本端如何得知这一信息呢？</p>
-
-<p>答案就是保活定时器。它每隔一段时间会超时，超时后会检查连接是否空闲太久了，如果空闲的时间超过了设置时间，就会发送探测报文。然后通过对端是否响应、响应是否符合预期，来判断对端是否正常，如果不正常，就主动关闭连接，而不用等待HTTP层的关闭了。</p>
-
-<p>当服务器发送探测报文时，客户端可能处于4种不同的情况：仍然正常运行、已经崩溃、已经崩溃并重启了、由于中间链路问题不可达。在不同的情况下，服务器会得到不一样的反馈。</p>
-
-<p>(1) 客户主机依然正常运行，并且从服务器端可达</p>
-
-<p>客户端的TCP响应正常，从而服务器端知道对方是正常的。保活定时器会在两小时以后继续触发。</p>
-
-<p>(2) 客户主机已经崩溃，并且关闭或者正在重新启动</p>
-
-<p>客户端的TCP没有响应，服务器没有收到对探测包的响应，此后每隔75s发送探测报文，一共发送9次。</p>
-
-<p>socket函数会返回-1，errno设置为ETIMEDOUT，表示连接超时。</p>
-
-<p>(3) 客户主机已经崩溃，并且重新启动了</p>
-
-<p>客户端的TCP发送RST，服务器端收到后关闭此连接。</p>
-
-<p>socket函数会返回-1，errno设置为ECONNRESET，表示连接被对端复位了。</p>
-
-<p>(4) 客户主机依然正常运行，但是从服务器不可达</p>
-
-<p>双方的反应和第二种是一样的，因为服务器不能区分对端异常与中间链路异常。</p>
-
-<p>socket函数会返回-1，errno设置为EHOSTUNREACH，表示对端不可达。</p>
-
-<h4>选项</h4>
-
-<p>内核默认并不使用TCP Keepalive功能，除非用户设置了SO_KEEPALIVE选项。</p>
-
-<p>有两种方式可以自行调整保活定时器的参数：一种是修改TCP参数，一种是使用TCP层选项。</p>
-
-<p>(1) TCP参数</p>
-
-<p>tcp_keepalive_time</p>
-
-<p>最后一次数据交换到TCP发送第一个保活探测报文的时间，即允许连接空闲的时间，默认为7200s。</p>
-
-<p>tcp_keepalive_intvl</p>
-
-<p>保活探测报文的重传时间，默认为75s。</p>
-
-<p>tcp_keepalive_probes</p>
-
-<p>保活探测报文的发送次数，默认为9次。</p>
-
-<p>Q：一次完整的保活探测需要花费多长时间？</p>
-
-<p>A：tcp_keepalive_time + tcp_keepalive_intvl * tcp_keepalive_probes，默认值为7875s。如果觉得两个多小时太长了，可以自行调整上述参数。</p>
-
-<p>(2) TCP层选项</p>
-
-<p>TCP_KEEPIDLE：含义同tcp_keepalive_time。</p>
-
-<p>TCP_KEEPINTVL：含义同tcp_keepalive_intvl。</p>
-
-<p>TCP_KEEPCNT：含义同tcp_keepalive_probes。</p>
-
-<p>Q：既然有了TCP参数可供调整，为什么还增加了上述的TCP层选项？</p>
-
-<p>A：TCP参数是面向本机的所有TCP连接，一旦调整了，对所有的连接都有效。而TCP层选项是面向一条连接的，一旦调整了，只对本条连接有效。</p>
-
-<h4>激活</h4>
-
-<p>在连接建立后，可以通过设置SO_KEEPALIVE选项，来激活保活定时器。</p>
-
-<pre><code>    int keepalive = 1;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &amp;keepalive, sizeof(keepalive));
-</code></pre>
-
-<pre><code>    int sock_setsockopt(struct socket *sock, int level, int optname, char __user *optval,   
-        unsigned int optlen)  
-    {  
-        ...  
-        case SO_KEEPALIVE:  
-    #ifdef CONFIG_INET  
-            if (sk-&gt;sk_protocol == IPPROTO_TCP &amp;&amp; sk-&gt;sk_type == SOCK_STREAM)  
-                tcp_set_keepalive(sk, valbool); /* 激活或删除保活定时器 */  
-    #endif  
-            sock_valbool_flag(sk, SOCK_KEEPOPEN, valbool); /* 设置或取消SOCK_KEEPOPEN标志位 */  
-            break;  
-        ...  
-    }  
-
-    static inline void sock_valbool_flag (struct sock *sk, int bit, int valbool)  
-    {  
-        if (valbool)  
-            sock_set_flag(sk, bit);  
-        else  
-            sock_reset_flag(sk, bit);  
-    }  
-</code></pre>
-
-<pre><code>    void tcp_set_keepalive(struct sock *sk, int val)  
-    {  
-        /* 不在以下两个状态设置保活定时器： 
-         * TCP_CLOSE：sk_timer用作FIN_WAIT2定时器 
-         * TCP_LISTEN：sk_timer用作SYNACK重传定时器 
-         */  
-        if ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE | TCPF_LISTEN))  
-            return;  
-
-        /* 如果SO_KEEPALIVE选项值为1，且此前没有设置SOCK_KEEPOPEN标志， 
-         * 则激活sk_timer，用作保活定时器。 
-         */  
-        if (val &amp;&amp; !sock_flag(sk, SOCK_KEEPOPEN))  
-            inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tcp_sk(sk)));  
-        else if (!val)  
-            /* 如果SO_KEEPALIVE选项值为0，则删除保活定时器 */  
-            inet_csk_delete_keepalive_timer(sk);  
-    }  
-
-    /* 保活定时器的超时时间 */  
-    static inline int keepalive_time_when(const struct tcp_sock *tp)  
-    {  
-        return tp-&gt;keepalive_time ? : sysctl_tcp_keepalive_time;  
-    }  
-
-    void inet_csk_reset_keepalive_timer (struc sock *sk, unsigned long len)  
-    {  
-        sk_reset_timer(sk, &amp;sk-&gt;sk_timer, jiffies + len);  
-    }  
-</code></pre>
-
-<p>可以使用TCP层选项来动态调整保活定时器的参数。</p>
-
-<pre><code>    int keepidle = 600;
-    int keepintvl = 10;
-    int keepcnt = 6;
-
-    setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &amp;keepidle, sizeof(keepidle));
-    setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &amp;keepintvl, sizeof(keepintvl));
-    setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &amp;keepcnt, sizeof(keepcnt));
-</code></pre>
-
-<pre><code>    struct tcp_sock {  
-        ...  
-        /* 最后一次接收到ACK的时间 */  
-        u32 rcv_tstamp; /* timestamp of last received ACK (for keepalives) */  
-        ...  
-        /* time before keep alive takes place, 空闲多久后才发送探测报文 */  
-        unsigned int keepalive_time;  
-        /* time iterval between keep alive probes */  
-        unsigned int keepalive_intvl; /* 探测报文之间的时间间隔 */  
-        /* num of allowed keep alive probes */  
-        u8 keepalive_probes; /* 探测报文的发送次数 */  
-        ...  
-        struct {  
-            ...  
-            /* 最后一次接收到带负荷的报文的时间 */  
-            __u32 lrcvtime; /* timestamp of last received data packet */  
-            ...  
-        } icsk_ack;  
-        ...  
-    };  
-
-    #define TCP_KEEPIDLE 4 /* Start Keepalives after this period */  
-    #define TCP_KEEPINTVL 5 /* Interval between keepalives */  
-    #define TCP_KEEPCNT 6 /* Number of keepalives before death */  
-
-    #define MAX_TCP_KEEPIDLE 32767  
-    #define MAX_TCP_KEEPINTVL 32767  
-    #define MAX_TCP_KEEPCNT 127  
-</code></pre>
-
-<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,  
-        unsigned int optlen)  
-    {  
-        ...  
-        case TCP_KEEPIDLE:  
-           if (val &lt; 1 || val &gt; MAX_TCP_KEEPIDLE)  
-               err = -EINVAL;  
-            else {  
-                tp-&gt;keepalive_time = val * HZ; /* 设置新的空闲时间 */  
-
-                /* 如果有使用SO_KEEPALIVE选项，连接处于非监听非结束的状态。 
-                 * 这个时候保活定时器已经在计时了，这里设置新的超时时间。 
-                 */  
-                if (sock_flag(sk, SOCK_KEEPOPEN) &amp;&amp;   
-                    !((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE | TCPF_LISTEN))) {  
-                    u32 elapsed = keepalive_time_elapsed(tp); /* 连接已经经历的空闲时间 */  
-
-                    if (tp-&gt;keepalive_time &gt; elapsed)  
-                        elapsed = tp-&gt;keepalive_time - elapsed; /* 接着等待的时间，然后超时 */  
-                    else  
-                        elapsed = 0; /* 会导致马上超时 */  
-                    inet_csk_reset_keepalive_timer(sk, elapsed);  
-                }  
-            }  
-            break;  
-
-        case TCP_KEEPINTVL:  
-            if (val &lt; 1 || val &gt; MAX_TCP_KEEPINTVL)  
-                err = -EINVAL;  
-            else  
-                tp-&gt;keepalive_intvl = val * HZ; /* 设置新的探测报文间隔 */  
-            break;  
-
-        case TCP_KEEPCNT:  
-            if (val &lt; 1 || val &gt; MAX_TCP_KEEPCNT)  
-                err = -EINVAL;  
-            else  
-                tp-&gt;keepalive_probes = val; /* 设置新的探测次数 */  
-            break;  
-        ...  
-    }  
-</code></pre>
-
-<p>到目前为止，连接已经经历的空闲时间，即最后一次接收到报文至今的时间。</p>
-
-<pre><code>    static inline u32 keepalive_time_elapsed (const struct tcp_sock *tp)  
-    {  
-        const struct inet_connection_sock *icsk = &amp;tp-&gt;inet_conn;  
-
-        /* lrcvtime是最后一次接收到数据报的时间 
-         * rcv_tstamp是最后一次接收到ACK的时间 
-         * 返回值就是最后一次接收到报文，到现在的时间，即经历的空闲时间。 
-         */  
-        return min_t(u32, tcp_time_stamp - icsk-&gt;icsk_ack.lrcvtime,  
-            tcp_time_stamp - tp-&gt;rcv_tstamp);  
-    }  
-</code></pre>
-
-<h4>超时处理函数</h4>
-
-<p>我们知道保活定时器、SYNACK重传定时器、FIN_WAIT2定时器是共用一个定时器实例sk->sk_timer，所以它们的超时处理函数也是一样的，都为tcp_keepalive_timer()。而在函数内部，可以根据此时连接所处的状态，来判断是哪个定时器触发了超时。</p>
-
-<p>Q：什么时候判断对端为异常并关闭连接？</p>
-
-<p>A：分两种情况。</p>
-
-<ol>
-<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
-<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
-</ol>
-
-
-<pre><code>    static void tcp_keepalive_timer (unsigned long data)  
-    {  
-        struct sock *sk = (struct sock *) data;  
-        struct inet_connection_sock *icsk = inet_csk(sk);  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        u32 elapsed;  
-
-        /* Only process if socket is not in use. */  
-        bh_lock_sock(sk);  
-
-        /* 加锁以保证在此期间，连接状态不会被用户进程修改。 
-         * 如果用户进程正在使用此sock，那么过50ms再来看看。 
-         */  
-        if (sock_owned_by_user(sk)) {  
-            /* Try again later. */  
-            inet_csk_reset_keepalive_timer(sk, HZ/20);  
-            goto out;  
-        }  
-
-        /* 三次握手期间，用作SYNACK定时器 */  
-        if (sk-&gt;sk_state == TCP_LISTEN) {  
-            tcp_synack_timer(sk);  
-            goto out;  
-        }      
-
-        /* 连接释放期间，用作FIN_WAIT2定时器 */  
-        if (sk-&gt;sk_state == TCP_FIN_WAIT2 &amp;&amp; sock_flag(sk, SOCK_DEAD)) {  
-            ...  
-        }  
-
-        /* 接下来就是用作保活定时器了 */  
-        if (!sock_flag(sk, SOCK_KEEPOPEN) || sk-&gt;sk_state == TCP_CLOSE)  
-            goto out;  
-
-        elapsed = keepalive_time_when(tp); /* 连接的空闲时间超过此值，就发送保活探测报文 */  
-
-        /* It is alive without keepalive. 
-         * 如果网络中有发送且未确认的数据包，或者发送队列不为空，说明连接不是idle的？ 
-         * 既然连接不是idle的，就没有必要探测对端是否正常。 
-         * 保活定时器重新开始计时即可。 
-         *  
-         * 而实际上当网络中有发送且未确认的数据包时，对端也可能会发生异常而没有响应。 
-         * 这个时候会导致数据包的不断重传，只能依靠重传超过了允许的最大时间，来判断连接超时。 
-         * 为了解决这一问题，引入了TCP_USER_TIMEOUT，允许用户指定超时时间，可见下文：） 
-         */  
-        if (tp-&gt;packets_out || tcp_send_head(sk))  
-            goto resched; /* 保活定时器重新开始计时 */  
-
-        /* 连接经历的空闲时间，即上次收到报文至今的时间 */  
-        elapsed = keepalive_time_elapsed(tp);  
-
-        /* 如果连接空闲的时间超过了设置的时间值 */  
-        if (elapsed &gt;= keepalive_time_when(tp)) {  
-
-            /* 什么时候关闭连接？ 
-             * 1. 使用了TCP_USER_TIMEOUT选项。当连接空闲时间超过了用户设置的时间，且有发送过探测报文。 
-             * 2. 用户没有使用选项。当发送的保活探测包达到了保活探测的最大次数。 
-             */  
-            if (icsk-&gt;icsk_user_timeout != 0 &amp;&amp; elapsed &gt;= icsk-&gt;icsk_user_timeout &amp;&amp;  
-                icsk-&gt;icsk_probes_out &gt; 0) || (icsk-&gt;icsk_user_timeout == 0 &amp;&amp;  
-                icsk-&gt;icsk_probes_out &gt;= keepalive_probes(tp))) {  
-                tcp_send_active_reset(sk, GFP_ATOMIC); /* 构造一个RST包并发送 */  
-                tcp_write_err(sk); /* 报告错误，关闭连接 */  
-                goto out;  
-            }  
-
-            /* 如果还不到关闭连接的时候，就继续发送保活探测包 */  
-            if (tcp_write_wakeup(sk) &lt;= 0) {  
-                icsk-&gt;icsk_probes_out++; /* 已发送的保活探测包个数 */  
-                elapsed = keepalive_intvl_when(tp); /* 下次超时的时间，默认为75s */  
-            } else {  
-                /* If keepalive was lost due to local congestion, try harder. */  
-                elapsd = TCP_RESOURCE_PROBE_INTERVAL; /* 默认为500ms，会使超时更加频繁 */  
-            }  
-
-        } else {  
-            /* 如果连接的空闲时间，还没有超过设定值，则接着等待 */  
-            elapsed = keepalive_time_when(tp) - elapsed;  
-        }   
-
-        sk_mem_reclaim(sk);  
-
-    resched: /* 重设保活定时器 */  
-        inet_csk_reset_keepalive_timer(sk, elapsed);  
-        goto out;   
-
-    out:  
-        bh_unlock_sock(sk);  
-        sock_put(sk);  
-    }  
-</code></pre>
-
-<p>Q：TCP是如何发送Keepalive探测报文的？</p>
-
-<p>A：分两种情况。</p>
-
-<ol>
-<li><p>有新的数据段可供发送，且对端接收窗口还没被塞满。发送新的数据段，来作为探测包。</p></li>
-<li><p>没有新的数据段可供发送，或者对端的接收窗口满了。发送序号为snd_una - 1、长度为0的ACK包作为探测包。</p></li>
-</ol>
-
-
-<pre><code>    /* Initiate keepalive or window probe from timer. */  
-
-    int tcp_write_wakeup (struct sock *sk)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        struct sk_buff *skb;  
-
-        if (sk-&gt;sk_state == TCP_CLOSE)  
-            return -1;  
-
-        /* 如果还有未发送过的数据包，并且对端的接收窗口还没有满 */  
-        if ((skb = tcp_send_head(sk)) != NULL &amp;&amp; before(TCP_SKB_CB(skb)-&gt;seq, tcp_wnd_end(tp))) {  
-            int err;  
-            unsigned int mss = tcp_current_mss(sk); /* 当前的MSS */  
-            /* 对端接收窗口所允许的最大报文长度 */  
-            unsigned int seg_size = tcp_wnd_end(tp) - TCP_SKB_CB(skb)-&gt;seq;  
-
-            /* pushed_seq记录发送出去的最后一个字节的序号 */  
-            if (before(tp-&gt;pushed_seq, TCP_SKB_CB(skb)-&gt;end_seq))  
-                tp-&gt;pushed_seq = TCP_SKB_CB(skb)-&gt;end_seq;  
-
-            /* 如果对端接收窗口小于此数据段的长度，或者此数据段的长度超过了MSS，那么就要进行分段 */  
-            if (seg_size &lt; TCP_SKB_CB(skb)-&gt;end_seq - TCP_SKB_CB(skb)-&gt;seq || skb-&gt;len &gt; mss) {  
-                seg_size = min(seg_size, mss);  
-                TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH; /* 设置PSH标志，让对端马上把数据提交给程序 */  
-                if (tcp_fragment(sk, skb, seg_size, mss)) /* 进行分段 */  
-                    return -1;  
-            } else if (! tcp_skb_pcount(skb)) /* 进行TSO分片 */  
-                tcp_set_skb_tso_segs(sk, skb, mss); /* 初始化分片相关变量 */  
-
-            TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH;  
-            TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
-            err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC); /* 发送此数据段 */  
-            if (!err)  
-                tcp_event_new_data_sent(sk, skb); /* 发送了新的数据，更新相关参数 */  
-
-        } else { /* 如果没有新的数据段可用作探测报文发送，或者对端的接收窗口为0 */  
-
-           /* 处于紧急模式时，额外发送一个序号为snd_una的ACK包，告诉对端紧急指针 */  
-           if (between(tp-&gt;snd_up, tp-&gt;snd_una + 1, tp-&gt;snd_una + 0xFFFF))  
-               tcp_xmit_probe_skb(sk, 1);  
-
-            /* 发送一个序号为snd_una -1的ACK包，长度为0，这是一个序号过时的报文。 
-             * snd_una: first byte we want an ack for，所以snd_una - 1序号的字节已经被确认过了。 
-             * 对端会响应一个ACK。 
-             */  
-            return tcp_xmit_probe_skb(sk, 0);  
-        }  
-    }  
-</code></pre>
-
-<p>Q：当没有新的数据可以用作探测包、或者对端的接收窗口为0时，怎么办呢？</p>
-
-<p>A：发送一个序号为snd_una - 1、长度为0的ACK包，对端收到此包后会发送一个ACK响应。如此一来本端就能够知道对端是否还活着、接收窗口是否打开了。</p>
-
-<pre><code>    /* This routine sends a packet with an out of date sequence number. 
-     * It assumes the other end will try to ack it. 
-     *  
-     * Question: what should we make while urgent mode? 
-     * 4.4BSD forces sending single byte of data. We cannot send out of window 
-     * data, because we have SND.NXT == SND.MAX... 
-     *  
-     * Current solution: to send TWO zero-length segments in urgent mode: 
-     * one is with SEG.SEG=SND.UNA to deliver urgent pointer, another is out-of-date with 
-     * SND.UNA - 1 to probe window. 
-     */  
-
-    static int tcp_xmit_probe_skb (struct sock *sk, int urgent)  
-    {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        struct sk_buff *skb;  
-
-        /* We don't queue it, tcp_transmit_skb() sets ownership. */  
-        skb = alloc_skb(MAX_TCP_HEADER, sk_gfp_atomic(sk, GFP_ATOMIC));  
-        if (skb == NULL)  
-            return -1;  
-
-        /* Reserve space for headers and set control bits. */  
-        skb_reserve(skb, MAX_TCP_HEADER);  
-
-        /* Use a previous sequence. This should cause the other end to send an ack. 
-         * Don't queue or clone SKB, just send it. 
-         */  
-        /* 如果没有设置紧急指针，那么发送的序号为snd_una - 1，否则发送的序号为snd_una */  
-        tcp_init_nondata_skb(skb, tp-&gt;snd_una - !urgent, TCPHDR_ACK);  
-        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
-        return tcp_transmit_skb(sk, skb, 0, GFP_ATOMIC); /* 发送探测包 */  
-    }  
-</code></pre>
-
-<p>发送RST包。</p>
-
-<pre><code>    /* We get here when a process closes a file descriptor (either due to an explicit close() 
-     * or as a byproduct of exit()'ing) and there was unread data in the receive queue. 
-     * This behavior is recommended by RFC 2525, section 2.17. -DaveM 
-     */  
-
-    void tcp_send_active_reset (struct sock *sk, gfp_t priority)  
-    {  
-        struct sk_buff *skb;  
-        /* NOTE: No TCP options attached and we never retransmit this. */  
-        skb = alloc_skb(MAX_TCP_HEADER, priority);  
-        if (!skb) {  
-            NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
-            return;  
-        }  
-
-        /* Reserve space for headers and prepare control bits. */  
-        skb_reserve(skb, MAX_TCP_HEADER); /* 为报文头部预留空间 */  
-        /* 初始化不携带数据的skb的一些控制字段 */  
-        tcp_init_nondata_skb(skb, tcp_acceptable_seq(sk), TCPHDR_ACK | TCPHDR_RST);  
-
-        /* Send if off，发送此RST包*/  
-        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
-        if (tcp_transmit_skb(sk, skb, 0, priority))  
-            NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
-        TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTRSTS);  
-    }  
-
-    static inline __u32 tcp_acceptable_seq (const struct sock *sk)  
-    {  
-        const struct tcp_sock *tp = tcp_sk(sk);  
-
-        /* 如果snd_nxt在对端接收窗口范围内 */  
-        if (! before(tcp_wnd_end(tp), tp-&gt;snd_nxt))  
-            return tp-&gt;snd_nxt;  
-        else  
-            return tcp_wnd_end(tp);  
-    }  
-</code></pre>
-
-<h4>TCP_USER_TIMEOUT选项</h4>
-
-<p>从上文可知同时符合以下条件时，保活定时器才会发送探测报文：</p>
-
-<ol>
-<li><p>网络中没有发送且未确认的数据包。</p></li>
-<li><p>发送队列为空。</p></li>
-<li><p>连接的空闲时间超过了设定的时间。</p></li>
-</ol>
-
-
-<p>Q：如果网络中有发送且未确认的数据包、或者发送队列不为空时，保活定时器不起作用了，岂不是不能够检测到对端的异常了？</p>
-
-<p>A：可以使用TCP_USER_TIMEOUT，显式的指定当发送数据多久后还没有得到响应，就判定连接超时，从而主动关闭连接。</p>
-
-<p>TCP_USER_TIMEOUT选项会影响到超时重传定时器和保活定时器。</p>
-
-<p>(1) 超时重传定时器</p>
-
-<p>判断连接是否超时，分3种情况：</p>
-
-<ol>
-<li><p>SYN包：当SYN包的重传次数达到上限时，判定连接超时。(默认允许重传5次，初始超时时间为1s，总共历时31s)</p></li>
-<li><p>非SYN包，用户使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过用户设置的时间时，判定连接超时。</p></li>
-<li><p>非SYN包，用户没有使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过以TCP_RTO_MIN为初始超时时间，重传boundary次所花费的时间后，判定连接超时。(boundary的最大值为tcp_retries2，默认值为15)</p></li>
-</ol>
-
-
-<p>(2) 保活定时器</p>
-
-<p>判断连接是否异常，分2种情况：</p>
-
-<ol>
-<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
-<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
-</ol>
-
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[TIME_WAIT状态下对接收到的数据包如何处理]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/09/29/kernel-net-timewait_state/"/>
-    <updated>2015-09-29T17:53:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/09/29/kernel-net-timewait_state</id>
-    <content type="html"><![CDATA[<p><a href="http://www.educity.cn/linux/1605134.html">http://www.educity.cn/linux/1605134.html</a></p>
-
-<p>正常情况下主动关闭连接的一端在连接正常终止后，会进入TIME_WAIT状态，存在这个状态有以下两个原因（参考《Unix网络编程》）：</p>
-
-<p>《UNIX网络编程.卷2：进程间通信(第2版)》[PDF]下载</p>
-
-<p>1、保证TCP连接关闭的可靠性。如果最终发送的ACK丢失，被动关闭的一端会重传最终的FIN包，如果执行主动关闭的一端没有维护这个连接的状态信息，会发送RST包响应，导致连接不正常关闭。</p>
-
-<p>2、允许老的重复分组在网络中消逝。假设在一个连接关闭后，发起建立连接的一端（客户端）立即重用原来的端口、IP地址和服务端建立新的连接。老的连接上的分组可能在新的连接建立后到达服务端，TCP必须防止来自某个连接的老的重复分组在连接终止后再现，从而被误解为同一个连接的化身。要实现这种功能，TCP不能给处于TIME_WAIT状态的连接启动新的连接。TIME_WAIT的持续时间是2MSL，保证在建立新的连接之前老的重复分组在网络中消逝。这个规则有一个例外：如果到达的SYN的序列号大于前一个连接的结束序列号，源自Berkeley的实现将给当前处于TIME_WAIT状态的连接启动新的化身。</p>
-
-<p>最初在看《Unix网络编程》 的时候看到这个状态，但是在项目中发现对这个状态的理解有误，特别是第二个理由。原本认为在TIME_WAIT状态下肯定不会再使用相同的五元组（协议类型，源目的IP、源目的端口号）建立一个新的连接，看书还是不认真啊！为了加深理解，决定结合内核代码，好好来看下内核在TIME_WAIT状态下的处理。其实TIME_WAIT存在的第二个原因的解释更多的是从被动关闭一方的角度来说明的。如果是执行主动关闭的是客户端，客户端户进入TIME_WAIT状态，假设客户端重用端口号来和服务器建立连接，内核会不会允许客户端来建立连接？内核如何来处理这种情况？书本中不会对这些点讲的那么详细，要从内核源码中来找答案。</p>
-
-<p>我们先来看服务器段进入TIME_WAIT后内核的处理，即服务器主动关闭连接。TCP层的接收函数是tcp_v4_rcv()，和TIME_WAIT状态相关的主要代码如下所示：</p>
-
-<pre><code>    int tcp_v4_rcv(struct sk_buff *skb)
-    {
-        ......
-
-        sk = __inet_lookup_skb(&amp;tcp_hashinfo, skb, th-&gt;source, th-&gt;dest);
-        if (!sk)
-            goto no_tcp_socket;
-    process:
-        if (sk-&gt;sk_state == TCP_TIME_WAIT)
-            goto do_time_wait;   
-            ......
-
-    discard_it:
-        /* Discard frame. */
-        kfree_skb(skb);
-        return 0;
-        ......
-    do_time_wait:
-        ......
-
-    switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
-        case TCP_TW_SYN: {
-            struct sock *sk2 = inet_lookup_listener(dev_net(skb-&gt;dev),
-                                &amp;tcp_hashinfo,
-                                iph-&gt;daddr, th-&gt;dest,
-                                inet_iif(skb));
-            if (sk2) {
-                inet_twsk_deschedule(inet_twsk(sk), &amp;tcp_death_row);
-                inet_twsk_put(inet_twsk(sk));
-                sk = sk2;
-                goto process;
-            }
-            /* Fall through to ACK */
-        }
-        case TCP_TW_ACK:
-            tcp_v4_timewait_ack(sk, skb);
-            break;
-        case TCP_TW_RST:
-            goto no_tcp_socket;
-        case TCP_TW_SUCCESS:;
-        }
-        goto discard_it;
-    }
-</code></pre>
-
-<p>接收到SKb包后，会调用__inet_lookup_skb()查找对应的sock结构。如果套接字状态是TIME_WAIT状态，会跳转到do_time_wait标签处处理。从代码中可以看到，主要由tcp_timewait_state_process()函数来处理SKB包，处理后根据返回值来做相应的处理。</p>
-
-<p>在看tcp_timewait_state_process()函数中的处理之前，需要先看一看不同的返回值会对应什么样的处理。</p>
-
-<p>如果返回值是TCP_TW_SYN，则说明接收到的是一个“合法”的SYN包（也就是说这个SYN包可以接受），这时会首先查找内核中是否有对应的监听套接字，如果存在相应的监听套接字，则会释放TIME_WAIT状态的传输控制结构，跳转到process处开始处理，开始建立一个新的连接。如果没有找到监听套接字会执行到TCP_TW_ACK分支。</p>
-
-<p>如果返回值是TCP_TW_ACK，则会调用tcp_v4_timewait_ack()发送ACK，然后跳转到discard_it标签处，丢掉数据包。</p>
-
-<p>如果返回值是TCP_TW_RST，则会调用tcp_v4_send_reset()给对端发送RST包，然后丢掉数据包。</p>
-
-<p>如果返回值是TCP_TW_SUCCESS，则会直接丢掉数据包。</p>
-
-<p>接下来我们通过tcp_timewait_state_process()函数来看TIME_WAIT状态下的数据包处理。</p>
-
-<p>为了方便讨论，假设数据包中没有时间戳选项，在这个前提下，tcp_timewait_state_process()中的局部变量paws_reject的值为0。</p>
-
-<p>如果需要保持在FIN_WAIT_2状态的时间小于等于TCP_TIMEWAIT_LEN，则会从FIN_WAIT_2状态直接迁移到TIME_WAIT状态，也就是使用描述TIME_WAIT状态的sock结构代替当前的传输控制块。虽然这时的sock结构处于TIME_WAIT结构，但是还要区分内部状态，这个内部状态存储在inet_timewait_sock结构的tw_substate成员中。</p>
-
-<p>如果内部状态为FIN_WAIT_2，tcp_timewait_state_process()中处理的关键代码片段如下所示：</p>
-
-<pre><code>    if (tw-&gt;tw_substate == TCP_FIN_WAIT2) {
-        /* Just repeat all the checks of tcp_rcv_state_process() */
-
-        /* Out of window, send ACK */
-        if (paws_reject ||
-            !tcp_in_window(TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq,
-                  tcptw-&gt;tw_rcv_nxt,
-                  tcptw-&gt;tw_rcv_nxt + tcptw-&gt;tw_rcv_wnd))
-            return TCP_TW_ACK;
-
-        if (th-&gt;rst)
-            goto kill;
-
-        if (th-&gt;syn &amp;&amp; !before(TCP_SKB_CB(skb)-&gt;seq, tcptw-&gt;tw_rcv_nxt))
-            goto kill_with_rst;
-
-        /* Dup ACK? */
-        if (!th-&gt;ack ||
-            !after(TCP_SKB_CB(skb)-&gt;end_seq, tcptw-&gt;tw_rcv_nxt) ||
-            TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq) {
-            inet_twsk_put(tw);
-            return TCP_TW_SUCCESS;
-        }
-
-        /* New data or FIN. If new data arrive after half-duplex close,
-         * reset.
-         */
-        if (!th-&gt;fin ||
-            TCP_SKB_CB(skb)-&gt;end_seq != tcptw-&gt;tw_rcv_nxt + 1) {
-    kill_with_rst:
-            inet_twsk_deschedule(tw, &amp;tcp_death_row);
-            inet_twsk_put(tw);
-            return TCP_TW_RST;
-        }
-
-        /* FIN arrived, enter true time-wait state. */
-        tw-&gt;tw_substate      = TCP_TIME_WAIT;
-        tcptw-&gt;tw_rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
-        if (tmp_opt.saw_tstamp) {
-            tcptw-&gt;tw_ts_recent_stamp = get_seconds();
-            tcptw-&gt;tw_ts_recent      = tmp_opt.rcv_tsval;
-        }
-
-        /* I am shamed, but failed to make it more elegant.
-         * Yes, it is direct reference to IP, which is impossible
-         * to generalize to IPv6. Taking into account that IPv6
-         * do not understand recycling in any case, it not
-         * a big problem in practice. --ANK 
-         */
-        if (tw-&gt;tw_family == AF_INET &amp;&amp;
-            tcp_death_row.sysctl_tw_recycle &amp;&amp; tcptw-&gt;tw_ts_recent_stamp &amp;&amp;
-            tcp_v4_tw_remember_stamp(tw))
-            inet_twsk_schedule(tw, &amp;tcp_death_row, tw-&gt;tw_timeout,
-                      TCP_TIMEWAIT_LEN);
-        else
-            inet_twsk_schedule(tw, &amp;tcp_death_row, TCP_TIMEWAIT_LEN,
-                      TCP_TIMEWAIT_LEN);
-
-        return TCP_TW_ACK;
-    }
-</code></pre>
-
-<p>如果TCP段序号不完全在接收窗口内，则返回TCP_TW_ACK，表示需要给对端发送ACK。</p>
-
-<p>如果在FIN_WAIT_2状态下接收到的是RST包，则跳转到kill标签处处理，立即释放timewait控制块，并返回TCP_TW_SUCCESS。</p>
-
-<p>如果是SYN包，但是SYN包的序列号在要接收的序列号之前，则表示这是一个过期的SYN包，则跳转到kill_with_rst标签处处理，此时不仅会释放TIME_WAIT传输控制块，还会返回TCP_TW_RST，要给对端发送RST包。</p>
-
-<p>如果接收到DACK，则释放timewait控制块，并返回TCP_TW_SUCCESS。在这种情况下有一个判断条件是看包的结束序列号和起始序列号相同时，会作为DACK处理，所以之后的处理是在数据包中的数据不为空的情况下处理。前面的处理中已经处理了SYN包、RST包的情况，接下来就剩以下三种情况：</p>
-
-<p>1、不带FIN标志的数据包</p>
-
-<p>2、带FIN标志，但是还包含数据</p>
-
-<p>3、FIN包，不包含数据</p>
-
-<p>如果是前两种情况，则会调用inet_twsk_deschedule()释放time_wait控制块。inet_twsk_deschedule()中会调用到inet_twsk_put()减少time_wait控制块的引用，在外层函数中再次调用inet_twsk_put()函数时，就会真正释放time_wait控制块。</p>
-
-<p>如果接收的是对端的FIN包，即第3种情况，则将time_wait控制块的子状态设置为TCP_TIME_WAIT，此时才是进入真正的TIME_WAIT状态。然后根据TIME_WAIT的持续时间的长短来确定是加入到twcal_row队列还是启动一个定时器，最后会返回TCP_TW_ACK，给对端发送TCP连接关闭时最后的ACK包。</p>
-
-<p>到这里，我们看到了对FIN_WAIT_2状态（传输控制块状态为TIME_WAIT状态下，但是子状态为FIN_WAIT_2）的完整处理。</p>
-
-<p>接下来的处理才是对真正的TIME_WAIT状态的处理，即子状态也是TIME_WAIT。</p>
-
-<p>如果在TIME_WAIT状态下，接收到ACK包（不带数据）或RST包，并且包的序列号刚好是下一个要接收的序列号，由以下代码片段处理：</p>
-
-<pre><code>    if (!paws_reject &amp;&amp;
-        (TCP_SKB_CB(skb)-&gt;seq == tcptw-&gt;tw_rcv_nxt &amp;&amp;
-        (TCP_SKB_CB(skb)-&gt;seq == TCP_SKB_CB(skb)-&gt;end_seq || th-&gt;rst))) {
-        /* In window segment, it may be only reset or bare ack. */
-        if (th-&gt;rst) {
-            /* This is TIME_WAIT assassination, in two flavors.
-            * Oh well... nobody has a sufficient solution to this
-            * protocol bug yet.
-            */
-            if (sysctl_tcp_rfc1337 == 0) {
-    kill:
-                inet_twsk_deschedule(tw, &amp;tcp_death_row);
-                inet_twsk_put(tw);
-                return TCP_TW_SUCCESS;
-            }
-        }
-        inet_twsk_schedule(tw, &amp;tcp_death_row, TCP_TIMEWAIT_LEN,
-                  TCP_TIMEWAIT_LEN);
-
-        if (tmp_opt.saw_tstamp) {
-            tcptw-&gt;tw_ts_recent      = tmp_opt.rcv_tsval;
-            tcptw-&gt;tw_ts_recent_stamp = get_seconds();
-        }
-
-        inet_twsk_put(tw);
-        return TCP_TW_SUCCESS;
-    }
-</code></pre>
-
-<p>如果是RST包的话，并且系统配置sysctl_tcp_rfc1337（默认情况下为0，参见/proc/sys/net/ipv4/tcp_rfc1337）的值为0，这时会立即释放time_wait传输控制块，丢掉接收的RST包。</p>
-
-<p>如果是ACK包，则会启动TIME_WAIT定时器后丢掉接收到的ACK包。</p>
-
-<p>接下来是对SYN包的处理。前面提到了，如果在TIME_WAIT状态下接收到序列号比上一个连接的结束序列号大的SYN包，可以接受，并建立新的连接，下面这段代码就是来处理这样的情况：</p>
-
-<pre><code>    if (th-&gt;syn &amp;&amp; !th-&gt;rst &amp;&amp; !th-&gt;ack &amp;&amp; !paws_reject &amp;&amp;
-        (after(TCP_SKB_CB(skb)-&gt;seq, tcptw-&gt;tw_rcv_nxt) ||
-        (tmp_opt.saw_tstamp &amp;&amp;
-          (s32)(tcptw-&gt;tw_ts_recent - tmp_opt.rcv_tsval) &lt; 0))) {
-        u32 isn = tcptw-&gt;tw_snd_nxt + 65535 + 2;
-        if (isn == 0)
-            isn++;
-        TCP_SKB_CB(skb)-&gt;when = isn;
-        return TCP_TW_SYN;
-    }
-</code></pre>
-
-<p>当返回TCP_TW_SYN时，在tcp_v4_rcv()中会立即释放time_wait控制块，并且开始进行正常的连接建立过程。</p>
-
-<p>如果数据包不是上述几种类型的包，可能的情况有：</p>
-
-<p>1、不是有效的SYN包。不考虑时间戳的话，就是序列号在上一次连接的结束序列号之前</p>
-
-<p>2、ACK包，起始序列号不是下一个要接收的序列号</p>
-
-<p>3、RST包，起始序列号不是下一个要接收的序列号</p>
-
-<p>4、带数据的SKB包</p>
-
-<p>这几种情况由以下代码处理：</p>
-
-<pre><code>    if (!th-&gt;rst) {
-        /* In this case we must reset the TIMEWAIT timer.
-         *
-         * If it is ACKless SYN it may be both old duplicate
-         * and new good SYN with random sequence number &lt;rcv_nxt.
-         * Do not reschedule in the last case.
-         */
-        if (paws_reject || th-&gt;ack)
-            inet_twsk_schedule(tw, &amp;tcp_death_row, TCP_TIMEWAIT_LEN,
-                      TCP_TIMEWAIT_LEN);
-
-        /* Send ACK. Note, we do not put the bucket,
-         * it will be released by caller.
-         */
-        return TCP_TW_ACK;
-    }
-    inet_twsk_put(tw);
-    return TCP_TW_SUCCESS;
-</code></pre>
-
-<p>如果是RST包，即第3种情况，则直接返回TCP_TW_SUCCESS，丢掉RST包。</p>
-
-<p>如果带有ACK标志的话，则会启动TIME_WAIT定时器，然后给对端发送ACK。我们知道SYN包正常情况下不会设置ACK标志，所以如果是SYN包不会启动TIME_WAIT定时器，只会给对端发送ACK，告诉对端已经收到SYN包，避免重传，但连接应该不会继续建立。</p>
-
-<p>还有一个细节需要提醒下，就是我们看到在返回TCP_TW_ACK时，没有调用inet_twsk_put()释放对time_wait控制块的引用。这时因为在tcp_v4_rcv()中调用tcp_v4_timewait_ack()发送ACK时会用到time_wait控制块，所以需要保持对time_wait控制块的引用。在tcp_v4_timewait_ack()中发送完ACK后，会调用inet_twsk_put()释放对time_wait控制块的引用。</p>
-
-<p>OK，现在我们对TIME_WAIT状态下接收到数据包的情况有了一个了解，知道内核会如何来处理这些包。但是看到的这些更多的是以服务器端的角度来看的，如果客户端主动关闭连接的话，进入TIME_WAIT状态的是客户端。如果客户端在TIME_WAIT状态下重用端口号来和服务器建立连接，内核会如何处理呢？</p>
-
-<p>我编写了一个测试程序：创建一个套接字，设置SO_REUSEADDR选项，建立连接后立即关闭，关闭后立即又重复同样的过程，发现在第二次调用connect()的时候返回EADDRNOTAVAIL错误。这个测试程序很容易理解，写起来也很容易，就不贴出来了。</p>
-
-<p>要找到这个错误是怎么返回的，需要从TCP层的连接函数tcp_4_connect()开始。在tcp_v4_connect()中没有显示返回EADDRNOTAVAIL错误的地方，可能的地方就是在调用inet_hash_connect()返回的。为了确定是不是在inet_hash_connect()中返回的，使用systemtap编写了一个脚本，发现确实是在这个函数中返回的-99错误（EADDRNOTAVAIL的值为99）。其实这个通过代码也可以看出来，在这个函数之前会先查找目的主机的路由缓存项，调用的是ip_route_connect（）函数，跟着这个函数的调用轨迹，没有发现返回EADDRNOTAVAIL错误的地方。</p>
-
-<p>inet_hash_connect()函数只是对<code>__inet_hash_connect()</code>函数进行了简单的封装。在<code>__inet_hash_connect()</code>中如果已绑定了端口号，并且是和其他传输控制块共享绑定的端口号，则会调用check_established参数指向的函数来检查这个绑定的端口号是否可用，代码如下所示：</p>
-
-<pre><code>    int __inet_hash_connect(struct inet_timewait_death_row *death_row,
-            struct sock *sk, u32 port_offset,
-            int (*check_established)(struct inet_timewait_death_row *,
-                struct sock *, __u16, struct inet_timewait_sock **),
-            void (*hash)(struct sock *sk))
-    {
-        struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
-        const unsigned short snum = inet_sk(sk)-&gt;num;
-        struct inet_bind_hashbucket *head;
-        struct inet_bind_bucket *tb;
-        int ret;
-        struct net *net = sock_net(sk);
-
-        if (!snum) {
-            ......
-        }
-
-        head = &amp;hinfo-&gt;bhash[inet_bhashfn(net, snum, hinfo-&gt;bhash_size)];
-        tb  = inet_csk(sk)-&gt;icsk_bind_hash;
-        spin_lock_bh(&amp;head-&gt;lock);
-        if (sk_head(&amp;tb-&gt;owners) == sk &amp;&amp; !sk-&gt;sk_bind_node.next) {
-            hash(sk);
-            spin_unlock_bh(&amp;head-&gt;lock);
-            return 0;
-        } else {
-            spin_unlock(&amp;head-&gt;lock);
-            /* No definite answer... Walk to established hash table */
-            ret = check_established(death_row, sk, snum, NULL);
-    out:
-            local_bh_enable();
-            return ret;
-        }
-    }
-</code></pre>
-
-<p>(sk_head(&amp;tb->owners) == sk &amp;&amp; !sk->sk_bind_node.next)这个判断条件就是用来判断是不是只有当前传输控制块在使用已绑定的端口，条件为false时，会执行else分支，检查是否可用。这么看来，调用bind()成功并不意味着这个端口就真的可以用。</p>
-
-<p>check_established参数对应的函数是__inet_check_established()，在inet_hash_connect()中可以看到。在上面的代码中我们还注意到调用check_established()时第三个参数为NULL，这在后面的分析中会用到。</p>
-
-<p><code>__inet_check_established()</code>函数中，会分别在TIME_WAIT传输控制块和除TIME_WIAT、LISTEN状态外的传输控制块中查找是已绑定的端口是否已经使用，代码片段如下所示：</p>
-
-<pre><code>    /* called with local bh disabled */
-    static int __inet_check_established(struct inet_timewait_death_row *death_row,
-                        struct sock *sk, __u16 lport,
-                        struct inet_timewait_sock **twp)
-    {
-        struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
-        struct inet_sock *inet = inet_sk(sk);
-        __be32 daddr = inet-&gt;rcv_saddr;
-        __be32 saddr = inet-&gt;daddr;
-        int dif = sk-&gt;sk_bound_dev_if;
-        INET_ADDR_COOKIE(acookie, saddr, daddr)
-        const __portpair ports = INET_COMBINED_PORTS(inet-&gt;dport, lport);
-        struct net *net = sock_net(sk);
-        unsigned int hash = inet_ehashfn(net, daddr, lport, saddr, inet-&gt;dport);
-        struct inet_ehash_bucket *head = inet_ehash_bucket(hinfo, hash);
-        spinlock_t *lock = inet_ehash_lockp(hinfo, hash);
-        struct sock *sk2;
-        const struct hlist_nulls_node *node;
-        struct inet_timewait_sock *tw;
-
-        spin_lock(lock);
-
-        /* Check TIME-WAIT sockets first. */
-        sk_nulls_for_each(sk2, node, &amp;head-&gt;twchain) {
-            tw = inet_twsk(sk2);
-
-        if (INET_TW_MATCH(sk2, net, hash, acookie,
-                        saddr, daddr, ports, dif)) {
-                if (twsk_unique(sk, sk2, twp))
-                    goto unique;
-                else
-                    goto not_unique;
-            }
-        }
-        tw = NULL;
-
-        /* And established part... */
-        sk_nulls_for_each(sk2, node, &amp;head-&gt;chain) {
-            if (INET_MATCH(sk2, net, hash, acookie,
-                        saddr, daddr, ports, dif))
-                goto not_unique;
-        }
-
-    unique:
-        ......
-        return 0;
-
-    not_unique:
-        spin_unlock(lock);
-        return -EADDRNOTAVAIL;
-    }
-</code></pre>
-
-<p>可以看到返回EADDRNOTVAIL错误的有两种情况：</p>
-
-<p>1、在TIME_WAIT传输控制块中找到匹配的端口，并且twsk_unique()返回true时</p>
-
-<p>2、在除TIME_WAIT和LISTEN状态外的传输块中存在匹配的端口。</p>
-
-<p>第二种情况很好容易理解了，只要状态在FIN_WAIT_1、ESTABLISHED等的传输控制块使用的端口和要查找的匹配，就会返回EADDRNOTVAIL错误。第一种情况还要取决于twsk_uniqueue()的返回值，所以接下来我们看twsk_uniqueue()中什么情况下会返回true。</p>
-
-<p>如果是TCP套接字，twsk_uniqueue()中会调用tcp_twsk_uniqueue()来判断，返回true的条件如下所示：</p>
-
-<pre><code>    int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
-    {
-        const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
-        struct tcp_sock *tp = tcp_sk(sk);
-
-        if (tcptw-&gt;tw_ts_recent_stamp &amp;&amp;
-            (twp == NULL || (sysctl_tcp_tw_reuse &amp;&amp;
-                    get_seconds() - tcptw-&gt;tw_ts_recent_stamp &gt; 1))) {
-            ......
-            return 1;
-        }
-
-        return 0;
-    }
-</code></pre>
-
-<p>我们前面提到过，<code>__inet_hash_connect()</code>函数调用check_established指向的函数时第三个参数为NULL，所以现在我们只需要关心tcptw->tw_ts_recent_stamp是否非零，只要这个值非零，tcp_twsk_unique()就会返回true， 在上层connect（）函数中就会返回EADDRNOTVAIL错误。tcptw->tw_ts_recent_stamp存储的是最近接收到段的时间戳值，所以正常情况下这个值不会为零。当然也可以通过调整系统的参数，让这个值可以为零，这不是本文讨论的重点，感兴趣的可以参考tcp_v4_connect()中的代码进行修改。</p>
-
-<p>在导致返回EADDRNOTVAIL的两种情况中，第一种情况可以有办法避免，但是如果的第二次建立连接的时间和第一次关闭连接之间的时间间隔太小的话，此时第一个连接可能处在FIN_WAIT_1、FIN_WAIT_2等状态，此时没有系统参数可以用来避免返回EADDRNOTVAIL。如果你还是想无论如何都要在很短的时间内重用客户端的端口，这样也有办法，要么是用kprobe机制，要么用systemtap脚本，改变<code>__inet_check_established()</code>函数的返回值。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[内核处理time_wait状态详解]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2015/09/29/kernel-net-timewait/"/>
-    <updated>2015-09-29T17:40:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2015/09/29/kernel-net-timewait</id>
-    <content type="html"><![CDATA[<p><a href="http://simohayha.iteye.com/blog/566980">http://simohayha.iteye.com/blog/566980</a></p>
-
-<p>这次来详细看内核的time_wait状态的实现，在前面介绍定时器的时候，time_wait就简单的介绍了下。这里我们会先介绍tw状态的实现，然后来介绍内核协议栈如何处理tw状态。</p>
-
-<p>首先我们要知道在linux内核中time_wait的处理是由tcp_time_wait这个函数来做得，比如我们在closing状态收到一个fin，就会调用tcp_time_wait.而内核为time_wait状态的socket专门设计了一个结构就是inet_timewait_sock，并且是挂载在inet_ehash_bucket的tw上(这个结构前面也已经介绍过了)。这里要注意，端口号的那个hash链表中也是会保存time_wait状态的socket的。</p>
-
-<pre><code>    struct inet_timewait_sock {  
-
-        //common也就是包含了一些socket的必要信息。  
-        struct sock_common  __tw_common;  
-    #define tw_family       __tw_common.skc_family  
-    #define tw_state        __tw_common.skc_state  
-    #define tw_reuse        __tw_common.skc_reuse  
-    #define tw_bound_dev_if     __tw_common.skc_bound_dev_if  
-    #define tw_node         __tw_common.skc_nulls_node  
-    #define tw_bind_node        __tw_common.skc_bind_node  
-    #define tw_refcnt       __tw_common.skc_refcnt  
-    #define tw_hash         __tw_common.skc_hash  
-    #define tw_prot         __tw_common.skc_prot  
-    #define tw_net          __tw_common.skc_net  
-
-         //tw状态的超时时间  
-        int         tw_timeout;  
-        //这个用来标记我们是正常进入tw还是说由于超时等一系列原因进入(比如超时等一系列原因)  
-        volatile unsigned char  tw_substate;  
-        /* 3 bits hole, try to pack */  
-        //和tcp option中的接收窗口比例类似  
-        unsigned char       tw_rcv_wscale;  
-
-        //也就是标示sock的4个域，源目的端口和地址  
-        __be16          tw_sport;  
-        __be32          tw_daddr __attribute__((aligned(INET_TIMEWAIT_ADDRCMP_ALIGN_BYTES)));  
-        __be32          tw_rcv_saddr;  
-        __be16          tw_dport;  
-        //本地端口。  
-        __u16           tw_num;  
-        kmemcheck_bitfield_begin(flags);  
-        /* And these are ours. */  
-        //几个标记位。  
-        unsigned int        tw_ipv6only     : 1,  
-                    tw_transparent  : 1,  
-                    tw_pad      : 14,   /* 14 bits hole */  
-                    tw_ipv6_offset  : 16;  
-        kmemcheck_bitfield_end(flags);  
-        unsigned long       tw_ttd;  
-        //链接到端口的hash表中。  
-        struct inet_bind_bucket *tw_tb;  
-        //链接到全局的tw状态hash表中。  
-        struct hlist_node   tw_death_node;  
-    };  
-</code></pre>
-
-<p>然后我们要知道linux有两种方式执行tw状态的socket，一种是等待2×MSL时间（内核中是60秒)，一种是基于RTO来计算超时时间。</p>
-
-<p>基于RTO的超时时间也叫做recycle模式，这里内核会通过sysctl_tw_recycle（也就是说我们能通过sysctl来打开这个值)以及是否我们还保存有从对端接收到的最近的数据包的时间戳来判断是否进入打开recycle模式的处理。如果进入则会调用tcp_v4_remember_stamp来得到是否打开recycle模式。</p>
-
-<p>下面就是这个片断的代码片断：</p>
-
-<pre><code>    //必须要设置sysctl_tw_recycle以及保存有最后一次的时间戳.  
-    if (tcp_death_row.sysctl_tw_recycle &amp;&amp; tp-&gt;rx_opt.ts_recent_stamp)  
-        //然后调用remember_stamp（在ipv4中被初始化为tcp_v4_remember_stamp）来得到是否要打开recycle模式。  
-        recycle_ok = icsk-&gt;icsk_af_ops-&gt;remember_stamp(sk);  
-</code></pre>
-
-<p>然后我们来看tcp_v4_remember_stamp，在看这个之前，我们需要理解inet_peer结构，这个结构也就是保存了何当前主机通信的主机的一些信息，我前面在分析ip层的时候有详细分析这个结构，因此可以看我前面的blog：</p>
-
-<p><a href="http://simohayha.iteye.com/blog/437695">http://simohayha.iteye.com/blog/437695</a></p>
-
-<p>tcp_v4_remember_stamp主要用来从全局的inet_peer中得到对应的当前sock的对端的信息(通过ip地址).然后设置相关的时间戳(tcp_ts_stamp和tcp_ts）.这里要特别注意一个东西，那就是inet_peer是ip层的东西，因此它的key是ip地址，它会忽略端口号。所以说这里inet_peer的这两个时间戳是专门为解决tw状态而设置的。</p>
-
-<p>然后我们来看下tcp option的几个关键的域：</p>
-
-<pre><code>    struct tcp_options_received {  
-        /*  PAWS/RTTM data  */  
-
-        //这个值为我们本机更新ts_recent的时间  
-        long    ts_recent_stamp;  
-        //这个表示最近接收的那个数据包的时间戳  
-        u32 ts_recent;  
-        //这个表示这个数据包发送时的时间戳    
-        u32 rcv_tsval;  
-        //这个表示当前数据包所回应的数据包的时间戳。  
-        u32 rcv_tsecr;  
-        //如果上面两个时间戳都有设置，则saw_tstamp设置为1.  
-        u16 saw_tstamp : 1,   //TIMESTAMP seen on SYN packet  
-            tstamp_ok : 1,    //d-scack标记  
-            dsack : 1,        //Wscale seen on SYN packet  
-            wscale_ok : 1,    //SACK seen on SYN packet     
-            sack_ok : 4,      //下面两个是窗口扩大倍数，主要是为了解决一些特殊网络下大窗口的问题。  
-            snd_wscale : 4,   
-            rcv_wscale : 4;   
-        /*  SACKs data  */  
-        u8  num_sacks;    
-        u16 user_mss;     
-        u16 mss_clamp;    
-    };  
-</code></pre>
-
-<p>而inet_peer中的两个时间戳与option中的ts_recent和ts_recent_stamp类似。</p>
-
-<p>来看tcp_v4_remember_stamp的实现：</p>
-
-<pre><code>    int tcp_v4_remember_stamp(struct sock *sk)  
-    {  
-        struct inet_sock *inet = inet_sk(sk);  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        struct rtable *rt = (struct rtable *)__sk_dst_get(sk);  
-        struct inet_peer *peer = NULL;  
-        int release_it = 0;  
-
-        //得到对应peer（两种得到的方式)。  
-        if (!rt || rt-&gt;rt_dst != inet-&gt;daddr) {  
-            peer = inet_getpeer(inet-&gt;daddr, 1);  
-            release_it = 1;  
-        } else {  
-            if (!rt-&gt;peer)  
-                rt_bind_peer(rt, 1);  
-            peer = rt-&gt;peer;  
-        }  
-
-        //如果peer不存在则会返回0,也就是关闭recycle模式。  
-        if (peer) {  
-        //这里tcp_ts以及tcp_ts_stamp保存的是最新的时间戳，所以这里与当前的sock的时间戳比较小的话就要更新。  
-        if ((s32)(peer-&gt;tcp_ts - tp-&gt;rx_opt.ts_recent) &lt;= 0 ||(peer-&gt;tcp_ts_stamp + TCP_PAWS_MSL &lt; get_seconds() &amp;&amp;  
-         peer-&gt;tcp_ts_stamp &lt;= tp-&gt;rx_opt.ts_recent_stamp)) {  
-
-        //更新时间戳。  
-        peer-&gt;tcp_ts_stamp = tp-&gt;rx_opt.ts_recent_stamp;  
-            peer-&gt;tcp_ts = tp-&gt;rx_opt.ts_recent;  
-            }  
-            if (release_it)  
-                inet_putpeer(peer);  
-            return 1;  
-        }  
-
-        //关闭recycle模式。  
-        return 0;  
-    }  
-</code></pre>
-
-<p>ok,我们来看tcp_time_wait的实现，这里删掉了ipv6以及md5的部分：</p>
-
-<pre><code>    //这里也就是2*MSL=60秒。  
-    #define TCP_TIMEWAIT_LEN (60*HZ)   
-
-    //这里的state标记我们是正常进入tw状态，还是由于死在fin-wait-2状态才进入tw状态的。  
-    void tcp_time_wait(struct sock *sk, int state, int timeo)  
-    {  
-        //TW的socket  
-        struct inet_timewait_sock *tw = NULL;  
-        const struct inet_connection_sock *icsk = inet_csk(sk);  
-        const struct tcp_sock *tp = tcp_sk(sk);  
-
-        //recycle模式的标记。  
-        int recycle_ok = 0;  
-
-        //上面已经分析过了。  
-        if (tcp_death_row.sysctl_tw_recycle &amp;&amp; tp-&gt;rx_opt.ts_recent_stamp)  
-        recycle_ok = icsk-&gt;icsk_af_ops-&gt;remember_stamp(sk);  
-        //然后判断tw状态的sock数量是否已经超过限制。  
-        if (tcp_death_row.tw_count &lt; tcp_death_row.sysctl_max_tw_buckets)  
-        //没有的话alloc一个新的。  
-            tw = inet_twsk_alloc(sk, state);  
-
-        //如果tw不为空才会进入处理。  
-        if (tw != NULL) {  
-            struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);  
-            //计算对应的超时时间，这里可以看到刚好是3.5*rto.  
-            const int rto = (icsk-&gt;icsk_rto &lt;&lt; 2) - (icsk-&gt;icsk_rto &gt;&gt; 1);  
-            //更新对应的域。  
-            tw-&gt;tw_rcv_wscale    = tp-&gt;rx_opt.rcv_wscale;  
-            tcptw-&gt;tw_rcv_nxt    = tp-&gt;rcv_nxt;  
-            tcptw-&gt;tw_snd_nxt    = tp-&gt;snd_nxt;  
-            tcptw-&gt;tw_rcv_wnd    = tcp_receive_window(tp);  
-            tcptw-&gt;tw_ts_recent  = tp-&gt;rx_opt.ts_recent;  
-            tcptw-&gt;tw_ts_recent_stamp = tp-&gt;rx_opt.ts_recent_stamp;  
-
-            //更新链表(下面会分析)。  
-            __inet_twsk_hashdance(tw, sk, &amp;tcp_hashinfo);  
-            //如果传递进来的超时时间小于我们计算的，则让他等于我们计算的超时时间。  
-            /* Get the TIME_WAIT timeout firing. */  
-            if (timeo &lt; rto)  
-                timeo = rto;  
-
-            //如果打开recycle模式，则超时时间为我们基于rto计算的时间。  
-            if (recycle_ok) {  
-                tw-&gt;tw_timeout = rto;  
-            } else {  
-                //否则为2*MSL=60秒  
-                tw-&gt;tw_timeout = TCP_TIMEWAIT_LEN;  
-                //如果正常进入则timeo也就是超时时间为2*MSL.  
-                if (state == TCP_TIME_WAIT)  
-                    timeo = TCP_TIMEWAIT_LEN;  
-            }  
-
-            //最关键的一个函数，我们后面会详细分析。  
-            inet_twsk_schedule(tw, &amp;tcp_death_row, timeo,  
-                       TCP_TIMEWAIT_LEN);  
-            //更新引用计数。  
-            inet_twsk_put(tw);  
-        } else {  
-            LIMIT_NETDEBUG(KERN_INFO "TCP: time wait bucket table overflow\n");  
-        }  
-        tcp_update_metrics(sk);  
-        tcp_done(sk);  
-    }  
-</code></pre>
-
-<p>然后我们来看__inet_twsk_hashdance函数，这个函数主要是用于更新对应的全局hash表。有关这几个hash表的结构可以去看我前面的blog。</p>
-
-<pre><code>    void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,  
-                   struct inet_hashinfo *hashinfo)  
-    {  
-        const struct inet_sock *inet = inet_sk(sk);  
-        const struct inet_connection_sock *icsk = inet_csk(sk);  
-        //得到ehash。  
-        struct inet_ehash_bucket *ehead = inet_ehash_bucket(hashinfo, sk-&gt;sk_hash);  
-        spinlock_t *lock = inet_ehash_lockp(hashinfo, sk-&gt;sk_hash);  
-        struct inet_bind_hashbucket *bhead;  
-
-        //下面这几步是将tw sock链接到bhash中。  
-        bhead = &amp;hashinfo-&gt;bhash[inet_bhashfn(twsk_net(tw), inet-&gt;num,hashinfo-&gt;bhash_size)];  
-        spin_lock(&amp;bhead-&gt;lock);  
-        //链接到bhash。这里icsk的icsk_bind_hash也就是bash的一个元素。  
-        tw-&gt;tw_tb = icsk-&gt;icsk_bind_hash;  
-        WARN_ON(!icsk-&gt;icsk_bind_hash);  
-        //将tw加入到bash中。  
-        inet_twsk_add_bind_node(tw, &amp;tw-&gt;tw_tb-&gt;owners);  
-        spin_unlock(&amp;bhead-&gt;lock);  
-
-        spin_lock(lock);  
-
-
-        atomic_inc(&amp;tw-&gt;tw_refcnt);  
-        //将tw sock加入到ehash的tw chain中。  
-        inet_twsk_add_node_rcu(tw, &amp;ehead-&gt;twchain);  
-
-        //然后从全局的establish hash中remove掉这个socket。详见sock的sk_common域。  
-        if (__sk_nulls_del_node_init_rcu(sk))  
-            sock_prot_inuse_add(sock_net(sk), sk-&gt;sk_prot, -1);  
-
-        spin_unlock(lock);  
-    }  
-</code></pre>
-
-<p>这里我们要知道还有一个专门的全局的struct inet_timewait_death_row类型的变量tcp_death_row来保存所有的tw状态的socket。而整个tw状态的socket并不是全部加入到定时器中，而是将tcp_death_row加入到定时器中，然后每次定时器超时通过tcp_death_row来查看定时器的超时情况，从而处理tw状态的sock。</p>
-
-<p>而这里定时器分为两种，一种是长时间的定时器，它也就是tw_timer域，一种是短时间的定时器，它也就是twcal_timer域。</p>
-
-<p>而这里还有两个hash表，一个是twcal_row，它对应twcal_timer这个定时器，也就是说当twcal_timer超时，它就会从twcal_row中取得对应的twsock。对应的cells保存的就是tw_timer定时器超时所用的twsock。</p>
-
-<p>还有两个slot，一个是slot域，一个是twcal_hand域，分别表示当前对应的定时器(上面介绍的两个)所正在执行的定时器的slot。</p>
-
-<p>而上面所说的recycle模式也就是指twcal_timer定时器。</p>
-
-<p>来看结构。
-```
-    struct inet_timewait_death_row {</p>
-
-<pre><code>    //这几个域会在tcp_death_row中被初始化。  
-    int         twcal_hand;  
-    unsigned long       twcal_jiffie;  
-    //短时间定时器。  
-    struct timer_list   twcal_timer;  
-    //twcal_timer定时器对应的hash表  
-    struct hlist_head   twcal_row[INET_TWDR_RECYCLE_SLOTS];  
-
-    spinlock_t      death_lock;  
-    //tw的个数。  
-    int         tw_count;  
-    //超时时间。  
-    int         period;  
-    u32         thread_slots;  
-    struct work_struct  twkill_work;  
-    //长时间定时器  
-    struct timer_list   tw_timer;  
-    int         slot;  
-
-    //短时间的定时器对应的hash表  
-    struct hlist_head   cells[INET_TWDR_TWKILL_SLOTS];  
-    struct inet_hashinfo    *hashinfo;  
-    int         sysctl_tw_recycle;  
-    int         sysctl_max_tw_buckets;  
-};  
-</code></pre>
-
-<pre><code>
-
-这里要注意INET_TWDR_TWKILL_SLOTS为8,而INET_TWDR_RECYCLE_SLOTS为32。
-
-ok我们接着来看tcp_death_row的初始化。
-</code></pre>
-
-<pre><code>struct inet_timewait_death_row tcp_death_row = {  
-
-    //最大桶的个数。  
-    .sysctl_max_tw_buckets = NR_FILE * 2,  
-    //超时时间，  
-    .period     = TCP_TIMEWAIT_LEN / INET_TWDR_TWKILL_SLOTS,  
-    //锁  
-    .death_lock = __SPIN_LOCK_UNLOCKED(tcp_death_row.death_lock),  
-
-    //可以看到它是链接到全局的inet_hashinfo中的。  
-    .hashinfo   = &amp;tcp_hashinfo,  
-    //定时器，这里要注意超时函数。  
-    .tw_timer   = TIMER_INITIALIZER(inet_twdr_hangman, 0,(unsigned long)&amp;tcp_death_row),  
-    //工作队列。其实也就是销毁twsock工作的工作队列。  
-    .twkill_work    = __WORK_INITIALIZER(tcp_death_row.twkill_work,                   inet_twdr_twkill_work),  
-    /* Short-time timewait calendar */  
-
-    //twcal_hand用来标记twcal_timer定时器是否还在工作。  
-    .twcal_hand = -1,  
-    .twcal_timer    = TIMER_INITIALIZER(inet_twdr_twcal_tick, 0,(unsigned long)&amp;tcp_death_row),  
-};  
-</code></pre>
-
-<pre><code>
-然后就是inet_twsk_schedule的实现，这个函数也就是tw状态的处理函数。他主要是用来基于超时时间来计算当前twsock的可用的位置。也就是来判断启动那个定时器，然后加入到那个队列。
-
-因此这里的关键就是slot的计算。这里slot的计算是根据我们传递进来的timeo来计算的。
-
-recycle模式下tcp_death_row的超时时间的就为2的INET_TWDR_RECYCLE_TICK幂。
-
-我们一般桌面的hz为100,来看对应的值：
-</code></pre>
-
-<pre><code>#elif HZ &lt;= 128  
-# define INET_TWDR_RECYCLE_TICK (7 + 2 - INET_TWDR_RECYCLE_SLOTS_LOG)  
-</code></pre>
-
-<pre><code>
-
-可以看到这时它的值就为4.
-
-而tw_timer的slot也就是长时间定时器的slot的计算是这样的，它也就是用我们传递进来的超时时间timeo/16(可以看到就是2的INET_TWDR_RECYCLE_TICK次方)然后向上取整。
-
-而这里twdr的period被设置为
-</code></pre>
-
-<pre><code>TCP_TIMEWAIT_LEN / INET_TWDR_TWKILL_SLOTS,  
-
-//取slot的代码片断。  
-slot = DIV_ROUND_UP(timeo, twdr-&gt;period);  
-</code></pre>
-
-<pre><code>
-
-而我们下面取slot的时候也就是会用这个值来散列。可以看到散列表的桶的数目就为INET_TWDR_TWKILL_SLOTS个，因此这里也就是把时间分为INET_TWDR_TWKILL_SLOTS份，每一段时间内的超时twsock都放在一个桶里面，而大于60秒的都放在最后一个桶。
-</code></pre>
-
-<pre><code>void inet_twsk_schedule(struct inet_timewait_sock *tw,  
-               struct inet_timewait_death_row *twdr,  
-               const int timeo, const int timewait_len)  
-{  
-    struct hlist_head *list;  
-    int slot;  
-
-    //得到slot。  
-    slot = (timeo + (1 &lt;&lt; INET_TWDR_RECYCLE_TICK) - 1) &gt;&gt; INET_TWDR_RECYCLE_TICK;  
-
-    spin_lock(&amp;twdr-&gt;death_lock);  
-
-    /* Unlink it, if it was scheduled */  
-    if (inet_twsk_del_dead_node(tw))  
-        twdr-&gt;tw_count--;  
-    else  
-        atomic_inc(&amp;tw-&gt;tw_refcnt);  
-
-    //判断该添加到那个定时器。  
-    if (slot &gt;= INET_TWDR_RECYCLE_SLOTS) {  
-        /* Schedule to slow timer */  
-        //如果大于timewait_len也就是2*MSL=60秒，则slot为cells的最后一项。  
-        if (timeo &gt;= timewait_len) {  
-            //设为最后一项。  
-            slot = INET_TWDR_TWKILL_SLOTS - 1;  
-        } else {  
-            //否则timeo除于period然后向上取整。  
-            slot = DIV_ROUND_UP(timeo, twdr-&gt;period);  
-            //如果大于cells的桶的大小，则也是放到最后一个位置。  
-            if (slot &gt;= INET_TWDR_TWKILL_SLOTS)  
-                slot = INET_TWDR_TWKILL_SLOTS - 1;  
-        }  
-        //然后设置超时时间，  
-        tw-&gt;tw_ttd = jiffies + timeo;  
-        //而twdr的slot为当前正在处理的slot，因此我们需要以这个slot为基准来计算真正的slot  
-        slot = (twdr-&gt;slot + slot) &amp; (INET_TWDR_TWKILL_SLOTS - 1);  
-        //最后取得对应的链表。  
-        list = &amp;twdr-&gt;cells[slot];  
-    } else {  
-        //设置应当超时的时间。  
-        tw-&gt;tw_ttd = jiffies + (slot &lt;&lt; INET_TWDR_RECYCLE_TICK);  
-        //判断定时器是否还在工作。如果是第一次我们一定会进入下面的处理  
-        if (twdr-&gt;twcal_hand &lt; 0) {  
-            //如果没有或者第一次进入，则修改定时器然后重新启动定时器  
-            twdr-&gt;twcal_hand = 0;  
-            twdr-&gt;twcal_jiffie = jiffies;  
-            //定时器的超时时间。可以看到时间为我们传进来的timeo(只不过象tick对齐了)  
-            twdr-&gt;twcal_timer.expires = twdr-&gt;twcal_jiffie +(slot &lt;&lt; INET_TWDR_RECYCLE_TICK);  
-            //重新添加定时器。  
-            add_timer(&amp;twdr-&gt;twcal_timer);  
-        } else {  
-            //如果原本超时时间太小，则修改定时器的超时时间  
-            if (time_after(twdr-&gt;twcal_timer.expires,  
-                    jiffies + (slot &lt;&lt; INET_TWDR_RECYCLE_TICK)))  
-                mod_timer(&amp;twdr-&gt;twcal_timer,  
-                        jiffies + (slot &lt;&lt; INET_TWDR_RECYCLE_TICK));  
-
-                //和上面的tw_timer定时器类似，我们要通过当前正在执行的slot也就是twcal_hand来得到真正的slot。  
-                slot = (twdr-&gt;twcal_hand + slot) &amp; (INET_TWDR_RECYCLE_SLOTS - 1);  
-            }  
-        //取得该插入的桶。  
-        list = &amp;twdr-&gt;twcal_row[slot];  
-    }  
-
-    //将tw加入到对应的链表中。  
-    hlist_add_head(&amp;tw-&gt;tw_death_node, list);  
-    //如果第一次则启动定时器。  
-    if (twdr-&gt;tw_count++ == 0)  
-        mod_timer(&amp;twdr-&gt;tw_timer, jiffies + twdr-&gt;period);  
-    spin_unlock(&amp;twdr-&gt;death_lock);  
-}  
-</code></pre>
-
-<pre><code>
-
-我们先来总结一下上面的代码。当我们进入tw状态，然后我们会根据计算出来的timeo的不同来加载到不同的hash表中。而对应的定时器一个（tw_timer)是每peroid启动一次，一个是每(slot &lt;&lt; INET_TWDR_RECYCLE_TICK)启动一次。
-
-下面的两张图很好的表示了recycle模式(twcal定时器)和非recycle模式的区别：
-
-先是非recycle模式： 
-
-![](/images/kernel/2015-09-29-1.jpeg)
-
-然后是recycle模式： 
-
-![](/images/kernel/2015-09-29-2.jpeg)
-
-
-接下来我们来看两个超时函数的实现，这里我只简单的介绍下两个超时函数，一个是inet_twdr_hangman，一个是inet_twdr_twcal_tick。
-
-在inet_twdr_hangman中，每次只是遍历对应的slot的队列，然后将队列中的所有sock删除，同时也从bind_hash中删除对应的端口信息。这个函数就不详细分析了。
-
-而在inet_twdr_twcal_tick中，每次遍历所有的twcal_row，然后超时的进行处理(和上面一样),然后没有超时的继续处理).
-
-这里有一个j的计算要注意，前面我们知道我们的twcal的超时时间可以说都是以INET_TWDR_RECYCLE_SLOTS对齐的，而我们这里在处理超时的同时，有可能上面又有很多sock加入到了tw状态，因此这里我们的超时检测的间隔就是1 &lt;&lt; INET_TWDR_RECYCLE_TICK。
-
-来看inet_twdr_twcal_tick的实现：
-</code></pre>
-
-<pre><code>void inet_twdr_twcal_tick(unsigned long data)  
-{  
-    ............................  
-    if (twdr-&gt;twcal_hand &lt; 0)  
-        goto out;  
-
-    //得到slot。  
-    slot = twdr-&gt;twcal_hand;  
-    //得到定时器启动时候的jiffes。  
-    j = twdr-&gt;twcal_jiffie;  
-
-    //遍历所有的twscok。  
-    for (n = 0; n &lt; INET_TWDR_RECYCLE_SLOTS; n++) {  
-        //判断是否超时。  
-        if (time_before_eq(j, now)) {  
-            //处理超时的socket  
-            struct hlist_node *node, *safe;  
-            struct inet_timewait_sock *tw;  
-            .......................................  
-        } else {  
-            if (!adv) {  
-                adv = 1;  
-                twdr-&gt;twcal_jiffie = j;  
-                twdr-&gt;twcal_hand = slot;  
-            }  
-
-        //如果不为空，则将重新添加这些定时器  
-        if (!hlist_empty(&amp;twdr-&gt;twcal_row[slot])) {  
-            mod_timer(&amp;twdr-&gt;twcal_timer, j);  
-                goto out;  
-            }  
-        }  
-        //设置间隔  
-        j += 1 &lt;&lt; INET_TWDR_RECYCLE_TICK;  
-        //更新  
-        slot = (slot + 1) &amp; (INET_TWDR_RECYCLE_SLOTS - 1);  
-    }  
-    //处理完毕则将twcal_hand设为-1.  
-    twdr-&gt;twcal_hand = -1;  
-
-    ...............................  
-}  
-</code></pre>
-
-<pre><code>
-然后我们来看tcp怎么样进入tw状态。这里分为两种，一种是正常进入也就是在wait2收到一个fin，或者closing收到ack。这种都是比较简单的。我们就不分析了。
-
-比较特殊的是，我们有可能会直接从wait1进入tw状态，或者是在wait2等待超时也将会直接进入tw状态。这个时候也就是没有收到对端的fin。
-
-这个主要是为了处理当对端死在close_wait状态的时候，我们需要自己能够恢复到close状态，而不是一直处于wait2状态。
-
-在看代码之前我们需要知道一个东西，那就是fin超时时间，这个超时时间我们可以通过TCP_LINGER2这个option来设置，并且这个值的最大值是sysctl_tcp_fin_timeout/HZ. 这里可以看到sysctl_tcp_fin_timeout是jiffies数，所以要转成秒。我这里简单的测试了下，linger2的默认值也就是60,刚好是2*MSL.
-
-这里linger2也就是代表在tcp_wait2的最大生命周期。如果小于0则说明我们要跳过tw状态。
-
-先来看在tcp_close中的处理，不过这里不理解为什么这么做的原因。
-
-这里为什么有可能会为wait2状态呢，原因是如果设置了linger，则我们就会休眠掉，而休眠的时间可能我们已经收到ack，此时将会进入wait2的处理。
-</code></pre>
-
-<pre><code>if (sk-&gt;sk_state == TCP_FIN_WAIT2) {  
-        struct tcp_sock *tp = tcp_sk(sk);  
-        //如果小于0,则说明从wait2立即超时此时也就是相当于跳过tw状态，所以我们直接发送rst，然后进入close。  
-        if (tp-&gt;linger2 &lt; 0) {  
-            tcp_set_state(sk, TCP_CLOSE);  
-            tcp_send_active_reset(sk, GFP_ATOMIC);  
-            NET_INC_STATS_BH(sock_net(sk),  
-                    LINUX_MIB_TCPABORTONLINGER);  
-        } else {  
-            //否则计算fin的时间，这里的超时时间是在linger2和3.5RTO之间取最大值。  
-            const int tmo = tcp_fin_time(sk);  
-
-            //如果超时时间很大，则说明我们需要等待时间很长，因此我们启动keepalive探测对端是否存活。  
-            if (tmo &gt; TCP_TIMEWAIT_LEN) {  
-            inet_csk_reset_keepalive_timer(sk,  
-                tmo - TCP_TIMEWAIT_LEN);  
-            } else {  
-                //否则我们直接进入tw状态。  
-                tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);  
-                goto out;  
-            }  
-        }  
-    }  
-</code></pre>
-
-<pre><code>
-
-还有从wait1直接进入tw，和上面类似，我就不介绍了。
-
-
-最后我们来看当内核处于tw状态后，再次接收到数据包后如何处理。这里的处理函数就是tcp_timewait_state_process，而他是在tcp_v4_rcv中被调用的，它会先判断是否处于tw状态，如果是的话，进入tw的处理。
-
-这个函数的返回值分为4种。
-</code></pre>
-
-<pre><code>enum tcp_tw_status  
-{  
-    //这个代表我们成功处理了数据包。  
-    TCP_TW_SUCCESS = 0,  
-    //我们需要发送给对端一个rst。  
-    TCP_TW_RST = 1,  
-    //我们接收到了重传的fin，因此我们需要重传ack。  
-    TCP_TW_ACK = 2,  
-    //这个表示我们需要重新建立一个连接。  
-    TCP_TW_SYN = 3  
-};  
-</code></pre>
-
-<pre><code>
-
-这里可能最后一个比较难理解，这里内核注释得很详细，主要是实现了RFC1122:
-
-引用
-
-RFC 1122:
-
-"When a connection is [...] on TIME-WAIT state [...] [a TCP] MAY accept a new SYN from the remote TCP to reopen the connection directly, if it:
-(1)  assigns its initial sequence number for the new  connection to be larger than the largest sequence number it used on the previous connection incarnation,and
-
-(2)  returns to TIME-WAIT state if the SYN turns out
-to be an old duplicate".
-
-来看这段处理代码：
-</code></pre>
-
-<pre><code>switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {  
-    case TCP_TW_SYN: {  
-        //取得一个sk。  
-        struct sock *sk2 = inet_lookup_listener(dev_net(skb-&gt;dev),&amp;tcp_hashinfo,  
-            iph-&gt;daddr, th-&gt;dest,inet_iif(skb));  
-        if (sk2) {  
-            //从tw中删除，然后继续执行（也就是开始三次握手)。  
-            inet_twsk_deschedule(inet_twsk(sk), &amp;tcp_death_row);  
-            inet_twsk_put(inet_twsk(sk));  
-            sk = sk2;  
-            goto process;  
-        }  
-        /* Fall through to ACK */  
-    }  
-    case TCP_TW_ACK:  
-        //发送ack  
-        tcp_v4_timewait_ack(sk, skb);  
-        break;  
-    //发送给对端rst。  
-    case TCP_TW_RST:  
-        goto no_tcp_socket;  
-    //处理成功  
-    case TCP_TW_SUCCESS:;  
-    }  
-    goto discard_it;  
-</code></pre>
-
-<p>```</p>
-
-<p>tcp_timewait_state_process这个函数具体的实现我就不介绍了，它就是分为两部分，一部分处理tw_substate == TCP_FIN_WAIT2的情况，一部分是正常情况。在前一种情况，我们对于syn的相应是直接rst的。而后一种我们需要判断是否新建连接。</p>
-
-<p>而对于fin的处理他们也是不一样的，wait2的话，它会将当前的tw重新加入到定时器列表(inet_twsk_schedule).而后一种则只是重新发送ack。</p>
 ]]></content>
   </entry>
   
