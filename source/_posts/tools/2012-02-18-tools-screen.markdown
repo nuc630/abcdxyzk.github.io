@@ -63,17 +63,17 @@ screen -d -r pid
  screen -r xx(刚才的sessionname)就可以了   
 当然，当你开了很多个session后，打算关闭几个session，可以进入到session后，exit一下就可以了.  
 ```
-	Ctrl + a + ?	显示所有键绑定信息
-	Ctrl + a + w	显示所有窗口列表
-	Ctrl + a + a	切换到之前显示的窗口
-	Ctrl + a + c	创建一个新的运行shell的窗口并切换到该窗口
-	Ctrl + a + n	切换到下一个窗口
-	Ctrl + a + p	切换到前一个窗口(与C-a n相对)
-	Ctrl + a + 0..9	切换到窗口0..9
-	Ctrl + a + a	发送 C-a到当前窗口
-	Ctrl + a + d	暂时断开screen会话
-	Ctrl + a + k	杀掉当前窗口
-	Ctrl + a + [ 或 Ctrl + a + Esc 进入拷贝/回滚模式
-	             Space 第一次按为标记copy区起点，第二次按为终点
-	Ctrl + a + ]	把刚刚在 copy mode 选定的内容贴上
+	Ctrl + a + ?            显示所有键绑定信息
+	Ctrl + a + w            显示所有窗口列表
+	Ctrl + a + a            切换到之前显示的窗口
+	Ctrl + a + c            创建一个新的运行shell的窗口并切换到该窗口
+	Ctrl + a + n            切换到下一个窗口
+	Ctrl + a + p            切换到前一个窗口(与C-a n相对)
+	Ctrl + a + 0..9         切换到窗口0..9
+	Ctrl + a + " + 0..99    切换到窗口0..99，用于超过9个窗口的切换
+	Ctrl + a + a            发送 C-a到当前窗口
+	Ctrl + a + d            暂时断开screen会话
+	Ctrl + a + k            杀掉当前窗口
+	Ctrl + a + [ OR Esc     进入拷贝/回滚模式，Space 第一次按为标记copy区起点，第二次按为终点
+	Ctrl + a + ]            把刚刚在 copy mode 选定的内容贴上
 ```
