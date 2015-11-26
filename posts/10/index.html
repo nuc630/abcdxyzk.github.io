@@ -62,6 +62,1838 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-4/">cpu子系统</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T16:41:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:41:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/23/2466721.html">http://www.cnblogs.com/lisperl/archive/2012/04/23/2466721.html</a></p>
+
+<p>cpu子系统用于控制cgroup中所有进程可以使用的cpu时间片。附加了cpu子系统的hierarchy下面建立的cgroup的目录下都有一个cpu.shares的文件，对其写入整数值可以控制该cgroup获得的时间片。例如：在两个 cgroup 中都将 cpu.shares 设定为 1 的任务将有相同的 CPU 时间，但在 cgroup 中将 cpu.shares 设定为 2 的任务可使用的 CPU 时间是在 cgroup 中将 cpu.shares 设定为 1 的任务可使用的 CPU 时间的两倍。</p>
+
+<p>cpu子系统是通过Linux CFS调度器实现的。所以在介绍cpu子系统之前，先简单说一下CFS调度器。按照作者Ingo Molnar的说法："CFS百分之八十的工作可以用一句话概括：CFS在真实的硬件上模拟了完全理想的多任务处理器"。在“完全理想的多任务处理器”下，每个进程都能同时获得CPU的执行时间。当系统中有两个进程时，CPU的计算时间被分成两份，每个进程获得50%。然而在实际的硬件上，当一个进程占用CPU时，其它进程就必须等待。所以CFS将惩罚当前进程，使其它进程能够在下次调度时尽可能取代当前进程。最终实现所有进程的公平调度。</p>
+
+<p>CFS调度器将所有状态为RUNABLE的进程都被插入红黑树。在每个调度点，CFS调度器都会选择红黑树的最左边的叶子节点作为下一个将获得cpu的进程。 那红黑树的键值是怎么计算的呢？红黑树的键值是进程所谓的虚拟运行时间。一个进程的虚拟运行时间是进程时间运行的时间按整个红黑树中所有的进程数量normalized的结果。</p>
+
+<p>每次tick中断，CFS调度器都要更新进程的虚拟运行时间，然后调整当前进程在红黑树中的位置，调整完成后如果发现当前进程不再是最左边的叶子，就标记need_resched 标志，中断返回时就会调用scheduler()完成进程切换。</p>
+
+<p>最后再说一下，进程的优先级和进程虚拟运行时间的关系。前面提到了，每次tick中断，CFS调度器都要更新进程的虚拟运行时间。那这个时间是怎么计算的呢？CFS首先计算出进程的时间运行时间delta_exec，然后计算normalized后的delta_exec_weighted，最后再将delta_exec_weighted加到进程的虚拟运行时间上。跟进程优先级有关的就是delta_exec_weighted，delta_exec_weighted=delta_exec_weighted*NICE_0_LOAD/se->load，其中NICE_0_LOAD是个常量，而se->load跟进程的nice值成反比，因此进程优先级越高（nice值越小）则se->load越大，则计算出来的delta_exec_weighted越小，这样进程优先级高的进程就可以获得更多的cpu时间。</p>
+
+<p>介绍完CFS调度器，我们开始介绍cpu子系统是如何通过CFS调度器实现的。CFS调度器不仅支持基于进程的调度，还支持基于进程组的组调度。CFS中定义了一个task_group的数据结构来管理组调度。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct task_group {
+</span><span class='line'>&#9;struct cgroup_subsys_state css;
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_FAIR_GROUP_SCHED
+</span><span class='line'>&#9;/* schedulable entities of this group on each cpu */
+</span><span class='line'>&#9;struct sched_entity **se;
+</span><span class='line'>&#9;/* runqueue "owned" by this group on each cpu */
+</span><span class='line'>&#9;struct cfs_rq **cfs_rq;
+</span><span class='line'>&#9;unsigned long shares;
+</span><span class='line'>#endif
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_RT_GROUP_SCHED
+</span><span class='line'>&#9;struct sched_rt_entity **rt_se;
+</span><span class='line'>&#9;struct rt_rq **rt_rq;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct rt_bandwidth rt_bandwidth;
+</span><span class='line'>#endif
+</span><span class='line'> 
+</span><span class='line'>&#9;struct rcu_head rcu;
+</span><span class='line'>&#9;struct list_head list;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct task_group *parent;
+</span><span class='line'>&#9;struct list_head siblings;
+</span><span class='line'>&#9;struct list_head children;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>task_group中内嵌了一个cgroup_subsys_state,也就是说进程可以通过cgroup_subsys_state来获取它所在的task_group,同样地cgroup也可以通过cgroup_subsys_state来获取它对应的task_group，因此进程和cgroup都存在了一组cgroup_subsys_state指针。</p>
+
+<p>struct sched_entity **se是一个指针数组，存了一组指向该task_group在每个cpu的调度实体（即一个struct sched_entity）。</p>
+
+<p>struct cfs_rq **cfs_rq也是一个指针数组，存在一组指向该task_group在每个cpu上所拥有的一个可调度的进程队列。</p>
+
+<p>Parent、siblings和children三个指针负责将task_group 连成一颗树，这个跟cgroup树类似。</p>
+
+<p>有了这个数据结构，我们来CFS在调度的时候是怎么处理进程组的。我们还是从CFS对tick中断的处理开始。</p>
+
+<p>CFS对tick中断的处理在task_tick_fair中进行，在task_tick_fair中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_sched_entity(se) {
+</span><span class='line'>&#9;cfs_rq = cfs_rq_of(se);
+</span><span class='line'>&#9;entity_tick(cfs_rq, se, queued);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们首先来看一下在组调度的情况下，for_each_sched_entity是怎么定义的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define for_each_sched_entity(se) \
+</span><span class='line'>&#9;for (; se; se = se-&gt;parent)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即从当前进程的se开始，沿着task_group树从下到上对se调用entity_tick，即更新各个se的虚拟运行时间。</p>
+
+<p>在非组调度情况下，</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define for_each_sched_entity(se) \
+</span><span class='line'>&#9;for (; se; se = NULL)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即只会对当前se做处理。</p>
+
+<p>CFS处理完tick中断后，如果有必要就会进行调度，CFS调度是通过pick_next_task_fair函数选择下一个运行的进程的。在pick_next_task_fair中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>do {
+</span><span class='line'>&#9;se = pick_next_entity(cfs_rq);
+</span><span class='line'>&#9;set_next_entity(cfs_rq, se);
+</span><span class='line'>&#9;cfs_rq = group_cfs_rq(se);
+</span><span class='line'>} while (cfs_rq);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这个循环中，首先从当前的队列选一个se，这个跟非组调度一样的（红黑树最左边的节点），再将se设置成下一个运行的se，再从该se获取该se对应的task_group拥有的cfs_rq（如果该se对应一个进程而非一个task_group的话，cfs_rq会变成NULL），继续这个过程直到cfs_rq为空，即当se对应的是一个进程。</p>
+
+<p>简而言之，同一层的task_group跟进程被当成同样的调度实体来选择，当被选到的是task_group时，则对task_group的孩子节点重复这个过程，直到选到一个运行的进程。因此当设置一个cgroup的shares值时，该cgroup当作一个整体和剩下的进程或其他cgroup分享cpu时间。比如,我在根cgroup下建立cgroup A，将其shares值设1024，再建立cgroup B,将其shares设为2048，再将一些进程分别加入到这两个cgroup中，则长期调度的结果应该是A:B:C=1:2:1（即cpu占用时间,其中C是系统中为加入到A或B的进程）。</p>
+
+<p>引起CFS调度的除了tick中断外，还有就是有新的进程加入可运行队列这种情况。CFS处理这个情况的函数是enqueue_task_fair,在enqueue_task_fair中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_sched_entity(se) {
+</span><span class='line'>&#9;if (se-&gt;on_rq)
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;cfs_rq = cfs_rq_of(se);
+</span><span class='line'>&#9;enqueue_entity(cfs_rq, se, flags);
+</span><span class='line'>&#9;flags = ENQUEUE_WAKEUP;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们前面已经看过for_each_sched_entity在组调度下的定义了，这里是将当前se和se的直系祖先节点都加入到红黑树（enqueue_entity），而在非组调度情况下，只需要将当前se本身加入即可。造成这种差异的原因，在于在pick_next_task_fair中选择se时，是从上往下的，如果一个se的祖先节点不在红黑树中，它永远都不会被选中。而在非组调度的情况下，se之间并没有父子关系，所有se都是平等独立，在pick_next_task_fair，第一次选中的肯定就是进程，不需要向下迭代。</p>
+
+<p>类似的处理还发生在将一个se出列（dequeue_task_fair）和put_prev_task_fair中。</p>
+
+<p>以上是cpu系统通过CFS调度器实现以cgroup为单位的cpu时间片分享，下面我们来看一下cpu子系统本身。cpu子系统通过一个cgroup_subsys结构体来管理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys cpu_cgroup_subsys = {
+</span><span class='line'>&#9;.name = "cpu",
+</span><span class='line'>&#9;.create = cpu_cgroup_create,
+</span><span class='line'>&#9;.destroy = cpu_cgroup_destroy,
+</span><span class='line'>&#9;.can_attach = cpu_cgroup_can_attach,
+</span><span class='line'>&#9;.attach = cpu_cgroup_attach,
+</span><span class='line'>&#9;.populate = cpu_cgroup_populate,
+</span><span class='line'>&#9;.subsys_id = cpu_cgroup_subsys_id,
+</span><span class='line'>&#9;.early_init = 1,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Cpu_cgroup_subsys其实是对抽象的cgroup_subsys的实现，其中的函数指针指向了特定于cpu子系统的实现。这里再说一下，Cgroups的整体设计。当用户使用cgroup文件系统，创建cgroup的时候，会调用cgroup目录操作的mkdir指针指向的函数，该函数调用了cgroup_create，而cgroup_create会根据该cgroup关联的子系统，分别调用对应的子系统实现的create指针指向的函数。即做了两次转换，一次从系统通用命令到cgroup文件系统，另一次从cgroup文件系统再特定的子系统实现。</p>
+
+<p>Cgroups中除了通用的控制文件外，每个子系统还有自己的控制文件，子系统也是通过cftype来管理这些控制文件。Cpu子系统很重要的一个文件就是cpu.shares文件，因为就是通过这个文件的数值来调节cgroup所占用的cpu时间。Shares文件对应的cftype结构为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_FAIR_GROUP_SCHED
+</span><span class='line'>{
+</span><span class='line'>&#9;.name = "shares",
+</span><span class='line'>&#9;.read_u64 = cpu_shares_read_u64,
+</span><span class='line'>&#9;.write_u64 = cpu_shares_write_u64,
+</span><span class='line'>},
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当对cgroup目录下的文件进行操作时，该结构体中定义的函数指针指向的函数就会被调用.下面我们就在看看这个两个函数的实现吗，从而发现shares文件的值是如何起作用的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static u64 cpu_shares_read_u64(struct cgroup *cgrp, struct cftype *cft)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct task_group *tg = cgroup_tg(cgrp);
+</span><span class='line'> 
+</span><span class='line'>&#9;return (u64) tg-&gt;shares;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>比较简单，简单的读取task_group中存储的shares就行了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int cpu_shares_write_u64(struct cgroup *cgrp, struct cftype *cftype,
+</span><span class='line'>&#9;&#9;&#9;&#9;u64 shareval)
+</span><span class='line'>{
+</span><span class='line'>&#9;return sched_group_set_shares(cgroup_tg(cgrp), shareval);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>则是设定cgroup对应的task_group的shares值。</p>
+
+<p>那这个shares值是怎么起作用的呢？在sched_group_set_shares中有:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tg-&gt;shares = shares;
+</span><span class='line'>for_each_possible_cpu(i) {
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * force a rebalance
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;cfs_rq_set_shares(tg-&gt;cfs_rq[i], 0);
+</span><span class='line'>&#9;set_se_shares(tg-&gt;se[i], shares);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cfs_rq_set_shares强制做一次cpu SMP负载均衡。</p>
+
+<p>真正起作用的是在set_se_shares中，它调用了<strong>set_se_shares，在</strong>set_se_shares中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>se-&gt;load.weight = shares;
+</span><span class='line'>se-&gt;load.inv_weight = 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>根据之前我们分析的CFS的调度原理可以知道，load.weight的值越大，算出来的虚拟运行时间越小，进程能使用的cpu时间越多。这样以来，shares值最终就是通过调度实体的load值来起作用的。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-3/">cgroup文件系统</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T16:41:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:41:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/23/2466151.html">http://www.cnblogs.com/lisperl/archive/2012/04/23/2466151.html</a></p>
+
+<h4>Cgroups用户空间管理</h4>
+
+<p>Cgroups用户空间的管理是通过cgroup文件系统实现的。</p>
+
+<p>比如要创建一个层级：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mount -t cgroup -o cpu,cpuset,memory cpu_and_mem /cgroup/cpu_and_mem</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个命令就创建一个名为cpu_and_mem的层级，这个层级上附加了cpu,cpuset,memory三个子系统，并把层级挂载到了/cgroup/cpu_and_mem.</p>
+
+<p>创建一个cgroup：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cd /cgroup/cpu_and_mem
+</span><span class='line'>mkdir foo</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过以上两个命令，我们就在刚才创建的层级下创建了一个叫foo的cgroup。</p>
+
+<p>你再cd foo，然后ls</p>
+
+<p>你会发现一些文件，这是cgroups相关子系统的控制文件，你可以读取这些控制文件，这些控制文件存储的值就是对相应的cgrouop的控制信息，你也可以写控制文件来更改控制信息。
+在这些文件中，有一个叫tasks的文件，里面的包含了所有属于这个cgroup的进程的进程号。</p>
+
+<p>在刚才创建的foo下，你cat tasks，应该是空的，因为此时这个cgroup里面还没有进程。你cd /cgroup/cpu_and_mem 再cat tasks，你可以看到系统中所有进程的进程号，这是因为每创建一个层级的时候，系统的所有进程都会自动被加到该层级的根cgroup里面。Tasks文件不仅可以读，还可以写，你将一个进程的进程号写入到某个cgroup目录下的tasks里面，你就将这个进程加入了相应的cgroup。</p>
+
+<h4>Cgroup文件系统的实现</h4>
+
+<p>在讲cgroup文件系统的实现之前，必须简单的介绍一下Linux VFS。</p>
+
+<p>VFS是所谓的虚拟文件系统转换，是一个内核软件层，用来处理与Unix标准文件系统的所有系统调用。VFS对用户提供统一的读写等文件操作调用接口，当用户调用读写等函数时，内核则调用特定的文件系统实现。具体而言，文件在内核内存中是一个file数据结构来表示的。这个数据结构包含一个f_op的字段，该字段中包含了一组指向特定文件系统实现的函数指针。当用户执行read()操作时，内核调用sys_read(),然后sys_read（）查找到指向该文件属于的文件系统的读函数指针，并调用它，即file->f_op->read().</p>
+
+<p>VFS其实是面向对象的，在这里，对象是一个软件结构，既定义数据也定义了之上的操作。处于效率，Linux并没有采用C++之类的面向对象的语言，而是采用了C的结构体，然后在结构体里面定义了一系列函数指针，这些函数指针对应于对象的方法。</p>
+
+<p>VFS文件系统定义了以下对象模型： <br/>
+超级块对象(superblock object)
+存放已安装文件系统的有关信息。
+索引节点对象(inode object)
+存放关于具体文件的一般信息。
+文件对象（file  object）
+存放打开文件与进程之间的交互信息
+目录项对象(dentry object)
+存放目录项与对应文件进行链接的有关信息。</p>
+
+<p>基于VFS实现的文件系统，都必须实现定义这些对象，并实现这些对象中定义的函数指针。cgroup文件系统也不例外，下面我们来看cgroups中这些对象的定义。</p>
+
+<p>cgroup文件系统的定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct file_system_type cgroup_fs_type = {
+</span><span class='line'>&#9;.name = "cgroup",
+</span><span class='line'>&#9;.get_sb = cgroup_get_sb,
+</span><span class='line'>&#9;.kill_sb = cgroup_kill_sb,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里有定义了两个函数指针，定义了一个文件系统必须实现了的两个操作get_sb,kill_sb，即获得超级块和释放超级块。这两个操作会在使用mount系统调用挂载cgroup文件系统时使用。</p>
+
+<p>cgroup 超级块的定义:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct super_operations cgroup_ops = {
+</span><span class='line'>&#9;.statfs = simple_statfs,
+</span><span class='line'>&#9;.drop_inode = generic_delete_inode,
+</span><span class='line'>&#9;.show_options = cgroup_show_options,
+</span><span class='line'>&#9;.remount_fs = cgroup_remount,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Cgroup 索引块定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct inode_operations cgroup_dir_inode_operations = {
+</span><span class='line'>&#9;.lookup = simple_lookup,
+</span><span class='line'>&#9;.mkdir = cgroup_mkdir,
+</span><span class='line'>&#9;.rmdir = cgroup_rmdir,
+</span><span class='line'>&#9;.rename = cgroup_rename,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在cgroup文件系统中，使用mkdir创建cgroup或者用rmdir删除cgroup时，就会调用相应的函数指针指向的函数。比如：使用mkdir创建cgroup时，会调用cgroup_mkdir，然后在cgroup_mkdir中再调用具体实现的cgroup_create函数。</p>
+
+<p>Cgroup 文件操作定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations cgroup_file_operations = {
+</span><span class='line'>&#9;.read = cgroup_file_read,
+</span><span class='line'>&#9;.write = cgroup_file_write,
+</span><span class='line'>&#9;.llseek = generic_file_llseek,
+</span><span class='line'>&#9;.open = cgroup_file_open,
+</span><span class='line'>&#9;.release = cgroup_file_release,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在cgroup文件系统中，对目录下的控制文件进行操作时，会调用该结构体中指针指向的函数。比如：对文件进行读操作时，会调用cgroup_file_read，在cgroup_file_read中，会根据需要调用该文件对应的cftype结构体定义的对应读函数。</p>
+
+<p>我们再来看cgroup文件系统中的cgroups控制文件。Cgroups定义一个cftype的结构体来管理控制文件。下面我们来看cftype的定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cftype {
+</span><span class='line'>&#9;char name[MAX_CFTYPE_NAME];
+</span><span class='line'>&#9;int private; /*
+</span><span class='line'>&#9;mode_t mode;
+</span><span class='line'>&#9;size_t max_write_len;
+</span><span class='line'> 
+</span><span class='line'>&#9;int (*open)(struct inode *inode, struct file *file);
+</span><span class='line'>&#9;ssize_t (*read)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;struct file *file,
+</span><span class='line'>&#9;char __user *buf, size_t nbytes, loff_t *ppos);
+</span><span class='line'>&#9;u64 (*read_u64)(struct cgroup *cgrp, struct cftype *cft);
+</span><span class='line'>&#9;s64 (*read_s64)(struct cgroup *cgrp, struct cftype *cft);
+</span><span class='line'>&#9;int (*read_map)(struct cgroup *cont, struct cftype *cft,
+</span><span class='line'>&#9;struct cgroup_map_cb *cb);
+</span><span class='line'>&#9;int (*read_seq_string)(struct cgroup *cont, struct cftype *cft,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct seq_file *m);
+</span><span class='line'> 
+</span><span class='line'>&#9;ssize_t (*write)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct file *file,
+</span><span class='line'>&#9;&#9;&#9;&#9;const char __user *buf, size_t nbytes, loff_t *ppos);
+</span><span class='line'>&#9;int (*write_u64)(struct cgroup *cgrp, struct cftype *cft, u64 val);
+</span><span class='line'>&#9;int (*write_s64)(struct cgroup *cgrp, struct cftype *cft, s64 val);
+</span><span class='line'>&#9;int (*write_string)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;&#9;&#9;&#9;const char *buffer);
+</span><span class='line'>&#9;int (*trigger)(struct cgroup *cgrp, unsigned int event);
+</span><span class='line'> 
+</span><span class='line'>&#9;int (*release)(struct inode *inode, struct file *file);
+</span><span class='line'>&#9;int (*register_event)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;struct eventfd_ctx *eventfd, const char *args); /*
+</span><span class='line'>&#9;void (*unregister_event)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;struct eventfd_ctx *eventfd);
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cftype中除了定义文件的名字和相关权限标记外，主要是定义了对文件进行操作的函数指针。不同的文件可以有不同的操作，对文件进行操作时，相关函数指针指向的函数会被调用。</p>
+
+<p>综合上面的分析，cgroups通过实现cgroup文件系统来为用户提供管理cgroup的工具，而cgroup文件系统是基于Linux VFS实现的。相应地，cgroups为控制文件定义了相应的数据结构cftype，对其操作由cgroup文件系统定义的通过操作捕获，再调用cftype定义的具体实现。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-2/">cgroups 数据结构设计</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T16:24:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:24:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/18/2455027.html">http://www.cnblogs.com/lisperl/archive/2012/04/18/2455027.html</a></p>
+
+<p>我们从进程出发来剖析cgroups相关数据结构之间的关系。
+在Linux中，管理进程的数据结构是task_struct，其中与cgroups有关的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_CGROUPS
+</span><span class='line'>&#9;/* Control Group info protected by css_set_lock */
+</span><span class='line'>&#9;struct css_set *cgroups;
+</span><span class='line'>&#9;/* cg_list protected by css_set_lock and tsk-&gt;alloc_lock */
+</span><span class='line'>&#9;struct list_head cg_list;
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中cgroups指针指向了一个css_set结构，而css_set存储了与进程相关的cgroups信息。Cg_list是一个嵌入的list_head结构，用于将连到同一个css_set的进程组织成一个链表。下面我们来看css_set的结构：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct css_set {
+</span><span class='line'>&#9;atomic_t refcount;
+</span><span class='line'>&#9;struct hlist_node hlist;
+</span><span class='line'>&#9;struct list_head tasks;
+</span><span class='line'>&#9;struct list_head cg_links;
+</span><span class='line'>&#9;struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
+</span><span class='line'>&#9;struct rcu_head rcu_head;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中refcount是该css_set的引用数，因为一个css_set可以被多个进程共用，只要这些进程的cgroups信息相同，比如：在所有已创建的层级里面都在同一个cgroup里的进程。</p>
+
+<p>hlist是嵌入的hlist_node，用于把所有css_set组织成一个hash表，这样内核可以快速查找特定的css_set。</p>
+
+<p>tasks指向所有连到此css_set的进程连成的链表。</p>
+
+<p>cg_links指向一个由struct cg_cgroup_link连成的链表。</p>
+
+<p>Subsys是一个指针数组，存储一组指向cgroup_subsys_state的指针。一个cgroup_subsys_state就是进程与一个特定子系统相关的信息。通过这个指针数组，进程就可以获得相应的cgroups控制信息了。</p>
+
+<p>下面我们就来看cgroup_subsys_state的结构：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys_state {
+</span><span class='line'>&#9;struct cgroup *cgroup;
+</span><span class='line'>&#9;atomic_t refcnt;
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;struct css_id *id;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cgroup指针指向了一个cgroup结构，也就是进程属于的cgroup。进程受到子系统的控制，实际上是通过加入到特定的cgroup实现的，因为cgroup在特定的层级上，而子系统又是附加到曾经上的。通过以上三个结构，进程就可以和cgroup连接起来了：task_struct->css_set->cgroup_subsys_state->cgroup。</p>
+
+<p>下面我们再来看cgroup的结构：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup {
+</span><span class='line'>&#9;unsigned long flags;       
+</span><span class='line'>&#9;atomic_t count;
+</span><span class='line'>&#9;struct list_head sibling;  
+</span><span class='line'>&#9;struct list_head children; 
+</span><span class='line'>&#9;struct cgroup *parent;     
+</span><span class='line'>&#9;struct dentry *dentry;     
+</span><span class='line'>&#9;struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
+</span><span class='line'>&#9;struct cgroupfs_root *root;
+</span><span class='line'>&#9;struct cgroup *top_cgroup;
+</span><span class='line'>&#9;struct list_head css_sets;
+</span><span class='line'>&#9;struct list_head release_list;
+</span><span class='line'>&#9;struct list_head pidlists;
+</span><span class='line'>&#9;struct mutex pidlist_mutex;
+</span><span class='line'>&#9;struct rcu_head rcu_head;
+</span><span class='line'>&#9;struct list_head event_list;
+</span><span class='line'>&#9;spinlock_t event_list_lock;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sibling,children和parent三个嵌入的list_head负责将同一层级的cgroup连接成一颗cgroup树。</p>
+
+<p>subsys是一个指针数组，存储一组指向cgroup_subsys_state的指针。这组指针指向了此cgroup跟各个子系统相关的信息，这个跟css_set中的道理是一样的。</p>
+
+<p>root指向了一个cgroupfs_root的结构，就是cgroup所在的层级对应的结构体。这样以来，之前谈到的几个cgroups概念就全部联系起来了。</p>
+
+<p>top_cgroup指向了所在层级的根cgroup，也就是创建层级时自动创建的那个cgroup。</p>
+
+<p>css_set指向一个由struct cg_cgroup_link连成的链表，跟css_set中cg_links一样。</p>
+
+<p>下面我们来分析一个css_set和cgroup之间的关系。我们先看一下 cg_cgroup_link的结构</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cg_cgroup_link {
+</span><span class='line'>&#9;struct list_head cgrp_link_list;
+</span><span class='line'>&#9;struct cgroup *cgrp;
+</span><span class='line'>&#9;struct list_head cg_link_list;
+</span><span class='line'>&#9;struct css_set *cg;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cgrp_link_list连入到cgroup->css_set指向的链表，cgrp则指向此cg_cgroup_link相关的cgroup。</p>
+
+<p>Cg_link_list则连入到css_set->cg_links指向的链表,cg则指向此cg_cgroup_link相关的css_set。</p>
+
+<p>那为什么要这样设计呢？</p>
+
+<p>那是因为cgroup和css_set是一个多对多的关系，必须添加一个中间结构来将两者联系起来，这跟数据库模式设计是一个道理。cg_cgroup_link中的cgrp和cg就是此结构体的联合主键，而cgrp_link_list和cg_link_list分别连入到cgroup和css_set相应的链表，使得能从cgroup或css_set都可以进行遍历查询。</p>
+
+<p>那为什么cgroup和css_set是多对多的关系呢？</p>
+
+<p>一个进程对应css_set，一个css_set就存储了一组进程（应该有可能被几个进程共享，所以是一组）跟各个子系统相关的信息，但是这些信息有可能不是从一个cgroup那里获得的，因为一个进程可以同时属于几个cgroup，只要这些cgroup不在同一个层级。举个例子：我们创建一个层级A，A上面附加了cpu和memory两个子系统，进程B属于A的根cgroup；然后我们再创建一个层级C，C上面附加了ns和blkio两个子系统，进程B同样属于C的根cgroup；那么进程B对应的cpu和memory的信息是从A的根cgroup获得的，ns和blkio信息则是从C的根cgroup获得的。因此，一个css_set存储的cgroup_subsys_state可以对应多个cgroup。另一方面，cgroup也存储了一组cgroup_subsys_state，这一组cgroup_subsys_state则是cgroup从所在的层级附加的子系统获得的。一个cgroup中可以有多个进程，而这些进程的css_set不一定都相同，因为有些进程可能还加入了其他cgroup。但是同一个cgroup中的进程与该cgroup关联的cgroup_subsys_state都受到该cgroup的管理（cgroups中进程控制是以cgroup为单位的）的，所以一个cgrouop也可以对应多个css_set。</p>
+
+<p>那为什么要这样一个结构呢？</p>
+
+<p>从前面的分析，我们可以看出从task到cgroup是很容易定位的，但是从cgroup获取此cgroup的所有的task就必须通过这个结构了。每个进程都会指向一个css_set，而与这个css_set关联的所有进程都会链入到css_set->tasks链表.而cgroup又通过一个中间结构cg_cgroup_link来寻找所有与之关联的所有css_set，从而可以得到与cgroup关联的所有进程。</p>
+
+<p>最后让我们看一下层级和子系统对应的结构体。层级对应的结构体是cgroupfs_root:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroupfs_root {
+</span><span class='line'>&#9;struct super_block *sb;
+</span><span class='line'>&#9;unsigned long subsys_bits;
+</span><span class='line'>&#9;int hierarchy_id;
+</span><span class='line'>&#9;unsigned long actual_subsys_bits;
+</span><span class='line'>&#9;struct list_head subsys_list;
+</span><span class='line'>&#9;struct cgroup top_cgroup;
+</span><span class='line'>&#9;int number_of_cgroups;
+</span><span class='line'>&#9;struct list_head root_list;
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;char release_agent_path[PATH_MAX];
+</span><span class='line'>&#9;char name[MAX_CGROUP_ROOT_NAMELEN];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sb指向该层级关联的文件系统超级块</p>
+
+<p>subsys_bits和actual_subsys_bits分别指向将要附加到层级的子系统和现在实际附加到层级的子系统，在子系统附加到层级时使用</p>
+
+<p>hierarchy_id是该层级唯一的id</p>
+
+<p>top_cgroup指向该层级的根cgroup</p>
+
+<p>number_of_cgroups记录该层级cgroup的个数</p>
+
+<p>root_list是一个嵌入的list_head，用于将系统所有的层级连成链表</p>
+
+<p>子系统对应的结构体是cgroup_subsys:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys {
+</span><span class='line'>&#9;struct cgroup_subsys_state *(*create)(struct cgroup_subsys *ss,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;struct cgroup *cgrp);
+</span><span class='line'>&#9;int (*pre_destroy)(struct cgroup_subsys *ss, struct cgroup *cgrp);
+</span><span class='line'>&#9;void (*destroy)(struct cgroup_subsys *ss, struct cgroup *cgrp);
+</span><span class='line'>&#9;int (*can_attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct task_struct *tsk, bool threadgroup);
+</span><span class='line'>&#9;void (*cancel_attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct task_struct *tsk, bool threadgroup);
+</span><span class='line'>&#9;void (*attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+</span><span class='line'>&#9;&#9;&#9;struct cgroup *old_cgrp, struct task_struct *tsk,
+</span><span class='line'>&#9;&#9;&#9;bool threadgroup);
+</span><span class='line'>&#9;void (*fork)(struct cgroup_subsys *ss, struct task_struct *task);
+</span><span class='line'>&#9;void (*exit)(struct cgroup_subsys *ss, struct task_struct *task);
+</span><span class='line'>&#9;int (*populate)(struct cgroup_subsys *ss,
+</span><span class='line'>&#9;&#9;&#9;struct cgroup *cgrp);
+</span><span class='line'>&#9;void (*post_clone)(struct cgroup_subsys *ss, struct cgroup *cgrp);
+</span><span class='line'>&#9;void (*bind)(struct cgroup_subsys *ss, struct cgroup *root);
+</span><span class='line'> 
+</span><span class='line'>&#9;int subsys_id;
+</span><span class='line'>&#9;int active;
+</span><span class='line'>&#9;int disabled;
+</span><span class='line'>&#9;int early_init;
+</span><span class='line'>&#9;bool use_id;
+</span><span class='line'>#define MAX_CGROUP_TYPE_NAMELEN 32
+</span><span class='line'>&#9;const char *name;
+</span><span class='line'>&#9;struct mutex hierarchy_mutex;
+</span><span class='line'>&#9;struct lock_class_key subsys_key;
+</span><span class='line'>&#9;struct cgroupfs_root *root;
+</span><span class='line'>&#9;struct list_head sibling;
+</span><span class='line'>&#9;struct idr idr;
+</span><span class='line'>&#9;spinlock_t id_lock;
+</span><span class='line'>&#9;struct module *module;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Cgroup_subsys定义了一组操作，让各个子系统根据各自的需要去实现。这个相当于C++中抽象基类，然后各个特定的子系统对应cgroup_subsys则是实现了相应操作的子类。类似的思想还被用在了cgroup_subsys_state中，cgroup_subsys_state并未定义控制信息，而只是定义了各个子系统都需要的共同信息，比如该cgroup_subsys_state从属的cgroup。然后各个子系统再根据各自的需要去定义自己的进程控制信息结构体，最后在各自的结构体中将cgroup_subsys_state包含进去，这样通过Linux内核的container_of等宏就可以通过cgroup_subsys_state来获取相应的结构体。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/06/namespace2/">Linux内核的namespace机制分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-06T15:30:00+08:00'><span class='date'>2015-08-06</span> <span class='time'>15:30:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2015-02/113022.htm">http://www.linuxidc.com/Linux/2015-02/113022.htm</a></p>
+
+<h4>1.  Linux内核namespace机制</h4>
+
+<p>Linux Namespaces机制提供一种资源隔离方案。PID,IPC,Network等系统资源不再是全局性的，而是属于某个特定的Namespace。每个namespace下的资源对于其他namespace下的资源都是透明，不可见的。因此在操作系统层面上看，就会出现多个相同pid的进程。系统中可以同时存在两个进程号为0,1,2的进程，由于属于不同的namespace，所以它们之间并不冲突。而在用户层面上只能看到属于用户自己namespace下的资源，例如使用ps命令只能列出自己namespace下的进程。这样每个namespace看上去就像一个单独的Linux系统。</p>
+
+<p><img src="/images/system/2015-08-06-1.jpg" alt="" /></p>
+
+<h4>2 .  Linux内核中namespace结构体</h4>
+
+<p>在Linux内核中提供了多个namespace，其中包括fs (mount), uts, network, sysvipc, 等。一个进程可以属于多个namesapce,既然namespace和进程相关，那么在task_struct结构体中就会包含和namespace相关联的变量。在task_struct 结构中有一个指向namespace结构体的指针nsproxy。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct task_struct {
+</span><span class='line'>&#9;……..
+</span><span class='line'>&#9;/* namespaces */
+</span><span class='line'>&#9;struct nsproxy *nsproxy;
+</span><span class='line'>&#9;…….
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>再看一下nsproxy是如何定义的，在include/linux/nsproxy.h文件中，这里一共定义了5个各自的命名空间结构体，在该结构体中定义了5个指向各个类型namespace的指针，由于多个进程可以使用同一个namespace，所以nsproxy可以共享使用，count字段是该结构的引用计数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 'count' is the number of tasks holding a reference.
+</span><span class='line'> * The count for each namespace, then, will be the number
+</span><span class='line'> * of nsproxies pointing to it, not the number of tasks.
+</span><span class='line'> * The nsproxy is shared by tasks which share all namespaces.
+</span><span class='line'> * As soon as a single namespace is cloned or unshared, the
+</span><span class='line'> * nsproxy is copied
+</span><span class='line'>*/
+</span><span class='line'>struct nsproxy {
+</span><span class='line'>&#9;atomic_t count;
+</span><span class='line'>&#9;struct uts_namespace *uts_ns;
+</span><span class='line'>&#9;struct ipc_namespace *ipc_ns;
+</span><span class='line'>&#9;struct mnt_namespace *mnt_ns;
+</span><span class='line'>&#9;struct pid_namespace *pid_ns_for_children;
+</span><span class='line'>&#9;struct net           *net_ns;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>(1)    UTS命名空间包含了运行内核的名称、版本、底层体系结构类型等信息。UTS是UNIX Timesharing System的简称。</p>
+
+<p>(2)    保存在struct ipc_namespace中的所有与进程间通信（IPC）有关的信息。</p>
+
+<p>(3)    已经装载的文件系统的视图，在struct mnt_namespace中给出。</p>
+
+<p>(4)    有关进程ID的信息，由struct pid_namespace提供。</p>
+
+<p>(5)    struct net_ns包含所有网络相关的命名空间参数。</p>
+
+<p>系统中有一个默认的nsproxy，init_nsproxy，该结构在task初始化是也会被初始化。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define INIT_TASK(tsk)  \
+</span><span class='line'>{ .nsproxy  = &init_nsproxy,   }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中init_nsproxy的定义为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct kmem_cache *nsproxy_cachep;
+</span><span class='line'> 
+</span><span class='line'>struct nsproxy init_nsproxy = {
+</span><span class='line'>&#9;.count                       = ATOMIC_INIT(1),
+</span><span class='line'>&#9;.uts_ns                      = &init_uts_ns,
+</span><span class='line'>#if defined(CONFIG_POSIX_MQUEUE) || defined(CONFIG_SYSVIPC)
+</span><span class='line'>&#9;.ipc_ns                        = &init_ipc_ns,
+</span><span class='line'>#endif
+</span><span class='line'>&#9;.mnt_ns                      = NULL,
+</span><span class='line'>&#9;.pid_ns_for_children         = &init_pid_ns,
+</span><span class='line'>#ifdef CONFIG_NET
+</span><span class='line'>&#9;.net_ns                      = &init_net,
+</span><span class='line'>#endif
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于 .mnt_ns 没有进行初始化，其余的namespace都进行了系统默认初始。</p>
+
+<p><img src="/images/system/2015-08-06-2.jpg" alt="" /></p>
+
+<h4>3. 使用clone创建自己的Namespace</h4>
+
+<p>如果要创建自己的命名空间，可以使用系统调用clone(),它在用户空间的原型为</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int clone(int (*fn)(void *), void *child_stack, int flags, void *arg)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里fn是函数指针，这个就是指向函数的指针，, child_stack是为子进程分配系统堆栈空间,flags就是标志用来描述你需要从父进程继承那些资源， arg就是传给子进程的参数也就是fn指向的函数参数。下面是flags可以取的值。这里只关心和namespace相关的参数。</p>
+
+<p>CLONE_FS          子进程与父进程共享相同的文件系统，包括root、当前目录、umask</p>
+
+<p>CLONE_NEWNS    当clone需要自己的命名空间时设置这个标志，不能同时设置CLONE_NEWS和CLONE_FS。</p>
+
+<p>Clone()函数是在libc库中定义的一个封装函数，它负责建立新轻量级进程的堆栈并且调用对编程者隐藏了clone系统条用。实现clone()系统调用的sys_clone()服务例程并没有fn和arg参数。封装函数把fn指针存放在子进程堆栈的每个位置处，该位置就是该封装函数本身返回地址存放的位置。Arg指针正好存放在子进程堆栈中的fn的下面。当封装函数结束时，CPU从堆栈中取出返回地址，然后执行fn(arg)函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Prototype for the glibc wrapper function */
+</span><span class='line'>#include &lt;sched.h&gt;
+</span><span class='line'>int clone(int (*fn)(void *), void *child_stack,
+</span><span class='line'>&#9;&#9;&#9;int flags, void *arg, ...
+</span><span class='line'>&#9;&#9;&#9;/* pid_t *ptid, struct user_desc *tls, pid_t *ctid */ );
+</span><span class='line'>
+</span><span class='line'>/* Prototype for the raw system call */
+</span><span class='line'>long clone(unsigned long flags, void *child_stack,
+</span><span class='line'>&#9;&#9;&#9;void *ptid, void *ctid,
+</span><span class='line'>&#9;&#9;&#9;struct pt_regs *regs);
+</span><span class='line'>我们在Linux内核中看到的实现函数，是经过libc库进行封装过的，在Linux内核中的fork.c文件中，有下面的定义，最终调用的都是do_fork()函数。
+</span><span class='line'>
+</span><span class='line'>#ifdef __ARCH_WANT_SYS_CLONE
+</span><span class='line'>#ifdef CONFIG_CLONE_BACKWARDS
+</span><span class='line'>SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, parent_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int, tls_val,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, child_tidptr)
+</span><span class='line'>#elif defined(CONFIG_CLONE_BACKWARDS2)
+</span><span class='line'>SYSCALL_DEFINE5(clone, unsigned long, newsp, unsigned long, clone_flags,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, parent_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, child_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int, tls_val)
+</span><span class='line'>#elif defined(CONFIG_CLONE_BACKWARDS3)
+</span><span class='line'>SYSCALL_DEFINE6(clone, unsigned long, clone_flags, unsigned long, newsp,
+</span><span class='line'>&#9;&#9;&#9;&#9;int, stack_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, parent_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, child_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int, tls_val)
+</span><span class='line'>#else
+</span><span class='line'>SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, parent_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int __user *, child_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;int, tls_val)
+</span><span class='line'>#endif
+</span><span class='line'>{
+</span><span class='line'>&#9;return do_fork(clone_flags, newsp, 0, parent_tidptr, child_tidptr);
+</span><span class='line'>}
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3.1  do_fork函数</h5>
+
+<p>在clone()函数中调用do_fork函数进行真正的处理，在do_fork函数中调用copy_process进程处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>long do_fork(unsigned long clone_flags,
+</span><span class='line'>&#9;&#9;&#9;unsigned long stack_start,
+</span><span class='line'>&#9;&#9;&#9;unsigned long stack_size,
+</span><span class='line'>&#9;&#9;&#9;int __user *parent_tidptr,
+</span><span class='line'>&#9;&#9;&#9;int __user *child_tidptr)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct task_struct *p;
+</span><span class='line'>&#9;int trace = 0;
+</span><span class='line'>&#9;long nr;
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Determine whether and which event to report to ptracer.  When
+</span><span class='line'>&#9; * called from kernel_thread or CLONE_UNTRACED is explicitly
+</span><span class='line'>&#9; * requested, no event is reported; otherwise, report if the event
+</span><span class='line'>&#9; * for the type of forking is enabled.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (!(clone_flags & CLONE_UNTRACED)) {
+</span><span class='line'>&#9;&#9;if (clone_flags & CLONE_VFORK)
+</span><span class='line'>&#9;&#9;&#9;trace = PTRACE_EVENT_VFORK;
+</span><span class='line'>&#9;&#9;else if ((clone_flags & CSIGNAL) != SIGCHLD)
+</span><span class='line'>&#9;&#9;&#9;trace = PTRACE_EVENT_CLONE;
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;trace = PTRACE_EVENT_FORK;
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if (likely(!ptrace_event_enabled(current, trace)))
+</span><span class='line'>&#9;&#9;&#9;trace = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;p = copy_process(clone_flags, stack_start, stack_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;child_tidptr, NULL, trace);
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Do this prior waking up the new thread - the thread pointer
+</span><span class='line'>&#9; * might get invalid after that point, if the thread exits quickly.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (!IS_ERR(p)) {
+</span><span class='line'>&#9;&#9;struct completion vfork;
+</span><span class='line'>&#9;&#9;struct pid *pid;
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;trace_sched_process_fork(current, p);
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;pid = get_task_pid(p, PIDTYPE_PID);
+</span><span class='line'>&#9;&#9;nr = pid_vnr(pid);
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if (clone_flags & CLONE_PARENT_SETTID)
+</span><span class='line'>&#9;&#9;&#9;put_user(nr, parent_tidptr);
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if (clone_flags & CLONE_VFORK) {
+</span><span class='line'>&#9;&#9;&#9;p-&gt;vfork_done = &vfork;
+</span><span class='line'>&#9;&#9;&#9;init_completion(&vfork);
+</span><span class='line'>&#9;&#9;&#9;get_task_struct(p);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;wake_up_new_task(p);
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;/* forking complete and child started to run, tell ptracer */
+</span><span class='line'>&#9;&#9;if (unlikely(trace))
+</span><span class='line'>&#9;&#9;&#9;ptrace_event_pid(trace, pid);
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if (clone_flags & CLONE_VFORK) {
+</span><span class='line'>&#9;&#9;&#9;if (!wait_for_vfork_done(p, &vfork))
+</span><span class='line'>&#9;&#9;&#9;&#9;ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;put_pid(pid);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;nr = PTR_ERR(p);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return nr;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3.2  copy_process函数</h5>
+
+<p>在copy_process函数中调用copy_namespaces函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct task_struct *copy_process(unsigned long clone_flags,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;unsigned long stack_start,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;unsigned long stack_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;int __user *child_tidptr,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct pid *pid,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;int trace)
+</span><span class='line'>{
+</span><span class='line'>&#9;int retval;
+</span><span class='line'>&#9;struct task_struct *p;
+</span><span class='line'>&#9;/*下面的代码是对clone_flag标志进行检查，有部分表示是互斥的，例如CLONE_NEWNS和CLONENEW_FS*/
+</span><span class='line'>&#9;if ((clone_flags & (CLONE_NEWNS|CLONE_FS)) == (CLONE_NEWNS|CLONE_FS))
+</span><span class='line'>&#9;&#9;return ERR_PTR(-EINVAL);
+</span><span class='line'> 
+</span><span class='line'>&#9;if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
+</span><span class='line'>&#9;&#9;return ERR_PTR(-EINVAL);
+</span><span class='line'> 
+</span><span class='line'>&#9;if ((clone_flags & CLONE_THREAD) && !(clone_flags & CLONE_SIGHAND))
+</span><span class='line'>&#9;&#9;return ERR_PTR(-EINVAL);
+</span><span class='line'> 
+</span><span class='line'>&#9;if ((clone_flags & CLONE_SIGHAND) && !(clone_flags & CLONE_VM))
+</span><span class='line'>&#9;&#9;return ERR_PTR(-EINVAL);
+</span><span class='line'> 
+</span><span class='line'>&#9;if ((clone_flags & CLONE_PARENT) &&
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  current-&gt;signal-&gt;flags & SIGNAL_UNKILLABLE)
+</span><span class='line'>&#9;&#9;return ERR_PTR(-EINVAL);
+</span><span class='line'>
+</span><span class='line'>&#9;……
+</span><span class='line'>&#9;retval = copy_namespaces(clone_flags, p);
+</span><span class='line'>&#9;if (retval)
+</span><span class='line'>&#9;&#9;goto bad_fork_cleanup_mm;
+</span><span class='line'>&#9;retval = copy_io(clone_flags, p);
+</span><span class='line'>&#9;if (retval)
+</span><span class='line'>&#9;&#9;goto bad_fork_cleanup_namespaces;
+</span><span class='line'>&#9;retval = copy_thread(clone_flags, stack_start, stack_size, p);
+</span><span class='line'>&#9;if (retval)
+</span><span class='line'>&#9;&#9;goto bad_fork_cleanup_io;
+</span><span class='line'>&#9;/*do_fork中调用copy_process函数，该函数中pid参数为NULL，所以这里的if判断是成立的。为进程所在的namespace分配pid，在3.0的内核之前还有一个关键函数，就是namespace创建后和cgroup的关系，
+</span><span class='line'>&#9;if (current-&gt;nsproxy != p-&gt;nsproxy) {
+</span><span class='line'>&#9;&#9;retval = ns_cgroup_clone(p, pid);
+</span><span class='line'>&#9;&#9;if (retval)
+</span><span class='line'>&#9;&#9;&#9;goto bad_fork_free_pid;
+</span><span class='line'>&#9;但在3.0内核以后给删掉了，具体请参考remove the ns_cgroup*/
+</span><span class='line'>&#9;if (pid != &init_struct_pid) {
+</span><span class='line'>&#9;&#9;retval = -ENOMEM;
+</span><span class='line'>&#9;&#9;pid = alloc_pid(p-&gt;nsproxy-&gt;pid_ns_for_children);
+</span><span class='line'>&#9;&#9;if (!pid)
+</span><span class='line'>&#9;&#9;&#9;goto bad_fork_cleanup_io;
+</span><span class='line'>&#9;}…..
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p><img src="/images/system/2015-08-06-3.jpg" alt="" /></p>
+
+<h5>3.3  copy_namespaces 函数</h5>
+
+<p>在kernel/nsproxy.c文件中定义了copy_namespaces函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int copy_namespaces(unsigned long flags, struct task_struct *tsk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct nsproxy *old_ns = tsk-&gt;nsproxy;
+</span><span class='line'>&#9;struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+</span><span class='line'>&#9;struct nsproxy *new_ns;
+</span><span class='line'>&#9;/*首先检查flag，如果flag标志不是下面的五种之一，就会调用get_nsproxy对old_ns递减引用计数，然后直接返回0*/
+</span><span class='line'>&#9;if (likely(!(flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
+</span><span class='line'>&#9;&#9;&#9;&#9;  CLONE_NEWPID | CLONE_NEWNET)))) {
+</span><span class='line'>&#9;&#9;get_nsproxy(old_ns);
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*当前进程是否有超级用户的权限*/
+</span><span class='line'>&#9;if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+</span><span class='line'>&#9;&#9;return -EPERM;
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * CLONE_NEWIPC must detach from the undolist: after switching
+</span><span class='line'>&#9; * to a new ipc namespace, the semaphore arrays from the old
+</span><span class='line'>&#9; * namespace are unreachable.  In clone parlance, CLONE_SYSVSEM
+</span><span class='line'>&#9; * means share undolist with parent, so we must forbid using
+</span><span class='line'>&#9; * it along with CLONE_NEWIPC.
+</span><span class='line'>&#9;   对CLONE_NEWIPC进行特殊的判断，*/
+</span><span class='line'>&#9;if ((flags & (CLONE_NEWIPC | CLONE_SYSVSEM)) ==
+</span><span class='line'>&#9;&#9;(CLONE_NEWIPC | CLONE_SYSVSEM)) 
+</span><span class='line'>&#9;&#9;return -EINVAL;
+</span><span class='line'>&#9;/*为进程创建新的namespace*/
+</span><span class='line'>&#9;new_ns = create_new_namespaces(flags, tsk, user_ns, tsk-&gt;fs);
+</span><span class='line'>&#9;if (IS_ERR(new_ns))
+</span><span class='line'>&#9;&#9;return  PTR_ERR(new_ns);
+</span><span class='line'> 
+</span><span class='line'>&#9;tsk-&gt;nsproxy = new_ns;
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3.4  create_new_namespaces函数</h5>
+
+<p>create_new_namespaces创建新的namespace</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct nsproxy *create_new_namespaces(unsigned long flags,
+</span><span class='line'>&#9;&#9;struct task_struct *tsk, struct user_namespace *user_ns,
+</span><span class='line'>&#9;&#9;struct fs_struct *new_fs)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct nsproxy *new_nsp;
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;/*为新的nsproxy分配内存空间，并对其引用计数设置为初始1*/
+</span><span class='line'>&#9;new_nsp = create_nsproxy();
+</span><span class='line'>&#9;if (!new_nsp)
+</span><span class='line'>&#9;&#9;return ERR_PTR(-ENOMEM);
+</span><span class='line'>&#9;/*如果Namespace中的各个标志位进行了设置，则会调用相应的namespace进行创建*/
+</span><span class='line'>&#9;new_nsp-&gt;mnt_ns = copy_mnt_ns(flags, tsk-&gt;nsproxy-&gt;mnt_ns, user_ns, new_fs);
+</span><span class='line'>&#9;if (IS_ERR(new_nsp-&gt;mnt_ns)) {
+</span><span class='line'>&#9;&#9;err = PTR_ERR(new_nsp-&gt;mnt_ns);
+</span><span class='line'>&#9;&#9;goto out_ns;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;new_nsp-&gt;uts_ns = copy_utsname(flags, user_ns, tsk-&gt;nsproxy-&gt;uts_ns);
+</span><span class='line'>&#9;if (IS_ERR(new_nsp-&gt;uts_ns)) {
+</span><span class='line'>&#9;&#9;err = PTR_ERR(new_nsp-&gt;uts_ns);
+</span><span class='line'>&#9;&#9;goto out_uts;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;new_nsp-&gt;ipc_ns = copy_ipcs(flags, user_ns, tsk-&gt;nsproxy-&gt;ipc_ns);
+</span><span class='line'>&#9;if (IS_ERR(new_nsp-&gt;ipc_ns)) {
+</span><span class='line'>&#9;&#9;err = PTR_ERR(new_nsp-&gt;ipc_ns);
+</span><span class='line'>&#9;&#9;goto out_ipc;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;new_nsp-&gt;pid_ns_for_children =
+</span><span class='line'>&#9;&#9;copy_pid_ns(flags, user_ns, tsk-&gt;nsproxy-&gt;pid_ns_for_children);
+</span><span class='line'>&#9;if (IS_ERR(new_nsp-&gt;pid_ns_for_children)) {
+</span><span class='line'>&#9;&#9;err = PTR_ERR(new_nsp-&gt;pid_ns_for_children);
+</span><span class='line'>&#9;&#9;goto out_pid;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;new_nsp-&gt;net_ns = copy_net_ns(flags, user_ns, tsk-&gt;nsproxy-&gt;net_ns);
+</span><span class='line'>&#9;if (IS_ERR(new_nsp-&gt;net_ns)) {
+</span><span class='line'>&#9;&#9;err = PTR_ERR(new_nsp-&gt;net_ns);
+</span><span class='line'>&#9;&#9;goto out_net;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;return new_nsp;
+</span><span class='line'> 
+</span><span class='line'>out_net:
+</span><span class='line'>&#9;if (new_nsp-&gt;pid_ns_for_children)
+</span><span class='line'>&#9;&#9;put_pid_ns(new_nsp-&gt;pid_ns_for_children);
+</span><span class='line'>out_pid:
+</span><span class='line'>&#9;if (new_nsp-&gt;ipc_ns)
+</span><span class='line'>&#9;&#9;put_ipc_ns(new_nsp-&gt;ipc_ns);
+</span><span class='line'>out_ipc:
+</span><span class='line'>&#9;if (new_nsp-&gt;uts_ns)
+</span><span class='line'>&#9;&#9;put_uts_ns(new_nsp-&gt;uts_ns);
+</span><span class='line'>out_uts:
+</span><span class='line'>&#9;if (new_nsp-&gt;mnt_ns)
+</span><span class='line'>&#9;&#9;put_mnt_ns(new_nsp-&gt;mnt_ns);
+</span><span class='line'>out_ns:
+</span><span class='line'>&#9;kmem_cache_free(nsproxy_cachep, new_nsp);
+</span><span class='line'>&#9;return ERR_PTR(err);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h6>3.4.1 create_nsproxy函数</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline struct nsproxy *create_nsproxy(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct nsproxy *nsproxy;
+</span><span class='line'> 
+</span><span class='line'>&#9;nsproxy = kmem_cache_alloc(nsproxy_cachep, GFP_KERNEL);
+</span><span class='line'>&#9;if (nsproxy)
+</span><span class='line'>&#9;&#9;atomic_set(&nsproxy-&gt;count, 1);
+</span><span class='line'>&#9;return nsproxy;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>例子1：namespace pid的例子</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;errno.h&gt;
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;stdlib.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;sched.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'> 
+</span><span class='line'>static int fork_child(void *arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;int a = (int)arg;
+</span><span class='line'>&#9;int i;
+</span><span class='line'>&#9;pid_t pid;
+</span><span class='line'>&#9;char *cmd  = "ps -el;
+</span><span class='line'>&#9;printf("In the container, my pid is: %d\n", getpid());
+</span><span class='line'>&#9;/*ps命令是解析procfs的内容得到结果的，而procfs根目录的进程pid目录是基于mount当时的pid namespace的，这个在procfs的get_sb回调中体现的。因此只需要重新mount一下proc, mount -t proc proc /proc*/
+</span><span class='line'>&#9;mount("proc", "/proc", "proc", 0, "");
+</span><span class='line'>&#9;for (i = 0; i &lt;a; i++) {
+</span><span class='line'>&#9;&#9;pid = fork();
+</span><span class='line'>&#9;&#9;if (pid &lt;0)
+</span><span class='line'>&#9;&#9;&#9;return pid;
+</span><span class='line'>&#9;&#9;else if (pid)
+</span><span class='line'>&#9;&#9;&#9;printf("pid of my child is %d\n", pid);
+</span><span class='line'>&#9;&#9;else if (pid == 0) {
+</span><span class='line'>&#9;&#9;&#9;sleep(30);
+</span><span class='line'>&#9;&#9;&#9;exit(0);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;execl("/bin/bash", "/bin/bash","-c",cmd, NULL);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>int main(int argc, char *argv[])
+</span><span class='line'>{
+</span><span class='line'>&#9;int cpid;
+</span><span class='line'>&#9;void *childstack, *stack;
+</span><span class='line'>&#9;int flags;
+</span><span class='line'>&#9;int ret = 0;
+</span><span class='line'>&#9;int stacksize = getpagesize() * 4;
+</span><span class='line'>&#9;if (argc != 2) {
+</span><span class='line'>&#9;&#9;fprintf(stderr, "Wrong usage.\n");
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;stack = malloc(stacksize);
+</span><span class='line'>&#9;if(stack == NULL)
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;printf("Out of the container, my pid is: %d\n", getpid());
+</span><span class='line'>&#9;childstack = stack + stacksize;
+</span><span class='line'>&#9;flags = CLONE_NEWPID | CLONE_NEWNS;
+</span><span class='line'>&#9;cpid = clone(fork_child, childstack, flags, (void *)atoi(argv[1]));
+</span><span class='line'>&#9;printf("cpid: %d\n", cpid);
+</span><span class='line'>&#9;if (cpid &lt;0) {
+</span><span class='line'>&#9;&#9;perror("clone");
+</span><span class='line'>&#9;&#9;ret = -1;
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;fprintf(stderr, "Parent sleeping 20 seconds\n");
+</span><span class='line'>&#9;sleep(20);
+</span><span class='line'>&#9;ret = 0;
+</span><span class='line'>out:
+</span><span class='line'>&#9;free(stack);
+</span><span class='line'>&#9;return ret;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>运行结果：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>root@Ubuntu:~/c_program# ./namespace 7 
+</span><span class='line'>Out of the container, my pid is: 8684
+</span><span class='line'>cpid: 8685
+</span><span class='line'>Parent sleeping 20 seconds
+</span><span class='line'>In the container, my pid is: 1
+</span><span class='line'>pid of my child is 2
+</span><span class='line'>pid of my child is 3
+</span><span class='line'>pid of my child is 4
+</span><span class='line'>pid of my child is 5
+</span><span class='line'>pid of my child is 6
+</span><span class='line'>pid of my child is 7
+</span><span class='line'>pid of my child is 8
+</span><span class='line'>F S  UID  PID  PPID  C PRI  NI ADDR SZ WCHAN  TTY          TIME CMD
+</span><span class='line'>4 R    0    1    0  0  80  0 -  1085 -      pts/0    00:00:00 ps
+</span><span class='line'>1 S    0    2    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</span><span class='line'>1 S    0    3    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</span><span class='line'>1 S    0    4    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</span><span class='line'>1 S    0    5    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</span><span class='line'>1 S    0    6    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</span><span class='line'>1 S    0    7    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace
+</span><span class='line'>1 S    0    8    1  0  80  0 -  458 hrtime pts/0    00:00:00 namespace</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>例子2：UTS的例子</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define _GNU_SOURCE
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>#include &lt;sys/utsname.h&gt;
+</span><span class='line'>#include &lt;sched.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;stdlib.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'> 
+</span><span class='line'>#define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE); \
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;} while (0)
+</span><span class='line'> 
+</span><span class='line'>static int              /* Start function for cloned child */
+</span><span class='line'>childFunc(void *arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct utsname uts;
+</span><span class='line'>&#9;/* Change hostname in UTS namespace of child */
+</span><span class='line'>&#9;if (sethostname(arg, strlen(arg)) == -1)
+</span><span class='line'>&#9;&#9;errExit("sethostname");
+</span><span class='line'>&#9;/* Retrieve and display hostname */
+</span><span class='line'>&#9;if (uname(&uts) == -1)
+</span><span class='line'>&#9;&#9;errExit("uname");
+</span><span class='line'>&#9;printf("uts.nodename in child:  %s\n", uts.nodename);
+</span><span class='line'>&#9;/* Keep the namespace open for a while, by sleeping.
+</span><span class='line'>&#9; *              This allows some experimentation--for example, another
+</span><span class='line'>&#9; *                process might join the namespace. */
+</span><span class='line'>&#9;sleep(200);
+</span><span class='line'>&#9;return 0;          /* Child terminates now */
+</span><span class='line'>}
+</span><span class='line'>#define STACK_SIZE (1024 * 1024)    /* Stack size for cloned child */
+</span><span class='line'> 
+</span><span class='line'>int
+</span><span class='line'>main(int argc, char *argv[])
+</span><span class='line'>{
+</span><span class='line'>&#9;char *stack;            /* Start of stack buffer */
+</span><span class='line'>&#9;char *stackTop;                /* End of stack buffer */
+</span><span class='line'>&#9;pid_t pid;
+</span><span class='line'>&#9;struct utsname uts;
+</span><span class='line'>&#9;if (argc &lt; 2) {
+</span><span class='line'>&#9;&#9;fprintf(stderr, "Usage: %s &lt;child-hostname&gt;\n", argv[0]);
+</span><span class='line'>&#9;&#9;exit(EXIT_SUCCESS);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/* Allocate stack for child */
+</span><span class='line'>&#9;stack = malloc(STACK_SIZE);
+</span><span class='line'>&#9;if (stack == NULL)
+</span><span class='line'>&#9;&#9;errExit("malloc");
+</span><span class='line'>&#9;stackTop = stack + STACK_SIZE;  /* Assume stack grows downward */
+</span><span class='line'>&#9;/* Create child that has its own UTS namespace;
+</span><span class='line'>&#9; *              child commences execution in childFunc() */
+</span><span class='line'>&#9;pid = clone(childFunc, stackTop, CLONE_NEWUTS | SIGCHLD, argv[1]);
+</span><span class='line'>&#9;if (pid == -1)
+</span><span class='line'>&#9;&#9;errExit("clone");
+</span><span class='line'>&#9;printf("clone() returned %ld\n", (long) pid);
+</span><span class='line'>&#9;/* Parent falls through to here */
+</span><span class='line'>&#9;sleep(1);          /* Give child time to change its hostname */
+</span><span class='line'> 
+</span><span class='line'>&#9;/* Display hostname in parent's UTS namespace. This will be
+</span><span class='line'>&#9; *              different from hostname in child's UTS namespace. */
+</span><span class='line'> 
+</span><span class='line'>&#9;if (uname(&uts) == -1)
+</span><span class='line'>&#9;&#9;errExit("uname");
+</span><span class='line'>&#9;printf("uts.nodename in parent: %s\n", uts.nodename);
+</span><span class='line'>&#9;if (waitpid(pid, NULL, 0) == -1)    /* Wait for child */
+</span><span class='line'>&#9;&#9;errExit("waitpid");
+</span><span class='line'>&#9;printf("child has terminated\n");
+</span><span class='line'>&#9;exit(EXIT_SUCCESS);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>root@ubuntu:~/c_program# ./namespace_1 test
+</span><span class='line'>clone() returned 4101
+</span><span class='line'>uts.nodename in child:  test
+</span><span class='line'>uts.nodename in parent: ubuntu</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/08/06/namespace1/">Linux Namespaces机制</a></h2>
     
     
@@ -107,1840 +1939,6 @@ if (query != null) {
 <p>以上所有clone flag都可以一起使用，为进程提供了一个独立的运行环境。LXC正是通过在clone时设定这些flag，为进程创建一个有独立PID，IPC，FS，Network，UTS空间的container。一个container就是一个虚拟的运行环境，对container里的进程是透明的，它会以为自己是直接在一个系统上运行的。</p>
 
 <p>一个container就像传统虚拟化技术里面的一台安装了OS的虚拟机，但是开销更小，部署更为便捷。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/05/kernel-mm-malloc/">内存分配的原理--molloc/brk/mmap</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-05T15:34:00+08:00'><span class='date'>2015-08-05</span> <span class='time'>15:34:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.163.com/xychenbaihu@yeah/blog/static/132229655201210975312473/">http://blog.163.com/xychenbaihu@yeah/blog/static/132229655201210975312473/</a></p>
-
-<p>内存分配的原理__进程分配内存有两种方式，分别由两个系统调用完成：brk和mmap（不考虑共享内存）。</p>
-
-<h4>如何查看进程发生缺页中断的次数？</h4>
-
-<p>用<code>ps -o majflt,minflt -C program</code>命令查看。</p>
-
-<p>majflt代表major fault，中文名叫大错误，minflt代表minor fault，中文名叫小错误。这两个数值表示一个进程自启动以来所发生的缺页中断的次数。</p>
-
-<p>发生缺页中断后，执行了那些操作？</p>
-
-<h4>当一个进程发生缺页中断的时候，进程会陷入内核态，执行以下操作：</h4>
-
-<p>1、检查要访问的虚拟地址是否合法</p>
-
-<p>2、查找/分配一个物理页</p>
-
-<p>3、填充物理页内容（读取磁盘，或者直接置0，或者啥也不干）</p>
-
-<p>4、建立映射关系（虚拟地址到物理地址）</p>
-
-<p>重新执行发生缺页中断的那条指令</p>
-
-<p>如果第3步，需要读取磁盘，那么这次缺页中断就是majflt，否则就是minflt。</p>
-
-<h4>内存分配的原理</h4>
-
-<p>从操作系统角度来看，进程分配内存有两种方式，分别由两个系统调用完成：brk和mmap（不考虑共享内存）。</p>
-
-<p>1、brk是将数据段(.data)的最高地址指针_edata往高地址推；</p>
-
-<p>2、mmap是在进程的虚拟地址空间中（堆和栈中间，称为文件映射区域的地方）找一块空闲的虚拟内存。</p>
-
-<p>这两种方式分配的都是虚拟内存，没有分配物理内存。在第一次访问已分配的虚拟地址空间的时候，发生缺页中断，操作系统负责分配物理内存，然后建立虚拟内存和物理内存之间的映射关系。</p>
-
-<p>在标准C库中，提供了malloc/free函数分配释放内存，这两个函数底层是由brk，mmap，munmap这些系统调用实现的。</p>
-
-<h4>下面以一个例子来说明内存分配的原理：</h4>
-
-<p>情况一、malloc小于128k的内存，使用brk分配内存，将_edata往高地址推(只分配虚拟空间，不对应物理内存(因此没有初始化)，第一次读/写数据时，引起内核缺页中断，内核才分配对应的物理内存，然后虚拟地址空间建立映射关系)，如下图：</p>
-
-<p><img src="/images/kernel/2015-08-05-1.jpg" alt="" /></p>
-
-<p>1、进程启动的时候，其（虚拟）内存空间的初始布局如图1-(1)所示。</p>
-
-<p>  其中，mmap内存映射文件是在堆和栈的中间（例如libc-2.2.93.so，其它数据文件等），为了简单起见，省略了内存映射文件。</p>
-
-<p>  _edata指针（glibc里面定义）指向数据段的最高地址。</p>
-
-<p>2、进程调用A=malloc(30K)以后，内存空间如图1-(2)：</p>
-
-<p>  malloc函数会调用brk系统调用，将_edata指针往高地址推30K，就完成虚拟内存分配。</p>
-
-<p>  你可能会问：只要把_edata+30K就完成内存分配了？</p>
-
-<p>  事实是这样的，_edata+30K只是完成虚拟地址的分配，A这块内存现在还是没有物理页与之对应的，等到进程第一次读写A这块内存的时候，发生缺页中断，这个时候，内核才分配A这块内存对应的物理页。也就是说，如果用malloc分配了A这块内容，然后从来不访问它，那么，A对应的物理页是不会被分配的。</p>
-
-<p>3、进程调用B=malloc(40K)以后，内存空间如图1-(3)。</p>
-
-<p>情况二、malloc大于128k的内存，使用mmap分配内存，在堆和栈之间找一块空闲内存分配(对应独立内存，而且初始化为0)，如下图：</p>
-
-<p><img src="/images/kernel/2015-08-05-2.jpg" alt="" /></p>
-
-<p>4、进程调用C=malloc(200K)以后，内存空间如图2-(4)：</p>
-
-<p>  默认情况下，malloc函数分配内存，如果请求内存大于128K（可由M_MMAP_THRESHOLD选项调节），那就不是去推_edata指针了，而是利用mmap系统调用，从堆和栈的中间分配一块虚拟内存。</p>
-
-<p>  这样子做主要是因为::<br/>
-   brk分配的内存需要等到高地址内存释放以后才能释放（例如，在B释放之前，A是不可能释放的，这就是内存碎片产生的原因，什么时候紧缩看下面），而mmap分配的内存可以单独释放。<br/>
-   当然，还有其它的好处，也有坏处，再具体下去，有兴趣的同学可以去看glibc里面malloc的代码了。</p>
-
-<p>5、进程调用D=malloc(100K)以后，内存空间如图2-(5)；</p>
-
-<p>6、进程调用<code>free(C)</code>以后，C对应的虚拟内存和物理内存一起释放如图2-(6)。</p>
-
-<p><img src="/images/kernel/2015-08-05-3.jpg" alt="" /></p>
-
-<p>7、进程调用free(B)以后，如图3-(7)所示：</p>
-
-<p>B对应的虚拟内存和物理内存都没有释放，因为只有一个_edata指针，如果往回推，那么D这块内存怎么办呢？</p>
-
-<p>当然，B这块内存，是可以重用的，如果这个时候再来一个40K的请求，那么malloc很可能就把B这块内存返回回去了。</p>
-
-<p>8、进程调用free(D)以后，如图3-(8)所示：</p>
-
-<p>B和D连接起来，变成一块140K的空闲内存。</p>
-
-<p>9、默认情况下：</p>
-
-<p>当最高地址空间的空闲内存超过128K（可由M_TRIM_THRESHOLD选项调节）时，执行内存紧缩操作（trim）。在上一个步骤free的时候，发现最高地址空闲内存超过128K，于是内存紧缩，变成图3-(9)所示。</p>
-
-<hr />
-
-<h4>mmap 样例</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;sys/mman.h&gt;
-</span><span class='line'>#include&lt;sys/types.h&gt;
-</span><span class='line'>#include&lt;fcntl.h&gt;
-</span><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>#include&lt;unistd.h&gt;
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,j,k,l;
-</span><span class='line'>&#9;char *mp;
-</span><span class='line'>&#9;mp = (char*)mmap(NULL, 1000000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-</span><span class='line'>&#9;*mp = 'A';
-</span><span class='line'>&#9;munmap(mp, 1000000);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;sys/mman.h&gt;
-</span><span class='line'>#include&lt;sys/types.h&gt;
-</span><span class='line'>#include&lt;fcntl.h&gt;
-</span><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>#include&lt;unistd.h&gt;
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,j,k,l;
-</span><span class='line'>&#9;int fd;
-</span><span class='line'>&#9;char *mp;
-</span><span class='line'>
-</span><span class='line'>&#9;fd = open("/tmp/mmap", O_CREAT|O_RDWR, 00777);
-</span><span class='line'>&#9;lseek(fd, 100, SEEK_SET);
-</span><span class='line'>&#9;write(fd, "", 1);
-</span><span class='line'>&#9;mp = malloc(1000000);
-</span><span class='line'>&#9;mp = (char*)mmap(NULL, 100, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-</span><span class='line'>&#9;i = *mp;
-</span><span class='line'>&#9;*mp = 'A';
-</span><span class='line'>&#9;munmap(mp, 100);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/04/cgroup-docker/">CentOS 6 使用 docker</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-04T10:02:00+08:00'><span class='date'>2015-08-04</span> <span class='time'>10:02:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2014-01/95513.htm">http://www.linuxidc.com/Linux/2014-01/95513.htm</a></p>
-
-<h4>一、禁用selinux</h4>
-
-<p>由于Selinux和LXC有冲突，所以需要禁用selinux。编辑/etc/selinux/config，设置两个关键变量。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>SELINUX=disabled
-</span><span class='line'>SELINUXTYPE=targeted</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>二、配置Fedora EPEL源</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo yum install http://ftp.riken.jp/Linux/fedora/epel/6/x86_64/epel-release-6-8.noarch.rpm</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>三、添加hop5.repo源</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cd /etc/yum.repos.d
-</span><span class='line'>sudo wget http://www.hop5.in/yum/el6/hop5.repo</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>四、安装Docker</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo yum install docker-io</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="http://www.server110.com/docker/201411/11105.html">http://www.server110.com/docker/201411/11105.html</a></p>
-
-<h4>启动docker服务</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# service docker start
-</span><span class='line'>Starting cgconfig service:                                 [  OK  ]
-</span><span class='line'>Starting docker:                                           [  OK  ]</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>基本信息查看</h4>
-
-<p>docker version：查看docker的版本号，包括客户端、服务端、依赖的Go等</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker version
-</span><span class='line'>Client version: 1.0.0
-</span><span class='line'>Client API version: 1.12
-</span><span class='line'>Go version (client): go1.2.2
-</span><span class='line'>Git commit (client): 63fe64c/1.0.0
-</span><span class='line'>Server version: 1.0.0
-</span><span class='line'>Server API version: 1.12
-</span><span class='line'>Go version (server): go1.2.2
-</span><span class='line'>Git commit (server): 63fe64c/1.0.0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>docker info ：查看系统(docker)层面信息，包括管理的images, containers数等</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker info
-</span><span class='line'>Containers: 16
-</span><span class='line'>Images: 40
-</span><span class='line'>Storage Driver: devicemapper
-</span><span class='line'> Pool Name: docker-253:0-1183580-pool
-</span><span class='line'> Data file: /var/lib/docker/devicemapper/devicemapper/data
-</span><span class='line'> Metadata file: /var/lib/docker/devicemapper/devicemapper/metadata
-</span><span class='line'> Data Space Used: 2180.4 Mb
-</span><span class='line'> Data Space Total: 102400.0 Mb
-</span><span class='line'> Metadata Space Used: 3.4 Mb
-</span><span class='line'> Metadata Space Total: 2048.0 Mb
-</span><span class='line'>Execution Driver: lxc-0.9.0
-</span><span class='line'>Kernel Version: 2.6.32-431.el6.x86_64</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>5 镜像的获取与容器的使用</h4>
-
-<p>镜像可以看作是包含有某些软件的容器系统，比如ubuntu就是一个官方的基础镜像，很多镜像都是基于这个镜像“衍生”，该镜像包含基本的ubuntu系统。再比如，hipache是一个官方的镜像容器，运行后可以支持http和websocket的代理服务，而这个镜像本身又基于ubuntu。</p>
-
-<p>搜索镜像</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker search &lt;image&gt;：在docker index中搜索image</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker search ubuntu12.10
-</span><span class='line'>NAME                        DESCRIPTION                                     STARS     OFFICIAL   AUTOMATED
-</span><span class='line'>mirolin/ubuntu12.10                                                         0
-</span><span class='line'>marcgibbons/ubuntu12.10                                                     0
-</span><span class='line'>mirolin/ubuntu12.10_redis                                                   0
-</span><span class='line'>chug/ubuntu12.10x32         Ubuntu Quantal Quetzal 12.10 32bit  base i...   0
-</span><span class='line'>chug/ubuntu12.10x64         Ubuntu Quantal Quetzal 12.10 64bit  base i...   0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下载镜像</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker pull &lt;image&gt; ：从docker registry server 中下拉image</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker pull chug/ubuntu12.10x64</span></code></pre></td></tr></table></div></figure>
-
-
-<p>查看镜像</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker images： 列出images
-</span><span class='line'>docker images -a ：列出所有的images（包含历史）
-</span><span class='line'>docker images --tree ：显示镜像的所有层(layer)
-</span><span class='line'>docker rmi  &lt;image ID&gt;： 删除一个或多个image</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用镜像创建容器</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker run chug/ubuntu12.10x64  /bin/echo hello world
-</span><span class='line'>hello world</span></code></pre></td></tr></table></div></figure>
-
-
-<p>交互式运行</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker run -i -t chug/ubuntu12.10x64  /bin/bash
-</span><span class='line'>root@2161509ff65e:/#</span></code></pre></td></tr></table></div></figure>
-
-
-<p>运行Container</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ docker run --name shell -i -t chug/ubuntu12.10x64 /bin/bash 
-</span><span class='line'>
-</span><span class='line'>$ docker run -t -i efd1e7457182 /bin/bash </span></code></pre></td></tr></table></div></figure>
-
-
-<p>两个参数，-t表示给容器tty终端，-i表示可以interactive，可以交互。</p>
-
-<p>查看容器</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker ps ：列出当前所有正在运行的container
-</span><span class='line'>docker ps -l ：列出最近一次启动的container
-</span><span class='line'>docker ps -a ：列出所有的container（包含历史，即运行过的container）
-</span><span class='line'>docker ps -q ：列出最近一次运行的container ID</span></code></pre></td></tr></table></div></figure>
-
-
-<p>再次启动容器</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker start/stop/restart &lt;container&gt; ：开启/停止/重启container
-</span><span class='line'>docker start [container_id] ：再次运行某个container （包括历史container）
-</span><span class='line'>docker attach [container_id] ：连接一个正在运行的container实例（即实例必须为start状态，可以多个窗口同时attach 一个container实例）
-</span><span class='line'>docker start -i &lt;container&gt; ：启动一个container并进入交互模式（相当于先start，在attach）
-</span><span class='line'>
-</span><span class='line'>docker run -i -t &lt;image&gt; /bin/bash ：使用image创建container并进入交互模式, login shell是/bin/bash
-</span><span class='line'>docker run -i -t -p &lt;host_port:contain_port&gt; ：映射 HOST 端口到容器，方便外部访问容器内服务，host_port 可以省略，省略表示把 container_port 映射到一个动态端口。
-</span><span class='line'>注：使用start是启动已经创建过得container，使用run则通过image开启一个新的container。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>删除容器</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker rm &lt;container...&gt; ：删除一个或多个container
-</span><span class='line'>docker rm `docker ps -a -q` ：删除所有的container
-</span><span class='line'>docker ps -a -q | xargs docker rm ：同上, 删除所有的container</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>6 持久化容器与镜像</h4>
-
-<h5>6.1 通过容器生成新的镜像</h5>
-
-<p>运行中的镜像称为容器。你可以修改容器（比如删除一个文件），但这些修改不会影响到镜像。不过，你使用docker commit <container-id> <image-name>命令可以把一个正在运行的容器变成一个新的镜像。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker commit &lt;container&gt; [repo:tag] 将一个container固化为一个新的image，后面的repo:tag可选。</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker images
-</span><span class='line'>REPOSITORY            TAG                 IMAGE ID            CREATED             VIRTUAL SIZE
-</span><span class='line'>chug/ubuntu12.10x64   latest              0b96c14dafcd        4 months ago        270.3 MB
-</span><span class='line'>[root@localhost /]# docker commit d0fd23b8d3ac chug/ubuntu12.10x64_2
-</span><span class='line'>daa11948e23d970c18ad89c9e5d8972157fb6f0733f4742db04219b9bb6d063b
-</span><span class='line'>[root@localhost /]# docker images
-</span><span class='line'>REPOSITORY              TAG                 IMAGE ID            CREATED             VIRTUAL SIZE
-</span><span class='line'>chug/ubuntu12.10x64_2   latest              daa11948e23d        6 seconds ago       270.3 MB
-</span><span class='line'>chug/ubuntu12.10x64     latest              0b96c14dafcd        4 months ago        270.3 MB</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>6.2 持久化容器</h5>
-
-<p>export命令用于持久化容器</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker export &lt;CONTAINER ID&gt; &gt; /tmp/export.tar</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>6.3 持久化镜像</h5>
-
-<p>Save命令用于持久化镜像</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker save 镜像ID &gt; /tmp/save.tar</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>6.4 导入持久化container</h5>
-
-<p>删除container 2161509ff65e</p>
-
-<p>导入export.tar文件</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# cat /tmp/export.tar | docker import - export:latest
-</span><span class='line'>af19a55ff0745fb0a68655392d6d7653c29460d22d916814208bbb9626183aaa
-</span><span class='line'>[root@localhost /]# docker images
-</span><span class='line'>REPOSITORY              TAG                 IMAGE ID            CREATED             VIRTUAL SIZE
-</span><span class='line'>export                  latest              af19a55ff074        34 seconds ago      270.3 MB
-</span><span class='line'>chug/ubuntu12.10x64_2   latest              daa11948e23d        20 minutes ago      270.3 MB
-</span><span class='line'>chug/ubuntu12.10x64     latest              0b96c14dafcd        4 months ago        270.3 MB</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>6.5 导入持久化image</h5>
-
-<p>删除image daa11948e23d</p>
-
-<p>导入save.tar文件</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker load &lt; /tmp/save.tar</span></code></pre></td></tr></table></div></figure>
-
-
-<p>对image打tag</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost /]# docker tag daa11948e23d load:tag</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>6.6 export-import与save-load的区别</h5>
-
-<p>导出后再导入(export-import)的镜像会丢失所有的历史，而保存后再加载（save-load）的镜像没有丢失历史和层(layer)。这意味着使用导出后再导入的方式，你将无法回滚到之前的层(layer)，同时，使用保存后再加载的方式持久化整个镜像，就可以做到层回滚。（可以执行docker tag <LAYER ID> <IMAGE NAME>来回滚之前的层）。</p>
-
-<h5>6.7 一些其它命令</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker logs $CONTAINER_ID #查看docker实例运行日志，确保正常运行
-</span><span class='line'>docker inspect $CONTAINER_ID #docker inspect &lt;image|container&gt; 查看image或container的底层信息
-</span><span class='line'>
-</span><span class='line'>docker build &lt;path&gt; 寻找path路径下名为的Dockerfile的配置文件，使用此配置生成新的image
-</span><span class='line'>docker build -t repo[:tag] 同上，可以指定repo和可选的tag
-</span><span class='line'>docker build - &lt; &lt;dockerfile&gt; 使用指定的dockerfile配置文件，docker以stdin方式获取内容，使用此配置生成新的image
-</span><span class='line'>docker port &lt;container&gt; &lt;container port&gt; 查看本地哪个端口映射到container的指定端口，其实用docker ps 也可以看到</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>7 一些使用技巧</h4>
-
-<h5>7.1 docker文件存放目录</h5>
-
-<p>Docker实际上把所有东西都放到/var/lib/docker路径下了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost docker]# ls -F
-</span><span class='line'>containers/  devicemapper/  execdriver/  graph/  init/  linkgraph.db  repositories-devicemapper  volumes/</span></code></pre></td></tr></table></div></figure>
-
-
-<p>containers目录当然就是存放容器（container）了，graph目录存放镜像，文件层（file system layer）存放在graph/imageid/layer路径下，这样我们就可以看看文件层里到底有哪些东西，利用这种层级结构可以清楚的看到文件层是如何一层一层叠加起来的。</p>
-
-<h5>7.2  查看root密码</h5>
-
-<p>docker容器启动时的root用户的密码是随机分配的。所以，通过这种方式就可以得到容器的root用户的密码了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>docker logs 5817938c3f6e 2&gt;&1 | grep 'User: ' | tail -n1</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="http://www.tuicool.com/articles/7V7vYn">http://www.tuicool.com/articles/7V7vYn</a></p>
-
-<h3>Docker常用命令</h3>
-
-<h4>1. 查看docker信息（version、info）</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 查看docker版本
-</span><span class='line'>$docker version
-</span><span class='line'>
-</span><span class='line'># 显示docker系统的信息
-</span><span class='line'>$docker info</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. 对image的操作（search、pull、images、rmi、history）</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 检索image
-</span><span class='line'>$docker search image_name
-</span><span class='line'>
-</span><span class='line'># 下载image
-</span><span class='line'>$docker pull image_name
-</span><span class='line'>
-</span><span class='line'># 列出镜像列表; -a, --all=false Show all images; --no-trunc=false Don't truncate output; -q, --quiet=false Only show numeric IDs
-</span><span class='line'>$docker images
-</span><span class='line'>
-</span><span class='line'># 删除一个或者多个镜像; -f, --force=false Force; --no-prune=false Do not delete untagged parents
-</span><span class='line'>$docker rmi image_name
-</span><span class='line'>
-</span><span class='line'># 显示一个镜像的历史; --no-trunc=false Don't truncate output; -q, --quiet=false Only show numeric IDs
-</span><span class='line'>$docker history image_name</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3. 启动容器（run）</h4>
-
-<p>docker容器可以理解为在沙盒中运行的进程。这个沙盒包含了该进程运行所必须的资源，包括文件系统、系统类库、shell 环境等等。但这个沙盒默认是不会运行任何程序的。你需要在沙盒中运行一个进程来启动某一个容器。这个进程是该容器的唯一进程，所以当该进程结束的时候，容器也会完全的停止。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 在容器中运行"echo"命令，输出"hello word"
-</span><span class='line'>$docker run image_name echo "hello word"
-</span><span class='line'>
-</span><span class='line'># 交互式进入容器中
-</span><span class='line'>$docker run -i -t image_name /bin/bash
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'># 在容器中安装新的程序
-</span><span class='line'>$docker run image_name apt-get install -y app_name</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Note：  在执行apt-get 命令的时候，要带上-y参数。如果不指定-y参数的话，apt-get命令会进入交互模式，需要用户输入命令来进行确认，但在docker环境中是无法响应这种交互的。apt-get 命令执行完毕之后，容器就会停止，但对容器的改动不会丢失。</p>
-
-<h4>4. 查看容器（ps）</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 列出当前所有正在运行的container
-</span><span class='line'>$docker ps
-</span><span class='line'># 列出所有的container
-</span><span class='line'>$docker ps -a
-</span><span class='line'># 列出最近一次启动的container
-</span><span class='line'>$docker ps -l</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>5. 保存对容器的修改（commit）</h4>
-
-<p>当你对某一个容器做了修改之后（通过在容器中运行某一个命令），可以把对容器的修改保存下来，这样下次可以从保存后的最新状态运行该容器。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 保存对容器的修改; -a, --author="" Author; -m, --message="" Commit message
-</span><span class='line'>$docker commit ID new_image_name</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Note：  image相当于类，container相当于实例，不过可以动态给实例安装新软件，然后把这个container用commit命令固化成一个image。</p>
-
-<h4>6. 对容器的操作（rm、stop、start、kill、logs、diff、top、cp、restart、attach）</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 删除所有容器
-</span><span class='line'>$docker rm `docker ps -a -q`
-</span><span class='line'>
-</span><span class='line'># 删除单个容器; -f, --force=false; -l, --link=false Remove the specified link and not the underlying container; -v, --volumes=false Remove the volumes associated to the container
-</span><span class='line'>$docker rm Name/ID
-</span><span class='line'>
-</span><span class='line'># 停止、启动、杀死一个容器
-</span><span class='line'>$docker stop Name/ID
-</span><span class='line'>$docker start Name/ID
-</span><span class='line'>$docker kill Name/ID
-</span><span class='line'>
-</span><span class='line'># 从一个容器中取日志; -f, --follow=false Follow log output; -t, --timestamps=false Show timestamps
-</span><span class='line'>$docker logs Name/ID
-</span><span class='line'>
-</span><span class='line'># 列出一个容器里面被改变的文件或者目录，list列表会显示出三种事件，A 增加的，D 删除的，C 被改变的
-</span><span class='line'>$docker diff Name/ID
-</span><span class='line'>
-</span><span class='line'># 显示一个运行的容器里面的进程信息
-</span><span class='line'>$docker top Name/ID
-</span><span class='line'>
-</span><span class='line'># 从容器里面拷贝文件/目录到本地一个路径
-</span><span class='line'>$docker cp Name:/container_path to_path
-</span><span class='line'>$docker cp ID:/container_path to_path
-</span><span class='line'>
-</span><span class='line'># 重启一个正在运行的容器; -t, --time=10 Number of seconds to try to stop for before killing the container, Default=10
-</span><span class='line'>$docker restart Name/ID
-</span><span class='line'>
-</span><span class='line'># 附加到一个运行的容器上面; --no-stdin=false Do not attach stdin; --sig-proxy=true Proxify all received signal to the process
-</span><span class='line'>$docker attach ID</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Note： attach命令允许你查看或者影响一个运行的容器。你可以在同一时间attach同一个容器。你也可以从一个容器中脱离出来，是从CTRL-C。</p>
-
-<h4>7. 保存和加载镜像（save、load）</h4>
-
-<p>当需要把一台机器上的镜像迁移到另一台机器的时候，需要保存镜像与加载镜像。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 保存镜像到一个tar包; -o, --output="" Write to an file
-</span><span class='line'>$docker save image_name -o file_path
-</span><span class='line'># 加载一个tar包格式的镜像; -i, --input="" Read from a tar archive file
-</span><span class='line'>$docker load -i file_path
-</span><span class='line'>
-</span><span class='line'># 机器a
-</span><span class='line'>$docker save image_name &gt; /home/save.tar
-</span><span class='line'># 使用scp将save.tar拷到机器b上，然后：
-</span><span class='line'>$docker load &lt; /home/save.tar</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>8、 登录registry server（login）</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 登陆registry server; -e, --email="" Email; -p, --password="" Password; -u, --username="" Username
-</span><span class='line'>$docker login</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>9. 发布image（push）</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 发布docker镜像
-</span><span class='line'>$docker push new_image_name</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>10.  根据Dockerfile 构建出一个容器</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#build
-</span><span class='line'>&#9;  --no-cache=false Do not use cache when building the image
-</span><span class='line'>&#9;  -q, --quiet=false Suppress the verbose output generated by the containers
-</span><span class='line'>&#9;  --rm=true Remove intermediate containers after a successful build
-</span><span class='line'>&#9;  -t, --tag="" Repository name (and optionally a tag) to be applied to the resulting image in case of success
-</span><span class='line'>$docker build -t image_name Dockerfile_path</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/04/cgroup-lxc/">CentOS 6 使用 LXC</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-04T09:41:00+08:00'><span class='date'>2015-08-04</span> <span class='time'>09:41:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://purplegrape.blog.51cto.com/1330104/1343766/">http://purplegrape.blog.51cto.com/1330104/1343766/</a></p>
-
-<p>LXC 自kernel 2.6.27 加入linux 内核，依赖Linux 内核的cgroup和namespace功能而实现，非常轻量级，设计用于操作系统内部应用级别的隔离。</p>
-
-<p>不同于vmware，kvm等虚拟化技术，它是一种类似chroot的容器技术，非常的轻量级。</p>
-
-<p>与传统的硬件虚拟化技术相比有以下优势：</p>
-
-<p>a、更小的虚拟化开销。Linux内核本身是一个很好的硬件资源调度器，LXC的诸多特性基本由内核提供，而内核实现这些特性只有极少的花费，CPU，内存，硬盘都是直接使用。</p>
-
-<p>b、更快的启动速度。lxc容器技术将操作系统抽象到了一个新的高度。直接从init启动，省去了硬件自检、grub引导、加载内核、加载驱动等传统启动项目，因此启动飞速。</p>
-
-<p>c、更快速的部署。lxc与带cow特性的后端文件系统相结合，一旦建好了模板，利用快照功能，半秒钟即可实现克隆一台lxc虚拟机。LXC虚拟机本质上只是宿主机上的一个目录，这也为备份和迁移提供了极大便利。</p>
-
-<p>d、更高内存使用效率。普通虚拟机一般会独占一段内存，即使闲置，其他虚拟机也无法使用，例如KVM。而容器可以只有一个内存上限，没有下限。如果它只使用1MB内存，那么它只占用宿主机1MB内存。宿主机可以将富余内存作为他用。</p>
-
-<p>LXC 目前已经比较成熟，官方在2014年2月推出1.0版本后就开始了长期维护，目前最新版本已经是1.07，CentOS 从6.5 开始支持LXC技术。</p>
-
-<p>将LXC投入生产环境完全没有问题，因为LXC并不是什么新技术，而是重新聚合了已经成熟了的技术。</p>
-
-<p>环境CentOS 6.5 x64</p>
-
-<h4>1、安装LXC</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install libcgroup lxc lxc-templates --enablerepo=epel
-</span><span class='line'>/etc/init.d/cgconfig start
-</span><span class='line'>/etc/init.d/lxc start</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2、检查环境</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-checkconfig</span></code></pre></td></tr></table></div></figure>
-
-
-<p>输出如下即是OK</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Kernel configuration not found at /proc/config.gz; searching...
-</span><span class='line'>Kernel configuration found at /boot/config-2.6.32-431.1.2.0.1.el6.x86_64
-</span><span class='line'>--- Namespaces ---
-</span><span class='line'>Namespaces: enabled
-</span><span class='line'>Utsname namespace: enabled
-</span><span class='line'>Ipc namespace: enabled
-</span><span class='line'>Pid namespace: enabled
-</span><span class='line'>User namespace: enabled
-</span><span class='line'>Network namespace: enabled
-</span><span class='line'>Multiple /dev/ptsinstances: enabled
-</span><span class='line'>--- Control groups---
-</span><span class='line'>Cgroup: enabled
-</span><span class='line'>Cgroup namespace: enabled
-</span><span class='line'>Cgroup device: enabled
-</span><span class='line'>Cgroup sched: enabled
-</span><span class='line'>Cgroup cpu account: enabled
-</span><span class='line'>Cgroup memory controller: enabled
-</span><span class='line'>Cgroup cpuset: enabled
-</span><span class='line'>--- Misc ---
-</span><span class='line'>Veth pair device: enabled
-</span><span class='line'>Macvlan: enabled
-</span><span class='line'>Vlan: enabled
-</span><span class='line'>File capabilities: enabled
-</span><span class='line'>Note : Before booting a new kernel, you can check its configuration
-</span><span class='line'>usage : CONFIG=/path/to/config/usr/bin/lxc-checkconfig</span></code></pre></td></tr></table></div></figure>
-
-
-<p>/usr/share/lxc/templates/ 自带了常用的模板可供选择，debian/ubuntu,centos/redhat 都有。</p>
-
-<h4>3、使用模板安装一个centos 6 虚拟机</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-create -n vm01 -t centos</span></code></pre></td></tr></table></div></figure>
-
-
-<p>或者</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-create -n vm01 -t download -- -d centos -r 6 -a amd64</span></code></pre></td></tr></table></div></figure>
-
-
-<p>安装后，虚拟机默认位于/var/lib/lxc/vm01/rootfs，配置文件为/var/lib/lxc/vm01/config</p>
-
-<p>a、如果你系统里恰好有个lvm VG 名字叫做lxc，那么lxc会识别到，加上一个参数 -B lvm，创建的虚拟机配置文件依然是/var/lib/lxc/vm01/config，但是lxc镜像会在/dev/lxc/vm01 这个LV 上 （默认500M大小）；</p>
-
-<p>示例：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-create -n vm01 -t centos -B lvm --thinpool --fssize 250G --fstype xfs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的命令将会在lvm上创建一个lv，名为vm01，最大容量250G（因为加了thinpool参数，用多少占多少），文件系统是xfs。</p>
-
-<p>b、如果你的/var 单独分区，恰好使用的是btrfs文件系统，lxc也会识别，创建lxc容器时自动创建子卷，并将容器镜像放在里面；</p>
-
-<h4>4、lxc容器</h4>
-
-<p>打开lxc容器并进入开机console，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-start -n vm01</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在后台运行虚拟机，并通过console连接过去 (使用ctrl+a+q退出console)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-start -n vm01 -d
-</span><span class='line'>lxc-console -n vm01</span></code></pre></td></tr></table></div></figure>
-
-
-<p>直接连上虚拟机，不需要密码，连上后passwd设置root密码</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-attach -n vm01</span></code></pre></td></tr></table></div></figure>
-
-
-<p>查看lxc容器相关信息(名称、是否在运行、PID，CPU使用、IO使用、内存使用、IP地址、网络吞吐量)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-info -n vm01</span></code></pre></td></tr></table></div></figure>
-
-
-<p>监视lxc容器的资源使用</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-top</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>5、配置虚拟机网络，</h4>
-
-<p>新版lxc自带一个桥接lxcbr0 (10.0.3.1)，物理网卡通过NAT桥接到lxcbr0 ，网段为10.0.3.0/24。</p>
-
-<p>如果上面新创建的虚拟机启动失败，很可能是lxcbr0 没有启动。</p>
-
-<p>编辑文件/var/lib/lxc/vm01/config，确保文件包含一下内容</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type= veth
-</span><span class='line'>lxc.network.link = lxcbr0
-</span><span class='line'>lxc.network.flags = up
-</span><span class='line'>lxc.network.name = eth0
-</span><span class='line'>lxc.network.ipv4 = 10.0.3.2/24
-</span><span class='line'>lxc.network.ipv4.gateway = 10.0.3.1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果需要第二块网卡，则继续在/var/lib/lxc/vm01/config添加一组配置</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type = veth
-</span><span class='line'>lxc.network.link = lxcbr0
-</span><span class='line'>lxc.network.flags = up
-</span><span class='line'>lxc.network.name = eth1
-</span><span class='line'>lxc.network.ipv4 = 10.0.3.3/24</span></code></pre></td></tr></table></div></figure>
-
-
-<p>虚拟机网络默认由dnsmasq分配，如果没有在lxc中指定，则由虚拟机内部dhcp获得。</p>
-
-<p>veth依赖网卡桥接，且可以与任何机器（宿主机，其他虚拟机，局域网其他机器）通讯。</p>
-
-<p>在网络层，可以采取下面的方式加固安全：</p>
-
-<p>如果要隔绝虚拟机与宿主机的通讯（虚拟机之间可以通信，与局域网其他机器也可以通信），网卡可选择macvlan中的bridge模式</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type = macvlan
-</span><span class='line'>lxc.network.macvlan.mode = bridge
-</span><span class='line'>lxc.network.flags = up
-</span><span class='line'>lxc.network.link = eth0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果要进一步隔离同一宿主机上不同虚拟机之间的通讯（仅可与局域网其他机器通信），网卡还要选择macvlan中的vepa模式</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type = macvlan
-</span><span class='line'>lxc.network.macvlan.mode = vepa
-</span><span class='line'>lxc.network.flags = up
-</span><span class='line'>lxc.network.link = eth0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面是三种特殊的网络</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type = none</span></code></pre></td></tr></table></div></figure>
-
-
-<p>none表示停用网络空间的namespace，复用宿主机的网络。</p>
-
-<p>据说关闭容器也会关闭宿主机，ubuntu phone通过lxc里的安卓容器，使用网络复用达到兼容安卓应用的目的。（个人没有测试通过）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type = empty</span></code></pre></td></tr></table></div></figure>
-
-
-<p>empty表示容器没有网卡，仅有一个回环lo，无法通过网络层与外部通信。用于某些特殊的场合。比如将宿主机的某个图片目录挂载到容器里，容器利用有限的资源对图片进行处理，如果放在宿主机上处理，图片处理占用的资源可能不好控制，影响整体性能。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc.network.type = vlan</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这种模式需要上联的物理交换机支持，用不同的vlan id 隔离容器与宿主机之间的通信。</p>
-
-<h4>6、控制虚拟机的资源</h4>
-
-<p>虚拟机默认与宿主机共享硬件资源，CPU，内存，IO等，也可以用cgroup实现资源隔离。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#设置虚拟机只使用0，1两个CPU核心
-</span><span class='line'>lxc-cgroup -n centos cpuset.cpus 0,1
-</span><span class='line'>#设置虚拟机可用内存为512M
-</span><span class='line'>lxc-cgroup -n centos memory.limit_in_bytes 536870912
-</span><span class='line'>#设置虚拟机消耗的CPU时间
-</span><span class='line'> lxc-cgroup -n centos cpu.shares 256
-</span><span class='line'>#设置虚拟机消耗的IO权重
-</span><span class='line'> lxc-cgroup -n centos blkio.weight 500</span></code></pre></td></tr></table></div></figure>
-
-
-<p>另一种限制资源的方法是将具体的限制写入虚拟机的配置文件，可选的参数如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#设置虚拟机只使用0，1两个CPU核心
-</span><span class='line'>lxc.cgroup.cpuset.cpus  = 0,1
-</span><span class='line'>#设置虚拟机消耗的CPU时间
-</span><span class='line'>lxc.cgroup.cpu.shares  = 256
-</span><span class='line'>#设置虚拟机可用内存为512M
-</span><span class='line'>lxc.cgroup.memory.limit_in_bytes = 512M
-</span><span class='line'>#限制虚拟机可用的内存和swap空间一共1G
-</span><span class='line'>lxc.cgroup.memory.memsw.limit_in_bytes = 1G
-</span><span class='line'>#设置虚拟机可使用的IO权重
-</span><span class='line'>lxc.cgroup.blkio.weight=500</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>7、安装ubuntu 12.04</h4>
-
-<p>LXC强大到有点变态，在centos上运行ubuntu？没错，因为内核对于LInux发行版来说是通用的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-create -n ubuntu -t ubuntu -- -r precise</span></code></pre></td></tr></table></div></figure>
-
-
-<p>或者加上MIRROR参数（仅适用于ubuntu，用于选择较近的软件源）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>MIRROR="http://cn.archive.ubuntu.com/ubuntu"  lxc-create -n ubuntu-test -t ubuntu -- -r precise</span></code></pre></td></tr></table></div></figure>
-
-
-<p>点到为止，不深入。</p>
-
-<h4>8、容器克隆</h4>
-
-<p>你可以创建一个标准化的lxc容器作为模板，然后对它进行克隆，避免重新安装，实现横向扩展和环境的标准化。下面以基于lvm卷的容器为例</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-clone vm01 webserver01 -B lvm</span></code></pre></td></tr></table></div></figure>
-
-
-<p>克隆后的容器，是一个独立的lvm逻辑卷，默认与原来的大小一致（也可以指定大小），仅仅会改变mac地址和主机名。</p>
-
-<p>如果你想节约空间，克隆时带上 -s （&ndash;snapshot） 参数，可以创建一个源容器的可读写快照，它几乎不占用空间，使得在一个机器上运行成百上千个容器成为可能，仅支持lvm和btrfs，因为它们都有cow功能 。-L 参数可以指定快照的大小。更多参数详见 man lxc-clone 。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-clone vm01 webserver01 -s -B lvm</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>9、lxc容器的系统安全</h4>
-
-<p>lxc容器里的系统完全可以不需要用到root密码和ssh，可以设置空密码或者超级长的密码，openssh服务可以不必启动甚至不必安装。因为从宿主机运行下面的命令可以直接获得root shell，相当于chroot</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lxc-attach -n webserver01</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果是应用容器，则更简单，因为容器里只有应用进程，比如httpd，连init 都木有。具体实现参考模板lxc-sshd 。</p>
-
-<p>lxc 1.0还支持非特权容器，利用uidmap映射技术，将容器里的root映射为宿主机上的普通用户，允许以普通用户身份运行LXC容器，大大提高了宿主机的安全性。</p>
-
-<p>使用方法省略，见我的另一篇文章。《ubuntu 14.04 体验LXC非特权容器》</p>
-
-<p><a href="http://purplegrape.blog.51cto.com/1330104/1528503">http://purplegrape.blog.51cto.com/1330104/1528503</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/03/kernel-base-relay/">relay 数据传输</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-03T16:39:00+08:00'><span class='date'>2015-08-03</span> <span class='time'>16:39:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://www.ibm.com/developerworks/cn/linux/l-cn-relay/">https://www.ibm.com/developerworks/cn/linux/l-cn-relay/</a></p>
-
-<h4>Relay 要解决的问题</h4>
-
-<p>对于任何在内核工作的程序而言，如何把大量的调试信息从内核空间传输到用户空间都是一个大麻烦，对于运行中的内核更是如此。特别是对于哪些用于调试内核性能的工具，更是如此。</p>
-
-<p>对于这种大量数据需要在内核中缓存并传输到用户空间需求，很多传统的方法都已到达了极限，例如内核程序员很熟悉的 printk() 调用。此外，如果不同的内核子系统都开发自己的缓存和传输代码，造成很大的代码冗余，而且也带来维护上的困难。</p>
-
-<p>这些，都要求开发一套能够高效可靠地将数据从内核空间转发到用户空间的系统，而且这个系统应该独立于各个调试子系统。</p>
-
-<p>这样就诞生了 RelayFS。</p>
-
-<h4>Relay的发展历史</h4>
-
-<p>Relay 的前身是 RelayFS，即作为 Linux 的一个新型文件系统。2003年3月，RelayFS的第一个版本的代码被开发出来，在7月14日，第一个针对2.6内核的版本也开始提供下载。经过广泛的试用和改进，直到2005年9月，RelayFS才被加入mainline内核(2.6.14)。同时，RelayFS也被移植到2.4内核中。在2006年2月，从2.6.17开始，RelayFS不再作为单独的文件系统存在，而是成为内核的一部分。它的源码也从fs/目录下转移到kernel/relay.c中，名称中也从RelayFS改成了Relay。</p>
-
-<p>RelayFS目前已经被越来越多的内核工具使用，包括内核调试工具SystemTap、LTT，以及一些特殊的文件系统例如DebugFS。</p>
-
-<h4>Relay的基本原理</h4>
-
-<p>总的说来，Relay提供了一种机制，使得内核空间的程序能够通过用户定义的relay通道(channel)将大量数据高效的传输到用户空间。</p>
-
-<p>一个relay通道由一组和CPU一一对应的内核缓冲区组成。这些缓冲区又被称为relay缓冲区(buffer)，其中的每一个在用户空间都用一个常规文件来表示，这被叫做relay文件(file)。内核空间的用户可以利用relay提供的API接口来写入数据，这些数据会被自动的写入当前的CPU id对应的那个relay缓冲区；同时，这些缓冲区从用户空间看来，是一组普通文件，可以直接使用read()进行读取，也可以使用mmap()进行映射。Relay并不关心数据的格式和内容，这些完全依赖于使用relay的用户程序。Relay的目的是提供一个足够简单的接口，从而使得基本操作尽可能的高效。</p>
-
-<p>Relay将数据的读和写分离，使得突发性大量数据写入的时候，不需要受限于用户空间相对较慢的读取速度，从而大大提高了效率。Relay作为写入和读取的桥梁，也就是将内核用户写入的数据缓存并转发给用户空间的程序。这种转发机制也正是Relay这个名称的由来。</p>
-
-<p>下面这个图给出了Relay的基本结构和典型操作：</p>
-
-<p><img src="/images/kernel/2015-08-03.png" alt="" /></p>
-
-<p>Relay的基本结构和典型操作</p>
-
-<p>可以看到，这里的relay通道由四个relay缓冲区(kbuf0到kbuf3)组成，分别对应于系统中的cpu0到cpu1。每个CPU上的代码调用relay_write()的时候将数据写入自己对应的relay缓冲区内。每个relay缓冲区称一个relay文件，即/cpu0到/cpu3。当文件系统被mount到/mnt/以后，这个relay文件就被映射成映射到用户空间的地址空间。一旦数据可用，用户程序就可以把它的数据读出来写入到硬盘上的文件中，即cpu0.out到cpu3.out。</p>
-
-<h4>Relay的主要API</h4>
-
-<p>前面提到的 relay_write() 就是 relay API 之一。除此以外，Relay 还提供了更多的 API来支持用户程序完整的使用 relay。这些 API，主要按照面向用户空间和面向内核空间分为两大类，下面我们来分别进行介绍。</p>
-
-<h5>面向用户空间的 API</h5>
-
-<p>这些 Relay 编程接口向用户空间程序提供了访问 relay 通道缓冲区数据的基本操作的入口，包括：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>open() - 允许用户打开一个已经存在的通道缓冲区
-</span><span class='line'>mmap() - 使通道缓冲区被映射到位于用户空间的调用者的地址空间。要特别注意的是，我们不能仅对局部区域进行映射。也就是说，必须映射整个缓冲区文件，其大小是 CPU的个数和单个 CPU 缓冲区大小的乘积
-</span><span class='line'>read() - 读取通道缓冲区的内容。这些数据一旦被读出，就意味着他们被用户空间的程序消费掉了，也就不能被之后的读操作看到
-</span><span class='line'>sendfile() - 将数据从通道缓冲区传输到一个输出文件描述符。其中可能的填充字符会被自动去掉，不会被用户看到
-</span><span class='line'>poll() - 支持 POLLIN/POLLRDNORM/POLLERR 信号。每次子缓冲区的边界被越过时，等待着的用户空间程序会得到通知
-</span><span class='line'>close() - 将通道缓冲区的引用数减1。当引用数减为0时，表明没有进程或者内核用户需要打开它，从而这个通道缓冲区被释放。</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>面向内核空间的 API</h5>
-
-<p>这些API接口向位于内核空间的用户提供了管理relay通道、数据写入等功能。下面介绍其中主要的部分，完整的API接口列表请参见这里。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>relay_open() - 创建一个relay通道，包括创建每个CPU对应的relay缓冲区。
-</span><span class='line'>relay_close() - 关闭一个relay通道，包括释放所有的relay缓冲区，在此之前会调用relay_switch()来处理这些relay缓冲区以保证已读取但是未满的数据不会丢失
-</span><span class='line'>relay_write() - 将数据写入到当前CPU对应的relay缓冲区内。由于它使用了local_irqsave()保护，因此也可以在中断上下文中使用。
-</span><span class='line'>relay_reserve() - 在relay通道中保留一块连续的区域来留给未来的写入操作。这通常用于那些希望直接写入到relay缓冲区的用户。考虑到性能或者其它因素，这些用户不希望先把数据写到一个临时缓冲区中，然后再通过relay_write()进行写入。</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>Relay的例子</h4>
-
-<p>我们用一个最简单的例子来介绍怎么使用Relay。这个例子由两部分组成：一部分是位于内核空间将数据写入relay文件的程序，使用时需要作为一个内核模块被加载；另一部分是位于用户空间从relay文件中读取数据的程序，使用时作为普通用户态程序运行。</p>
-
-<p>内核空间的程序主要操作是：<br/>
-  加载模块时，打开一个relay通道，并且往打开的relay通道中写入消息；<br/>
-  卸载模块时，关闭relay通道。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/relay.h&gt;
-</span><span class='line'>#include &lt;linux/debugfs.h&gt;
-</span><span class='line'>
-</span><span class='line'>static struct dentry *create_buf_file_handler(const char *filename, struct dentry *parent, int mode, struct rchan_buf *buf, int *is_global)
-</span><span class='line'>{
-</span><span class='line'>&#9;return debugfs_create_file(filename, mode, parent, buf, &relay_file_operations);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static int remove_buf_file_handler(struct dentry *dentry)
-</span><span class='line'>{
-</span><span class='line'>&#9;debugfs_remove(dentry);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static struct rchan_callbacks relay_callbacks =
-</span><span class='line'>{
-</span><span class='line'>&#9;.create_buf_file = create_buf_file_handler,
-</span><span class='line'>&#9;.remove_buf_file = remove_buf_file_handler,
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>static struct rchan *hello_rchan;
-</span><span class='line'>struct dentry *dir;
-</span><span class='line'>
-</span><span class='line'>int init_module(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;const char *msg="Hello world\n";
-</span><span class='line'>&#9;dir = debugfs_create_dir("test", NULL);
-</span><span class='line'>#if (LINUX_VERSION_CODE &gt;= KERNEL_VERSION(2,6,32))
-</span><span class='line'>&#9;hello_rchan = relay_open("cpu", dir, 8192, 2, &relay_callbacks, NULL);
-</span><span class='line'>#else   
-</span><span class='line'>&#9;hello_rchan = relay_open("cpu", dir, 8192, 2, &relay_callbacks);
-</span><span class='line'>#endif  
-</span><span class='line'>&#9;if(!hello_rchan){
-</span><span class='line'>&#9;&#9;printk("relay_open() failed.\n");
-</span><span class='line'>&#9;&#9;return -ENOMEM;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;relay_write(hello_rchan, msg, strlen(msg));
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/relay.h&gt;
-</span><span class='line'>#include &lt;linux/debugfs.h&gt;
-</span><span class='line'>
-</span><span class='line'>static struct dentry *create_buf_file_handler(const char *filename, struct dentry *parent, int mode, struct rchan_buf *buf, int *is_global)
-</span><span class='line'>{
-</span><span class='line'>&#9;return debugfs_create_file(filename, mode, parent, buf, &relay_file_operations);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static int remove_buf_file_handler(struct dentry *dentry)
-</span><span class='line'>{
-</span><span class='line'>&#9;debugfs_remove(dentry);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static struct rchan_callbacks relay_callbacks =
-</span><span class='line'>{
-</span><span class='line'>&#9;.create_buf_file = create_buf_file_handler,
-</span><span class='line'>&#9;.remove_buf_file = remove_buf_file_handler,
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>static struct rchan *hello_rchan;
-</span><span class='line'>struct dentry *dir;
-</span><span class='line'>
-</span><span class='line'>int init_module(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;const char *msg="Hello world\n";
-</span><span class='line'>&#9;dir = debugfs_create_dir("test", NULL);
-</span><span class='line'>#if (LINUX_VERSION_CODE &gt;= KERNEL_VERSION(2,6,32))
-</span><span class='line'>&#9;hello_rchan = relay_open("cpu", dir, 8192, 2, &relay_callbacks, NULL);
-</span><span class='line'>#else   
-</span><span class='line'>&#9;hello_rchan = relay_open("cpu", dir, 8192, 2, &relay_callbacks);
-</span><span class='line'>#endif  
-</span><span class='line'>&#9;if(!hello_rchan){
-</span><span class='line'>&#9;&#9;printk("relay_open() failed.\n");
-</span><span class='line'>&#9;&#9;return -ENOMEM;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;relay_write(hello_rchan, msg, strlen(msg));
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>查看输出</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mount -t debugfs debugfs /media
-</span><span class='line'>cat /media/test/cpu*</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<hr />
-
-<p><a href="http://www.cnblogs.com/hoys/archive/2011/04/10/2011270.html">http://www.cnblogs.com/hoys/archive/2011/04/10/2011270.html</a></p>
-
-<h3>用户空间与内核空间数据交换的方式(4)&mdash;&mdash;relayfs</h3>
-
-<p>relayfs是一个快速的转发（relay）数据的文件系统，它以其功能而得名。它为那些需要从内核空间转发大量数据到用户空间的工具和应用提供了快速有效的转发机制。</p>
-
-<p>Channel是relayfs文件系统定义的一个主要概念，每一个channel由一组内核缓存组成，每一个CPU有一个对应于该channel 的内核缓存，每一个内核缓存用一个在relayfs文件系统中的文件文件表示，内核使用relayfs提供的写函数把需要转发给用户空间的数据快速地写入当前CPU上的channel内核缓存，用户空间应用通过标准的文件I/O函数在对应的channel文件中可以快速地取得这些被转发出的数据mmap 来。写入到channel中的数据的格式完全取决于内核中创建channel的模块或子系统。</p>
-
-<h4>relayfs的用户空间API：</h4>
-
-<p>relayfs实现了四个标准的文件I/O函数，open、mmap、poll和close.</p>
-
-<p>open()，打开一个channel在某一个CPU上的缓存对应的文件。</p>
-
-<p>mmap()，把打开的channel缓存映射到调用者进程的内存空间。</p>
-
-<p>read ()，读取channel缓存，随后的读操作将看不到被该函数消耗的字节，如果channel的操作模式为非覆盖写，那么用户空间应用在有内核模块写时仍 可以读取，但是如果channel的操作模式为覆盖式，那么在读操作期间如果有内核模块进行写，结果将无法预知，因此对于覆盖式写的channel，用户 应当在确认在channel的写完全结束后再进行读。</p>
-
-<p>poll()，用于通知用户空间应用转发数据跨越了子缓存的边界，支持的轮询标志有POLLIN、POLLRDNORM和POLLERR。</p>
-
-<p>close()，关闭open函数返回的文件描述符，如果没有进程或内核模块打开该channel缓存，close函数将释放该channel缓存。</p>
-
-<p>注意：用户态应用在使用上述API时必须保证已经挂载了relayfs文件系统，但内核在创建和使用channel时不需要relayfs已经挂载。下面命令将把relayfs文件系统挂载到/mnt/relay。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mount -t relayfs relayfs /mnt/relay</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>relayfs内核API：</h4>
-
-<p>relayfs提供给内核的API包括四类：channel管理、写函数、回调函数和辅助函数。</p>
-
-<p>Channel管理函数包括：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>relay_open(base_filename, parent, subbuf_size, n_subbufs, overwrite, callbacks)
-</span><span class='line'>relay_close(chan)
-</span><span class='line'>relay_flush(chan)
-</span><span class='line'>relay_reset(chan)
-</span><span class='line'>relayfs_create_dir(name, parent)
-</span><span class='line'>relayfs_remove_dir(dentry)
-</span><span class='line'>relay_commit(buf, reserved, count)
-</span><span class='line'>relay_subbufs_consumed(chan, cpu, subbufs_consumed)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>写函数包括：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>relay_write(chan, data, length)
-</span><span class='line'>__relay_write(chan, data, length)
-</span><span class='line'>relay_reserve(chan, length)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>回调函数包括：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>subbuf_start(buf, subbuf, prev_subbuf_idx, prev_subbuf)
-</span><span class='line'>buf_mapped(buf, filp)
-</span><span class='line'>buf_unmapped(buf, filp)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>辅助函数包括：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>relay_buf_full(buf)
-</span><span class='line'>subbuf_start_reserve(buf, length)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>前面已经讲过，每一个channel由一组channel缓存组成，每个CPU对应一个该channel的缓存，每一个缓存又由一个或多个子缓存组成，每一个缓存是子缓存组成的一个环型缓存。</p>
-
-<p>函数relay_open用于创建一个channel并分配对应于每一个CPU的缓存，用户空间应用通过在relayfs文件系统中对应的文件可以 访问channel缓存，参数base_filename用于指定channel的文件名，relay_open函数将在relayfs文件系统中创建 base_filename0..base_filenameN-1，即每一个CPU对应一个channel文件，其中N为CPU数，缺省情况下，这些文件将建立在relayfs文件系统的根目录下，但如果参数parent非空，该函数将把channel文件创建于parent目录下，parent目录使 用函数relay_create_dir创建，函数relay_remove_dir用于删除由函数relay_create_dir创建的目录，谁创建的目录，谁就负责在不用时负责删除。参数subbuf_size用于指定channel缓存中每一个子缓存的大小，参数n_subbufs用于指定 channel缓存包含的子缓存数，因此实际的channel缓存大小为(subbuf_size x n_subbufs)，参数overwrite用于指定该channel的操作模式，relayfs提供了两种写模式，一种是覆盖式写，另一种是非覆盖式 写。使用哪一种模式完全取决于函数subbuf_start的实现，覆盖写将在缓存已满的情况下无条件地继续从缓存的开始写数据，而不管这些数据是否已经 被用户应用读取，因此写操作决不失败。在非覆盖写模式下，如果缓存满了，写将失败，但内核将在用户空间应用读取缓存数据时通过函数 relay_subbufs_consumed()通知relayfs。如果用户空间应用没来得及消耗缓存中的数据或缓存已满，两种模式都将导致数据丢失，唯一的区别是，前者丢失数据在缓存开头，而后者丢失数据在缓存末尾。一旦内核再次调用函数relay_subbufs_consumed()，已满的缓存将不再满，因而可以继续写该缓存。当缓存满了以后，relayfs将调用回调函数buf_full()来通知内核模块或子系统。当新的数据太大无法写 入当前子缓存剩余的空间时，relayfs将调用回调函数subbuf_start()来通知内核模块或子系统将需要使用新的子缓存。内核模块需要在该回调函数中实现下述功能：</p>
-
-<p>初始化新的子缓存；</p>
-
-<p>如果1正确，完成当前子缓存；</p>
-
-<p>如果2正确，返回是否正确完成子缓存切换；</p>
-
-<p>在非覆盖写模式下，回调函数subbuf_start()应该如下实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int subbuf_start(struct rchan_buf *buf, void *subbuf, void *prev_subbuf, unsigned intprev_padding)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (prev_subbuf)
-</span><span class='line'>&#9;&#9;*((unsigned *)prev_subbuf) = prev_padding;
-</span><span class='line'>
-</span><span class='line'>&#9;if (relay_buf_full(buf))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>
-</span><span class='line'>&#9;subbuf_start_reserve(buf, sizeof(unsigned int));
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果当前缓存满，即所有的子缓存都没读取，该函数返回0，指示子缓存切换没有成功。当子缓存通过函数relay_subbufs_consumed ()被读取后，读取者将负责通知relayfs，函数relay_buf_full()在已经有读者读取子缓存数据后返回0，在这种情况下，子缓存切换成 功进行。</p>
-
-<p>在覆盖写模式下， subbuf_start()的实现与非覆盖模式类似：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int subbuf_start(struct rchan_buf *buf, void *subbuf, void *prev_subbuf, unsigned int prev_padding)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (prev_subbuf)
-</span><span class='line'>&#9;&#9;*((unsigned *)prev_subbuf) = prev_padding;
-</span><span class='line'>
-</span><span class='line'>&#9;subbuf_start_reserve(buf, sizeof(unsigned int));
-</span><span class='line'>
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>只是不做relay_buf_full()检查，因为此模式下，缓存是环行的，可以无条件地写。因此在此模式下，子缓存切换必定成功，函数 relay_subbufs_consumed() 也无须调用。如果channel写者没有定义subbuf_start()，缺省的实现将被使用。 可以通过在回调函数subbuf_start()中调用辅助函数subbuf_start_reserve()在子缓存中预留头空间，预留空间可以保存任 何需要的信息，如上面例子中，预留空间用于保存子缓存填充字节数，在subbuf_start()实现中，前一个子缓存的填充值被设置。前一个子缓存的填 充值和指向前一个子缓存的指针一道作为subbuf_start()的参数传递给subbuf_start()，只有在子缓存完成后，才能知道填充值。 subbuf_start()也被在channel创建时分配每一个channel缓存的第一个子缓存时调用，以便预留头空间，但在这种情况下，前一个子 缓存指针为NULL。</p>
-
-<p>内核模块使用函数relay_write()或__relay_write()往channel缓存中写需要转发的数据，它们的区别是前者失效了本 地中断，而后者只抢占失效，因此前者可以在任何内核上下文安全使用，而后者应当在没有任何中断上下文将写channel缓存的情况下使用。这两个函数没有 返回值，因此用户不能直接确定写操作是否失败，在缓存满且写模式为非覆盖模式时，relayfs将通过回调函数buf_full来通知内核模块。</p>
-
-<p>函数relay_reserve()用于在channel缓存中预留一段空间以便以后写入，在那些没有临时缓存而直接写入channel缓存的内核 模块可能需要该函数，使用该函数的内核模块在实际写这段预留的空间时可以通过调用relay_commit()来通知relayfs。当所有预留的空间全 部写完并通过relay_commit通知relayfs后，relayfs将调用回调函数deliver()通知内核模块一个完整的子缓存已经填满。由于预留空间的操作并不在写channel的内核模块完全控制之下，因此relay_reserve()不能很好地保护缓存，因此当内核模块调用 relay_reserve()时必须采取恰当的同步机制。</p>
-
-<p>当内核模块结束对channel的使用后需要调用relay_close() 来关闭channel，如果没有任何用户在引用该channel，它将和对应的缓存全部被释放。</p>
-
-<p>函数relay_flush()强制在所有的channel缓存上做一个子缓存切换，它在channel被关闭前使用来终止和处理最后的子缓存。</p>
-
-<p>函数relay_reset()用于将一个channel恢复到初始状态，因而不必释放现存的内存映射并重新分配新的channel缓存就可以使用channel，但是该调用只有在该channel没有任何用户在写的情况下才可以安全使用。</p>
-
-<p>回调函数buf_mapped() 在channel缓存被映射到用户空间时被调用。</p>
-
-<p>回调函数buf_unmapped()在释放该映射时被调用。内核模块可以通过它们触发一些内核操作，如开始或结束channel写操作。</p>
-
-<p>在源代码包中给出了一个使用relayfs的示例程序relayfs_exam.c，它只包含一个内核模块，对于复杂的使用，需要应用程序配合。该模块实现了类似于文章中seq_file示例实现的功能。</p>
-
-<p>当然为了使用relayfs，用户必须让内核支持relayfs，并且要mount它，下面是作者系统上的使用该模块的输出信息：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ mkdir -p /relayfs
-</span><span class='line'>$ insmod ./relayfs-exam.ko
-</span><span class='line'>$ mount -t relayfs relayfs /relayfs
-</span><span class='line'>$ cat /relayfs/example0
-</span><span class='line'>…
-</span><span class='line'>$</span></code></pre></td></tr></table></div></figure>
-
-
-<p>relayfs是一种比较复杂的内核态与用户态的数据交换方式，本例子程序只提供了一个较简单的使用方式，对于复杂的使用，请参考relayfs用例页面<a href="http://relayfs.sourceforge.net/examples.html%E3%80%82">http://relayfs.sourceforge.net/examples.html%E3%80%82</a></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>//kernel module: relayfs-exam.c
-</span><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/relayfs_fs.h&gt;
-</span><span class='line'>#include &lt;linux/string.h&gt;
-</span><span class='line'>#include &lt;linux/sched.h&gt;
-</span><span class='line'>
-</span><span class='line'>#define WRITE_PERIOD (HZ * 60)
-</span><span class='line'>static struct rchan * chan;
-</span><span class='line'>static size_t subbuf_size = 65536;
-</span><span class='line'>static size_t n_subbufs = 4;
-</span><span class='line'>static char buffer[256];
-</span><span class='line'>
-</span><span class='line'>void relayfs_exam_write(unsigned long data);
-</span><span class='line'>
-</span><span class='line'>static DEFINE_TIMER(relayfs_exam_timer, relayfs_exam_write, 0, 0);
-</span><span class='line'>
-</span><span class='line'>void relayfs_exam_write(unsigned long data)
-</span><span class='line'>{
-</span><span class='line'>&#9;int len;
-</span><span class='line'>&#9;task_t * p = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;len = sprintf(buffer, "Current all the processes:\n");
-</span><span class='line'>&#9;len += sprintf(buffer + len, "process name\t\tpid\n");
-</span><span class='line'>&#9;relay_write(chan, buffer, len);
-</span><span class='line'>
-</span><span class='line'>&#9;for_each_process(p) {
-</span><span class='line'>&#9;&#9;len = sprintf(buffer, "%s\t\t%d\n", p-&gt;comm, p-&gt;pid);
-</span><span class='line'>&#9;&#9;relay_write(chan, buffer, len);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;len = sprintf(buffer, "\n\n");
-</span><span class='line'>&#9;relay_write(chan, buffer, len);
-</span><span class='line'>
-</span><span class='line'>&#9;relayfs_exam_timer.expires = jiffies + WRITE_PERIOD;
-</span><span class='line'>&#9;add_timer(&relayfs_exam_timer);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'>* subbuf_start() relayfs callback.
-</span><span class='line'>*
-</span><span class='line'>* Defined so that we can 1) reserve padding counts in the sub-buffers, and
-</span><span class='line'>* 2) keep a count of events dropped due to the buffer-full condition.
-</span><span class='line'>*/
-</span><span class='line'>static int subbuf_start(struct rchan_buf *buf,
-</span><span class='line'>&#9;&#9;&#9;&#9;void *subbuf,
-</span><span class='line'>&#9;&#9;&#9;&#9;void *prev_subbuf,
-</span><span class='line'>&#9;&#9;&#9;&#9;unsigned int prev_padding)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (prev_subbuf)
-</span><span class='line'>&#9;&#9;*((unsigned *)prev_subbuf) = prev_padding;
-</span><span class='line'>
-</span><span class='line'>&#9;if (relay_buf_full(buf))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>
-</span><span class='line'>&#9;subbuf_start_reserve(buf, sizeof(unsigned int));
-</span><span class='line'>
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'>* relayfs callbacks
-</span><span class='line'>*/
-</span><span class='line'>static struct rchan_callbacks relayfs_callbacks =
-</span><span class='line'>{
-</span><span class='line'>&#9;.subbuf_start = subbuf_start,
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>/**
-</span><span class='line'>* module init - creates channel management control files
-</span><span class='line'>*
-</span><span class='line'>* Returns 0 on success, negative otherwise.
-</span><span class='line'>*/
-</span><span class='line'>static int init(void)
-</span><span class='line'>{
-</span><span class='line'>
-</span><span class='line'>&#9;chan = relay_open("example", NULL, subbuf_size,
-</span><span class='line'>&#9;n_subbufs, &relayfs_callbacks);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!chan) {
-</span><span class='line'>&#9;&#9;printk("relay channel creation failed.\n");
-</span><span class='line'>&#9;&#9;return 1;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;relayfs_exam_timer.expires = jiffies + WRITE_PERIOD;
-</span><span class='line'>&#9;add_timer(&relayfs_exam_timer);
-</span><span class='line'>
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void cleanup(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;del_timer_sync(&relayfs_exam_timer);
-</span><span class='line'>&#9;if (chan) {
-</span><span class='line'>&#9;&#9;relay_close(chan);
-</span><span class='line'>&#9;&#9;chan = NULL;
-</span><span class='line'>&#9;}
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(init);
-</span><span class='line'>module_exit(cleanup);
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
 </div>
   
   
@@ -2087,8 +2085,8 @@ if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~sched')) document.getElementById('aexp_kernel~sched').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(20)</span></li>
-<div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>11</span></li>
+<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(21)</span></li>
+<div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('android~base')) document.getElementById('aexp_android~base').style.visibility = 'hidden';
 </script>
@@ -2109,8 +2107,8 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(66)</span></li>
-<div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>16</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(68)</span></li>
+<div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
 </script>
@@ -2188,6 +2186,12 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
+<li class='catclass'><a href='/blog/cats/lang/'>lang</a><a href='##' onmousedown=showDiv('lang') id='aexp_lang'><span class='exp_style' id='exp_lang'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='lang' class='catsub'><li><a href='/blog/cats/lang~c/?opendiv=lang'>c</a><a href='##' onmousedown=showDiv('lang~c') id='aexp_lang~c'><span class='exp_style' id='exp_lang~c'>[+]</span></a><span class='right_span'>1</span></li>
+</div><script language='javascript' type='text/javascript'>
+if (!document.getElementById('lang')) document.getElementById('aexp_lang').style.visibility = 'hidden';
+if (!document.getElementById('lang~c')) document.getElementById('aexp_lang~c').style.visibility = 'hidden';
+</script>
 
 </ul>
 </div>
@@ -2202,8 +2206,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(199)</span></li>
-<div id='2015' class='catsub'><li><a href='/blog/cats/2015~11/?opendiv=2015'>2015-11</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(203)</span></li>
+<div id='2015' class='catsub'><li><a href='/blog/cats/2015~11/?opendiv=2015'>2015-11</a><span class='right_span'>9</span></li>
 <li><a href='/blog/cats/2015~10/?opendiv=2015'>2015-10</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2015~09/?opendiv=2015'>2015-09</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2015~08/?opendiv=2015'>2015-08</a><span class='right_span'>25</span></li>
@@ -2291,23 +2295,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2015/11/26/lang-c-flock/">c 文件锁flock</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/11/26/debug-spec/">debuginfo 编译速度</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/11/26/android-base-busybox/">busybox</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2015/11/17/debug-CC_STACKPROTECTOR/">CC_STACKPROTECTOR防内核堆栈溢出补丁分析</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2015/11/17/kernel-net-ixgbe/">ixgbe</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/11/17/kernel-net-cubic/">cubic</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/11/17/kernel-net-iptables/">iptables</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/11/17/command-curl/">curl命令</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2015/11/17/command-alias/">alias命令</a>
       </li>
     
   </ul>
