@@ -23,11 +23,15 @@ tags:
 
 	echo $PATH
 
-	cp /sdcard/busybox /system/sbin
+	cp /sdcard/busybox /system/xbin
 	chmod 755 busybox
 
 	# 但是每次前面都加上个busybox太麻烦了，所以我们还要继续完成安装。
-	# 在 /system/sbin 下输入
-	busybox --install .
+	# 在 /system/xbin 下输入
+	# busybox --install .
+	# 安装可能会影响root功能，建议改用ln几个常用即可。
+	# 例如PATH中/system/sbin在/system/bin之前，安装在/system/sbin之后root软件就访问不到/system/bin/su。
+	ln -s busybox free
+	ln -s busybox vi
 ```
 
