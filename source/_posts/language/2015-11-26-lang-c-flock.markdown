@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2015
 - 2015~11
-- lang
-- lang~c
+- language
+- language~c
 tags:
 ---
 http://blog.csdn.net/lin_fs/article/details/7804494
