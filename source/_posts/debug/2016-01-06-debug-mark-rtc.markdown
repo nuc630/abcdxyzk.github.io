@@ -39,13 +39,21 @@ CentOS在安装完新内核之后，每次重启之后时钟总是会发生一�
 #### 2. 旧汤和新药的冲突
 主板上的硬件时钟在Linux操作系统中呈现为一个设备，设备名称为rtc（Real Time Clock）。
 
-使用旧的系统（如CentOS的2.6.18内核）编译新内核时，在调用mkinitrd命令时，会将/dev/rtc生成好，放到initrd- x.x.x.img文件中;而新的内核是自己生成/dev/rtc文件的，当kernel生成/dev/rtc时，发现系统内已经有了这个设备，于是就会 创建/dev/rtc0设备。这时hwclock程序仍然会读取rtc设备，就会造成设备读写失败。运行hwclock –debug命令可以看到如下输出：
+使用旧的系统（如CentOS的2.6.18内核）编译新内核时，在调用mkinitrd命令时，会将/dev/rtc生成好，放到initrd- x.x.x.img文件中;而新的内核是自己生成/dev/rtc文件的，当kernel生成/dev/rtc时，发现系统内已经有了这个设备，于是就会 创建/dev/rtc0设备。这时hwclock程序仍然会读取rtc设备，就会造成设备读写失败。运行`hwclock --debug`命令可以看到如下输出：
 ```
 	[root@localhost ~]# hwclock --debug
 	hwclock from util-linux-2.13-pre7
 	hwclock: Open of /dev/rtc failed, errno=19: No such device.
 	No usable clock interface found.
 	Cannot access the Hardware Clock via any known method.
+```
+但是有的能够直接读写I/O，这样虽然/dev/rtc是错的，但还能正常运行
+```
+	[root@localhost ~]# hwclock --debug
+	hwclock from util-linux-2.13-pre7
+	hwclock: Open of /dev/rtc failed, errno=19: No such device.
+	Using direct I/O instructions to ISA clock.
+	.....
 ```
 
 其实，对应这个问题，新版的hwclock已经做出了调整。新的hwclock会主动去寻找/dev/rtc0设备，来操作主板硬件时钟。于是，解决方法就出现了。

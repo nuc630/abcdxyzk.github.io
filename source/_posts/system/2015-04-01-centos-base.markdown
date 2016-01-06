@@ -11,6 +11,24 @@ categories:
 tags:
 ---
 
+binkernel.spec
+```
+	%pre
+	mkdir -p /usr/local/kernel/etc/
+	echo "version=%{version}-%{release}" > /usr/local/kernel/etc/install.conf
+
+	%post
+	/sbin/new-kernel-pkg --package kernel --mkinitrd --depmod --install 2.6.32-358.6.1.ws5.b.5.1.11t25
+
+	%preun
+	rm -rf /usr/local/kernel/
+
+	%postun
+	/sbin/new-kernel-pkg  --remove 2.6.32-358.6.1.ws5.b.5.1.11t25
+```
+
+-------------
+
 更改 bash_history 默认历史记录
 
 ```
