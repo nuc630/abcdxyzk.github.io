@@ -22,6 +22,48 @@ el5可选的一个做法是：修改/etc/rc.sysinit,在/sbin/start_udev这行之
 
 el5试着将这两句改在/sbin/mkinitrd里修改，但不知道为什么改完后在执行到 /etc/rc.sysinit 时 /dev/rtc 这个软连接不见了。
 
+或者直接将/dev/rtc改成254，0
+```
+	diff --git a/mkinitrd b/mkinitrd
+	index 5ddb909..dcba61d 100755
+	--- a/mkinitrd
+	+++ b/mkinitrd
+	@@ -1708,7 +1708,14 @@ done
+	 mknod $MNTIMAGE/dev/tty c 5 0
+	 mknod $MNTIMAGE/dev/console c 5 1
+	 mknod $MNTIMAGE/dev/ptmx c 5 2
+	-mknod $MNTIMAGE/dev/rtc c 10 135
+	+
+	+kernelval=`echo $kernel | awk -F "[-|.]" '{print $1*65536+$2*256+$3}'`
+	+#echo "kernel=$kernel kernelval=$kernelval"
+	+if [ $kernelval -lt 132640 ]; then
+	+	mknod $MNTIMAGE/dev/rtc c 10 135
+	+else
+	+	mknod $MNTIMAGE/dev/rtc c 254 0
+	+fi
+	 
+	 if [ "$(uname -m)" == "ia64" ]; then
+		 mknod $MNTIMAGE/dev/efirtc c 10 136
+	@@ -1911,8 +1918,16 @@ mknod /dev/systty c 4 0
+	 mknod /dev/tty c 5 0
+	 mknod /dev/console c 5 1
+	 mknod /dev/ptmx c 5 2
+	-mknod /dev/rtc c 10 135
+	 EOF
+	+
+	+kernelval=`echo $kernel | awk -F "[-|.]" '{print $1*65536+$2*256+$3}'`
+	+#echo "kernel=$kernel kernelval=$kernelval"
+	+if [ $kernelval -lt 132640 ]; then
+	+	emit "mknod /dev/rtc c 10 135"
+	+else
+	+	emit "mknod /dev/rtc c 254 0"
+	+fi
+	+
+	 if [ "$(uname -m)" == "ia64" ]; then
+		 emit "mknod /dev/efirtc c 10 136"
+	 fi
+```
+
 ------------------
 
 http://www.csdn123.com/html/mycsdn20140110/59/59dd8c5f069a09bf9dc1785e19eb329f.html

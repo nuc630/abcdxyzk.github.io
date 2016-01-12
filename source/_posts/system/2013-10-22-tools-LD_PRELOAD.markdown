@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2013
 - 2013~10
-- tools
-- tools~base
+- system
+- system~base
 tags:
 ---
 在Linux的动态链接库的世界中，LD_PRELOAD就是这样一个环境变量，它可以影响程序的运行时的链接（Runtime linker），它允许你定义在程序运行前优先加载的动态链接库。这个功能主要就是用来有选择性的载入不同动态链接库中的相同函数。通过这个环境变量，我们可以在主程序和其动态链接库的中间加载别的动态链接库，甚至覆盖正常的函数库。一方面，我们可以以此功能来使用自己的或是更好的函数（无需别人的源码），而另一方面，我们也可以以向别人的程序注入恶意程序，从而达到那不可告人的罪恶的目的。
@@ -52,24 +52,24 @@ OK。还是让我用一个例子来看一下用LD_PRELOAD来hack别人的程序�
 ```
 编译程序：
 ```
-$ gcc -o verifypasswd verifypasswd.c
-$ gcc -shared -o hack.so hack.c
+	$ gcc -o verifypasswd verifypasswd.c
+	$ gcc -shared -o hack.so hack.c
 ```
 测试一下程序：（得到正确结果）
 ```
-$ ./verifypasswd asdf
-Invalid Password!
-``` 
+	$ ./verifypasswd asdf
+	Invalid Password!
+```
 ##### 设置LD_PRELOAD变量：
 （使我们重写过的strcmp函数的hack.so成为优先载入链接库）
 ```
-$ export LD_PRELOAD="./hack.so"
-``` 
+	$ export LD_PRELOAD="./hack.so"
+```
 再次运行程序：
 ```
-$ ./verifypasswd  asdf
-hack function invoked. s1=<password> s2=<asdf>
-Correct Password!
+	$ ./verifypasswd  asdf
+	hack function invoked. s1=<password> s2=<asdf>
+	Correct Password!
 ```
 我们可以看到，  
 1）我们的hack.so中的strcmp被调用了。  

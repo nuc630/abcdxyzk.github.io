@@ -11,6 +11,14 @@ categories:
 tags:
 ---
 
+
+```
+	lsattr /etc/passwd /etc/group /etc/shadow /etc/gshadow
+	chattr -i /etc/passwd /etc/group /etc/shadow /etc/gshadow
+```
+
+-------------
+
 binkernel.spec
 ```
 	%pre
