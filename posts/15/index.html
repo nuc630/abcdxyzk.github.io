@@ -62,6 +62,544 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src5/">HAProxy 研究笔记 -- HTTP请求处理-2-解析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-07-29T16:07:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:07:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3819702.html">http://blog.chinaunix.net/uid-10167808-id-3819702.html</a></p>
+
+<p> 本文继续分析 1.5-dev17 中接收到 client 数据之后的处理。</p>
+
+<p>haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP请求处理-1-接收</p>
+
+<h4>1. haproxy 主循环的处理流程</h4>
+
+<p>主循环处理流程见文档 主循环简介</p>
+
+<p>请求数据的解析工作在主循环 process_runnable_tasks() 中执行。</p>
+
+<h4>2. 执行 run queue 中的任务</h4>
+
+<p> HTTP请求处理-1-接收 中分析到 session 建立之后，一来会将 session 的 task 放入 runqueue，该 task 会 在下一轮遍历可以运行的 task 中出现，并得到执行。二是立即调用 conn_fd_handler 去 接收 client 发送的数据。</p>
+
+<p>数据接收流程结束后（注意，这并不代表接收到了完整的 client 请求，因为也可能暂时 读取不到 client 的数据退出接收），haproxy 调度执行下一轮循环，调用 process_runnable_tasks() 处理所有在 runqueue 中的 task：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void process_runnable_tasks(int *next)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;eb = eb32_lookup_ge(&rqueue, rqueue_ticks - TIMER_LOOK_BACK);
+</span><span class='line'>&#9;while (max_processed--) {
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;&#9;t = eb32_entry(eb, struct task, rq);
+</span><span class='line'>&#9;&#9;eb = eb32_next(eb);
+</span><span class='line'>&#9;&#9;__task_unlink_rq(t);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;t-&gt;state |= TASK_RUNNING;
+</span><span class='line'>&#9;&#9;/* This is an optimisation to help the processor's branch
+</span><span class='line'>&#9;&#9; * predictor take this most common call.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;t-&gt;calls++;
+</span><span class='line'>&#9;&#9;if (likely(t-&gt;process == process_session))
+</span><span class='line'>&#9;&#9;&#9;t = process_session(t);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;t = t-&gt;process(t);
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>大多数情况下，task 的 proecss 都指向 process_session() 函数。该函数就是负责解析 已接收到的数据，选择 backend server，以及 session 状态的变化等等。</p>
+
+<h4>3. session 的处理：process_session()</h4>
+
+<p>下面介绍 process_session() 函数的实现。该函数代码比较庞大，超过一千行，这里仅 介绍与 HTTP 请求处理的逻辑，采用代码块的逻辑介绍。</p>
+
+<p>处理 HTTP 请求的逻辑代码集中在 label resync_request 处。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct task *process_session(struct task *t)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'> resync_request:
+</span><span class='line'>&#9;/* Analyse request */
+</span><span class='line'>&#9;if (((s-&gt;req-&gt;flags & ~rqf_last) & CF_MASK_ANALYSER) ||
+</span><span class='line'>&#9;&#9;((s-&gt;req-&gt;flags ^ rqf_last) & CF_MASK_STATIC) ||
+</span><span class='line'>&#9;&#9;s-&gt;si[0].state != rq_prod_last ||
+</span><span class='line'>&#9;&#9;s-&gt;si[1].state != rq_cons_last) {
+</span><span class='line'>&#9;&#9;unsigned int flags = s-&gt;req-&gt;flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (s-&gt;req-&gt;prod-&gt;state &gt;= SI_ST_EST) {
+</span><span class='line'>&#9;&#9;&#9;ana_list = ana_back = s-&gt;req-&gt;analysers;
+</span><span class='line'>&#9;&#9;&#9;while (ana_list && max_loops--) {
+</span><span class='line'>&#9;&#9;&#9;&#9;/* 这段代码中逐一的列举出了所有的 analysers 对应的处理函数
+</span><span class='line'>&#9;&#9;&#9;&#9; * 这里不一一列出，等待下文具体分析
+</span><span class='line'>&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;&#9;...
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;rq_prod_last = s-&gt;si[0].state;
+</span><span class='line'>&#9;&#9;rq_cons_last = s-&gt;si[1].state;
+</span><span class='line'>&#9;&#9;s-&gt;req-&gt;flags &= ~CF_WAKE_ONCE;
+</span><span class='line'>&#9;&#9;rqf_last = s-&gt;req-&gt;flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if ((s-&gt;req-&gt;flags ^ flags) & CF_MASK_STATIC)
+</span><span class='line'>&#9;&#9;&#9;goto resync_request;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>首先要判断 s->req->prod->state 的状态是否已经完成建连，根据之前的初始化动作， se->req->prod 指向 s->si[0]，即标识与 client 端连接的相关信息。正确建连成功之 后，会更改 si 的状态的，具体代码在 session_complete() 中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>s-&gt;si[0].state     = s-&gt;si[0].prev_state = SI_ST_EST;
+</span><span class='line'>...
+</span><span class='line'>s-&gt;req-&gt;prod = &s-&gt;si[0];
+</span><span class='line'>s-&gt;req-&gt;cons = &s-&gt;si[1];</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只有 frontend 连接建立成功，才具备处理 client 发送请求数据的基础。上一篇文章中 已经接收到了 client 发送的数据。这里就是需要根据 s->req->analysers 的值，确定 while 循环中哪些函数处理当前的数据。</p>
+
+<p>补充介绍一下 s->req->analysers 的赋值。 同样是在 session_complete 中初始化的</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* activate default analysers enabled for this listener */
+</span><span class='line'>s-&gt;req-&gt;analysers = l-&gt;analysers;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，其直接使用 session 所在的 listener 的 analyser。 listener 中该数值的初始化 是在 check_config_validity() 中完成的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;listener-&gt;analysers |= curproxy-&gt;fe_req_ana;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>而归根结蒂还是来源于 listener 所在的 proxy 上的 fe_req_ana， proxy 上的 fe_req_ana 的初始化同样是在 check_config_validity()，且是在给 listener->analysers 赋值之前</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;if (curproxy-&gt;cap & PR_CAP_FE) {
+</span><span class='line'>&#9;&#9;if (!curproxy-&gt;accept)
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;accept = frontend_accept;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (curproxy-&gt;tcp_req.inspect_delay ||
+</span><span class='line'>&#9;&#9;&#9;!LIST_ISEMPTY(&curproxy-&gt;tcp_req.inspect_rules))
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_INSPECT_FE;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (curproxy-&gt;mode == PR_MODE_HTTP) {
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_WAIT_HTTP | AN_REQ_HTTP_PROCESS_FE;
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_rsp_ana |= AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_FE;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* both TCP and HTTP must check switching rules */
+</span><span class='line'>&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_SWITCHING_RULES;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从上面代码可以看出，一个 HTTP 模式的 proxy，至少有三个标记位会被置位： AN_REQ_WAIT_HTTP, AN_REQ_HTTP_PROCESS_FE, AN_REQ_SWITCHING_RULES。也就是说， s->req->analysers 由以上三个标记置位。那么随后处理 HTTP REQ 的循环中，就要经过 这三个标记位对应的 analyser 的处理。</p>
+
+<p>接着回到 resync_request 标签下的那个 while 循环，就是逐个判断 analysers 的设置， 并调用对应的函数处理。需要启用那些 analysers，是和 haproxy 的配置相对应的。本文 使用最简单的配置，下面仅列出配置所用到的几个处理函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;while (ana_list && max_loops--) {
+</span><span class='line'>&#9;&#9;&#9;/* Warning! ensure that analysers are always placed in ascending order! */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_INSPECT_FE) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!tcp_inspect_request(s, s-&gt;req, AN_REQ_INSPECT_FE))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_INSPECT_FE);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_WAIT_HTTP) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!http_wait_for_request(s, s-&gt;req, AN_REQ_WAIT_HTTP))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_WAIT_HTTP);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_HTTP_PROCESS_FE) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!http_process_req_common(s, s-&gt;req, AN_REQ_HTTP_PROCESS_FE, s-&gt;fe))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_HTTP_PROCESS_FE);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_SWITCHING_RULES) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!process_switching_rules(s, s-&gt;req, AN_REQ_SWITCHING_RULES))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_SWITCHING_RULES);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;...
+</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>analysers 的处理也是有顺序的。其中处理请求的第一个函数是 tcp_inspect_request()。 该函数主要是在于如果配置了这里先介绍 http_wait_for_request() 函数的实现。 顾名思义，该函数主要是配置中启用 inspect_rules 时，会调用到该函数。否则的话， 处理 HTTP Req 的第一个函数就是 http_wait_for_request().</p>
+
+<p>顾名思义，http_wait_for_request() 该函数分析所解析的 HTTP Requset 不一定是一个 完整的请求。上篇文章分析读取 client 请求数据的实现中，已经提到，只要不能从 socket 读到更多的数据，就会结束数据的接收。一个请求完全完全有可能因为一些异常原因，或者 请求长度本身就比较大而被拆分到不同的 IP 报文中，一次 read 系统调用可能只读取到其 中的一部分内容。因此，该函数会同时分析已经接收到的数据，并确认是否已经接收到了 完整的 HTTP 请求。只有接收到了完整的 HTTP 请求，该函数处理完，才会交给下一个 analyser 处理，否则只能结束请求的处理，等待接收跟多的数据，解析出一个完成的 HTTP 请求才行。</p>
+
+<h4>4. 解析接收到的 http 请求数据： http_wait_for_request()</h4>
+
+<p>以下是 http_wait_for_request() 的简要分析：</p>
+
+<p>1.调用 http_msg_analyzer，解析 s->req->buf 中新读取到的数据。该函数会按照 HTTP 协议， 解析 HTTP request 和 response 的头部数据，并记录到数据结构 struct http_msg 中。</p>
+
+<p>2.如果开启了 debug，并且已经完整的解析了 header，则 header 内容打印出来</p>
+
+<p>3.尚未读取到完整的 request 的处理，分作以下几种情形处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(msg-&gt;msg_state &lt; HTTP_MSG_BODY)) {
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * First, let's catch bad requests.
+</span><span class='line'>&#9; */
+</span><span class='line'>
+</span><span class='line'>解析到 header 内容中有不符合 HTTP 协议的情形 HTTP_MSG_ERROR，应答 400 bad request 处理
+</span><span class='line'>req-&gt;buf 满了，甚至加入 maxrewrite 的空间仍然不够用，应答 400 bad request
+</span><span class='line'>读取错误 CF_READ_ERROR 发生，比如 client 发送 RST 断开连接， 应答 400 bad request
+</span><span class='line'>读取超时，client 超时未发送完整的请求，应答 408 Request Timeout
+</span><span class='line'>client 主动关闭，发送 FIN 包，实际上是所谓的 half-close，同样应答 400 bad request
+</span><span class='line'>如果以上情况都不满足，则意味着还可以继续尝试读取新数据，设置一下超时
+</span><span class='line'>
+</span><span class='line'>&#9;/* just set the request timeout once at the beginning of the request */
+</span><span class='line'>&#9;if (!tick_isset(req-&gt;analyse_exp)) {
+</span><span class='line'>&#9;&#9;if ((msg-&gt;msg_state == HTTP_MSG_RQBEFORE) &&
+</span><span class='line'>&#9;&#9;&#9;(txn-&gt;flags & TX_WAIT_NEXT_RQ) &&
+</span><span class='line'>&#9;&#9;&#9;tick_isset(s-&gt;be-&gt;timeout.httpka))
+</span><span class='line'>&#9;&#9;&#9;req-&gt;analyse_exp = tick_add(now_ms, s-&gt;be-&gt;timeout.httpka);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;req-&gt;analyse_exp = tick_add_ifset(now_ms, s-&gt;be-&gt;timeout.httpreq);
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>根据以上代码，在等待 http request 期间，有两种 timeout 可以设置： 当是http 连接 Keep-Alive 时，并且处理完了头一个请求之后，等待第二个请求期间，设置 httpka 的超 时，超过设定时间不发送新的请求，将会超时；否则，将设置 http 的 request timeout。</p>
+
+<p>因此，在不启用 http ka timeout 时，http request 同时承担起 http ka timeout 的 功能。在有 http ka timeout 时，这两者各自作用的时间段没有重叠。</p>
+
+<p>满足该环节的请求都终止处理，不再继续了。</p>
+
+<h5>4.2. 处理完整的 http request</h5>
+
+<p>这里处理的都是已经解析到完整 http request header 的情况，并且所有 header 都被 索引化了，便于快速查找。根据已经得到的 header 的信息，设置 session 和 txn 的 相关成员，相当于汇总一下 header 的摘要信息，便于随后处理之用。流程如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>更新 session 和 proxy 的统计计数
+</span><span class='line'>删除 http ka timeout 的超时处理。可能在上一个请求处理完之后，设置了 http ka 的 timeout，因为这里已经得到完整的请求，因此需要停止该 timeout 的处理逻辑
+</span><span class='line'>确认 METHOD，并设置 session 的标记位 s-&gt;flags |= SN_REDIRECTABLE，只有 GET 和 HEAD 请求可以被重定向
+</span><span class='line'>检测 URI 是否是配置的要做 monitor 的 URI，是的话，则执行对应 ACL，并设置应答
+</span><span class='line'>检测如果开启 log 功能的话，要给 txn-&gt;uri 分配内存，用于记录 URI
+</span><span class='line'>检测 HTTP version
+</span><span class='line'>&#9;将 0.9 版本的升级为 1.0
+</span><span class='line'>&#9;1.1 及其以上的版本都当做 1.1 处理
+</span><span class='line'>初始化用于标识 Connection header 的标记位
+</span><span class='line'>如果启用了 capture header 配置，调用 capture_headers() 记录下对应的 header
+</span><span class='line'>处理 Transfer-Encoding/Content-Length 等 header
+</span><span class='line'>最后一步，清理 req-&gt;analysers 的标记位 AN_REQ_WAIT_HTTP，因为本函数已经成功处理完毕，可以进行下一个 analyser 的处理了。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>至此，http_wait_for_request() 的处理已经结束。</p>
+
+<h4>5. 其他对 HTTP 请求的处理逻辑</h4>
+
+<p>按照我们前面分析的，随后应该还有两个 analyser 要处理，简单介绍一下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>AN_REQ_HTTP_PROCESS_FE 对应的 http_process_req_common()
+</span><span class='line'>&#9;对 frontend 中 req 配置的常见处理，比如 block ACLs, filter, reqadd 等
+</span><span class='line'>&#9;设置 Connection mode， 主要是 haproxy 到 server 采用什么连接方式，tunnel 或者 按照 transcation 处理的短连接
+</span><span class='line'>AN_REQ_SWITCHING_RULES 对应的 process_switching_rules()
+</span><span class='line'>&#9;如果配置了选择 backend 的 rules，比如用 use_backend，则查询规则为 session 分配一个 backend
+</span><span class='line'>&#9;处理 persist_rules，一旦设置了 force-persist, 则不管 server 是否 down，都要保证 session 分配给 persistence 中记录的 server。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以上两个函数，不再具体分析。待以后需要时再完善。</p>
+
+<p>至此，client 端 http 请求已经完成解析和相关设置，并且给 session 指定了将来选择 server 所属的 backend。</p>
+
+<p>下一篇文章就分析选择 server 的流程。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src4/">HAProxy 研究笔记 -- 主循环处理流程</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-07-29T16:05:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:05:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3807412.html">http://blog.chinaunix.net/uid-10167808-id-3807412.html</a></p>
+
+<p>本文简单介绍 HAProxy 主循环的处理逻辑，版本为 1.5-dev17.</p>
+
+<h4>0. 主循环 run_poll_loop</h4>
+
+<p>HAproxy 的主循环在 haproxy.c 中的 run_poll_loop() 函数，代码如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Runs the polling loop */
+</span><span class='line'>void run_poll_loop()
+</span><span class='line'>{
+</span><span class='line'>&#9;int next;
+</span><span class='line'>
+</span><span class='line'>&#9;tv_update_date(0,1);
+</span><span class='line'>&#9;while (1) {
+</span><span class='line'>&#9;&#9;/* check if we caught some signals and process them */
+</span><span class='line'>&#9;&#9;signal_process_queue();
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Check if we can expire some tasks */
+</span><span class='line'>&#9;&#9;wake_expired_tasks(&next);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Process a few tasks */
+</span><span class='line'>&#9;&#9;process_runnable_tasks(&next);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* stop when there's nothing left to do */
+</span><span class='line'>&#9;&#9;if (jobs == 0)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* The poller will ensure it returns around  */
+</span><span class='line'>&#9;&#9;cur_poller.poll(&cur_poller, next);
+</span><span class='line'>&#9;&#9;fd_process_spec_events();
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>主循环的结构比较清晰，就是循环的调用几个函数，并在适当的时候结束循环并退出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. 处理信号队列
+</span><span class='line'>2. 超时任务
+</span><span class='line'>3. 处理可运行的任务
+</span><span class='line'>4. 检测是否可以结束循环
+</span><span class='line'>5. 执行 poll 处理 fd 的 IO 事件
+</span><span class='line'>6. 处理可能仍有 IO 事件的 fd</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>1. signal_process_queue - 处理信号队对列</h4>
+
+<p>haproxy 实现了自己的信号处理机制。接受到信号之后，将该信号放到信号队列中。在程序 运行到 signal_process_queue() 时处理所有位于信号队列中的信号。</p>
+
+<h4>2. wake_expired_tasks - 唤醒超时任务</h4>
+
+<p>haproxy 的顶层处理逻辑是 task，task 上存储着要处理的任务的全部信息。task 的管理 是采用队列方式，同时分为 wait queue 和 run queue。顾名思义，wait queue 是需要等 待一定时间的 task 的集合，而 run queue 则代表需要立即执行的 task 的集合。</p>
+
+<p>该函数就是检查 wait queue 中那些超时的任务，并将其放到 run queue 中。haproxy 在 执行的过程中，会因为一些情况导致需要将当前的任务通过调用 task_queue 等接口放到 wait queue 中。</p>
+
+<h4>3. process_runnable_tasks - 处理可运行的任务</h4>
+
+<p>处理位于 run queue 中的任务。</p>
+
+<p>前面提到，wake_expired_tasks 可能将一些超时的任务放到 run queue 中。此外，haproxy 执行的过程中，还有可能通过调用 task_wakeup 直接讲某个 task 放到 run queue 中，这代表程序希望该任务下次尽可能快的被执行。</p>
+
+<p>对于 TCP 或者 HTTP 业务流量的处理，该函数最终通过调用 process_session 来完成，包括解析已经接收到的数据， 并执行一系列 load balance 的特性，但不负责从 socket 收发数据。</p>
+
+<h4>4. jobs == 0 - 无任务可执行，结束循环</h4>
+
+<p>haproxy 中用 jobs 记录当前要处理的任务总数，一个 listener 也会被计算在内。因此， 如果 jobs 为 0 的话，通常意味着 haproxy 要退出了，因为连 listener 都要释放了。 jobs 的数值通常在 process_session 时更新。因此，是否可以退出循环，就放在了所有 任务的 process_session 执行之后。</p>
+
+<h4>5. cur_poller.poll() - 执行 poll 处理 fd 的 IO 事件</h4>
+
+<p>haproxy 启动阶段，会检测当前系统可以启用那种异步处理的机制，比如 select、poll、 epoll、kqueue 等，并注册对应 poller 的 poll 方法。epoll 的相关函数接口在 ev_epoll.c 中。</p>
+
+<p>这里就是执行已经注册的 poller 的 poll 方法，主要功能就是获取所有活动的 fd，并 调用对应的 handler，完成接受新建连接、数据收发等功能。</p>
+
+<h4>6. 处理可能仍有 IO 事件的 fd</h4>
+
+<p>poller 的 poll 方法执行时，程序会将某些符合条件以便再次执行 IO 处理的的 fd 放到 fd_spec list[] 中，fd_process_spec_events() 函数会再次执行这些 fd 的 io handler。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src3/">HAProxy 研究笔记 -- HTTP请求处理-1-接收</a></h2>
     
     
@@ -1084,321 +1622,6 @@ if (query != null) {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/29/kvm-blog/">kvm虚拟化学习笔记</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-29T15:32:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>15:32:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://koumm.blog.51cto.com/703525/1288795">http://koumm.blog.51cto.com/703525/1288795</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/29/kvm-qemu/">编译qemu-kvm和安装qemu-kvm</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-29T15:22:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>15:22:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://smilejay.com/2012/06/qemu-kvm_compilation_installation/">http://smilejay.com/2012/06/qemu-kvm_compilation_installation/</a></p>
-
-<h4>3.4 编译和安装qemu-kvm</h4>
-
-<p>除了在内核空间的KVM模块之外，在用户空间需要QEMU[注6]来模拟所需要CPU和设备模型以及用于启动客户机进程，这样才有了一个完整的KVM运行环境。而qemu-kvm是为了针对KVM专门做了修改和优化的QEMU分支[注7]，在本书写作的2012年，qemu-kvm分支里面的小部分特性还没有完全合并进入到qemu的主干代码之中，所以本书中采用qemu-kvm来讲解。</p>
-
-<p>在编译和安装了KVM并且启动到编译的内核之后，下面来看一下qemu-kvm的编译和安装。</p>
-
-<h5>3.4.1 下载qemu-kvm源代码</h5>
-
-<p>目前的QEMU项目针对KVM的代码分支qemu-kvm也是由Redhat公司的Gleb Natapov和Marcelo Tosatti作维护者（Maintainer），代码也是托管在kernel.org上。</p>
-
-<p>qemu-kvm开发代码仓库的网页连接为：<a href="http://git.kernel.org/?p=virt/kvm/qemu-kvm.git">http://git.kernel.org/?p=virt/kvm/qemu-kvm.git</a></p>
-
-<p>其中，可以看到有如下3个URL连接可供下载开发中的最新qemu-kvm的代码仓库。
-git://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git<br/>
-<a href="http://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git  ">http://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git  </a>
-<a href="https://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git">https://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git</a></p>
-
-<p>可以根据自己实际需要选择3个中任一个用git clone命令下载即可，它们是完全一样的。</p>
-
-<p>另外，可以到sourceforge.net的如下链接中根据需要下载qemu-kvm各个发布版本的代码压缩包（作者建议使用最新的正式发布版本，因为它的功能更多，同时也比较稳定）。</p>
-
-<p><a href="http://sourceforge.net/projects/kvm/files/qemu-kvm/">http://sourceforge.net/projects/kvm/files/qemu-kvm/</a></p>
-
-<p>在本节讲解编译时，以下载开发中的最新的qemu-kvm.git为例，获取其代码仓库过程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux kvm_demo]# git clone\ git://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git qemu-kvm.git
-</span><span class='line'>Initialized empty Git repository in /root/kvm_demo/qemu-kvm.git/.git/
-</span><span class='line'>remote: Counting objects: 145222, done.
-</span><span class='line'>remote: Compressing objects: 100% (35825/35825), done.
-</span><span class='line'>remote: Total 145222 (delta 114656), reused 137663 (delta 107444)
-</span><span class='line'>Receiving objects: 100% (145222/145222), 40.83 MiB | 10.33 MiB/s, done.
-</span><span class='line'>Resolving deltas: 100% (114656/114656), done.
-</span><span class='line'>[root@jay-linux kvm_demo]# cd qemu-kvm.git
-</span><span class='line'>[root@jay-linux kvm.git]# pwd
-</span><span class='line'>/root/kvm_demo/qemu-kvm.git</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>3.4.2 配置和编译qemu-kvm</h5>
-
-<p>qemu-kvm的配置并不复杂，通常情况下，可以直接运行代码仓库中configure文件进行配置即可。当然，如果对其配置并不熟悉，可以运行“./configure –help”命令查看配置的一些选项及其帮助信息。</p>
-
-<p>显示配置的帮助手册信息如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# ./configure --help
-</span><span class='line'>Usage: configure [options]
-</span><span class='line'>Options: [defaults in brackets after descriptions]
-</span><span class='line'> 
-</span><span class='line'>Standard options:
-</span><span class='line'>--help                   print this message
-</span><span class='line'>--prefix=PREFIX          install in PREFIX [/usr/local]
-</span><span class='line'>--interp-prefix=PREFIX   where to find shared libraries, etc.
-</span><span class='line'>use %M for cpu name [/usr/gnemul/qemu-%M]
-</span><span class='line'>--target-list=LIST       set target list (default: build everything)
-</span><span class='line'>Available targets: i386-softmmu x86_64-softmmu
-</span><span class='line'>&lt;!- 此处省略百余行帮助信息的输出 -&gt;
-</span><span class='line'>--disable-guest-agent    disable building of the QEMU Guest Agent
-</span><span class='line'>--enable-guest-agent     enable building of the QEMU Guest Agent
-</span><span class='line'>--with-coroutine=BACKEND coroutine backend. Supported options:
-</span><span class='line'>gthread, ucontext, sigaltstack, windows
-</span><span class='line'>
-</span><span class='line'>NOTE: The object files are built at the place where configure is launched</span></code></pre></td></tr></table></div></figure>
-
-
-<p>执行configure文件进行配置的过程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# ./configure
-</span><span class='line'>Install prefix    /usr/local
-</span><span class='line'>BIOS directory    /usr/local/share/qemu
-</span><span class='line'>binary directory  /usr/local/bin
-</span><span class='line'>library directory /usr/local/lib
-</span><span class='line'>include directory /usr/local/include
-</span><span class='line'>config directory  /usr/local/etc
-</span><span class='line'>Manual directory  /usr/local/share/man
-</span><span class='line'>ELF interp prefix /usr/gnemul/qemu-%M
-</span><span class='line'>Source path       /root/kvm_demo/qemu-kvm.git
-</span><span class='line'>C compiler        gcc
-</span><span class='line'>Host C compiler   gcc
-</span><span class='line'>&lt;!– 此处省略数十行 –&gt;
-</span><span class='line'>VNC support       yes     #通常需要通过VNC连接到客户机中
-</span><span class='line'>&lt;!– 此处省略十余行 –&gt;
-</span><span class='line'>KVM support       yes     #这是对KVM的支持
-</span><span class='line'>TCG interpreter   no
-</span><span class='line'>KVM device assig. yes    #这是对KVM中VT-d功能的支持
-</span><span class='line'>&lt;!– 此处省略十余行 –&gt;
-</span><span class='line'>OpenGL support    yes
-</span><span class='line'>libiscsi support  no
-</span><span class='line'>build guest agent yes
-</span><span class='line'>coroutine backend ucontext</span></code></pre></td></tr></table></div></figure>
-
-
-<p>需要注意的是，上面命令行输出的KVM相关的选项需要是配置为yes，另外，一般VNC的支持也是配置为yes的（因为通常需要用VNC连接到客户机中）。</p>
-
-<p>【2013.05.13 updated】 在configure时，可能遇到“glib-2.12 required to compile QEMU”的错误，是需要安装glib2和glib2-dev软件包，在RHEL上的安装命令为“yum install glib2 glib2-devel”，在Ubuntu上安装的过程为“apt-get install libglib2.0 libglib2.0-dev”。</p>
-
-<p>经过配置之后，进行编译就很简单了，直接执行make即可进行编译，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# make -j 20
-</span><span class='line'>GEN   config-host.h
-</span><span class='line'>GEN   trace.h
-</span><span class='line'>GEN   qemu-options.def
-</span><span class='line'>GEN   qmp-commands.h
-</span><span class='line'>GEN   qapi-types.h
-</span><span class='line'>GEN   qapi-visit.h
-</span><span class='line'>GEN   tests/test-qapi-types.h
-</span><span class='line'>GEN   tests/test-qapi-visit.h
-</span><span class='line'>GEN   tests/test-qmp-commands.h
-</span><span class='line'>CC    libcacard/cac.o
-</span><span class='line'>CC    libcacard/event.o
-</span><span class='line'>&lt;!– 此处省略数百行的编译时输出信息 –&gt;
-</span><span class='line'>CC    x86_64-softmmu/target-i386/cpu.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/machine.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/arch_memory_mapping.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/arch_dump.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/kvm.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/hyperv.o
-</span><span class='line'>LINK  x86_64-softmmu/qemu-system-x86_64</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到，最后有编译生成qemu-system-x86_64文件，它就是我们常用的qemu-kvm的命令行工具（在多数Linux发行版中自带的qemu-kvm软件包的命令行是qemu-kvm，只是名字不同而已）。</p>
-
-<h5>3.4.2 安装qemu-kvm</h5>
-
-<p>编译完成之后，运行“make install”命令即可安装qemu-kvm，其过程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# make install | tee make-install.log
-</span><span class='line'>install -d -m 0755 “/usr/local/share/qemu”
-</span><span class='line'>install -d -m 0755 “/usr/local/etc/qemu”
-</span><span class='line'>install -c -m 0644 /root/kvm_demo/qemu-kvm.git/sysconfigs/target/target-x86_64.conf “/usr/local/etc/qemu”
-</span><span class='line'>install -c -m 0644 /root/kvm_demo/qemu-kvm.git/sysconfigs/target/cpus-x86_64.conf “/usr/local/share/qemu”
-</span><span class='line'>install -d -m 0755 “/usr/local/bin”
-</span><span class='line'>install -c -m 0755  vscclient qemu-ga qemu-nbd qemu-img qemu-io  “/usr/local/bin”
-</span><span class='line'>install -d -m 0755 “/usr/local/libexec”
-</span><span class='line'>&lt;!– 此处省略数行的安装时输出信息 –&gt;
-</span><span class='line'>make[1]: Entering directory `/root/kvm_demo/qemu-kvm.git/x86_64-softmmu’
-</span><span class='line'>install -m 755 qemu-system-x86_64 “/usr/local/bin”
-</span><span class='line'>strip “/usr/local/bin/qemu-system-x86_64″
-</span><span class='line'>make[1]: Leaving directory `/root/kvm_demo/qemu-kvm.git/x86_64-softmmu’</span></code></pre></td></tr></table></div></figure>
-
-
-<p>qemu-kvm的安装过程的主要任务有这几个：创建qemu的一些目录，拷贝一些配置文件到相应的目录下，拷贝一些firmware文件(如：sgabios.bin, kvmvapic.bin)到目录下以便qemu-kvm的命令行启动时可以找到对应的固件提供给客户机使用，拷贝keymaps到相应的目录下以便在客户机中支持各种所需键盘类型，拷贝qemu-system-x86_64、qemu-img等可执行程序到对应的目录下。下面的一些命令行检查了qemu-kvm被安装了之后的系统状态。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# which qemu-system-x86_64
-</span><span class='line'>/usr/local/bin/qemu-system-x86_64
-</span><span class='line'>[root@jay-linux qemu-kvm.git]# which qemu-img
-</span><span class='line'>/usr/local/bin/qemu-img
-</span><span class='line'>[root@jay-linux qemu-kvm.git]# ls /usr/local/share/qemu/
-</span><span class='line'>bamboo.dtb        mpc8544ds.dtb     petalogix-ml605.dtb       pxe-pcnet.rom    slof.bin            vgabios-vmware.bin
-</span><span class='line'>bios.bin          multiboot.bin     petalogix-s3adsp1800.dtb  pxe-rtl8139.rom  spapr-rtas.bin
-</span><span class='line'>cpus-x86_64.conf  openbios-ppc      ppc_rom.bin               pxe-virtio.rom   vgabios.bin
-</span><span class='line'>keymaps           openbios-sparc32  pxe-e1000.rom             qemu-icon.bmp    vgabios-cirrus.bin
-</span><span class='line'>kvmvapic.bin      openbios-sparc64  pxe-eepro100.rom          s390-zipl.rom    vgabios-qxl.bin
-</span><span class='line'>linuxboot.bin     palcode-clipper   pxe-ne2k_pci.rom          sgabios.bin      vgabios-stdvga.bin
-</span><span class='line'>[root@jay-linux qemu-kvm.git]# ls /usr/local/share/qemu/keymaps/
-</span><span class='line'>ar    common  de     en-gb  es  fi  fr     fr-ca  hr  is  ja  lv  modifiers  nl-be  pl  pt-br  sl  th
-</span><span class='line'>bepo  da      de-ch  en-us  et  fo  fr-be  fr-ch  hu  it  lt  mk  nl         no     pt  ru     sv  tr</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由于qemu-kvm是用户空间的程序，安装之后不用重启系统，直接用qemu-system-x86_64、qemu-img这样的命令行工具即可使用qemu-kvm了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/16">&larr; Older</a>
@@ -1508,7 +1731,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(161)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(163)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -1529,7 +1752,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>78</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>80</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1653,8 +1876,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(7)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
 <div id='2015' class='catsub'><li><a href='/blog/cats/2015~12/?opendiv=2015'>2015-12</a><span class='right_span'>4</span></li>
@@ -1746,6 +1970,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/03/09/kernel-net-bonding-source/">bonding的源代码分析</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2016/03/09/kernel-net-bonding/">七种网卡绑定模式详解</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/02/29/kernel-net-connect/">socket建立连接 sys_connect</a>
       </li>
     
@@ -1755,14 +1987,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/01/21/system-base-init/">Linux系统启动过程分析</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/01/12/kernel-base-rtc/">linux 实时时钟（RTC）驱动</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/01/12/debug-kdump-rtc/">kdump时间错误</a>
       </li>
     
   </ul>

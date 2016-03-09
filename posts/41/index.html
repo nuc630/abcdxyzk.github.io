@@ -62,6 +62,549 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/01/23/kernel-irq-mark3/">linux软中断机制分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-23T14:29:00+08:00'><span class='date'>2015-01-23</span> <span class='time'>14:29:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>软中断分析</h3>
+
+<h4>1. 为什么要软中断</h4>
+
+<p>编写驱动的时候，一个中断产生之后，内核在中断处理函数中可能需要完成很多工作。但是中断处理函数的处理是关闭了中断的。也就是说在响应中断时，系统不能再次响应外部的其它中断。这样的后果会造成有可能丢失外部中断。于是，linux内核设计出了一种架构，中断函数需要处理的任务分为两部分，一部分在中断处理函数中执行，这时系统关闭中断。另外一部分在软件中断中执行，这个时候开启中断，系统可以响应外部中断。</p>
+
+<p>关于软件中断的理论各种书籍都有介绍，不多叙述。而要真正体会软件中断的作用就必须从代码的角度来分析。我们做工作时候讲求的是professional，当一个人在某个领域一无所知的时候，我们称他为小白，偶，非苹果电脑。小白的脑子里充满了各种问题。慢慢的当这些疑惑解释完之后，小白就脱白了。此时，我们对这个领域的基本框架有了解，但这和professional还有一定的差距。再加以时日，逐渐融会贯通该领域才能达到专业的境界。</p>
+
+<h4>2. 什么时候触发处理软件中断</h4>
+
+<p>说了这么多废话，赶快步入正题。初识软中断，脑子里肯定有不少的疑问，首先就是软件中断在什么地方被触发处理？这个问题的答案就是：一个硬件中断处理完成之后。下面的函数在处理完硬件中断之后推出中断处理函数，在irq_exit中会触发软件中断的处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>asmlinkage void __exception asm_do_IRQ(unsigned int irq, struct pt_regs *regs)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct pt_regs *old_regs = set_irq_regs(regs);
+</span><span class='line'> 
+</span><span class='line'>&#9;irq_enter();
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Some hardware gives randomly wrong interrupts.  Rather
+</span><span class='line'>&#9; * than crashing, do something sensible.
+</span><span class='line'>&#9; */ 
+</span><span class='line'>&#9;if (irq &gt;= NR_IRQS)
+</span><span class='line'>&#9;    handle_bad_irq(irq, &bad_irq_desc);
+</span><span class='line'>&#9;else 
+</span><span class='line'>&#9;    generic_handle_irq(irq);
+</span><span class='line'> 
+</span><span class='line'>&#9;/* AT91 specific workaround */ 
+</span><span class='line'>&#9;irq_finish(irq);
+</span><span class='line'> 
+</span><span class='line'>&#9;irq_exit();
+</span><span class='line'>&#9;set_irq_regs(old_regs);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里要注意，invoke_softirq必须满足两个条件才能被调用到，一个就是不是在硬件中断处理过程中或者在软件中断处理中，第二个就是必须有软件中断处于pending状态。第二个好理解，有软件中断产生才去处理，没有就不处理。第一个就不好理解了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'>* Exit an interrupt context. Process softirqs if needed and possible:
+</span><span class='line'>*/ 
+</span><span class='line'>void irq_exit(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;account_system_vtime(current);
+</span><span class='line'>&#9;trace_hardirq_exit();
+</span><span class='line'>&#9;sub_preempt_count(IRQ_EXIT_OFFSET);
+</span><span class='line'>&#9;if (!in_interrupt() && local_softirq_pending())
+</span><span class='line'>&#9;    invoke_softirq();
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_NO_HZ
+</span><span class='line'>&#9;/* Make sure that timer wheel updates are propagated */ 
+</span><span class='line'>&#9;rcu_irq_exit();
+</span><span class='line'>&#9;if (idle_cpu(smp_processor_id()) && !in_interrupt() && !need_resched())
+</span><span class='line'>&#9;    tick_nohz_stop_sched_tick(0);
+</span><span class='line'>#endif 
+</span><span class='line'>&#9;preempt_enable_no_resched();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在linux系统的进程数据结构里，有这么一个数据结构</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define preempt_count() (current_thread_info()-&gt;preempt_count)，</span></code></pre></td></tr></table></div></figure>
+
+
+<p>利用preempt_count可以表示是否处于中断处理或者软件中断处理过程中。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define PREEMPT_MASK    (__IRQ_MASK(PREEMPT_BITS) &lt;&lt; PREEMPT_SHIFT)
+</span><span class='line'>#define SOFTIRQ_MASK    (__IRQ_MASK(SOFTIRQ_BITS) &lt;&lt; SOFTIRQ_SHIFT)
+</span><span class='line'>#define HARDIRQ_MASK    (__IRQ_MASK(HARDIRQ_BITS) &lt;&lt; HARDIRQ_SHIFT)
+</span><span class='line'> 
+</span><span class='line'>#define PREEMPT_OFFSET    (1UL &lt;&lt; PREEMPT_SHIFT)
+</span><span class='line'>#define SOFTIRQ_OFFSET    (1UL &lt;&lt; SOFTIRQ_SHIFT)
+</span><span class='line'>#define HARDIRQ_OFFSET    (1UL &lt;&lt; HARDIRQ_SHIFT)
+</span><span class='line'>
+</span><span class='line'>sub_preempt_count(IRQ_EXIT_OFFSET);
+</span><span class='line'>
+</span><span class='line'>#define in_interrupt() (irq_count())
+</span><span class='line'>
+</span><span class='line'>#define irq_count() (preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK))</span></code></pre></td></tr></table></div></figure>
+
+
+<p><img src="/images/kernel/2015-01-23-1.png" alt="" /></p>
+
+<p>preempt_count的8～23位记录中断处理和软件中断处理过程的计数。如果有计数，表示系统在硬件中断或者软件中断处理过程中。系统这么设计是为了避免软件中断在中断嵌套中被调用，并且达到在单个CPU上软件中断不能被重入的目的。对于ARM架构的CPU不存在中断嵌套中调用软件中断的问题，因为ARM架构的CPU在处理硬件中断的过程中是关闭掉中断的。只有在进入了软中断处理过程中之后才会开启硬件中断，如果在软件中断处理过程中有硬件中断嵌套，也不会再次调用软中断，because硬件中断是软件中断处理过程中再次进入的，此时preempt_count已经记录了软件中断！对于其它架构的CPU，有可能在触发调用软件中断前，也就是还在处理硬件中断的时候，就已经开启了硬件中断，可能会发生中断嵌套，在中断嵌套中是不允许调用软件中断处理的。Why？我的理解是，在发生中断嵌套的时候，表明这个时候是系统突发繁忙的时候，内核第一要务就是赶紧把中断中的事情处理完成，退出中断嵌套。避免多次嵌套，哪里有时间处理软件中断，所以把软件中断推迟到了所有中断处理完成的时候才能触发软件中断。</p>
+
+<h4>3. 软件中断的处理过程</h4>
+
+<p>之前我已经说到，软中断的一个很大的目的就是避免中断处理中，处理的操作过多而丢失中断。同时中断还需要考虑到一件事情就是中断处理过程过长就会影响系统响应时间。如果一个中断处理一秒钟，那你一定能感受到串口卡住的现象。从另外一方面说呢，我们又必须考虑中断处理的操作一定的优先度，毕竟是硬件触发的事务，关系到网络、块设备的效率问题。Linux内核就中断方面就必须考虑平衡这三个方面的问题。而下面我要分析的__do_softirq函数就恰似在这三者之间打太极，游刃有余，面面俱到！</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'>* We restart softirq processing MAX_SOFTIRQ_RESTART times,
+</span><span class='line'>* and we fall back to softirqd after that.
+</span><span class='line'>*
+</span><span class='line'>* This number has been established via experimentation.
+</span><span class='line'>* The two things to balance is latency against fairness -
+</span><span class='line'>* we want to handle softirqs as soon as possible, but they
+</span><span class='line'>* should not be able to lock up the box.
+</span><span class='line'>*/ 
+</span><span class='line'>#define MAX_SOFTIRQ_RESTART 10 
+</span><span class='line'> 
+</span><span class='line'>asmlinkage void __do_softirq(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct softirq_action *h;
+</span><span class='line'>&#9;__u32 pending;
+</span><span class='line'>&#9;int max_restart = MAX_SOFTIRQ_RESTART;
+</span><span class='line'>&#9;int cpu;
+</span><span class='line'> 
+</span><span class='line'>&#9;pending = local_softirq_pending();
+</span><span class='line'>&#9;account_system_vtime(current);
+</span><span class='line'> 
+</span><span class='line'>&#9;__local_bh_disable((unsigned long)__builtin_return_address(0));
+</span><span class='line'>&#9;trace_softirq_enter();
+</span><span class='line'> 
+</span><span class='line'>&#9;cpu = smp_processor_id();
+</span><span class='line'>restart:
+</span><span class='line'>&#9;/* Reset the pending bitmask before enabling irqs */ 
+</span><span class='line'>&#9;set_softirq_pending(0);
+</span><span class='line'> 
+</span><span class='line'>&#9;local_irq_enable();
+</span><span class='line'> 
+</span><span class='line'>&#9;h = softirq_vec;
+</span><span class='line'> 
+</span><span class='line'>&#9;do 
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;    if (pending & 1)
+</span><span class='line'>&#9;    {
+</span><span class='line'>&#9;        int prev_count = preempt_count();
+</span><span class='line'> 
+</span><span class='line'>&#9;        h-&gt;action(h);
+</span><span class='line'> 
+</span><span class='line'>&#9;        if (unlikely(prev_count != preempt_count()))
+</span><span class='line'>&#9;        {
+</span><span class='line'>&#9;            printk(KERN_ERR "huh, entered softirq %td %p" 
+</span><span class='line'>&#9;                   "with preempt_count %08x," 
+</span><span class='line'>&#9;                   " exited with %08x?\n", h - softirq_vec,
+</span><span class='line'>&#9;                   h-&gt;action, prev_count, preempt_count());
+</span><span class='line'>&#9;            preempt_count() = prev_count;
+</span><span class='line'>&#9;        }
+</span><span class='line'> 
+</span><span class='line'>&#9;        rcu_bh_qsctr_inc(cpu);
+</span><span class='line'>&#9;    }
+</span><span class='line'>&#9;    h++;
+</span><span class='line'>&#9;    pending &gt;&gt;= 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;while (pending);
+</span><span class='line'> 
+</span><span class='line'>&#9;local_irq_disable();
+</span><span class='line'> 
+</span><span class='line'>&#9;pending = local_softirq_pending();
+</span><span class='line'>&#9;if (pending && --max_restart)
+</span><span class='line'>&#9;    goto restart;
+</span><span class='line'> 
+</span><span class='line'>&#9;if (pending)
+</span><span class='line'>&#9;    wakeup_softirqd();
+</span><span class='line'> 
+</span><span class='line'>&#9;trace_softirq_exit();
+</span><span class='line'> 
+</span><span class='line'>&#9;account_system_vtime(current);
+</span><span class='line'>&#9;_local_bh_enable();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>__do_softirq函数处理软件中断过程如下图流程分析</p>
+
+<ol>
+<li><p>首先调用local_softirq_pending函数取得目前有哪些位存在软件中断</p></li>
+<li><p>调用<strong>local_bh_disable关闭软中断，其实就是设置正在处理软件中断标记，在同一个CPU上使得不能重入</strong>do_softirq函数</p></li>
+<li><p>重新设置软中断标记为0，set_softirq_pending重新设置软中断标记为0，这样在之后重新开启中断之后硬件中断中又可以设置软件中断位。</p></li>
+<li><p>开启硬件中断</p></li>
+<li><p>之后在一个循环中，遍历pending标志的每一位，如果这一位设置就会调用软件中断的处理函数。在这个过程中硬件中断是开启的，随时可以打断软件中断。这样保证硬件中断不会丢失。</p></li>
+<li><p>之后关闭硬件中断，查看是否又有软件中断处于pending状态，如果是，并且在本次调用__do_softirq函数过程中没有累计重复进入软件中断处理的次数超过10次，就可以重新调用软件中断处理。如果超过了10次，就调用wakeup_softirqd();唤醒内核的一个进程来处理软件中断。设立10次的限制，也是为了避免影响系统响应时间。</p></li>
+</ol>
+
+
+<p><img src="/images/kernel/2015-01-23-2.png" alt="" /></p>
+
+<h4>4. 处理软中断内核线程</h4>
+
+<p>之前我说到不能让CPU长时间来处理中断事务，这样会影响系统的响应时间，严重影响用户和系统之间的交互式体验。所以在之前的__do_softirq中最多将循环执行10次，那么当执行了10次仍然有软中断在pending状态，这个时候应该怎么处理呢？系统将唤醒一个软件中断处理的内核进程，在内核进程中处理pending中的软件中断。这里要注意，之前我们分析的触发软件中断的位置其实是中断上下文中，而在软中断的内核线程中实际已经是进程的上下文。</p>
+
+<p>这里说的软中断上下文指的就是系统为每个CPU建立的ksoftirqd进程。</p>
+
+<p>看完这个函数，我不得不佩服这个函数设计的精巧！而我更多的从中体会到其中蕴藏的一种做人的道理。那就是做人要霸道一点，太谦和太恭维不行，但是又不能横行霸道，原则的问题要公平讲理，一定的时候顾及别人的利益，好处不能一个人独吞。这就跟下面ksoftirqd处理过程一样，该狠的时候禁止抢占，其它进程别想调度到哦，但是自己占用CPU时间过长的话，也自觉的问一问是不是该释放CPU给其它进程了。</p>
+
+<p>下面我们就来分析一下这个处理过程怎么就体现了上面的这种说法呢？软中断的内核进程中主要有两个大循环，外层的循环处理有软件中断就处理，没有软件中断就休眠。内层的循环处理软件中断，并每循环一次都试探一次是否过长时间占据了CPU，需要调度释放CPU给其它进程。具体的操作在注释中做了解释。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int ksoftirqd(void *__bind_cpu)
+</span><span class='line'>{
+</span><span class='line'>&#9;set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'> 
+</span><span class='line'>&#9;while (!kthread_should_stop())
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;    /*不管三七二十一首先禁止抢占，我掌握CPU，并全凭我自己掌握调度*/ 
+</span><span class='line'>&#9;    preempt_disable();
+</span><span class='line'>&#9;    if (!local_softirq_pending())
+</span><span class='line'>&#9;    {
+</span><span class='line'>&#9;        preempt_enable_no_resched();
+</span><span class='line'>&#9;        /*如果没有软中断在pending，那就让出CPU来吧*/ 
+</span><span class='line'>&#9;        schedule();
+</span><span class='line'>&#9;       /*我被唤醒了，首先掌握CPU，不让自己被抢占，自己决定自己的是否要调度*/ 
+</span><span class='line'>&#9;        preempt_disable();
+</span><span class='line'>&#9;    }
+</span><span class='line'> 
+</span><span class='line'>&#9;    __set_current_state(TASK_RUNNING);
+</span><span class='line'> 
+</span><span class='line'>&#9;    while (local_softirq_pending())
+</span><span class='line'>&#9;    {
+</span><span class='line'>&#9;        /* Preempt disable stops cpu going offline.
+</span><span class='line'>&#9;           If already offline, we'll be on wrong CPU:
+</span><span class='line'>&#9;           don't process */ 
+</span><span class='line'>&#9;        if (cpu_is_offline((long)__bind_cpu))
+</span><span class='line'>&#9;            goto wait_to_die;
+</span><span class='line'>&#9;        /*处理软中断*/ 
+</span><span class='line'>&#9;        do_softirq();
+</span><span class='line'>&#9;        /*虽然我自己掌握是否要调度，虽然我可以一直不调度，但是我是
+</span><span class='line'>&#9;        个正直的人，运行一段时间后我会看看是否需要调度，还其它进程运行*/ 
+</span><span class='line'>&#9;        preempt_enable_no_resched();
+</span><span class='line'>&#9;        cond_resched();
+</span><span class='line'>&#9;        preempt_disable();
+</span><span class='line'>&#9;        rcu_qsctr_inc((long)__bind_cpu);
+</span><span class='line'>&#9;    }
+</span><span class='line'>&#9;    preempt_enable();
+</span><span class='line'>&#9;    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;__set_current_state(TASK_RUNNING);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'> 
+</span><span class='line'>wait_to_die:
+</span><span class='line'>&#9;preempt_enable();
+</span><span class='line'>&#9;/* Wait for kthread_stop */ 
+</span><span class='line'>&#9;set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;while (!kthread_should_stop())
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;    schedule();
+</span><span class='line'>&#9;    set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;__set_current_state(TASK_RUNNING);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/23/kernel-irq-mark2/">中断机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-23T14:03:00+08:00'><span class='date'>2015-01-23</span> <span class='time'>14:03:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>1、</h4>
+
+<p>cpu的中断管理和指令执行（运算器）是两套硬件，他们互相独立又有关联。</p>
+
+<h4>2、</h4>
+
+<p>无论中断是否允许，运算器都按自己的节奏工作，无须花时间去查询是否由中断到达。</p>
+
+<h4>3、</h4>
+
+<p>中断管理器则不断地探测是否有中断信号到达，若有且中断允许，则保存当前执行状态信息，然后打断当前取指序列，强行转到特定地址（中断向量）取指令，整个过程运算器并不知道，它只是忠实地执行取指电路取得的指令。<br/>
+  因此，只要没有中断信号到达，就不存在cpu边走边看的问题。
+  为保证正确访问临界数据区和正确执行临界代码段，操作系统一般有：关中断、关调度、信号量，还有些操作系统提供原子变量的方法，linux中广为人知的锁其实是用信号量实现的。那么，这么多的方法中，什么情况适用哪一种方法呢？是有规律的。</p>
+
+<h5>1、原子变量</h5>
+
+<p>  原子变量可以保证一个变量单次操作的正确性，其保护甚至比信号量还完善，信号量只能保护全局数据不被其他线程破坏，而原子变量能保证全局数据不被中断破坏。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>example1：
+</span><span class='line'>&#9;atomic int a;
+</span><span class='line'>int b,c;
+</span><span class='line'>a = a + b + c;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上述代码中，cpu对a有一个读、修改、写的过程，这个过程如果被打断，并在其他线程中修改了a值，执行结果将出现错误，而原子变量将保证不会发生这样的错误。
+原子变量不能保护一系列操作的原子性，若把上述代码改为</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>example2：
+</span><span class='line'>atomic int a;
+</span><span class='line'>int b,c;
+</span><span class='line'>a = a + b; //L1
+</span><span class='line'>a = a + c; //L2</span></code></pre></td></tr></table></div></figure>
+
+
+<p>原子变量不能保证L1和L2两行程序间a不被其他线程修改，因此example2不一定能得到正确的结果。</p>
+
+<h5>2、信号量</h5>
+
+<p>  稍微完善一点的操作系统都提供信号量机制，用于保护临界代码。上述example2就应该用下列代码替代L1和L2：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>获取信号量；
+</span><span class='line'>a = a + b; //L1
+</span><span class='line'>a = a + c; //L2
+</span><span class='line'>释放信号量；</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当一个全局变量可能被多个线程操作时，就应该用信号量保护，注意，不能在中断中访问用信号量保护的变量。</p>
+
+<h5>3、关调度</h5>
+
+<p>  关调度是一种比较粗暴的方式，关调度后，操作系统不会再进行线程上下文切换，而是专心执行一个线程，但是中断仍然开着。关调度可以起到替代信号量保护全局变量的作用，但一般不这样用，太粗暴了。但是如果某一段代码的执行时间有要求，希望cpu全速执行不被打断，但又不希望关中断时，可用关调度的方法。注意，从逻辑上，关调度能替换信号量，但不能替换原子变量。</p>
+
+<h5>4、关中断</h5>
+
+<p>  关中断是最粗暴的一种方式，用于保证最严格的时序执行，比如某段代码要在IO上输出两个高精度脉冲，脉冲宽度2uS，间隔2uS，这种需求只能通过用精确的指令延时来实现，延时过程中，如果被中断，或者发生线程切换，将不能正确输出脉冲。从逻辑上，前面所讲的三种保护，都可以用关中断实现，只是，太粗暴了。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/01/22/kernel-sched-n2/">linux的调度分析（转）</a></h2>
     
     
@@ -1433,258 +1976,6 @@ b：从系统调用返回用户空间时。</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/15/tools-cscope/">vim+cscope</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-15T15:41:00+08:00'><span class='date'>2015-01-15</span> <span class='time'>15:41:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>Ctags:<br/>
-按下"Ctrl+]&ldquo;, 光标会自动跳转到其定义处<br/>
-按下"ctrl+t&rdquo;, 返回上一个查找的地方</p>
-
-<hr />
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install cscope
-</span><span class='line'>sudo apt-get install cscope</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>生成Cscope数据</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cscope –Rbq</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>Cscope相关命令</h3>
-
-<p>所有的cscope命令都是通过向主cscope命令”:cscope”传递参数选项。她最短的缩写是”:cs”。”:scscope”命令也做同样的事情并且同时会横向分隔窗口（简称：”scs”）。</p>
-
-<p>可用的缩写有：</p>
-
-<h4>add ：增加一个新的cscope数据库/链接库</h4>
-
-<p>  使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs add {file|dir} [pre-path] [flags]</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  其中：<br/>
- [pre-path] 就是以-p选项传递给cscope的文件路径，是以相对路径表示的文件前加上的path，这样你不要切换到你数据库文件所在的目录也可以使用它了。<br/>
- [flags] 你想传递给cscope的额外旗标</p>
-
-<p>  实例：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cscope add /root/code/vimtest/ftpd
-</span><span class='line'>:cscope add /project/vim/cscope.out /usr/local/vim
-</span><span class='line'>:cscope add cscope.out /usr/local/vim –C</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>find ：查询cscope。所有的cscope查询选项都可用除了数字5（“修改这个匹配模式”）。</h4>
-
-<p>  使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs find {querytype} {name}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  其中：
- {querytype} 即相对应于实际的cscope行接口数字，同时也相对应于nvi命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>0或者s   —— 查找这个C符号
-</span><span class='line'>1或者g   —— 查找这个定义
-</span><span class='line'>2或者d   —— 查找被这个函数调用的函数（们）
-</span><span class='line'>3或者c   —— 查找调用这个函数的函数（们）
-</span><span class='line'>4或者t   —— 查找这个字符串
-</span><span class='line'>6或者e   —— 查找这个egrep匹配模式
-</span><span class='line'>7或者f   —— 查找这个文件
-</span><span class='line'>8或者i   —— 查找#include这个文件的文件（们）</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  实例：（#号后为注释）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cscope find c ftpd_send_resp    # 查找所有调用这个函数的函数（们）
-</span><span class='line'>:cscope find 3 ftpd_send_resp # 和上面结果一样
-</span><span class='line'>
-</span><span class='line'>:cscope find 0 FTPD_CHECK_LOGIN   # 查找FTPD_CHECK_LOGIN这个符号
-</span><span class='line'>执行结果如下：
-</span><span class='line'>Cscope tag: FTPD_CHECK_LOGIN                   
-</span><span class='line'>   #   line  filename / context / line
-</span><span class='line'>   1     19  ftpd.h &lt;&lt;GLOBAL&gt;&gt;
-</span><span class='line'>&#9;         #define FTPD_CHECK_LOGIN() \
-</span><span class='line'>   2    648  ftpd.c &lt;&lt;ftpd_do_pwd&gt;&gt;
-</span><span class='line'>&#9;         FTPD_CHECK_LOGIN();
-</span><span class='line'>   3    661  ftpd.c &lt;&lt;ftpd_do_cwd&gt;&gt;
-</span><span class='line'>&#9;         FTPD_CHECK_LOGIN();
-</span><span class='line'>Enter nr of choice (&lt;CR&gt; to abort):
-</span><span class='line'>
-</span><span class='line'>然后输入最前面的序列号即可。</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>help ：显示一个简短的摘要。</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs help</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>kill ：杀掉一个cscope链接（或者杀掉所有的cscope链接）</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs kill {num|partial_name}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>为了杀掉一个cscope链接，那么链接数字或者一个部分名称必须被指定。部分名称可以简单的是cscope数据库文件路径的一部分。要特别小心使用部分路径杀死一个cscope链接。假如指定的链接数字为-1，那么所有的cscope链接都会被杀掉。</p>
-
-<h4>reset：重新初始化所有的cscope链接。</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs reset</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>show：显示cscope的链接</h4>
-
-<p>使用方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>:cs show</span></code></pre></td></tr></table></div></figure>
-
-
-<p>假如你在使用cscope的同时也使用ctags，|:cstag|可以允许你在跳转之前指定从一个或另一个中查找。例如，你可以选择首先从cscope数据库中查找，然后再查找你的tags文件（由ctags生成）。上述执行的顺序取决于|csto|的值。<br/>
-|:cstag|当从cscope数据库中查找标识符时等同于“:cs find g”。<br/>
-|:cstag|当从你的tags文件中查找标识符时等同于“|:tjump|”。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/14/debug-mod-timer/">mod_timer会切换cpu</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-14T23:59:01+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:59:01</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://lkml.org/lkml/2009/4/16/45">https://lkml.org/lkml/2009/4/16/45</a></p>
-
-<blockquote><p>Ingo, Thomas, all,</p>
-
-<p>In an SMP system, tasks are scheduled on different CPUs by the
-scheduler, interrupts are managed by irqbalancer daemon, but timers
-are still stuck to the CPUs that they have been initialised.  Timers
-queued by tasks gets re-queued on the CPU where the task gets to run
-next, but timers from IRQ context like the ones in device drivers are
-still stuck on the CPU they were initialised.  This framework will
-help move all &lsquo;movable timers&rsquo; using a sysctl interface.</p></blockquote>
-
-<p>kernel/timer.c 中 __mod_timer函数的部分patch：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>+    cpu = smp_processor_id();
-</span><span class='line'>+ if (get_sysctl_timer_migration() && idle_cpu(cpu) && !pinned) {
-</span><span class='line'>+#if defined(CONFIG_NO_HZ) && (CONFIG_SMP)
-</span><span class='line'>+     preferred_cpu = get_nohz_load_balancer();
-</span><span class='line'>+#endif
-</span><span class='line'>+     if (preferred_cpu &gt;= 0)
-</span><span class='line'>+         cpu = preferred_cpu;
-</span><span class='line'>+ }
-</span><span class='line'>+
-</span><span class='line'>+ new_base = per_cpu(tvec_bases, cpu);
-</span><span class='line'>+</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>也就是说：如果当前进程是idle（函数idle_cpu(cpu)判定），那么在mod_timer时会根据cpu的struct rq runqueues;中的 struct sched_domain *sd; 来选一个不是idle的cpu，然后把timer移到他上去。如果都是idle，就还在本cpu。<br/>
-禁用该功能可以 echo 0 > /proc/sys/kernel/timer_magration，默认的启用是1。</p>
-
-<p>也就是说：系统默认状态下mod_timer有可能会mod_timer到其他cpu上。</p>
-
-<hr />
-
-<p>但是基本只有softirq时（如 <a href="/blog/2015/01/14/debug-softirq-time-count/">/blog/2015/01/14/debug-softirq-time-count/</a>），这时会的当前进程就是idle，但cpu实际并不空闲。这样的话softirq的timer在mod_timer时，会被加到其他cpu的定时器队列。如果这些timer是不允许切换cpu的（如对per_cpu变量的操作），那么就会产生bug。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/42">&larr; Older</a>
@@ -1794,7 +2085,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(161)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(163)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -1815,7 +2106,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>78</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>80</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1939,8 +2230,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(7)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
 <div id='2015' class='catsub'><li><a href='/blog/cats/2015~12/?opendiv=2015'>2015-12</a><span class='right_span'>4</span></li>
@@ -2032,6 +2324,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/03/09/kernel-net-bonding-source/">bonding的源代码分析</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2016/03/09/kernel-net-bonding/">七种网卡绑定模式详解</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/02/29/kernel-net-connect/">socket建立连接 sys_connect</a>
       </li>
     
@@ -2041,14 +2341,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/01/21/system-base-init/">Linux系统启动过程分析</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/01/12/kernel-base-rtc/">linux 实时时钟（RTC）驱动</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/01/12/debug-kdump-rtc/">kdump时间错误</a>
       </li>
     
   </ul>

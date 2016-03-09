@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2016-02-29T23:44:14+08:00</updated>
+  <updated>2016-03-09T11:22:18+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,1172 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[bonding的源代码分析]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2016/03/09/kernel-net-bonding-source/"/>
+    <updated>2016-03-09T10:10:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2016/03/09/kernel-net-bonding-source</id>
+    <content type="html"><![CDATA[<p><a href="https://github.com/matrix207/bonding">https://github.com/matrix207/bonding</a></p>
+
+<h3>1.  目的</h3>
+
+<p>  本文档结合相关内核代码和对Linux 2.6.9内核中Bonding模块的三种主要工作模式的工作<br/>
+  原理和流程。在配置Bond模块时，除了资料[2]，本文档也有一定的参考价值。</p>
+
+<h3>2. 内容</h3>
+
+<p>本文档包含下列内容：</p>
+
+<ul>
+<li>Bonding模块工作流程综述。（第3节）</li>
+<li>Bonding链路状态监控机制（mii模式、arp模式）描述。（第4节）</li>
+<li>Bonding模块三种主要工作模式：balance-rr、active- backup和broadcast相关代码分析。（第5节）</li>
+<li>Bonding模块关键数据结构和函数的代码分析。（第5节）</li>
+</ul>
+
+
+<p>如果想了解bonding模块的原理和工作流程，请阅读3、4节，如果想进一步分析bonding模块的代码，请阅读5节。</p>
+
+<h3>3. Bonding模块工作流程综述</h3>
+
+<p>  Bonding模块本质上是一个虚拟的网卡驱动（network device driver），只不过并没有<br/>
+  真实的物理网卡与之对应，而是由这个虚拟网卡去“管辖”一系列的真实的物理网卡，所以<br/>
+  它的代码结构和一般网卡驱动的代码结构非常类似，这是共性；除此之外，它还有自己的<br/>
+  一些特性功能，例如特别的链路状态监控机制，绑定/解除绑定等。</p>
+
+<h4>3.1 物理网卡的活动状态和链路状态：</h4>
+
+<p>  在bonding模块中为每一个被绑定的物理网卡定义了两种活动状态和四种链路状态：注意，<br/>
+  这里的链路状态和实际网卡真实的链路状态（是否故障、是否有网线连接）没有直接的关系，<br/>
+  虽然bonding模块通过MII或者ARP侦测到实际网卡故障时也会改变自定义的链路状态值<br/>
+  （例如从BOND_LINK_UP切换到BOND_LINK_FAIL随后切换到 BOND_LINK_DOWN状态），但是<br/>
+  概念上应该把这两类链路状态区分开。在本文档随后的内容中，除非特别指出，“链路状态”<br/>
+  都指bonding模块自定义的链路状态。</p>
+
+<p>  活动状态：
+<code>
+    BOND_STATE_ACTIVE：处于该状态的网卡是潜在的发送数据包的候选者
+    BOND_STATE_BACKUP：处于该状态的网卡在选择发送数据的网卡时被排除
+</code></p>
+
+<p>  链路状态：
+<code>
+    BOND_LINK_UP：  上线状态（处于该状态的网卡是是潜在的发送数据包的候选者）
+    BOND_LINK_DOWN：故障状态
+    BOND_LINK_FAIL：网卡出现故障，向状态BOND_LINK_DOWN 切换中
+    BOND_LINK_BACK：网卡恢复，向状态BOND_LINK_UP切换中
+</code></p>
+
+<p>  一个网卡必须活动状态为BOND_STATE_ACTIVE并且链路状态为 BOND_LINK_UP，才有可能作<br/>
+  为发送数据包的候选者，注意，这里所说的数据包并不包含ARP请求，在使用ARP链路状态<br/>
+  监控时，一个处于BOND_LINK_BACK状态的网卡也可能发送ARP请求。</p>
+
+<p>  bonding模块的所有工作模式可以分为两类：多主型工作模式和主备型工作模式，balance-rr<br/>
+  和broadcast属于多主型工作模式而active-backup属于主备型工作模式。（balance-xor、<br/>
+  自适应传输负载均衡模式（balance-tlb）和自适应负载均衡模式（balance-alb）也属于<br/>
+  多主型工作模式，IEEE 802.3ad动态链路聚合模式（802.3ad）属于主备型工作模式，在本文档中不加以讨论）</p>
+
+<p>  在多主型工作模式中，如果物理网卡不出现故障，所有的物理网卡都处于 BOND_STATE_ACTIVE<br/>
+  和BOND_LINK_UP的状态下，参与数据的收发，此时：如果工作在balance-rr 模式中轮流<br/>
+  向各个网卡发送数据，curr_active_slave字段（见5.1.3）指向前次发送数据（不包含<br/>
+  ARP请求）的物理网卡，该指针每次发送过数据后都会切换到下一个物理网卡；在broadcast<br/>
+  模式中向所有网卡发送数据，curr_active_slave字段除非网卡有故障发生不会切换。</p>
+
+<p>  在主备型工作模式中，如果物理网卡不出现故障，只有一块网卡（活动网卡）处于 <br/>
+  BOND_STATE_ACTIVE和BOND_LINK_UP的状态下，负责数据的收发，而其他网卡（后备网卡）<br/>
+  处于BOND_STATE_BACKUP 和BOND_LINK_DOWN状态下，此时curr_active_slave字段指向当前的活动网卡。</p>
+
+<p>  如果工作在active-backup模式下，可以指定一个物理网卡作为主网卡（primitive interface）<br/>
+  ,如果主网卡可用，就把主网卡作为当前活动网卡，否则在其他的可用网卡中选取一块网<br/>
+  卡作为当前活动网卡，而一旦主网卡从故障中恢复，不管当前活动网卡是否故障都切换到<br/>
+  主网卡。在balance-tlb和balance-alb模式中也可以指定主网卡，但是其意义和active-backup模式中并不相同。</p>
+
+<h4>3.2 数据收发流程</h4>
+
+<p>  如果一个物理网卡被虚拟网卡绑定，则代表该网卡的数据结构struct net_device中下列字段将发生变化：
+<code>
+    flags字段（unsigned short）将包含IFF_SLAVE标志。
+    master字段（struct net_device *）将指向虚拟网卡。
+</code></p>
+
+<p>  在主备型工作模式下，所有的非活动物理网卡的flags字段还将设置IFF_NOARP标志位表示对ARP请求不做出回应。</p>
+
+<p>  而代表虚拟网卡的struct net_device数据结构的flags字段将包含IFF_MASTER标志。</p>
+
+<p>  所有被绑定的物理网卡都将被设置相同的MAC地址和MTU值（和虚拟网卡也相同），这些值<br/>
+  将和第一块被绑定的物理网卡保持一致（“第一块网卡”并不是一个强制条件，这是由bonding<br/>
+  模块的启动流程造成的，我们也可以手工设置虚拟网卡的MAC地址和MTU值，这个设定同时<br/>
+  也将用于所有被绑定的物理网卡）。另外，所有被绑定的物理网卡没有IP地址，所以不参<br/>
+  与发送IP数据包的路由选择。</p>
+
+<p>  在下面的三节中，只描述数据发送和接收过程中和bonding相关的一些特殊处理，关于Linux<br/>
+  内核的一般数据包收发流程请参考资料[3][4]，本文档不再赘述。</p>
+
+<h5>3.2.1 接收数据</h5>
+
+<p>  无论在何种模式下，只要物理网卡的实际链路状态正常，任何被绑定的物理网卡都可以接<br/>
+  收数据（虽然没有IP地址，但是仍然有MAC地址），即使是处于BOND_STATE_BACKUP和BOND_LINK_DOWN<br/>
+  状态时，这是由于BOND_STATE_BACKUP和BOND_LINK_DOWN是bonding模块自己定义的管理物<br/>
+  理网卡所用的状态，和内核的TCP/IP栈没有任何关系，bonding模块最多在主备模式下给<br/>
+  备用物理网卡设置IFF_NOARP标志，使它对ARP数据包不做出回应，仅此而已。</p>
+
+<p>  收取数据包时，物理网卡驱动的中断处理函数把数据包放入接收队列中，随后软中断<br/>
+  NET_RX_SOFTIRQ的处理函数net_rx_action被调用，该函数将调用接收数据包的物理网卡网卡的poll函数。</p>
+
+<p>  无论一个物理网卡是否支持NAPI，函数netif_receive_skb都将在某个阶段被调用。<br/>
+  （如果物理网卡不支持NAPI，内核使用函数process_backlog代替真实的poll调用，<br/>
+  而process_backlog调用netif_receive_skb）。</p>
+
+<p>  在netif_receive_skb函数中将调用函数skb_bond，该函数本质上作如下操作：
+<code>
+    if(dev-&gt;master) skb-&gt;dev = dev-&gt;master;
+</code>
+  即把数据包skb的物理网卡字段替换为虚拟网卡，使得该数据包看起来像是从虚拟网卡接<br/>
+  收的一样，随后的处理和其他数据包没有任何差别，不再赘述。</p>
+
+<h5>3.2.2 发送数据</h5>
+
+<p>  发送数据包时，内核根据路由选择某一个虚拟网卡作为发送接口（注意被绑定的物理网卡<br/>
+  没有IP地址），最后调用该虚拟网卡的数据包传输接口net_device-> hard_start_xmit，<br/>
+  注意此时该数据包中的dev字段指向虚拟网卡。net_device-> hard_start_xmit接口根据<br/>
+  不同的工作模式指向不同的传输函数，但是无论是何种工作模式，最后bond_dev_queue_xmit<br/>
+  函数都将被调用（以一个选定的物理网卡作为参数调用）。</p>
+
+<p>  bond_dev_queue_xmit函数将作如下操作：
+<code>
+    skb-&gt;dev = slave_dev;
+</code></p>
+
+<p>  即替换skb的dev字段为选定的物理网卡。</p>
+
+<p>  随后，bond_dev_queue_xmit将调用标准的内核接口dev_queue_xmit把数据包放入选定物理网卡的发送队列中。</p>
+
+<h5>3.2.3 ARP请求和回应</h5>
+
+<p>  既然被绑定物理网卡没有IP地址，那么如果接收到ARP请求之后，根据何IP地址决定是否产生应答？<br/>
+  如果产生应答，在应答中，源IP地址应该是什么？</p>
+
+<p>  答案是：被绑定物理网卡接收到ARP请求后，由于函数arp_rcv在netif_receive_skb之后被调用，<br/>
+  而skb->dev经过netif_receive_skb的处理将指向虚拟网卡，所以是否产生应答由该物理网卡所<br/>
+  属的虚拟网卡的IP地址决定（当然前提是物理网卡没有设置IFF_NOARP标志），并且最终的ARP<br/>
+  回应将包含虚拟网卡的IP地址（细节请参考arp_rcv和arp_process函数）。</p>
+
+<h3>4. 链路状态监控</h3>
+
+<p>链路状态监控有如下两个作用：</p>
+
+<ul>
+<li>根据被绑定物理网卡的实际链路状态（是否故障、网线是否连接）更新bonding模块自定义<br/>
+的物理网卡链路状态和活动状态。</li>
+<li>在主备模式下，根据自定义的物理网卡链路状态切换活动状态和当前的活动网卡。</li>
+</ul>
+
+
+<p>Bonging模块支持两种模式的链路状态监控：通过MII ioctl调用直接进行或是通过发送ARP<br/>
+请求间接进行。前者通过调用物理网卡驱动程序的MII ioctl接口直接获得物理网卡是否<br/>
+故障的信息，后者通过向预定义的一组IP地址发送ARP请求，并观察被监控物理网卡是否<br/>
+有收到数据包（可能是ARP回答或者是一般数据包）间接进行。</p>
+
+<p>这两种链路状态监控模式不能并存。参数arp_interval和miimon表示以毫秒为单位的检测<br/>
+间隔，在加载bonding模块时如果指定了非0的arp_interval参数并且miimon参数等于0，<br/>
+则使用ARP链路状态监控；如果指定了非0 miimon参数则使用MII链路状态监控<br/>
+（强制arp_interval = 0从而忽略arp_interval参数）。如果arp_interval和miimon都<br/>
+等于0则使用参数值为100的MII链路状态监控（强制miimon等于100 ms）。</p>
+
+<p>如果使用ARP链路状态监控，还<em>必须</em>指定 arp_ip_target参数，该参数设定ARP监控时发送ARP<br/>
+请求的目标IP列表，各个IP之间使用逗号分隔。</p>
+
+<p>如果使用MII链路状态监控，还<em>可以</em>指定参数updelay和downdelay作为从BOND_LINK_DOWN到<br/>
+BOND_LINK_UP或者从BOND_LINK_UP 到BOND_LINK_DOWN切换的时间间隔，这两个参数默认是0值。<br/>
+（在ARP链路状态监控中这两个参数没有用）</p>
+
+<h4>4.1 MII链路状态监控</h4>
+
+<p>MII链路状态监控可以用下列流程图表示</p>
+
+<p>您的浏览器可能不支持显示此图像。</p>
+
+<p>初始时，如果虚拟网卡工作在多主型工作模式下，则所有物理网卡的链路状态为BOND_LINK_UP，<br/>
+并且活动状态处于BOND_STATE_ACTIVE，IFF_NOARP标志都没有设置；否则所有物理网卡的链路<br/>
+状态为 BOND_LINK_UP，但是只有当前活动网卡的活动状态处于BOND_STATE_ACTIVE并且没有<br/>
+设置IFF_NOARP 标志，而其余网卡的活动状态为BOND_STATE_BACKUP并且IFF_NOARP标志被设置。</p>
+
+<p>MII检测机制每miimon毫秒检测一遍所有被绑定物理网卡的状态。</p>
+
+<ol>
+<li>在某时刻，如果通过MII调用侦测到某一个物理网卡发生故障，则该物理网卡的链路状态立<br/>
+即被设置为BOND_LINK_FAILED。</li>
+<li>如果在downdelay毫秒内物理网卡恢复正常，则重新把网卡的链路状态设置为BOND_LINK_UP。</li>
+<li>如果在downdelay毫秒内物理网卡始终没有恢复正常，则该物理网卡的链路状态被设置为<br/>
+BOND_LINK_DOWN。如果虚拟网卡工作于主备型工作模式下，则活动状态被设置为BOND_STATE_BACKUP<br/>
+同时设置物理网卡的IFF_NOARP标志，并且如果出故障的是当前活动网卡，则通过一个重<br/>
+选择过程选择新的活动网卡（一般是第一块可用物理网卡）。</li>
+<li>如果一个链路状态为BOND_LINK_DOWN的物理网卡在MII检测过程中恢复正常，则立即把网卡<br/>
+的链路状态设置为BOND_LINK_BACK。</li>
+<li>如果在updelay毫秒内物理网卡又发生故障，就把链路状态重新设置为BOND_LINK_DOWN。</li>
+<li>如果ådelay毫秒内物理网卡始终保持可用状态，就把链路状态重新设置为BOND_LINK_UP。<br/>
+如果虚拟网卡工作于主备型工作模式下，则同时设置活动状态为BOND_STATE_ACTIVE并且<br/>
+清除物理网卡的IFF_NOARP标志，并且如果是主网卡恢复到BOND_STATE_ACTIVE状态，则会<br/>
+把当前活动网卡切换到主网卡。</li>
+</ol>
+
+
+<h4>4.2 ARP链路状态监控</h4>
+
+<h5>4.2.1 active-backup工作模式下的ARP链路状态监控</h5>
+
+<p>该模式下的ARP链路状态监控可以分为两个阶段：</p>
+
+<ol>
+<li><p>如果当前活动网卡（curr_active_slave不为NULL）存在，则以间隔 arp_interval毫秒从当<br/>
+前活动网卡向arp_targets表示的各个IP地址发送ARP请求，如果当前活动网卡在过去的<br/>
+2<em>arp_interval毫秒内没有数据包发送</em>和<em>接收并且已经作为活动网卡至少 2</em>arp_interval<br/>
+毫秒，则把当前活动网卡的链路状态设置为BOND_LINK_DOWN并且试图在链路状态为BOND_LINK_UP<br/>
+或者BOND_LINK_BACK的网卡中选取一个网卡作为当前活动网卡。如果有这样一个网卡存在，<br/>
+则原来的活动网卡的活动状态被设置为BOND_STATE_BACKUP，并且IFF_NOARP标志被设置，<br/>
+新的活动网卡链路状态被设置为BOND_STATE_UP, 活动状态被设置为BOND_STATE_ACTIVE，<br/>
+IFF_NOARP标志被清除。</p></li>
+<li><p>如果上述过程没有选出新的活动网卡（正常情况下active-backup 模式下除当前活动网卡<br/>
+外所有网卡的链路状态都是BOND_LINK_DOWN，所以可能没有链路状态为BOND_LINK_UP或者<br/>
+BOND_LINK_BACK的后备网卡），则开始一个下述的选取活动网卡的过程：</p></li>
+</ol>
+
+
+<p>从第一块可用（即IFF_UP标志被设置，netif_running(dev)和netif_carrier_ok(dev)都返回非0值）<br/>
+物理网卡开始，向arp_targets表示的各个IP地址发送ARP请求，然后观察所有的物理网卡，<br/>
+如果有物理网卡在arp_interval毫秒内有数据发送<em>和</em>接收，就把它设置为当前活动网卡，结束这个选取过程。否则换下一个可用物理网卡，重复这个过程。
+注意即使物理网卡被设置IFF_NOARP标志，仍旧可以收到ARP应答数据包。</p>
+
+<h5>4.2.2 其他工作模式下的ARP链路状态监控</h5>
+
+<p>  虚拟网卡每arp_interval遍历一遍所有被绑定物理网卡，如果在网卡在过去的2 * arp_interval毫秒内没有任何数据的发送<em>或者</em>接收，就把网卡的链路状态设置为 BOND_LINK_DOWN，活动状态设置为BOND_STATE_BACKUP，如果在过去的arp_interval毫秒有数据包发送<em>和</em>接收，则把网卡的链路状态设置为BOND_LINK_UP，活动状态设置为 BOND_STATE_ACTIVE。</p>
+
+<p>  在遍历过程中，对每一个可用的物理网卡（IFF_UP标志被设置，netif_running(dev)和netif_carrier_ok(dev)都返回非0值），都试图从该网卡向arp_targets表示的各个IP地址发送ARP请求，保证其他的被绑定的物理网卡可以收到ARP应答包。</p>
+
+<h3>5. 代码分析</h3>
+
+<h4>5.1 关键数据结构</h4>
+
+<ul>
+<li>1.struct bond_params</li>
+</ul>
+
+
+<p>文件：driver/net/bonding/bonding.h</p>
+
+<p>该结构是全局结构（每系统一个），对应于加载bonding模块时传入的各个参数
+<code>
+    主要成员：
+    名称  类型  含义
+    mode  int  Bonding模块工作模式
+        BOND_MODE_ROUNDROBIN     balance-rr模式
+        BOND_MODE_ACTIVEBACKUP   active-backup模式
+        BOND_MODE_XOR            balance-xor模式
+        BOND_MODE_BROADCAST      broadcast模式
+        BOND_MODE_8023AD         IEEE 802.3ad动态链路聚合模式
+        BOND_MODE_TLB            自适应传输负载均衡模式
+        BOND_MODE_ALB            自适应负载均衡模式
+    miimon  int  使用MII链路状态监控时的时间间隔（ms）
+    arp_interval  int  使用arp链路状态监控时的时间间隔（ms）
+    use_carrier  int  使用MII链路状态监控时是否使用更新的carrier调用
+    updelay  int  使用MII链路状态监控时从BACK状态切换到UP状态的时延(ms)
+    downdelay  int  使用MII链路状态监控时从FAIL状态切换到DOWN状态的时延(ms)
+    primary  char[]  用来在active-backup、balance-tlb和balance-alb模式中指定主网卡
+    arp_targets  u32[]  在ARP链路状态监控中将向这些IP地址发送ARP请求。
+</code></p>
+
+<ul>
+<li>2.struct slave</li>
+</ul>
+
+
+<p>文件：driver/net/bonding/Bonding.h</p>
+
+<p>每一个被管辖的物理网卡对应一个该数据结构的实例</p>
+
+<pre><code>    主要成员：
+    名称  类型  含义
+    dev  struct net_device*  指向被绑定的物理网卡
+    next，prev  struct slave *  所有的slave数据结构通过这两个指针双向链接到一起形成*循环*链表
+    delay  s16  用于保存MII链路状态监控和ARP链路状态监控的时延值。
+    jiffies  u32  用于active-backup模式下的ARP状态监控
+    link  s8  表示对应网卡的链路状态，取下列四个值之一：
+        BOND_LINK_UP     上线状态
+        BOND_LINK_DOWN   故障状态
+        BOND_LINK_FAIL   网卡出现故障，状态BOND_LINK_DOWN切换中
+        BOND_LINK_BACK   网卡恢复，状态BOND_LINK_UP切换中
+    state  s8  表示对应网卡活动状态，取下列两个值之一：
+        BOND_STATE_ACTIVE            活动状态
+        BOND_STATE_BACKUP            后备状态
+    original_flags  u32  保存被绑定物理网卡原来的flags
+    perm_hwaddr  u8[]  保存被绑定物理网卡原来的MAC地址
+    ad_info  struct ad_slave_info  记录IEEE 802.3ad动态链路聚合模式下的“每网卡”相关状态信息
+    tlb_info  struct tlb_slave_info  记录自适应传输负载均衡模式下的“每网卡”相关状态信息
+    link_failure_count  u32  网卡从BOND_LINK_FAIL切换到BOND_LINK_DOWN的次数
+    speed  u16  记录网卡的传输速度（10M/100M/1000G）
+    duplex  u8  网卡工作模式（全双工？）
+</code></pre>
+
+<ul>
+<li>3.struct bonding</li>
+</ul>
+
+
+<p>文件：driver/net/bonding/Bonding.h</p>
+
+<p>每一个虚拟网卡对应一个该数据结构的实例。</p>
+
+<pre><code>    主要成员：
+    名称  类型  含义
+    dev  struct net_device*  指向虚拟网卡（例如bond0、bond1等等）
+    first_slave  struct   slave *  指向被绑定的第一个物理网卡对应的slave结构。
+    curr_active_slave  struct   slave *  指向当前活动的网卡对应的slave结构，在不同的工作模式下有不同的含义。
+    current_arp_slave  struct   slave *  用于ARP状态监控（只用于bond_activebackup_arp_mon）
+    primary_slave  struct   slave *  如果使用BOND_MODE_ACTIVEBACKUP、BOND_MODE_TLB或者BOND_MODE_ALB模式，则指向主物理网卡对应的slave结构（primary_slave）
+    slave_cnt  s32  虚拟网卡所管辖的物理网络接口的个数
+    lock  rwlock_t  每一个虚拟网卡管辖一系列物理网卡，每一个物理网卡对应一个slave结构，所有的slave被放在一个链表中，这个读写锁用来保护该链表。
+    curr_slave_lock  rwlock_t  用来保护curr_active_slave的读写锁。
+    mii_timer  struct   timer_list  用于MII链路状态监控的定时器
+    arp_timer  struct   timer_list  用于ARP链路状态监控的定时器
+    kill_timers  s8  如果该标志置位，所有的计时器超时后就不再重新设置，从而可以被安全删除
+    bond_list  struct   list_head  通过该结构，所有的bonding数据结构被连接为双向链表，链表头是全局变量bond_dev_list。
+</code></pre>
+
+<h4>5.2 关键函数</h4>
+
+<p>本节描述了bonding模块关键函数的操作流程，这些函数是基本的原子模块，其他没有被列举的函数仅仅是对这些函数的简单包装。</p>
+
+<h5>5.2.1 模块初始化/释放</h5>
+
+<ul>
+<li>1.初始化</li>
+</ul>
+
+
+<h6>bonding_init</h6>
+
+<p>原型：
+<code>
+    static int __init bonding_init(void)
+</code></p>
+
+<p>bonding_init作为bonging模块的初始化函数，在模块被加载时被调用。它主要做如下工作：</p>
+
+<ol>
+<li>调用函数bond_check_params解析传入模块的参数并检查其合法性，结果放入数据结构params中。其中params是一个类型为bond_params的全局变量。</li>
+<li>如果内核支持proc文件系统，调用bond_create_proc_dir在/proc/net下创建目录/proc/net/bonding。</li>
+<li>如果传入参数指定了bond设备的个数（通过参数max_bonds），则通过下列步骤创建max_bonds个bond设备（从bond0到bondN）
+
+<ol>
+<li>调用alloc_netdev和dev_alloc_name创建网络设备，指定每一个设嘯一个bonding结构（dev->priv）。</li>
+<li>为每一个新创建的虚拟网络设备调用bond_init函数。</li>
+<li>调用register_netdevice注册这个新创建的网络设备。</li>
+</ol>
+</li>
+<li>调用register_netdevice_notifier，注册函数bond_netdev_notifier为网络事件处理函数。</li>
+</ol>
+
+
+<h6>bond_init</h6>
+
+<p>原型：
+<code>
+    static int __init bond_init(struct net_device *bond_dev, struct bond_params *params)
+</code></p>
+
+<p>该函数对每一个新创建的虚拟网络设备调用一次。它主要做下列工作。</p>
+
+<ol>
+<li>取出虚拟网络设备bond_dev的私有数据块，用bond指向它（struct bonding *bond）。</li>
+<li>初始化两个读写锁bond->lock和bond->curr_slave_lock。</li>
+<li>把bond->first_slave、bond->curr_active_slave、bond->current_arp_slave、bond->primary_slave全部置为NULL。bond->dev指向属主网络设备bond_dev。</li>
+<li>设置bond_dev的一系列通用接口函数，例如open、close、get_stats、do_ioctl、set_multicast_list、change_mtu和set_mac_address。</li>
+<li>根据不同的工作模式，设置bond_dev的通用接口函数hard_start_xmit 指向不同的目的函数。例如如果工作模式是BOND_MODE_ROUNDROBIN，则 hard_start_xmit指向函数bond_xmit_roundrobin。</li>
+<li>设置bond_dev->tx_queue_len为0，表示发送队列大小没有限制。</li>
+<li>设置bond_dev->flags为IFF_MASTER|IFF_MULTICAST表示该设备支持Muticase并且是一个流量均衡组中的master（被它管辖的其他物理网卡将被设置IFF_SLAVE标志）。</li>
+<li>其他和VLAN相关的标志设置和初始化。</li>
+<li>如果内核支持proc文件系统，调用bond_create_proc_entry在目录/proc/net/bonding下创建对应的proc文件。</li>
+<li>调用list_add_tail把该bonding数据结构添加到bond_dev_list中。</li>
+</ol>
+
+
+<h6>2. 释放 bonding_exit</h6>
+
+<p>原型：
+<code>
+    static void __exit bonding_exit(void)
+</code>
+该函数在模块被卸载的时候被调用，它主要做如下工作：</p>
+
+<ol>
+<li>调用unregister_netdevice_notifier注销网络事件处理函数。</li>
+<li>调用bond_free_all注销所有形如bondN的虚拟网络接口。bond_free_all遍历bond_dev_list链表，并且对其中的每一个类型为 struct bonding*的数据结构bond做如下操作：</li>
+<li>调用unregister_netdevice注销bond->dev</li>
+<li>调用bond_deinit(bond->dev)</li>
+<li>调用bond_destroy_proc_dir删除/proc/net/bonding目录</li>
+</ol>
+
+
+<h5>bond_deinit</h5>
+
+<p>原型：
+<code>
+    static inline void bond_deinit(struct net_device *bond_dev)
+</code></p>
+
+<p>该函数对每一个虚拟网卡的实例调用一次，它主要做如下操作：</p>
+
+<ol>
+<li>调用list_del把虚拟网卡对应的bonding数据结构从bond_dev_list链表中摘除。</li>
+<li>调用bond_remove_proc_entry删除/proc/net/bonding目录中的对应文件。</li>
+</ol>
+
+
+<h5>5.2.2 物理网卡的绑定/解除绑定</h5>
+
+<p>在下面的讨论中，假定ifenslave使用新的ABI接口，即：</p>
+
+<ul>
+<li>在绑定物理网卡时，如果虚拟的网卡还没有MAC地址，则ifenslave通过IOCTL把该虚拟网卡的MAC地址设置为该物理网卡的MAC地址（保证bond_enslave被调用时虚拟网卡已经有了MAC地址）。</li>
+<li>如果被绑定网卡处于UP状态，则ifenslave首先把它设置为DOWN状态（保证bond_enslave被调用时被绑定物理网卡处于DOWN状态）。</li>
+</ul>
+
+
+<p>如果使用旧版本的ABI接口，则虚拟的网卡的MAC地址由bonding模块在bond_enslave函数中自行设置，并且被绑定网卡在bond_enslave被调用时可能处于UP状态，需要由bond_enslave函数自行处理。</p>
+
+<h6>1. 绑定 bond_enslave</h6>
+
+<p>原型：
+<code>
+    static int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev)
+</code></p>
+
+<p>该函数在试图把一个物理网卡绑定到一个虚拟的网卡时被调用，其中bond_dev表示虚拟的网卡，slave_dev表示真实的物理网卡。该函数主要做如下操作：</p>
+
+<ol>
+<li>取出bond_dev的私有数据，用bond指向它（struct bonding *）。</li>
+<li>一系列的合法性检查，包括：
+
+<ol>
+<li>bond_dev的flags是否已经设置了IFF_UP（虚拟的网卡必须已经处于UP状态）</li>
+<li>slave_dev的flags是否没有设置IFF_SLAVE（防止同一个物理网卡被绑定两次）</li>
+<li>bond_dev的flags如果设置了NETIF_F_VLAN_CHALLENGED，则bond->vlan_list不能为空。</li>
+<li>slave_dev->flags是否没有设置IFF_UP（物理网卡应该处于DOWN状态）</li>
+<li>slave_dev->set_mac_address不能为NULL（物理网卡应该支持设置MAC地址）</li>
+</ol>
+</li>
+<li>调用kmalloc分配一个新的slave结构。</li>
+<li>把slave_dev->flags保存在slave->original_flags中。</li>
+<li>把slave_dev原有的MAC地址保存在slave-> perm_hwaddr中。</li>
+<li>设置slave_dev新的MAC地址为虚拟网卡的MAC地址。</li>
+<li>调用netdev_set_master设置slave_dev，该函数主要作如下操作：
+
+<ol>
+<li>设置slave_dev->flags的IFF_SLAVE标志。</li>
+<li>设置slave_dev->master指向虚拟网卡bond_dev。</li>
+</ol>
+</li>
+<li>设置slave->dev指向slave_dev。</li>
+<li>如果bond_dev工作在模式BOND_MODE_TLB或者BOND_MODE_ALB，对slave调用bond_alb_init_slave函数。</li>
+<li>维护和Multicast以及VLAN相关的一系列数据结构。</li>
+<li>调用bond_attach_slave把slave加入bond的链表（通过维护bond-> first_slave和slave结构的next，prev指针）</li>
+<li>把slave的delay和link_failure_count都清零。</li>
+<li>监测slave_dev的链路状态：<br/>
+1.如果使用MII链路，并且bond_check_dev_link返回BMSR_LSTATUS（表示链路正常），或者不使用MII链路监控，则根据updelay是否为0把slave->link设置为BOND_LINK_BACK或者BOND_LINK_UP。<br/>
+2.如果使用MII链路，并且bond_check_dev_link返回非BMSR_LSTATUS值，则设置slave->link为BOND_LINK_DOWN。</li>
+<li>调用bond_update_speed_duplex更新slave_dev的链路速率，如果失败则设置slave_dev的链路速率为100M全双工。</li>
+<li>如果虚拟网卡工作在BOND_MODE_ACTIVEBACKUP、BOND_MODE_TLB或者BOND_MODE_ALB模式下，并且slave_dev是用户指定的主网卡，则设置bond->primary_slave为slave_dev。</li>
+<li>设置bond->curr_active_slave和slave的活动状态，维护VLAN和Multicast相关数据结构：<br/>
+1.如果虚拟网卡工作在BOND_MODE_ACTIVEBACKUP：如果bond->curr_active_slave没有被设置或者bond->curr_active_slave不响应ARP（设置了IFF_NOARP标志），并且slave_dev不处于BOND_LINK_DOWN状态，则设置slave_dev为活动网卡（设置BOND_STATE_ACTIVE标志，清除IFF_NOARP标志），否则设置slave_dev为后备网卡（设置BOND_STATE_BACKUP标志，设置IFF_NOARP标志）。<br/>
+2.如果虚拟网卡工作在BOND_MODE_ROUNDROBIN或者 BOND_MODE_BROADCAST：直接设置slave_dev的活动状态为BOND_STATE_ACTIVE（在BOND_MODE_ROUNDROBIN和BOND_MODE_BROADCAST 模式下，IFF_NOARP标志始终被清除），如果没有设置bond->curr_active_slave，则设置bond->curr_active_slave指向slave。<br/>
+3.其他工作模式：（还没有加以分析）</li>
+</ol>
+
+
+<h6>2. 解除绑定 bond_release</h6>
+
+<p>原型
+<code>
+    static int bond_release(struct net_device *bond_dev, struct net_device *slave_dev)
+</code></p>
+
+<p>该函数在试图解除一个物理网卡的绑定状态时被调用，其中bond_dev表示虚拟的网卡，slave_dev表示真实的物理网卡。该函数主要做如下操作：</p>
+
+<ol>
+<li>取出bond_dev的私有数据，用bond指向它（struct bonding *）。</li>
+<li>寻找对应的slave结构。</li>
+<li>一系列的合法性检查，包括：
+
+<ol>
+<li>slave_dev->flags是否设置了IFF_SLAVE。</li>
+<li>slave结构是否存在。</li>
+<li>slave_dev原来的MAC地址是否和bond_dev相同，如果相同给出警告（防止MAC冲突）</li>
+</ol>
+</li>
+<li>如果虚拟网卡工作在BOND_MODE_8023AD模式，调用bond_3ad_unbind_slave</li>
+<li>调用bond_detach_slave把slave从bond的链表中摘除（通过维护bond-> first_slave和slave结构的next，prev指针）。</li>
+<li>如果slave_dev是虚拟网卡以前的主物理网卡，则设置bond->primary_slave为NULL。</li>
+<li>如果slave_dev是虚拟网卡以前的活动网卡，则设置bond->active_slave为NULL（通过调用bond_change_active_slave函数）。</li>
+<li>如果虚拟网卡工作在模式BOND_MODE_TLB或者BOND_MODE_ALB则调用bond_alb_deinit_slave。</li>
+<li>如果slave_dev是虚拟网卡以前的活动网卡，则调用bond_select_active_slave寻找一个新的活动网卡。</li>
+<li>如果虚拟网卡再也没有管辖的物理网卡，清除虚拟网卡的MAC地址（如果新调用ifenslave绑定物理网卡，则重新设置这个MAC地址）。</li>
+<li>维护VLAN和Multicast相关的数据结构。</li>
+<li>调用netdev_set_master解除master和slave的绑定关系并且调用dev_close关闭slave_dev。</li>
+<li>恢复slave_dev的MAC地址（根据slave->perm_hwaddr）和flags（根据slave->original_flags）。</li>
+<li>调用kfree释放slave结构。</li>
+</ol>
+
+
+<h5>5.2.3 网卡驱动通用接口（interface service routines）</h5>
+
+<p>既然bonding模块本质上是一个虚拟网卡的驱动模块，所以必须提供一组所有网卡驱动模块都遵守的通用接口函数。</p>
+
+<h6>1. open/close</h6>
+
+<p>bond_open（net_device->open接口）</p>
+
+<p>原型：
+<code>
+    static int bond_open(struct net_device *bond_dev)
+</code></p>
+
+<p>该函数在对应的虚拟网卡被打开时调用（即使用ifup/ifconfig工具启动网卡的时候），主要做如下操作（只分析三种主要模式）：</p>
+
+<ol>
+<li>设置bond->kill_timers为0。</li>
+<li>如果使用MII链路状态监控：
+
+<ol>
+<li>初始化mii_timer。</li>
+<li>设置超时时间mii_timer->expires为当前jiffies+1（立即调用bond_mii_monitor函数）</li>
+<li>设置bond_mii_monitor为定时器的超时处理函数。</li>
+</ol>
+</li>
+<li>如果使用ARP链路状态监控：
+
+<ol>
+<li>初始化arp_timer。</li>
+<li>设置超时时间arp_timer->expires为当前jiffies+1（立即调用定时器的超时处理函数）</li>
+<li>如果工作在BOND_MODE_ACTIVEBACKUP，设置bond_activebackup_arp_mon为超时处理函数。</li>
+<li>如果工作在其他模式，设置bond_loadbalance_arp_mon为超时处理函数。</li>
+</ol>
+</li>
+</ol>
+
+
+<h6>bond_close（net_device->stop接口）</h6>
+
+<p>原型：
+<code>
+    static int bond_close(struct net_device *bond_dev)
+</code></p>
+
+<p>该函数在对应的虚拟网卡被关闭时调用（即使用ifdown/ifconfig工具关闭网卡的时候），主要做如下操作（只分析三种主要模式）：</p>
+
+<ol>
+<li>调用bond_mc_list_destroy维护Multicast相关数据结构。</li>
+<li>设置bond->kill_timers为1，所有的计时器超时后就不再重新设置，从而可以被安全删除。</li>
+<li>删除所有的定时器，包括mii_timer和arp_timer。</li>
+<li>调用bond_release_all释放所有被绑定的物理网卡，本质上该函数只是遍历slave链表并且对每一个元素调用bond_release。</li>
+<li>如果虚拟网卡工作在BOND_MODE_TLB或者BOND_MODE_ALB模式下，调用bond_alb_deinitialize。</li>
+</ol>
+
+
+<h6>2. ioctl接口</h6>
+
+<p>bond_do_ioctl（net_device->do_ioctl 接口）</p>
+
+<p>原型：
+<code>
+    static int bond_do_ioctl(struct net_device *bond_dev, struct ifreq *ifr, int cmd)
+</code></p>
+
+<p>该函数是虚拟网卡的IOCTRL接口，仅仅根据不同的IOCTRL命令调用其他函数执行相应的功能，
+所以不再列出操作流程而仅仅列举出这些被调用的函数和相应的功能：</p>
+
+<p>  1.链路状态设置和查询（bond_ethtool_ioctl或者if_mii）
+  2.Bonding模块状态查询（bond_info_query）
+  3.被绑定的物理网卡状态查询（bond_slave_info_query）
+  4.物理网卡的绑定和解除绑定（bond_enslave/bond_release）
+  5.虚拟网卡的MAC地址设置（bond_sethwaddr）
+  6.切换当前活动的物理网卡（bond_ioctl_change_active）</p>
+
+<h6>3. 统计值查询</h6>
+
+<p>bond_get_stats（net_device-> get_stats 接口）</p>
+
+<p>原型：
+<code>
+    static struct net_device_stats *bond_get_stats(struct net_device *bond_dev)
+</code></p>
+
+<p>该函数枚举所有被管辖的物理网卡，并且对每一个物理网卡调用get_stats接口，然后把对应的统计值加起来并作为最终的返回值，这些统计值包括。
+名称  含义
+rx_packets  接收包总数
+rx_bytes  接收字节总数
+rx_errors  接收过程中错误数据包数
+rx_dropped  接受过程中丢弃包数
+tx_packets  发送包总数
+tx_bytes  发送字节总数
+tx_errors  发送过程中错误数据包数
+tx_dropped  发送过程中丢弃包数
+multicast  Multicast数据包总数
+collisions  MAC地址冲突次数
+rx_length_errors  接收数据包长度错误总数
+rx_over_errors  ring buff溢出次数
+rx_crc_errors  接收数据包CRC校验错误总数
+rx_frame_errors  接收数据包frame对齐错误总数
+rx_fifo_errors  接收队列溢出次数
+rx_missed_errors  接收时丢失的包数（仅仅对某些媒体有效）
+tx_aborted_errors  发送取消次数（例如发送超时）
+tx_carrier_errors  链路错误总数
+tx_fifo_errors  发送队列溢出次数
+tx_heartbeat_errors  心跳信号丢失（仅仅对某些媒体有效）
+tx_window_errors  接收窗口错误（不明，需要进一步确认）</p>
+
+<h6>bond_set_multicast_list（net_device-> set_multicast_list 接口）</h6>
+
+<p>原型：
+<code>
+    static void bond_set_multicast_list(struct net_device *bond_dev)
+</code>
+该函数设置和Multicast和混杂模式相关的一组数据结构，由于三种主要工作模式并不过多地涉及这个函数，所以本文档不给出详细的说明。</p>
+
+<h6>bond_change_mtu（net_device-> change_mtu 接口）</h6>
+
+<p>原型：
+<code>
+    static int bond_change_mtu(struct net_device *bond_dev, int new_mtu)
+</code>
+该函数把被虚拟网卡的MTU和被它管辖的所有物理网卡的MTU设置为同一值，主要做如下操作：</p>
+
+<ol>
+<li>枚举所有被管辖的物理网卡，对每一个物理网卡调用change_mtu设置新的MTU值，如果物理网卡没有change_mtu接口函数，则直接设置slave->dev->mtu等于new_mtu。</li>
+<li>设置bond_dev->mtu的值等于new_mtu。</li>
+</ol>
+
+
+<h6>bond_set_mac_address（net_device-> set_mac_address 接口）</h6>
+
+<p>原型：
+<code>
+    static int bond_set_mac_address(struct net_device *bond_dev, void *addr)
+</code>
+该函数设置虚拟网卡的MAC地址和被管辖的物理网卡的MAC地址为同一值，主要做如下操作：</p>
+
+<ol>
+<li>枚举所有被管辖的物理网卡，对每一个物理网卡调用set_mac_address设置新的MAC地址，如果物理网卡没有set_mac_address函数，则错误返回。</li>
+<li>设置bond_dev->dev_addr的值等于新的MAC地址。</li>
+</ol>
+
+
+<h6>4. 数据包传输（接收/发送）</h6>
+
+<p>Bonding模块仅仅负责把发送数据包按照特定的工作模式转给被管辖的物理网卡发送，而每一个物理网卡负责自己的数据包接收，即虚拟网卡不管理各个物理网卡的数据接收过程，它能做的仅仅是设置它们的IFF_NOARP标志，使某一个物理网卡对ARP请求不做出回应。</p>
+
+<p>在模块初始化时， bond_init函数根据工作模式把net_device-> hard_start_xmit接口设置为不同的函数，对于 BOND_MODE_ROUNDROBIN、BOND_MODE_ACTIVEBACKUP和BOND_MODE_BROADCAST 模式，该接口分别被设置为下列三个函数之一</p>
+
+<h6>bond_xmit_roundrobin（net_device-> hard_start_xmit 接口）</h6>
+
+<p>原型：
+<code>
+    static int bond_xmit_roundrobin(struct sk_buff *skb, struct net_device *bond_dev)
+</code>
+该函数用来在BOND_MODE_ROUNDROBIN模式中发送数据包，主要做如下操作：</p>
+
+<ol>
+<li><p>合法性检查，包括：</p>
+
+<ol>
+<li>检查bond_dev ->flags中IFF_UP标志是否设置</li>
+<li>netif_running(bond_dev)是否返回非0值</li>
+<li>对应的虚拟网卡是否至少有一个管辖的物理网卡</li>
+</ol>
+</li>
+<li><p>从bond->curr_active_slave开始遍历slave链表，找到第一个链路状态为BOND_LINK_UP，活动状态为BOND_STATE_ACTIVE的物理网卡并且调用bond_dev_queue_xmit向这个物理网卡发送数据，然后设置bond->curr_active_slave为slave链表中的下一个物理网卡。</p></li>
+<li><p>如果没有找到这样的网卡或者bond_dev_queue_xmit返回非0值，则调用dev_kfree_skb丢弃数据包。</p></li>
+</ol>
+
+
+<h6>bond_xmit_activebackup（net_device-> hard_start_xmit 接口）</h6>
+
+<p>原型：
+<code>
+    static int bond_xmit_activebackup(struct sk_buff *skb, struct net_device *bond_dev)
+</code></p>
+
+<p>该函数用来在BOND_MODE_ACTIVEBACKUP模式中发送数据包，主要做如下操作：</p>
+
+<ol>
+<li>如果是试图发送ARP请求，则把全局变量my_ip设置为ARP请求中的发送方IP地址（skb->data+以太网头长度+ARP头长度+6），这个全局变量在ARP链路状态监控中被使用。</li>
+<li><p>合法性检查，包括：</p>
+
+<ol>
+<li>检查bond_dev ->flags中IFF_UP标志是否设置</li>
+<li>netif_running(bond_dev)是否返回非0值</li>
+<li>对应的虚拟网卡是否至少有一个管辖的物理网卡</li>
+</ol>
+</li>
+<li><p>如果bond->curr_active_slave不为空，则调用bond_dev_queue_xmit向这个物理网卡发送数据。</p></li>
+<li><p>否则，调用dev_kfree_skb丢弃数据包。</p></li>
+</ol>
+
+
+<h6>bond_xmit_broadcast（net_device-> hard_start_xmit接口）</h6>
+
+<p>原型：
+<code>
+    static int bond_xmit_broadcast(struct sk_buff *skb, struct net_device *bond_dev)
+</code>
+该函数用来在BOND_MODE_BROADCAST模式中发送数据包，主要做如下操作：</p>
+
+<ol>
+<li><p>合法性检查，包括：</p>
+
+<ol>
+<li>检查bond_dev ->flags中IFF_UP标志是否设置</li>
+<li>netif_running(bond_dev)是否返回非0值</li>
+<li>对应的虚拟网卡是否至少有一个管辖的物理网卡</li>
+</ol>
+</li>
+<li><p>从bond->curr_active_slave开始遍历slave链表，找到所有状态为BOND_LINK_UP，活动状态为BOND_STATE_ACTIVE的物理网卡，包括bond->curr_active_slave，调用bond_dev_queue_xmit向这些物理网卡发送数据（其中需要通过skb_clone复制skb结构）。</p></li>
+<li><p>如果发送失败，调用dev_kfree_skb丢弃数据包</p></li>
+</ol>
+
+
+<h6># bond_dev_queue_xmit</h6>
+
+<p>原型：
+<code>
+    int bond_dev_queue_xmit(struct bonding *bond, struct sk_buff *skb, struct net_device *slave_dev)
+</code>
+该函数被bond_xmit_roundrobin，bond_xmit_activebackup 和bond_xmit_broadcast 调用，向实际的物理网卡发送数据包，主要做如下操作：</p>
+
+<ol>
+<li>设置skb->dev为slave_dev（在此之前skb->dev指向虚拟网卡，现在指向真实的物理网卡）</li>
+<li>维护和VLAN相关的数据结构。</li>
+<li>调用dev_queue_xmit发送数据包。</li>
+</ol>
+
+
+<h6>dev_queue_xmit</h6>
+
+<p>原型：
+<code>
+    int dev_queue_xmit(struct sk_buff *skb)
+</code>
+该函数不是bonding模块的一部分而是内核的一个标准接口，为了清楚起见也把它列出来，请参考net/core/dev.c文件。</p>
+
+<ol>
+<li>如果底层的物理网卡不支持Scatter/Gather IO，而skb包含了分片（注意不是IP分片，而是和DMA相关的一个概念，见skbbuff.h），则调用__skb_linearize合并分片。</li>
+<li>如果底层的设备不支持计算校验和，则计算一系列校验和。</li>
+<li>如果底层的设备有发送队列（qdisc），则把数据包放入发送队列中，退出。</li>
+<li>如果底层的设备没有发送队列（例如loopback或者其他没有真实物理网卡对应的设备，bonding模块自然也算一个），则直接调用底层设备的hard_start_xmit发送数据包。</li>
+<li>如果发送失败，调用dev_kfree_skb丢弃数据包</li>
+</ol>
+
+
+<h5>5.2.4. 链路状态监控</h5>
+
+<h6>1. MII链路状态监控</h6>
+
+<p>bond_mii_monitor</p>
+
+<p>原型：
+<code>
+    static void bond_mii_monitor(struct net_device *bond_dev)
+</code></p>
+
+<p>如果使用MII链路状态监控，则该函数被周期调用以检测每一个被绑定物理网卡的链路状态, 主要做如下操作：</p>
+
+<ol>
+<li>计算局部变量delta_in_ticks = (bond->params.miimon * HZ) / 1000，即miimon参数的jiffies表示。</li>
+<li>如果kill_timers被设置，直接退出。</li>
+<li>如果没有任何物理网卡被绑定，重新设置定时器，退出。</li>
+<li>根据bond_check_dev_link的结果，按照第5节描述的MII链路状态监控模型设置网卡的链路状态。</li>
+<li><p>如果原来物理网卡的链路状态为BOND_LINK_FAIL，而 bond_check_dev_link返回非BMSR_LSTATUS值，则除了把链路状态设置为BOND_LINK_DOWN之外，还做如下操作：</p>
+
+<ol>
+<li>如果虚拟网卡工作在模式BOND_MODE_8023AD，调用bond_3ad_handle_link_change</li>
+<li>如果虚拟网卡工作在模式BOND_MODE_TLB或者BOND_MODE_ALB模式下，调用bond_alb_handle_link_change。</li>
+<li>如果当前被检查的slave不是curr_active_slave，设置标志do_failover表明可能会发生slave切换。</li>
+</ol>
+</li>
+<li><p>如果原来物理网卡的链路状态为BOND_LINK_BACK而bond_check_dev_link 返回BMSR_LSTATUS，则除了把链路状态设置为BOND_LINK_UP之外，还做如下操作：</p>
+
+<ol>
+<li>如果虚拟网卡工作在模式BOND_MODE_8023AD或者被监测网卡不是primary_slave，则设置物理网卡的活动状态为BOND_STATE_BACKUP</li>
+<li>如果虚拟网卡<em>不是</em>工作在模式BOND_MODE_ACTIVEBACKUP，则设置物理网卡的活动状态为BOND_STATE_ACTIVE</li>
+<li>如果虚拟网卡工作在模式BOND_MODE_8023AD，调用bond_3ad_handle_link_change</li>
+<li>如果虚拟网卡工作在模式BOND_MODE_TLB或者BOND_MODE_ALB模式下，调用bond_alb_handle_link_change。</li>
+<li>如果当前被检查的slave不是curr_active_slave，设置标志do_failover表明可能会发生slave切换。</li>
+</ol>
+</li>
+<li><p>调用bond_update_speed_duplex更新物理网卡的速率。</p></li>
+<li><p>如果do_failover被设置，调用bond_select_active_slave。</p></li>
+<li>设置定时器的超时值为jiffies+delta_in_ticks。</li>
+</ol>
+
+
+<h6>bond_check_dev_link</h6>
+
+<p>原型：
+<code>
+    static int bond_check_dev_link(struct bonding *bond, struct net_device *slave_dev, int reporting)
+</code></p>
+
+<p>该函数调用MII/ETHTOOL IOCTL或者使用netif_carrier_ok()检查链路是否正常工作（如果用<br/>
+户指定了use_carrier）参数，如果该函数返回BMSR_LSTATUS表明链路是正常的，否则表示链<br/>
+路故障（例如掉网线等等）。</p>
+
+<h6>2. ARP链路状态监控</h6>
+
+<p>bond_loadbalance_arp_mon</p>
+
+<p>原型：
+<code>
+    static void bond_loadbalance_arp_mon(struct net_device *bond_dev)
+</code></p>
+
+<p>如果虚拟网卡工作在<em>非</em>BOND_MODE_ACTIVEBACKUP 模式下，而用户指定了使用ARP状态监控，<br/>
+则周期性地对每一个被绑定物理网卡调用该函数，注意该函数不使用 downdelay和updelay参数。</p>
+
+<p>由于<em>非</em>BOND_MODE_ACTIVEBACKUP模式下所有的被绑定网卡都是处于活动状态（BOND_STATE_ACTIVE），<br/>
+所以该函数的功能是轮流从每一个被绑定物理网卡发送ARP请求，并且在一段时间间隔内是否<br/>
+有数据包接收，如果没有就设置被检查物理网卡的链路状态为BOND_LINK_DOWN，活动状态设置<br/>
+为BOND_STATE_BACKUP 表示不参与发送数据（但是只要IFF_UP被设置、netif_running和<br/>
+netif_carrier_ok都返回非0（真）值，即本地网卡检查通过，仍然周期性地发送ARP请求出去），<br/>
+请参考5.2节中的描述。</p>
+
+<p>该函数主要做如下操作：</p>
+
+<ol>
+<li>计算局部变量delta_in_ticks = (bond->params.arp_interval * HZ) / 1000，即arp_interval参数的jiffies表示。</li>
+<li>如果kill_timers被设置，直接退出。</li>
+<li>如果没有任何物理网卡被绑定，重新设置定时器，退出。</li>
+<li>枚举所有被绑定的物理网卡，做如下操作：
+
+<ol>
+<li>假如物理网卡的链路状态不是BOND_LINK_UP并且在delta_in_ticks时间间隔内发送过<em>并且</em>接受过数据包，则把链路状态设置为BOND_LINK_UP，活动状态设置为BOND_STATE_ACTIVE，并且如果curr_active_slave为空则设置do_failover局部变量。</li>
+<li>假如物理网卡的链路状态是BOND_LINK_UP并且在2*delta_in_ticks时间间隔内没有发送过或者没有接受过数据包，则把链路状态设置为BOND_LINK_DOWN，活动状态设置为BOND_STATE_BACKUP，如果当前slave是curr_active_slave则设置do_failover局部变量。</li>
+<li>如果dev->flags中IFF_UP被设置，netif_running和netif_carrier_ok都返回非0（真）值，则尝试调用bond_arp_send_all从该网卡发送ARP请求（参考bond_arp_send_all的描述）。</li>
+</ol>
+</li>
+<li>如果do_failover被设置，调用bond_select_active_slave。</li>
+<li>设置定时器的超时值为jiffies+delta_in_ticks。</li>
+</ol>
+
+
+<h6>bond_activebackup_arp_mon</h6>
+
+<p>原型：
+<code>
+    static void bond_activebackup_arp_mon(struct net_device *bond_dev)
+</code></p>
+
+<p>如果虚拟网卡工作在BOND_MODE_ACTIVEBACKUP模式下，而用户指定了使用ARP状态监控，则周期性地对每一个被绑定物理网卡调用该函数。</p>
+
+<p>该函数主要做如下操作：</p>
+
+<ol>
+<li>计算局部变量delta_in_ticks = (bond->params.arp_interval * HZ) / 1000，即arp_interval参数的jiffies表示。</li>
+<li>如果kill_timers被设置，直接退出。</li>
+<li>如果没有任何物理网卡被绑定，重新设置定时器，退出。</li>
+<li>枚举所有被绑定的物理网卡，做如下操作：
+
+<ol>
+<li>如果物理网卡在时间间隔delta_in_ticks内接收过数据包，就把网卡的链路状态设置为BOND_LINK_UP（网卡的活动状态保持不变），设置curr_active_slave为NULL。</li>
+<li>如果物理网卡在时间间隔3*delta_in_ticks内没有接收过数据包并且该网卡不是curr_active_slave，就把网卡的链路状态设置为BOND_LINK_DOWN并且调用bond_set_slave_inactive_flags设置网卡的活动状态为BOND_STATE_BACKUP，并且设置IFF_NOARP标志位，设置curr_active_slave为NULL。</li>
+</ol>
+</li>
+<li>检查curr_active_slave，如果curr_active_slave不为NULL：
+
+<ol>
+<li>如果curr_active_slave在2*delta_in_ticks内没有发送也没有接收过数据包，就把curr_active_slave的链路状态设置为BOND_LINK_DOWN并且调用bond_select_active_slave寻找一个新的网卡作为新的curr_active_slave，设置current_arp_slave为curr_active_slave。</li>
+<li>如果使用bond->primary_slave并且bond->primary_slave的链路状态是BOND_LINK_UP且bond->primary_slave不是curr_active_slave，就把bond->primary_slave作为新的curr_active_slave。</li>
+<li>否则设置current_arp_slave为NULL；</li>
+<li>调用bond_arp_send_all通过curr_active_slave发送ARP请求。</li>
+</ol>
+</li>
+<li>检查curr_active_slave，如果curr_active_slave为NULL，则从current_arp_slave 开始或者从first_slave开始选出一个网卡并且把链路状态设置为BOND_LINK_BACK的作为 curr_active_slave的候选者（包存在current_arp_slave中），在下一次lbond_activebackup_arp_mon 被调用的时候将把这个网卡设置为curr_active_slave。</li>
+<li>设置定时器的超时值为jiffies+delta_in_ticks。</li>
+</ol>
+
+
+<h6>3. slave切换</h6>
+
+<p>bond_find_best_slave</p>
+
+<p>原型：
+<code>
+    static struct slave *bond_find_best_slave(struct bonding *bond)
+</code></p>
+
+<p>该函数从被绑定网卡中选出最佳者作为curr_active_slave的候选，主要做如下操作：</p>
+
+<ol>
+<li>如果没有物理网卡被绑定，返回NULL。</li>
+<li>如果没有设置primary_slave或者primary_slave不可用，从first_slave开始，否则从primary_slave开始遍历被绑定物理网卡列表，如果有网卡的链路状态为BOND_LINK_UP，则返回这个物理网卡。如果没有链路状态为BOND_LINK_UP的网卡，返回处于BOND_LINK_BACK状态最久者（delay值最小）。</li>
+</ol>
+
+
+<h6>bond_change_active_slave</h6>
+
+<p>原型：
+<code>
+    static void bond_change_active_slave(struct bonding *bond, struct slave *new_active)
+</code></p>
+
+<p>该函数切换new_active为新的curr_active_slave，主要做如下操作：</p>
+
+<ol>
+<li>如果curr_active_slave和new_active相同，不做任何操作。</li>
+<li>如果new_active的链路状态是BOND_LINK_BACK，把链路状态设为BOND_LINK_UP。</li>
+<li>如果当前工作在BOND_MODE_ACTIVEBACKUP状态，把curr_active_slave的活动状态设置为BOND_STATE_BACKUP，并且设置IFF_NOARP标志位；把new_active的活动状态设置为BOND_STATE_ACTIVE，清除IFF_NOARP标志位。</li>
+<li>设置curr_active_slave为new_active。</li>
+</ol>
+
+
+<h3>6. 参考</h3>
+
+<ul>
+<li>[1]《Linux 多网卡绑定/负载均衡调研报告》</li>
+<li>[2]《Linux Ethernet Bonding Driver mini-howto》/src/net/Documentation/networking/bonding.txt</li>
+<li>[3]《The Linux® Networking Architecture: Design and Implementation of Network Protocols in the Linux Kernel》Klaus Wehrle</li>
+<li>[4]《Understanding Linux Network_Internals》Christian Benvenuti</li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[七种网卡绑定模式详解]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2016/03/09/kernel-net-bonding/"/>
+    <updated>2016-03-09T09:50:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2016/03/09/kernel-net-bonding</id>
+    <content type="html"><![CDATA[<p>按ip+port哈希可能会比较好
+<code>
+    mode=2 miimon=100 xmit_hash_policy=1
+</code></p>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/wuweilong/article/details/39720571">http://blog.csdn.net/wuweilong/article/details/39720571</a></p>
+
+<h4>概览：</h4>
+
+<p>目前网卡绑定mode共有七种(0~6)mode=0、mode=1、mode=2、mode=3、mode=4、mode=5、mode=6</p>
+
+<h4>说明:</h4>
+
+<p>需要说明的是如果想做成mode 0的负载均衡,仅仅设置这里optionsbond0 miimon=100 mode=0是不够的,与网卡相连的交换机必须做特殊配置（这两个端口应该采取聚合方式），因为做bonding的这两块网卡是使用同一个MAC地址.从原理分析一下（bond运行在mode0下）：</p>
+
+<p>mode 0下bond所绑定的网卡的IP都被修改成相同的mac地址，如果这些网卡都被接在同一个交换机，那么交换机的arp表里这个mac地址对应的端口就有多 个，那么交换机接受到发往这个mac地址的包应该往哪个端口转发呢？正常情况下mac地址是全球唯一的，一个mac地址对应多个端口肯定使交换机迷惑了。所以 mode0下的bond如果连接到交换机，交换机这几个端口应该采取聚合方式（cisco称为 ethernetchannel，foundry称为portgroup），因为交换机做了聚合后，聚合下的几个端口也被捆绑成一个mac地址.我们的解 决办法是，两个网卡接入不同的交换机即可。</p>
+
+<p>mode6模式下无需配置交换机，因为做bonding的这两块网卡是使用不同的MAC地址。</p>
+
+<h3>七种bond模式说明：</h3>
+
+<h4>第一种模式：mode=0 ，即：(balance-rr)Round-robin policy（平衡抡循环策略）</h4>
+
+<p>特点：传输数据包顺序是依次传输（即：第1个包走eth0，下一个包就走eth1….一直循环下去，直到最后一个传输完毕），此模式提供负载平衡和容错能力；但是我们知道如果一个连接或者会话的数据包从不同的接口发出的话，中途再经过不同的链路，在客户端很有可能会出现数据包无序到达的问题，而无序到达的数据包需要重新要求被发送，这样网络的吞吐量就会下降</p>
+
+<h4>第二种模式：mode=1，即： (active-backup)Active-backup policy（主-备份策略）</h4>
+
+<p>特点：只有一个设备处于活动状态，当一个宕掉另一个马上由备份转换为主设备。mac地址是外部可见得，从外面看来，bond的MAC地址是唯一的，以避免switch(交换机)发生混乱。此模式只提供了容错能力；由此可见此算法的优点是可以提供高网络连接的可用性，但是它的资源利用率较低，只有一个接口处于工作状态，在有 N 个网络接口的情况下，资源利用率为1/N</p>
+
+<h4>第三种模式：mode=2，即：(balance-xor)XOR policy（平衡策略）</h4>
+
+<p>特点：基于指定的传输HASH策略传输数据包。缺省的策略是：(源MAC地址 XOR 目标MAC地址)% slave数量。其他的传输策略可以通过xmit_hash_policy选项指定，此模式提供负载平衡和容错能力</p>
+
+<h4>第四种模式：mode=3，即：broadcast（广播策略）</h4>
+
+<p>特点：在每个slave接口上传输每个数据包，此模式提供了容错能力</p>
+
+<h4>第五种模式：mode=4，即：(802.3ad)IEEE 802.3ad Dynamic link aggregation（IEEE802.3ad 动态链接聚合）</h4>
+
+<p>特点：创建一个聚合组，它们共享同样的速率和双工设定。根据802.3ad规范将多个slave工作在同一个激活的聚合体下。外出流量的slave选举是基于传输hash策略，该策略可以通过xmit_hash_policy选项从缺省的XOR策略改变到其他策略。需要注意的 是，并不是所有的传输策略都是802.3ad适应的，尤其考虑到在802.3ad标准43.2.4章节提及的包乱序问题。不同的实现可能会有不同的适应 性。</p>
+
+<h5>必要条件：</h5>
+
+<p>条件1：ethtool支持获取每个slave的速率和双工设定</p>
+
+<p>条件2：switch(交换机)支持IEEE802.3ad Dynamic link aggregation</p>
+
+<p>条件3：大多数switch(交换机)需要经过特定配置才能支持802.3ad模式</p>
+
+<h4>第六种模式：mode=5，即：(balance-tlb)Adaptive transmit load balancing（适配器传输负载均衡）</h4>
+
+<p>特点：不需要任何特别的switch(交换机)支持的通道bonding。在每个slave上根据当前的负载（根据速度计算）分配外出流量。如果正在接受数据的slave出故障了，另一个slave接管失败的slave的MAC地址。</p>
+
+<p>该模式的必要条件：ethtool支持获取每个slave的速率</p>
+
+<h4>第七种模式：mode=6，即：(balance-alb)Adaptive load balancing（适配器适应性负载均衡）</h4>
+
+<p>特点：该模式包含了balance-tlb模式，同时加上针对IPV4流量的接收负载均衡(receiveload balance, rlb)，而且不需要任何switch(交换机)的支持。接收负载均衡是通过ARP协商实现的。bonding驱动截获本机发送的ARP应答，并把源硬件地址改写为bond中某个slave的唯一硬件地址，从而使得不同的对端使用不同的硬件地址进行通信。</p>
+
+<p>来自服务器端的接收流量也会被均衡。当本机发送ARP请求时，bonding驱动把对端的IP信息从ARP包中复制并保存下来。当ARP应答从对端到达时，bonding驱动把它的硬件地址提取出来，并发起一个ARP应答给bond中的某个slave。使用ARP协商进行负载均衡的一个问题是：每次广播 ARP请求时都会使用bond的硬件地址，因此对端学习到这个硬件地址后，接收流量将会全部流向当前的slave。这个问题可以通过给所有的对端发送更新（ARP应答）来解决，应答中包含他们独一无二的硬件地址，从而导致流量重新分布。当新的slave加入到bond中时，或者某个未激活的slave重新 激活时，接收流量也要重新分布。接收的负载被顺序地分布（roundrobin）在bond中最高速的slave上当某个链路被重新接上，或者一个新的slave加入到bond中，接收流量在所有当前激活的slave中全部重新分配，通过使用指定的MAC地址给每个 client发起ARP应答。下面介绍的updelay参数必须被设置为某个大于等于switch(交换机)转发延时的值，从而保证发往对端的ARP应答 不会被switch(交换机)阻截。</p>
+
+<h5>必要条件：</h5>
+
+<p>条件1：ethtool支持获取每个slave的速率；</p>
+
+<p>条件2：底层驱动支持设置某个设备的硬件地址，从而使得总是有个slave(curr_active_slave)使用bond的硬件地址，同时保证每个 bond 中的slave都有一个唯一的硬件地址。如果curr_active_slave出故障，它的硬件地址将会被新选出来的 curr_active_slave接管其实mod=6与mod=0的区别：mod=6，先把eth0流量占满，再占eth1，….ethX；而mod=0的话，会发现2个口的流量都很稳定，基本一样的带宽。而mod=6，会发现第一个口流量很高，第2个口只占了小部分流量</p>
+
+<h4>Linux网口绑定：</h4>
+
+<p>通过网口绑定(bond)技术,可以很容易实现网口冗余，负载均衡，从而达到高可用高可靠的目的。前提约定：</p>
+
+<p>2个物理网口分别是：eth0,eth1</p>
+
+<p>绑定后的虚拟口是：bond0</p>
+
+<p>服务器IP是：10.10.10.1</p>
+
+<h5>第一步，配置设定文件：</h5>
+
+<pre><code>    [root@woo ~]# vi  /etc/sysconfig/network-scripts/ifcfg-bond0
+    DEVICE=bond0
+    BOOTPROTO=none
+    ONBOOT=yes
+    IPADDR=10.10.10.1
+    NETMASK=255.255.255.0
+    NETWORK=192.168.0.0
+
+    [root@woo ~]# vi  /etc/sysconfig/network-scripts/ifcfg-eth0
+    DEVICE=eth0
+    BOOTPROTO=none
+    MASTER=bond0
+    SLAVE=yes
+
+    [root@woo ~]# vi  /etc/sysconfig/network-scripts/ifcfg-eth1
+    DEVICE=eth1
+    BOOTPROTO=none
+    MASTER=bond0
+    SLAVE=yes
+</code></pre>
+
+<h5>第二步，修改modprobe相关设定文件，并加载bonding模块：</h5>
+
+<p>1.在这里，我们直接创建一个加载bonding的专属设定文件/etc/modprobe.d/bonding.conf
+<code>
+    [root@woo ~]# vi /etc/modprobe.d/bonding.conf
+    alias bond0 bonding
+    options bonding mode=0 miimon=200
+</code>
+2.加载模块(重启系统后就不用手动再加载了)
+<code>
+    [root@woo ~]# modprobe bonding
+</code>
+3.确认模块是否加载成功：
+<code>
+    [root@woo ~]# lsmod | grep bonding
+    bonding 100065 0
+</code></p>
+
+<h5>第三步，重启一下网络，然后确认一下状况：</h5>
+
+<pre><code>    [root@db01 ~]# service network restart
+    Shutting down interface bond0:  [  OK  ]
+    Shutting down loopback interface:  [  OK  ]
+    Bringing up loopback interface:  [  OK  ]
+    Bringing up interface bond0:  [  OK  ]
+</code></pre>
+
+<pre><code>    [root@db01 ~]#  cat /proc/net/bonding/bond0
+    Ethernet Channel Bonding Driver: v3.4.0-1 (October 7, 2008)
+
+    Bonding Mode: fault-tolerance (active-backup)
+    Primary Slave: None
+    Currently Active Slave: eth0
+    MII Status: up
+    MII Polling Interval (ms): 100
+    Up Delay (ms): 0
+    Down Delay (ms): 0
+
+    Slave Interface: eth0
+    MII Status: up
+    Speed: 1000 Mbps
+    Duplex: full
+    Link Failure Count: 0
+    Permanent HW addr: 40:f2:e9:db:c9:c2
+
+    Slave Interface: eth1
+    MII Status: up
+    Speed: 1000 Mbps
+    Duplex: full
+    Link Failure Count: 0
+    Permanent HW addr: 40:f2:e9:db:c9:c3
+    [root@db01 ~]#  ifconfig | grep HWaddr
+    bond0     Link encap:Ethernet  HWaddr 40:F2:E9:DB:C9:C2
+    eth0      Link encap:Ethernet  HWaddr 40:F2:E9:DB:C9:C2
+    eth1      Link encap:Ethernet  HWaddr 40:F2:E9:DB:C9:C2
+</code></pre>
+
+<p>从上面的确认信息中，我们可以看到3个重要信息：</p>
+
+<p>1.现在的bonding模式是active-backup</p>
+
+<p>2.现在Active状态的网口是eth0</p>
+
+<p>3.bond0,eth1的物理地址和处于active状态下的eth0的物理地址相同，这样是为了避免上位交换机发生混乱。</p>
+
+<p>任意拔掉一根网线，然后再访问你的服务器，看网络是否还是通的。</p>
+
+<h5>第四步(一般不需要)，系统启动自动绑定、增加默认网关：</h5>
+
+<pre><code>    [root@woo ~]# vi /etc/rc.d/rc.local
+    #追加
+    ifenslave bond0 eth0 eth1
+    route add default gw 10.10.10.1
+    #如可上网就不用增加路由，0.1地址按环境修改.
+</code></pre>
+
+<hr />
+
+<p>留心：前面只是2个网口绑定成一个bond0的情况，如果我们要设置多个bond口，比如物理网口eth0和eth1组成bond0，eth2和eth3组成bond1，</p>
+
+<h4>多网口绑定：</h4>
+
+<p>那么网口设置文件的设置方法和上面第1步讲的方法相同，只是/etc/modprobe.d/bonding.conf的设定就不能像下面这样简单的叠加了：</p>
+
+<pre><code>    alias bond0 bonding
+    options bonding mode=1 miimon=200
+
+    alias bond1 bonding
+    options bonding mode=1 miimon=200
+</code></pre>
+
+<h5>正确的设置方法有2种：</h5>
+
+<p>第一种,你可以看到，这种方式的话，多个bond口的模式就只能设成相同的了：</p>
+
+<pre><code>    alias bond0 bonding
+    alias bond1 bonding
+    options bonding max_bonds=2 miimon=200 mode=1
+</code></pre>
+
+<p>第二种，这种方式，不同的bond口的mode可以设成不一样：</p>
+
+<pre><code>    alias bond0 bonding
+    options bond0 miimon=100 mode=1
+    install bond1 /sbin/modprobe bonding -o bond1 miimon=200 mode=0
+</code></pre>
+
+<p>仔细看看上面这2种设置方法，现在如果是要设置3个，4个，甚至更多的bond口，你应该也会了吧！</p>
+
+<h4>后记：</h4>
+
+<p>简单的介绍一下上面在加载bonding模块的时候，options里的一些参数的含义：</p>
+
+<p>miimon 监视网络链接的频度，单位是毫秒，我们设置的是200毫秒。</p>
+
+<p>max_bonds 配置的bond口个数</p>
+
+<p>mode bond模式，主要有以下几种，在一般的实际应用中，0和1用的比较多。</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[socket建立连接 sys_connect]]></title>
@@ -398,1892 +1564,771 @@
 <p>check_established参数对应的函数是<code>__inet_check_established()</code>，在inet_hash_connect()中可以看到。在上面的代码中我们还注意到调用check_established()时第三个参数为NULL，这在后面的分析中会用到。</p>
 
 <p><code>__inet_check_established()</code>函数中，会分别在TIME_WAIT传输控制块和除TIME_WIAT、LISTEN状态外的传输控制块中查找是已绑定的端口是否已经使用，代码片段如下所示：
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-<span class='line-number'>195</span>
-<span class='line-number'>196</span>
-<span class='line-number'>197</span>
-<span class='line-number'>198</span>
-<span class='line-number'>199</span>
-<span class='line-number'>200</span>
-<span class='line-number'>201</span>
-<span class='line-number'>202</span>
-<span class='line-number'>203</span>
-<span class='line-number'>204</span>
-<span class='line-number'>205</span>
-<span class='line-number'>206</span>
-<span class='line-number'>207</span>
-<span class='line-number'>208</span>
-<span class='line-number'>209</span>
-<span class='line-number'>210</span>
-<span class='line-number'>211</span>
-<span class='line-number'>212</span>
-<span class='line-number'>213</span>
-<span class='line-number'>214</span>
-<span class='line-number'>215</span>
-<span class='line-number'>216</span>
-<span class='line-number'>217</span>
-<span class='line-number'>218</span>
-<span class='line-number'>219</span>
-<span class='line-number'>220</span>
-<span class='line-number'>221</span>
-<span class='line-number'>222</span>
-<span class='line-number'>223</span>
-<span class='line-number'>224</span>
-<span class='line-number'>225</span>
-<span class='line-number'>226</span>
-<span class='line-number'>227</span>
-<span class='line-number'>228</span>
-<span class='line-number'>229</span>
-<span class='line-number'>230</span>
-<span class='line-number'>231</span>
-<span class='line-number'>232</span>
-<span class='line-number'>233</span>
-<span class='line-number'>234</span>
-<span class='line-number'>235</span>
-<span class='line-number'>236</span>
-<span class='line-number'>237</span>
-<span class='line-number'>238</span>
-<span class='line-number'>239</span>
-<span class='line-number'>240</span>
-<span class='line-number'>241</span>
-<span class='line-number'>242</span>
-<span class='line-number'>243</span>
-<span class='line-number'>244</span>
-<span class='line-number'>245</span>
-<span class='line-number'>246</span>
-<span class='line-number'>247</span>
-<span class='line-number'>248</span>
-<span class='line-number'>249</span>
-<span class='line-number'>250</span>
-<span class='line-number'>251</span>
-<span class='line-number'>252</span>
-<span class='line-number'>253</span>
-<span class='line-number'>254</span>
-<span class='line-number'>255</span>
-<span class='line-number'>256</span>
-<span class='line-number'>257</span>
-<span class='line-number'>258</span>
-<span class='line-number'>259</span>
-<span class='line-number'>260</span>
-<span class='line-number'>261</span>
-<span class='line-number'>262</span>
-<span class='line-number'>263</span>
-<span class='line-number'>264</span>
-<span class='line-number'>265</span>
-<span class='line-number'>266</span>
-<span class='line-number'>267</span>
-<span class='line-number'>268</span>
-<span class='line-number'>269</span>
-<span class='line-number'>270</span>
-<span class='line-number'>271</span>
-<span class='line-number'>272</span>
-<span class='line-number'>273</span>
-<span class='line-number'>274</span>
-<span class='line-number'>275</span>
-<span class='line-number'>276</span>
-<span class='line-number'>277</span>
-<span class='line-number'>278</span>
-<span class='line-number'>279</span>
-<span class='line-number'>280</span>
-<span class='line-number'>281</span>
-<span class='line-number'>282</span>
-<span class='line-number'>283</span>
-<span class='line-number'>284</span>
-<span class='line-number'>285</span>
-<span class='line-number'>286</span>
-<span class='line-number'>287</span>
-<span class='line-number'>288</span>
-<span class='line-number'>289</span>
-<span class='line-number'>290</span>
-<span class='line-number'>291</span>
-<span class='line-number'>292</span>
-<span class='line-number'>293</span>
-<span class='line-number'>294</span>
-<span class='line-number'>295</span>
-<span class='line-number'>296</span>
-<span class='line-number'>297</span>
-<span class='line-number'>298</span>
-<span class='line-number'>299</span>
-<span class='line-number'>300</span>
-<span class='line-number'>301</span>
-<span class='line-number'>302</span>
-<span class='line-number'>303</span>
-<span class='line-number'>304</span>
-<span class='line-number'>305</span>
-<span class='line-number'>306</span>
-<span class='line-number'>307</span>
-<span class='line-number'>308</span>
-<span class='line-number'>309</span>
-<span class='line-number'>310</span>
-<span class='line-number'>311</span>
-<span class='line-number'>312</span>
-<span class='line-number'>313</span>
-<span class='line-number'>314</span>
-<span class='line-number'>315</span>
-<span class='line-number'>316</span>
-<span class='line-number'>317</span>
-<span class='line-number'>318</span>
-<span class='line-number'>319</span>
-<span class='line-number'>320</span>
-<span class='line-number'>321</span>
-<span class='line-number'>322</span>
-<span class='line-number'>323</span>
-<span class='line-number'>324</span>
-<span class='line-number'>325</span>
-<span class='line-number'>326</span>
-<span class='line-number'>327</span>
-<span class='line-number'>328</span>
-<span class='line-number'>329</span>
-<span class='line-number'>330</span>
-<span class='line-number'>331</span>
-<span class='line-number'>332</span>
-<span class='line-number'>333</span>
-<span class='line-number'>334</span>
-<span class='line-number'>335</span>
-<span class='line-number'>336</span>
-<span class='line-number'>337</span>
-<span class='line-number'>338</span>
-<span class='line-number'>339</span>
-<span class='line-number'>340</span>
-<span class='line-number'>341</span>
-<span class='line-number'>342</span>
-<span class='line-number'>343</span>
-<span class='line-number'>344</span>
-<span class='line-number'>345</span>
-<span class='line-number'>346</span>
-<span class='line-number'>347</span>
-<span class='line-number'>348</span>
-<span class='line-number'>349</span>
-<span class='line-number'>350</span>
-<span class='line-number'>351</span>
-<span class='line-number'>352</span>
-<span class='line-number'>353</span>
-<span class='line-number'>354</span>
-<span class='line-number'>355</span>
-<span class='line-number'>356</span>
-<span class='line-number'>357</span>
-<span class='line-number'>358</span>
-<span class='line-number'>359</span>
-<span class='line-number'>360</span>
-<span class='line-number'>361</span>
-<span class='line-number'>362</span>
-<span class='line-number'>363</span>
-<span class='line-number'>364</span>
-<span class='line-number'>365</span>
-<span class='line-number'>366</span>
-<span class='line-number'>367</span>
-<span class='line-number'>368</span>
-<span class='line-number'>369</span>
-<span class='line-number'>370</span>
-<span class='line-number'>371</span>
-<span class='line-number'>372</span>
-<span class='line-number'>373</span>
-<span class='line-number'>374</span>
-<span class='line-number'>375</span>
-<span class='line-number'>376</span>
-<span class='line-number'>377</span>
-<span class='line-number'>378</span>
-<span class='line-number'>379</span>
-<span class='line-number'>380</span>
-<span class='line-number'>381</span>
-<span class='line-number'>382</span>
-<span class='line-number'>383</span>
-<span class='line-number'>384</span>
-<span class='line-number'>385</span>
-<span class='line-number'>386</span>
-<span class='line-number'>387</span>
-<span class='line-number'>388</span>
-<span class='line-number'>389</span>
-<span class='line-number'>390</span>
-<span class='line-number'>391</span>
-<span class='line-number'>392</span>
-<span class='line-number'>393</span>
-<span class='line-number'>394</span>
-<span class='line-number'>395</span>
-<span class='line-number'>396</span>
-<span class='line-number'>397</span>
-<span class='line-number'>398</span>
-<span class='line-number'>399</span>
-<span class='line-number'>400</span>
-<span class='line-number'>401</span>
-<span class='line-number'>402</span>
-<span class='line-number'>403</span>
-<span class='line-number'>404</span>
-<span class='line-number'>405</span>
-<span class='line-number'>406</span>
-<span class='line-number'>407</span>
-<span class='line-number'>408</span>
-<span class='line-number'>409</span>
-<span class='line-number'>410</span>
-<span class='line-number'>411</span>
-<span class='line-number'>412</span>
-<span class='line-number'>413</span>
-<span class='line-number'>414</span>
-<span class='line-number'>415</span>
-<span class='line-number'>416</span>
-<span class='line-number'>417</span>
-<span class='line-number'>418</span>
-<span class='line-number'>419</span>
-<span class='line-number'>420</span>
-<span class='line-number'>421</span>
-<span class='line-number'>422</span>
-<span class='line-number'>423</span>
-<span class='line-number'>424</span>
-<span class='line-number'>425</span>
-<span class='line-number'>426</span>
-<span class='line-number'>427</span>
-<span class='line-number'>428</span>
-<span class='line-number'>429</span>
-<span class='line-number'>430</span>
-<span class='line-number'>431</span>
-<span class='line-number'>432</span>
-<span class='line-number'>433</span>
-<span class='line-number'>434</span>
-<span class='line-number'>435</span>
-<span class='line-number'>436</span>
-<span class='line-number'>437</span>
-<span class='line-number'>438</span>
-<span class='line-number'>439</span>
-<span class='line-number'>440</span>
-<span class='line-number'>441</span>
-<span class='line-number'>442</span>
-<span class='line-number'>443</span>
-<span class='line-number'>444</span>
-<span class='line-number'>445</span>
-<span class='line-number'>446</span>
-<span class='line-number'>447</span>
-<span class='line-number'>448</span>
-<span class='line-number'>449</span>
-<span class='line-number'>450</span>
-<span class='line-number'>451</span>
-<span class='line-number'>452</span>
-<span class='line-number'>453</span>
-<span class='line-number'>454</span>
-<span class='line-number'>455</span>
-<span class='line-number'>456</span>
-<span class='line-number'>457</span>
-<span class='line-number'>458</span>
-<span class='line-number'>459</span>
-<span class='line-number'>460</span>
-<span class='line-number'>461</span>
-<span class='line-number'>462</span>
-<span class='line-number'>463</span>
-<span class='line-number'>464</span>
-<span class='line-number'>465</span>
-<span class='line-number'>466</span>
-<span class='line-number'>467</span>
-<span class='line-number'>468</span>
-<span class='line-number'>469</span>
-<span class='line-number'>470</span>
-<span class='line-number'>471</span>
-<span class='line-number'>472</span>
-<span class='line-number'>473</span>
-<span class='line-number'>474</span>
-<span class='line-number'>475</span>
-<span class='line-number'>476</span>
-<span class='line-number'>477</span>
-<span class='line-number'>478</span>
-<span class='line-number'>479</span>
-<span class='line-number'>480</span>
-<span class='line-number'>481</span>
-<span class='line-number'>482</span>
-<span class='line-number'>483</span>
-<span class='line-number'>484</span>
-<span class='line-number'>485</span>
-<span class='line-number'>486</span>
-<span class='line-number'>487</span>
-<span class='line-number'>488</span>
-<span class='line-number'>489</span>
-<span class='line-number'>490</span>
-<span class='line-number'>491</span>
-<span class='line-number'>492</span>
-<span class='line-number'>493</span>
-<span class='line-number'>494</span>
-<span class='line-number'>495</span>
-<span class='line-number'>496</span>
-<span class='line-number'>497</span>
-<span class='line-number'>498</span>
-<span class='line-number'>499</span>
-<span class='line-number'>500</span>
-<span class='line-number'>501</span>
-<span class='line-number'>502</span>
-<span class='line-number'>503</span>
-<span class='line-number'>504</span>
-<span class='line-number'>505</span>
-<span class='line-number'>506</span>
-<span class='line-number'>507</span>
-<span class='line-number'>508</span>
-<span class='line-number'>509</span>
-<span class='line-number'>510</span>
-<span class='line-number'>511</span>
-<span class='line-number'>512</span>
-<span class='line-number'>513</span>
-<span class='line-number'>514</span>
-<span class='line-number'>515</span>
-<span class='line-number'>516</span>
-<span class='line-number'>517</span>
-<span class='line-number'>518</span>
-<span class='line-number'>519</span>
-<span class='line-number'>520</span>
-<span class='line-number'>521</span>
-<span class='line-number'>522</span>
-<span class='line-number'>523</span>
-<span class='line-number'>524</span>
-<span class='line-number'>525</span>
-<span class='line-number'>526</span>
-<span class='line-number'>527</span>
-<span class='line-number'>528</span>
-<span class='line-number'>529</span>
-<span class='line-number'>530</span>
-<span class='line-number'>531</span>
-<span class='line-number'>532</span>
-<span class='line-number'>533</span>
-<span class='line-number'>534</span>
-<span class='line-number'>535</span>
-<span class='line-number'>536</span>
-<span class='line-number'>537</span>
-<span class='line-number'>538</span>
-<span class='line-number'>539</span>
-<span class='line-number'>540</span>
-<span class='line-number'>541</span>
-<span class='line-number'>542</span>
-<span class='line-number'>543</span>
-<span class='line-number'>544</span>
-<span class='line-number'>545</span>
-<span class='line-number'>546</span>
-<span class='line-number'>547</span>
-<span class='line-number'>548</span>
-<span class='line-number'>549</span>
-<span class='line-number'>550</span>
-<span class='line-number'>551</span>
-<span class='line-number'>552</span>
-<span class='line-number'>553</span>
-<span class='line-number'>554</span>
-<span class='line-number'>555</span>
-<span class='line-number'>556</span>
-<span class='line-number'>557</span>
-<span class='line-number'>558</span>
-<span class='line-number'>559</span>
-<span class='line-number'>560</span>
-<span class='line-number'>561</span>
-<span class='line-number'>562</span>
-<span class='line-number'>563</span>
-<span class='line-number'>564</span>
-<span class='line-number'>565</span>
-<span class='line-number'>566</span>
-<span class='line-number'>567</span>
-<span class='line-number'>568</span>
-<span class='line-number'>569</span>
-<span class='line-number'>570</span>
-<span class='line-number'>571</span>
-<span class='line-number'>572</span>
-<span class='line-number'>573</span>
-<span class='line-number'>574</span>
-<span class='line-number'>575</span>
-<span class='line-number'>576</span>
-<span class='line-number'>577</span>
-<span class='line-number'>578</span>
-<span class='line-number'>579</span>
-<span class='line-number'>580</span>
-<span class='line-number'>581</span>
-<span class='line-number'>582</span>
-<span class='line-number'>583</span>
-<span class='line-number'>584</span>
-<span class='line-number'>585</span>
-<span class='line-number'>586</span>
-<span class='line-number'>587</span>
-<span class='line-number'>588</span>
-<span class='line-number'>589</span>
-<span class='line-number'>590</span>
-<span class='line-number'>591</span>
-<span class='line-number'>592</span>
-<span class='line-number'>593</span>
-<span class='line-number'>594</span>
-<span class='line-number'>595</span>
-<span class='line-number'>596</span>
-<span class='line-number'>597</span>
-<span class='line-number'>598</span>
-<span class='line-number'>599</span>
-<span class='line-number'>600</span>
-<span class='line-number'>601</span>
-<span class='line-number'>602</span>
-<span class='line-number'>603</span>
-<span class='line-number'>604</span>
-<span class='line-number'>605</span>
-<span class='line-number'>606</span>
-<span class='line-number'>607</span>
-<span class='line-number'>608</span>
-<span class='line-number'>609</span>
-<span class='line-number'>610</span>
-<span class='line-number'>611</span>
-<span class='line-number'>612</span>
-<span class='line-number'>613</span>
-<span class='line-number'>614</span>
-<span class='line-number'>615</span>
-<span class='line-number'>616</span>
-<span class='line-number'>617</span>
-<span class='line-number'>618</span>
-<span class='line-number'>619</span>
-<span class='line-number'>620</span>
-<span class='line-number'>621</span>
-<span class='line-number'>622</span>
-<span class='line-number'>623</span>
-<span class='line-number'>624</span>
-<span class='line-number'>625</span>
-<span class='line-number'>626</span>
-<span class='line-number'>627</span>
-<span class='line-number'>628</span>
-<span class='line-number'>629</span>
-<span class='line-number'>630</span>
-<span class='line-number'>631</span>
-<span class='line-number'>632</span>
-<span class='line-number'>633</span>
-<span class='line-number'>634</span>
-<span class='line-number'>635</span>
-<span class='line-number'>636</span>
-<span class='line-number'>637</span>
-<span class='line-number'>638</span>
-<span class='line-number'>639</span>
-<span class='line-number'>640</span>
-<span class='line-number'>641</span>
-<span class='line-number'>642</span>
-<span class='line-number'>643</span>
-<span class='line-number'>644</span>
-<span class='line-number'>645</span>
-<span class='line-number'>646</span>
-<span class='line-number'>647</span>
-<span class='line-number'>648</span>
-<span class='line-number'>649</span>
-<span class='line-number'>650</span>
-<span class='line-number'>651</span>
-<span class='line-number'>652</span>
-<span class='line-number'>653</span>
-<span class='line-number'>654</span>
-<span class='line-number'>655</span>
-<span class='line-number'>656</span>
-<span class='line-number'>657</span>
-<span class='line-number'>658</span>
-<span class='line-number'>659</span>
-<span class='line-number'>660</span>
-<span class='line-number'>661</span>
-<span class='line-number'>662</span>
-<span class='line-number'>663</span>
-<span class='line-number'>664</span>
-<span class='line-number'>665</span>
-<span class='line-number'>666</span>
-<span class='line-number'>667</span>
-<span class='line-number'>668</span>
-<span class='line-number'>669</span>
-<span class='line-number'>670</span>
-<span class='line-number'>671</span>
-<span class='line-number'>672</span>
-<span class='line-number'>673</span>
-<span class='line-number'>674</span>
-<span class='line-number'>675</span>
-<span class='line-number'>676</span>
-<span class='line-number'>677</span>
-<span class='line-number'>678</span>
-<span class='line-number'>679</span>
-<span class='line-number'>680</span>
-<span class='line-number'>681</span>
-<span class='line-number'>682</span>
-<span class='line-number'>683</span>
-<span class='line-number'>684</span>
-<span class='line-number'>685</span>
-<span class='line-number'>686</span>
-<span class='line-number'>687</span>
-<span class='line-number'>688</span>
-<span class='line-number'>689</span>
-<span class='line-number'>690</span>
-<span class='line-number'>691</span>
-<span class='line-number'>692</span>
-<span class='line-number'>693</span>
-<span class='line-number'>694</span>
-<span class='line-number'>695</span>
-<span class='line-number'>696</span>
-<span class='line-number'>697</span>
-<span class='line-number'>698</span>
-<span class='line-number'>699</span>
-<span class='line-number'>700</span>
-<span class='line-number'>701</span>
-<span class='line-number'>702</span>
-<span class='line-number'>703</span>
-<span class='line-number'>704</span>
-<span class='line-number'>705</span>
-<span class='line-number'>706</span>
-<span class='line-number'>707</span>
-<span class='line-number'>708</span>
-<span class='line-number'>709</span>
-<span class='line-number'>710</span>
-<span class='line-number'>711</span>
-<span class='line-number'>712</span>
-<span class='line-number'>713</span>
-<span class='line-number'>714</span>
-<span class='line-number'>715</span>
-<span class='line-number'>716</span>
-<span class='line-number'>717</span>
-<span class='line-number'>718</span>
-<span class='line-number'>719</span>
-<span class='line-number'>720</span>
-<span class='line-number'>721</span>
-<span class='line-number'>722</span>
-<span class='line-number'>723</span>
-<span class='line-number'>724</span>
-<span class='line-number'>725</span>
-<span class='line-number'>726</span>
-<span class='line-number'>727</span>
-<span class='line-number'>728</span>
-<span class='line-number'>729</span>
-<span class='line-number'>730</span>
-<span class='line-number'>731</span>
-<span class='line-number'>732</span>
-<span class='line-number'>733</span>
-<span class='line-number'>734</span>
-<span class='line-number'>735</span>
-<span class='line-number'>736</span>
-<span class='line-number'>737</span>
-<span class='line-number'>738</span>
-<span class='line-number'>739</span>
-<span class='line-number'>740</span>
-<span class='line-number'>741</span>
-<span class='line-number'>742</span>
-<span class='line-number'>743</span>
-<span class='line-number'>744</span>
-<span class='line-number'>745</span>
-<span class='line-number'>746</span>
-<span class='line-number'>747</span>
-<span class='line-number'>748</span>
-<span class='line-number'>749</span>
-<span class='line-number'>750</span>
-<span class='line-number'>751</span>
-<span class='line-number'>752</span>
-<span class='line-number'>753</span>
-<span class='line-number'>754</span>
-<span class='line-number'>755</span>
-<span class='line-number'>756</span>
-<span class='line-number'>757</span>
-<span class='line-number'>758</span>
-<span class='line-number'>759</span>
-<span class='line-number'>760</span>
-<span class='line-number'>761</span>
-<span class='line-number'>762</span>
-<span class='line-number'>763</span>
-<span class='line-number'>764</span>
-<span class='line-number'>765</span>
-<span class='line-number'>766</span>
-<span class='line-number'>767</span>
-<span class='line-number'>768</span>
-<span class='line-number'>769</span>
-<span class='line-number'>770</span>
-<span class='line-number'>771</span>
-<span class='line-number'>772</span>
-<span class='line-number'>773</span>
-<span class='line-number'>774</span>
-<span class='line-number'>775</span>
-<span class='line-number'>776</span>
-<span class='line-number'>777</span>
-<span class='line-number'>778</span>
-<span class='line-number'>779</span>
-<span class='line-number'>780</span>
-<span class='line-number'>781</span>
-<span class='line-number'>782</span>
-<span class='line-number'>783</span>
-<span class='line-number'>784</span>
-<span class='line-number'>785</span>
-<span class='line-number'>786</span>
-<span class='line-number'>787</span>
-<span class='line-number'>788</span>
-<span class='line-number'>789</span>
-<span class='line-number'>790</span>
-<span class='line-number'>791</span>
-<span class='line-number'>792</span>
-<span class='line-number'>793</span>
-<span class='line-number'>794</span>
-<span class='line-number'>795</span>
-<span class='line-number'>796</span>
-<span class='line-number'>797</span>
-<span class='line-number'>798</span>
-<span class='line-number'>799</span>
-<span class='line-number'>800</span>
-<span class='line-number'>801</span>
-<span class='line-number'>802</span>
-<span class='line-number'>803</span>
-<span class='line-number'>804</span>
-<span class='line-number'>805</span>
-<span class='line-number'>806</span>
-<span class='line-number'>807</span>
-<span class='line-number'>808</span>
-<span class='line-number'>809</span>
-<span class='line-number'>810</span>
-<span class='line-number'>811</span>
-<span class='line-number'>812</span>
-<span class='line-number'>813</span>
-<span class='line-number'>814</span>
-<span class='line-number'>815</span>
-<span class='line-number'>816</span>
-<span class='line-number'>817</span>
-<span class='line-number'>818</span>
-<span class='line-number'>819</span>
-<span class='line-number'>820</span>
-<span class='line-number'>821</span>
-<span class='line-number'>822</span>
-<span class='line-number'>823</span>
-<span class='line-number'>824</span>
-<span class='line-number'>825</span>
-<span class='line-number'>826</span>
-<span class='line-number'>827</span>
-<span class='line-number'>828</span>
-<span class='line-number'>829</span>
-<span class='line-number'>830</span>
-<span class='line-number'>831</span>
-<span class='line-number'>832</span>
-<span class='line-number'>833</span>
-<span class='line-number'>834</span>
-<span class='line-number'>835</span>
-<span class='line-number'>836</span>
-<span class='line-number'>837</span>
-<span class='line-number'>838</span>
-<span class='line-number'>839</span>
-<span class='line-number'>840</span>
-<span class='line-number'>841</span>
-<span class='line-number'>842</span>
-<span class='line-number'>843</span>
-<span class='line-number'>844</span>
-<span class='line-number'>845</span>
-<span class='line-number'>846</span>
-<span class='line-number'>847</span>
-<span class='line-number'>848</span>
-<span class='line-number'>849</span>
-<span class='line-number'>850</span>
-<span class='line-number'>851</span>
-<span class='line-number'>852</span>
-<span class='line-number'>853</span>
-<span class='line-number'>854</span>
-<span class='line-number'>855</span>
-<span class='line-number'>856</span>
-<span class='line-number'>857</span>
-<span class='line-number'>858</span>
-<span class='line-number'>859</span>
-<span class='line-number'>860</span>
-<span class='line-number'>861</span>
-<span class='line-number'>862</span>
-<span class='line-number'>863</span>
-<span class='line-number'>864</span>
-<span class='line-number'>865</span>
-<span class='line-number'>866</span>
-<span class='line-number'>867</span>
-<span class='line-number'>868</span>
-<span class='line-number'>869</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/&lt;em&gt; called with local bh disabled &lt;/em&gt;/
-</span><span class='line'>static int &lt;strong&gt;inet_check_established(struct inet_timewait_death_row &lt;em&gt;death_row,
-</span><span class='line'>            struct sock &lt;/em&gt;sk, &lt;/strong&gt;u16 lport,
-</span><span class='line'>            struct inet_timewait_sock &lt;em&gt;&lt;em&gt;twp)
-</span><span class='line'>{
-</span><span class='line'>    struct inet_hashinfo &lt;/em&gt;hinfo = death_row-&gt;hashinfo;
-</span><span class='line'>    struct inet_sock &lt;/em&gt;inet = inet_sk(sk);
-</span><span class='line'>    &lt;strong&gt;be32 daddr = inet-&gt;rcv_saddr;
-</span><span class='line'>    &lt;/strong&gt;be32 saddr = inet-&gt;daddr;
-</span><span class='line'>    int dif = sk-&gt;sk_bound_dev_if;
-</span><span class='line'>    INET_ADDR_COOKIE(acookie, saddr, daddr)
-</span><span class='line'>    const __portpair ports = INET_COMBINED_PORTS(inet-&gt;dport, lport);
-</span><span class='line'>    struct net &lt;em&gt;net = sock_net(sk);
-</span><span class='line'>    unsigned int hash = inet_ehashfn(net, daddr, lport, saddr, inet-&gt;dport);
-</span><span class='line'>    struct inet_ehash_bucket &lt;/em&gt;head = inet_ehash_bucket(hinfo, hash);
-</span><span class='line'>    spinlock_t &lt;em&gt;lock = inet_ehash_lockp(hinfo, hash);
-</span><span class='line'>    struct sock &lt;/em&gt;sk2;
-</span><span class='line'>    const struct hlist_nulls_node &lt;em&gt;node;
-</span><span class='line'>    struct inet_timewait_sock &lt;/em&gt;tw;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    spin_lock(lock);
-</span><span class='line'>
-</span><span class='line'>/* Check TIME-WAIT sockets first. */
-</span><span class='line'>sk_nulls_for_each(sk2, node, &amp;head-&gt;twchain) {
-</span><span class='line'>    tw = inet_twsk(sk2);
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>    if (INET_TW_MATCH(sk2, net, hash, acookie,
-</span><span class='line'>            saddr, daddr, ports, dif)) {
-</span><span class='line'>        if (twsk_unique(sk, sk2, twp))
-</span><span class='line'>            goto unique;
-</span><span class='line'>        else
-</span><span class='line'>            goto not_unique;
-</span><span class='line'>    }
-</span><span class='line'>}
-</span><span class='line'>tw = NULL;
-</span><span class='line'>
-</span><span class='line'>/* And established part... */
-</span><span class='line'>sk_nulls_for_each(sk2, node, &amp;head-&gt;chain) {
-</span><span class='line'>    if (INET_MATCH(sk2, net, hash, acookie,
-</span><span class='line'>            saddr, daddr, ports, dif))
-</span><span class='line'>        goto not_unique;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>unique:
-</span><span class='line'>......
-</span><span class='line'>return 0;
-</span><span class='line'>
-</span><span class='line'>not_unique:
-</span><span class='line'>spin_unlock(lock);
-</span><span class='line'>return -EADDRNOTAVAIL;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>如果是TCP套接字，twsk_uniqueue()中会调用tcp_twsk_uniqueue()来判断，返回true的条件如下所示：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
-</span><span class='line'>{
-</span><span class='line'>const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>
-</span><span class='line'>if (tcptw-&gt;tw_ts_recent_stamp &amp;&amp;
-</span><span class='line'>        (twp == NULL || (sysctl_tcp_tw_reuse &amp;&amp;
-</span><span class='line'>        get_seconds() - tcptw-&gt;tw_ts_recent_stamp &gt; 1))) {
-</span><span class='line'>    ......
-</span><span class='line'>    return 1;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>return 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;/*
-</span><span class='line'> * Build a SYN and send it off.
-</span><span class='line'> */
-</span><span class='line'>int tcp_connect(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>struct sk_buff *buff;
-</span><span class='line'>/* 初始化连接对应的INET socket结构的参数，为连接做准备 */
-</span><span class='line'>tcp_connect_init(sk);
-</span><span class='line'>/* 获取一个skb，由于是syn包，没有数据，所以大小是MAX_TCP_HEADER的16位对齐 */
-</span><span class='line'>buff = alloc_skb_fclone(MAX_TCP_HEADER + 15, sk-&gt;sk_allocation);
-</span><span class='line'>if (unlikely(buff == NULL))
-</span><span class='line'>    return -ENOBUFS;
-</span><span class='line'>
-</span><span class='line'>/* Reserve space for headers. */
-</span><span class='line'>skb_reserve(buff, MAX_TCP_HEADER);
-</span><span class='line'>
-</span><span class='line'>tp-&gt;snd_nxt = tp-&gt;write_seq;
-</span><span class='line'>/* 设置skb相关参数 */
-</span><span class='line'>tcp_init_nondata_skb(buff, tp-&gt;write_seq++, TCPCB_FLAG_SYN);
-</span><span class='line'>/* 设置ECN */
-</span><span class='line'>TCP_ECN_send_syn(sk, buff);
-</span><span class='line'>
-</span><span class='line'>/* Send it off. */
-</span><span class='line'>/* 保存该数据包的发送时间*/
-</span><span class='line'>TCP_SKB_CB(buff)-&gt;when = tcp_time_stamp;
-</span><span class='line'>tp-&gt;retrans_stamp = TCP_SKB_CB(buff)-&gt;when;
-</span><span class='line'>skb_header_release(buff);
-</span><span class='line'>/* 加入发送队列，待确认后在丢弃*/
-</span><span class='line'>__tcp_add_write_queue_tail(sk, buff);
-</span><span class='line'>sk-&gt;sk_wmem_queued += buff-&gt;truesize;
-</span><span class='line'>sk_mem_charge(sk, buff-&gt;truesize);
-</span><span class='line'>tp-&gt;packets_out += tcp_skb_pcount(buff);
-</span><span class='line'>tcp_transmit_skb(sk, buff, 1, GFP_KERNEL);
-</span><span class='line'>
-</span><span class='line'>/* We change tp-&gt;snd_nxt after the tcp_transmit_skb() call
-</span><span class='line'> * in order to make this packet get counted in tcpOutSegs.
-</span><span class='line'> */
-</span><span class='line'>tp-&gt;snd_nxt = tp-&gt;write_seq;
-</span><span class='line'>tp-&gt;pushed_seq = tp-&gt;write_seq;
-</span><span class='line'>TCP_INC_STATS(sock_net(sk), TCP_MIB_ACTIVEOPENS);
-</span><span class='line'>
-</span><span class='line'>/* Timer for repeating the SYN until an answer. */
-</span><span class='line'>inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-</span><span class='line'>              inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
-</span><span class='line'>return 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;/*
-</span><span class='line'> * Do all connect socket setups that can be done AF independent.
-</span><span class='line'> */
-</span><span class='line'>static void tcp_connect_init(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>struct dst_entry *dst = __sk_dst_get(sk);
-</span><span class='line'>struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>__u8 rcv_wscale;
-</span><span class='line'>
-</span><span class='line'>/* We'll fix this up when we get a response from the other end.
-</span><span class='line'> * See tcp_input.c:tcp_rcv_state_process case TCP_SYN_SENT.
-</span><span class='line'> */
-</span><span class='line'>tp-&gt;tcp_header_len = sizeof(struct tcphdr) +
-</span><span class='line'>    (sysctl_tcp_timestamps ? TCPOLEN_TSTAMP_ALIGNED : 0);
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_TCP_MD5SIG
-</span><span class='line'>if (tp-&gt;af_specific-&gt;md5_lookup(sk, sk) != NULL)
-</span><span class='line'>    tp-&gt;tcp_header_len += TCPOLEN_MD5SIG_ALIGNED;
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>/* If user gave his TCP_MAXSEG, record it to clamp */
-</span><span class='line'>if (tp-&gt;rx_opt.user_mss)
-</span><span class='line'>    tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
-</span><span class='line'>tp-&gt;max_window = 0;
-</span><span class='line'>/* 初始化MTU probe*/
-</span><span class='line'>tcp_mtup_init(sk);
-</span><span class='line'>/* 设置mss */
-</span><span class='line'>tcp_sync_mss(sk, dst_mtu(dst));
-</span><span class='line'>
-</span><span class='line'>if (!tp-&gt;window_clamp)
-</span><span class='line'>    tp-&gt;window_clamp = dst_metric(dst, RTAX_WINDOW);
-</span><span class='line'>tp-&gt;advmss = dst_metric(dst, RTAX_ADVMSS);
-</span><span class='line'>if (tp-&gt;rx_opt.user_mss &amp;&amp; tp-&gt;rx_opt.user_mss &lt; tp-&gt;advmss)
-</span><span class='line'>    tp-&gt;advmss = tp-&gt;rx_opt.user_mss;
-</span><span class='line'>
-</span><span class='line'>tcp_initialize_rcv_mss(sk);
-</span><span class='line'>/* 根据接收空间大小初始化一个通告窗口 */
-</span><span class='line'>tcp_select_initial_window(tcp_full_space(sk),
-</span><span class='line'>              tp-&gt;advmss - (tp-&gt;rx_opt.ts_recent_stamp ? tp-&gt;tcp_header_len - sizeof(struct tcphdr) : 0),
-</span><span class='line'>              &amp;tp-&gt;rcv_wnd,
-</span><span class='line'>              &amp;tp-&gt;window_clamp,
-</span><span class='line'>              sysctl_tcp_window_scaling,
-</span><span class='line'>              &amp;rcv_wscale);
-</span><span class='line'>
-</span><span class='line'>tp-&gt;rx_opt.rcv_wscale = rcv_wscale;
-</span><span class='line'>tp-&gt;rcv_ssthresh = tp-&gt;rcv_wnd;
-</span><span class='line'>
-</span><span class='line'>sk-&gt;sk_err = 0;
-</span><span class='line'>sock_reset_flag(sk, SOCK_DONE);
-</span><span class='line'>tp-&gt;snd_wnd = 0;
-</span><span class='line'>/* 更新一些滑动窗口的成员*/
-</span><span class='line'>tcp_init_wl(tp, tp-&gt;write_seq, 0);
-</span><span class='line'>tp-&gt;snd_una = tp-&gt;write_seq;
-</span><span class='line'>tp-&gt;snd_sml = tp-&gt;write_seq;
-</span><span class='line'>tp-&gt;snd_up = tp-&gt;write_seq;
-</span><span class='line'>tp-&gt;rcv_nxt = 0;
-</span><span class='line'>tp-&gt;rcv_wup = 0;
-</span><span class='line'>tp-&gt;copied_seq = 0;
-</span><span class='line'>
-</span><span class='line'>inet_csk(sk)-&gt;icsk_rto = TCP_TIMEOUT_INIT;
-</span><span class='line'>inet_csk(sk)-&gt;icsk_retransmits = 0;
-</span><span class='line'>tcp_clear_retrans(tp);
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>skb发送后，connect并没有返回，因为此时连接还没有建立，tcp进入等待状态，此时回到前面的inet_stream_connect函数
-</span><span class='line'>
-</span><span class='line'>在发送syn后进入等待状态
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static long inet_wait_for_connect(struct sock *sk, long timeo)
-</span><span class='line'>{
-</span><span class='line'>DEFINE_WAIT(wait);
-</span><span class='line'>/* sk_sleep 保存此INET SOCKET的等待队列 */
-</span><span class='line'>prepare_to_wait(sk-&gt;sk_sleep, &amp;wait, TASK_INTERRUPTIBLE);
-</span><span class='line'>
-</span><span class='line'>/* Basic assumption: if someone sets sk-&gt;sk_err, he _must_
-</span><span class='line'> * change state of the socket from TCP_SYN_*.
-</span><span class='line'> * Connect() does not allow to get error notifications
-</span><span class='line'> * without closing the socket.
-</span><span class='line'> */
-</span><span class='line'>/* 定时等待知道状态变化 */
-</span><span class='line'>while ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
-</span><span class='line'>    release_sock(sk);
-</span><span class='line'>    timeo = schedule_timeout(timeo);
-</span><span class='line'>    lock_sock(sk);
-</span><span class='line'>    if (signal_pending(current) || !timeo)
-</span><span class='line'>        break;
-</span><span class='line'>    prepare_to_wait(sk-&gt;sk_sleep, &amp;wait, TASK_INTERRUPTIBLE);
-</span><span class='line'>}
-</span><span class='line'>finish_wait(sk-&gt;sk_sleep, &amp;wait);
-</span><span class='line'>return timeo;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[udp checksum]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2016/01/21/kernel-net-udp-sum/"/&gt;
-</span><span class='line'>&lt;updated&gt;2016-01-21T16:43:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2016/01/21/kernel-net-udp-sum&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://wenx05124561.blog.163.com/blog/static/124000805201242032041268/"&gt;http://wenx05124561.blog.163.com/blog/static/124000805201242032041268/&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;a. 网卡设备属性&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define NETIF_F_IP_CSUM     2   /* 基于IPv4的L4层checksum. */  
-</span><span class='line'>#define NETIF_F_NO_CSUM     4   /* 设备可靠不需要L4层checksum. loopack. */  
-</span><span class='line'>#define NETIF_F_HW_CSUM     8   /* 基于所有协议的L4层checksum*/  
-</span><span class='line'>#define NETIF_F_IPV6_CSUM   16  /* 基于IPv6的L4层checksum*/  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;通过ethtool -k eth0可以查看网卡是否支持硬件checksum，tx-checksumming: on  表明支持发送hardware checksum。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;b. linux UDP checksum数据结构&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    union {
-</span><span class='line'>    __wsum  csum;
-</span><span class='line'>    struct {
-</span><span class='line'>        __u16   csum_start;
-</span><span class='line'>        __u16   csum_offset;
-</span><span class='line'>    };
-</span><span class='line'>};
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1） skb-&gt;csum和skb-&gt;ip_summed这两个域也是与4层校验相关的，这两个域的含义依赖于skb表示的是一个输入包还是一个输出包。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2） 当网卡设备能提供硬件checksum并且作为输出包的时候，表示为skb-&gt;csum_start和skb-&gt;csum_offset&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;csum_start: Offset from skb-&gt;head where checksumming should start&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;csum_offset: Offset from csum_start where checksum should be stored&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;当数据包是一个输入包时&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;skb-&gt;ip_summed表示的是四层校验的状态，下面的几个宏定义表示了设备驱动传递给4层的一些信息。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define CHECKSUM_NONE 0
-</span><span class='line'>#define CHECKSUM_UNNECESSARY 1
-</span><span class='line'>#define CHECKSUM_COMPLETE 2
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;skb-&gt;csum:存放硬件或者软件计算的payload的checksum不包括伪头，但是是否有意义由skb-&gt;ip_summed的值决定。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CHECKSUM_NONE表示csum域中的校验值是无意义的，需要L4层自己校验payload和伪头。有可能是硬件检验出错或者硬件没有校验功能，协议栈软件更改如pskb_trim_rcsum函数。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CHECKSUM_UNNECESSARY表示网卡或者协议栈已经计算和验证了L4层的头和校验值。也就是计算了tcp udp的伪头。还有一种情况就是回环，因为在回环中错误发生的概率太低了，因此就不需要计算校验来节省cpu事件。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CHECKSUM_COMPLETE表示网卡已经计算了L4层payload的校验，并且csum已经被赋值，此时L4层的接收者只需要加伪头并验证校验结果。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1) 在L4层发现如果udp-&gt;check位段被设为0，那么skb-&gt;ip_summed直接设为CHECKSUM_UNNECESSARY，放行该报文。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2) 如果skb-&gt;ip_summed为CHECKSUM_COMPLETE，则把skb-&gt;csum加上伪头进行校验，成功则将skb-&gt;ip_summed设为CHECKSUM_UNNECESSARY， 放行该数据包。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;3) 通过上述后skb-&gt;ip_summed还不是CHECKSUM_UNNECESSARY，那么重新计算伪头赋给skb-&gt;csum。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;4) 将还不是CHECKSUM_UNNECESSARY的数据报文的payload加上skb-&gt;csum进行checksum计算，成功将设为CHECKSUM_UNNECESSARY并放行，失败则丢弃。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh, 
-</span><span class='line'>                int proto)
-</span><span class='line'>{
-</span><span class='line'>    const struct iphdr *iph;
-</span><span class='line'>    int err; 
-</span><span class='line'>
-</span><span class='line'>    UDP_SKB_CB(skb)-&gt;partial_cov = 0; 
-</span><span class='line'>    UDP_SKB_CB(skb)-&gt;cscov = skb-&gt;len;
-</span><span class='line'>
-</span><span class='line'>    if (proto == IPPROTO_UDPLITE) {
-</span><span class='line'>        err = udplite_checksum_init(skb, uh); 
-</span><span class='line'>        if (err)
-</span><span class='line'>            return err; 
-</span><span class='line'>    }    
-</span><span class='line'>
-</span><span class='line'>    iph = ip_hdr(skb);
-</span><span class='line'>    if (uh-&gt;check == 0) { 
-</span><span class='line'>        skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
-</span><span class='line'>    } else if (skb-&gt;ip_summed == CHECKSUM_COMPLETE) {
-</span><span class='line'>        if (!csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len,
-</span><span class='line'>                proto, skb-&gt;csum))
-</span><span class='line'>            skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
-</span><span class='line'>    }    
-</span><span class='line'>    if (!skb_csum_unnecessary(skb))
-</span><span class='line'>        skb-&gt;csum = csum_tcpudp_nofold(iph-&gt;saddr, iph-&gt;daddr,
-</span><span class='line'>                            skb-&gt;len, proto, 0);
-</span><span class='line'>    /* Probably, we should checksum udp header (it should be in cache
-</span><span class='line'>     * in any case) and data in tiny packets (&lt; rx copybreak).
-</span><span class='line'>     */
-</span><span class='line'>
-</span><span class='line'>    return 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (udp_lib_checksum_complete(skb))
-</span><span class='line'>    goto csum_error;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static inline int udp_lib_checksum_complete(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    return !skb_csum_unnecessary(skb) &amp;&amp;
-</span><span class='line'>        __udp_lib_checksum_complete(skb);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static inline __sum16 __udp_lib_checksum_complete(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>    return __skb_checksum_complete_head(skb, UDP_SKB_CB(skb)-&gt;cscov);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>__sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
-</span><span class='line'>{
-</span><span class='line'>    __sum16 sum;
-</span><span class='line'>
-</span><span class='line'>    sum = csum_fold(skb_checksum(skb, 0, len, skb-&gt;csum));
-</span><span class='line'>    if (likely(!sum)) {
-</span><span class='line'>        if (unlikely(skb-&gt;ip_summed == CHECKSUM_COMPLETE))
-</span><span class='line'>            netdev_rx_csum_fault(skb-&gt;dev);
-</span><span class='line'>        skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
-</span><span class='line'>    }
-</span><span class='line'>    return sum;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;当数据包是输出包时&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;skb-&gt;csum表示为csum_start和csum_offset，它表示硬件网卡存放将要计算的校验值的地址，和最后填充的便宜。这个域在输出包时使用，只在校验值在硬件计算的情况下才对于网卡真正有意义。硬件checksum功能只能用于非分片报文。
-</span><span class='line'>而此时ip_summed可以被设置的值有下面两种：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    #define CHECKSUM_NONE       0
-</span><span class='line'>#define CHECKSUM_PARTIAL    3
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CHECKSUM_NONE 表示协议栈计算好了校验值，设备不需要做任何事。CHECKSUM_PARTIAL表示协议栈算好了伪头需要硬件计算payload checksum。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;1）对于UDP socket开启了UDP_CSUM_NOXMIT /&lt;em&gt; UDP csum disabled &lt;/em&gt;/&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    uh-&gt;check = 0；
-</span><span class='line'>skb-&gt;ip_summed = CHECKSUM_NONE;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;2）软件udp checksum
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>struct iphdr *iph = ip_hdr(skb);
-</span><span class='line'>struct udphdr *uh = udp_hdr(skb);
-</span><span class='line'>uh-&gt;check = 0;
-</span><span class='line'>skb-&gt;csum = csum_partial(skb_transport_header (skb), skb-&gt;len, 0);//skb-&gt;data指向传输层头
-</span><span class='line'>uh-&gt;check = csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len, iph-&gt;protocol, skb-&gt;csum);
-</span><span class='line'>skb-&gt;ip_summed = CHECKSUM_NONE;
-</span><span class='line'>//Todo: scatter and gather
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;3)  硬件checksum: 只能是ip报文长度小于mtu的数据报(没有分片的报文)。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;CHECKSUM_PARTIAL表示使用硬件checksum ，L4层的伪头的校验已经完毕，并且已经加入uh-&gt;check字段中，此时只需要设备计算整个头4层头的校验值。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;（对于支持scatter and gather的报文必须要传输层头在线性空间才能使用硬件checksum功能）&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    uh-&gt;check = ~csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len, IPPROTO_UDP, 0);
-</span><span class='line'>skb-&gt;csum_start = skb_transport_header (skb) - skb-&gt;head;
-</span><span class='line'>skb-&gt;csum_offset = offsetof(struct udphdr, check);
-</span><span class='line'>skb-&gt;ip_summed = CHECKSUM_PARTIAL;
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;最后在dev_queue_xmit发送的时候发现设备不支持硬件checksum就会进行软件计算&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
-</span><span class='line'>                struct netdev_queue *txq)
-</span><span class='line'>
-</span><span class='line'>{
-</span><span class='line'>    .......
-</span><span class='line'>
-</span><span class='line'>            /* If packet is not checksummed and device does not
-</span><span class='line'>             * support checksumming for this protocol, complete
-</span><span class='line'>             * checksumming here.
-</span><span class='line'>             */
-</span><span class='line'>            if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
-</span><span class='line'>                skb_set_transport_header(skb, skb-&gt;csum_start -
-</span><span class='line'>                        skb_headroom(skb));
-</span><span class='line'>                if (!dev_can_checksum(dev, skb) &amp;&amp;
-</span><span class='line'>                        skb_checksum_help(skb))
-</span><span class='line'>                    goto out_kfree_skb;
-</span><span class='line'>            }
-</span><span class='line'>    ........
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[linux 实时时钟（RTC）驱动]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2016/01/12/kernel-base-rtc/"/&gt;
-</span><span class='line'>&lt;updated&gt;2016-01-12T15:53:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2016/01/12/kernel-base-rtc&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="/download/kernel/rtc.txt"&gt;Documentation/rtc.txt&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;hr /&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;a href="http://blog.csdn.net/yaozhenguo2006/article/details/6820218"&gt;http://blog.csdn.net/yaozhenguo2006/article/details/6820218&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这个是linux内核文档关于rtc实时时钟部分的说明，此文档主要描述了rtc实时时钟的作用和编程接口，分别介绍了老的rtc接口和新的rtc类架构。并给出了一个测试rtc驱动的程序。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h3&gt;linux 实时时钟（RTC）驱动&lt;/h3&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;翻译：窗外云天&lt;a href="&#x6d;&#97;&#105;&#108;&#116;&#111;&#58;&#121;&#97;&#x6f;&#122;&#104;&#x65;&#110;&#103;&#x75;&#x6f;&#x32;&#48;&#48;&#x36;&#64;&#x31;&#x32;&#54;&#46;&#x63;&#x6f;&#x6d;"&gt;&#x79;&#x61;&#111;&#x7a;&#x68;&#101;&#x6e;&#103;&#x75;&#x6f;&#50;&#48;&#48;&#x36;&#x40;&#49;&#x32;&#x36;&#x2e;&#99;&#x6f;&#x6d;&lt;/a&gt;  最后矫正时间：2011.9.25&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;当linux开发者提到“实时时钟”的时候，他们通常所指的就是墙钟时间，这个时间是电池供电的，所以在系统掉电的情况下还能正常工作。除非在MS-Windows启动的时候设置，否则这个时钟不会同步于本地时区和夏令时间。事实上，他被设置成格林威治时间。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;最新的非pc体系的硬件趋向于记秒数，比如time(2)系统调用的输出，但是实时时钟用公历和24小时表示日期与时间，比如gmtime(3)的输出。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;linux提供两类的rtc兼容性很高的用户空间系统调用接口，如下所示：&lt;br/&gt;
-</span><span class='line'>（1） /dev/rtc &hellip; 这个RTC适合pc体系的系统，而并不适合非x86体系的系统&lt;br/&gt;
-</span><span class='line'>（2） /dev/rtc0,/dev/rtc1 &hellip; 他们依赖一种架构，这种架构在所有的系统上被RTC芯片广泛的支持。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;程序员必须知道，PC/AT的功能不总是有效，其他的系统可能会有另外的实现。这种情况下，如果在相同的系统结构上使用同样的RTC API，那么硬件会有不同的反应。例如，不是每一个RTC都提供IRQ，所以这些不能处理报警中断；标准的PC系统RTC只能处理未来24小时以内的闹钟，而其他系统的RTC可能处理未来一个世纪的任何时间。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;老的PC/AT驱动：/dev/rtc&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;所有基于PC的系统（甚至Alpha体系的机器）都有一个集成的实时时钟。通常他们集成在计算机的芯片组内，但是也有一些系统是在主板上焊接着摩托罗拉MC146818（或者类似的芯片），他们给系统提供时间和日期，这个时间和日期在系统掉电后仍然会保存。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;ACPT(高级配置与电源管理接口)对MC146818的功能进行了标准化，并且在一些方面进行了功能扩展（提供了更长的定时周期，睡眠唤醒功能）。然而这些扩展的功能不适合老的驱动程序。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这个RTC还可以产生频率从 2HZ 到 8192HZ 的信号，以2的乘方增长。这些信号通过中断信号线8报告给系统。这个RTC还可以用作定时限制为24小时的闹钟，当定时时间到时产生8号中断。这个闹钟可以设置成任意一个可编程值的子集，这意味着可以设置成任意小时的任意分钟任意秒，例如，可以将这个时钟设置成在每个clk产生中断，从而产生1hz的信号。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这些中断通过/dev/rtc报告给系统（主设备号10,次设备号135，只读字符设备），中断传回一个无符号整数类型的数据。最低的位包含中断的类型（更新，闹钟，或者期），其他的字节代表了最后一次读到现在中断发生的次数。状态信息由虚拟文件/proc/driver/rtc产生，前提条件是使能了/proc文件系统。驱动应该提供锁机制，保证在同一时刻只有一个进程访问/dev/rtc。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;用户进程通过系统调用read(2)或者select(2)读取/dev/rtc来获取这些中断。当调用这两个系统调用的时候，进程会阻塞或者退出直到下一个中断到来。这个功能用在需要不频繁的获取数据而又不希望通过轮询当前时间而占用CPU时间的情况下。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;在高频率中断或者高系统负载下，用户进程应该检查从上次读取到现在发生中断的次数以判断是否有未处理的中断。例如，一个典型的 486-33 对/dev/rtc以大于1024hz的频率进行循环读，偶尔会产生中断积累（从上次读取到现在发生大于一次的中断）。鉴于此你应该检查读取数据的高字节，特别是在频率高于普通定时器中断&ndash;100hz的情况下。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;中断频率是可编程的或可以让他超过64hz，但是只有root权限的用户可以这样做。这样做可能有点保守，但是我们不希望有恶意的用户在一个较慢的386sx-16机器上产生很多中断，这样会严重影响系统的性能。我们可以通过向/proc/sys/dev/rtc/max-user-freq写入值来修改这个64hz的限制。但是注意你一定要这样做，减少中断处理程序的代码才会亡羊补牢，使对系统性能的影响降到最小。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;如果内核时间是和外部时钟源同步的，那么内核将每隔11分钟就会将时间写回CMOS时钟。在这个过程中，内核会关闭rtc周期中断，如果你的程序在做一些关键的工作一定要注意到。如果你的内核不和外部时钟源同步，那么内核会一直处理rtc中断，处理方式根据你具体的应用。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;闹钟和中断频率可以通过系统调用ioctl(2)来设置，ioctl的命令定义在./include/linux/rtc.h。与其长篇大论的介绍怎么样使用这个系统调用，还不如写一个实例程序来的方便，这个程序用来演示驱动的功能，对很多人来说用驱动程序提供的功能来进行应用编程他们会更感兴趣。在这个文档的最后有这段程序。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;新接口 “RTC类” 驱动：/dev/rtcn&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;因为linux支持许多非ACPI非PC平台，其中一些平台有不只一个RTC，所以需要更多可移植性的设计，而不是仅仅在每个系统都实现类似MC146818的接口。在这种情况下，新的“RTC类”构架产生了。他提供不同的用户空间接口：
-</span><span class='line'>（1） /dev/rtcn 和老的接口一样
-</span><span class='line'>（2）/dev/class/rtc/rtcn   sysfs 属性，一些属性是只读的
-</span><span class='line'>（3） /dev/driver/rtc 第一个rtc会使用procfs接口。更多的信息会显示在这里而不是sysfs。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;RTC类构架支持很多类型的RTC，从集成在嵌入式SOC处理器内的RTC到通过I2C，SPI和其他总线连接到CPU的芯片。这个架构甚至还支持PC系统的RTC，包括使用ACPI，PC的一些新特性。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;新架构也打破了“每个系统只有一个RTC”的限制。例如，一个低功耗电池供电的RTC是一个分离的I2C接口的芯片，但是系统可能还集成了一个多功能的RTC。系统可能从分离的RTC读取系统时钟，但是对于其他任务用集成的RTC，因为这个RTC提供更多的功能。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;SYSFS 接口&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;在/sys/class/rtc/rtcn下面的sysfs接口提供了操作rtc属性的方法，而不用通过Ioclt系统调用。所有的日期时间都是墙钟时间，而不是系统时间。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>date:           RTC提供的日期
-</span><span class='line'>hctosys:        如果在内核配置选项中配置了CONFIG_RTC_HCTOSYS，RTC会在系统启动的时候提供系统时间，这种情况下这个位就是1,否则为0
-</span><span class='line'>max_user_freq:  非特权用户可以从RTC得到的最大中断频率
-</span><span class='line'>name:           RTC的名字，与sysfs目录相关
-</span><span class='line'>since_epoch:    从纪元开始所经历的秒数
-</span><span class='line'>time:           RTC提供的时间
-</span><span class='line'>wakealarm:      唤醒时间的时间事件。 这是一种单次的唤醒事件，所以如果还需要唤醒，在唤醒发生后必须复位。这个域的数据结构或者是从纪元开始经历的妙数，或者是相对的秒数
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;IOCTL 接口&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;/dev/rtc支持的Ioctl系统调用，RTC类构架也支持。然而，因为芯片和系统没有一个统一的标准，一些PC/AT功能可能没有提供。以相同方式工作的一些新特性，&ndash;包括ACPI提供的，&ndash;在RTC类构架中表现出的，在老的驱动上不会工作。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;（1） RTC_RD_TIME,RTC_SET_TIME .. 每一个RTC都至少支持读时间这个命令，时间格式为公历和24小时制墙钟时间。最有用的特性是，这个时间可以更新。&lt;br/&gt;
-</span><span class='line'>（2） RTC_ATE_ON,RTC_ATE_OFF,RTC_ALM_SET,RTC_ALM_READ &hellip; 当RTC连接了一条IRQ线，他还能处理在未来24小时的报警中断。&lt;br/&gt;
-</span><span class='line'>（3） RTC_WKALM_SET，RTC_WKALM_RD 。。。 RTCs 使用一个功能更强大的api,他可以处理超过24小时的报警时间。这个API支持设置更长的报警时间，支持单次请求的IRQ中断。&lt;br/&gt;
-</span><span class='line'>（4） RTC_UIE_ON,RTC_UIE_OFF &hellip; 如果RTC提供IRQ，他可能也提供每秒更新的IRQ中断。如果需要，RTC结构可以模仿这个机制。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;（5） RTC_PIE_ON,RTC_PIE_OFF,RTC_IRQP_SET,RTC_IRQP_READ &hellip; 如果一个IRQ是周期中断，那么这个IRQ还有可设置频率的特性（频率通常是2的n次方）&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;很多情况下，RTC报警时钟通常是一个系统唤醒事件，用于将Linux从低功耗睡眠模式唤醒到正常的工作模式。例如，系统会处于低功耗的模式下，直到时间到了去执行一些任务。注意这些ioctl的一些功能不必在你的驱动程序中实现。如果一个ioctl调用，你的驱动返回ENOIOCTLCMD，那么这个Ioctl就由通用RTC设备接口处理。下面是一些通用的例子：&lt;br/&gt;
-</span><span class='line'>（6） RTC_RD_TIME, RTC_SET_TIME: read_time/set_time 函数会被调用。&lt;br/&gt;
-</span><span class='line'>（7） RTC_ALM_SET, RTC_ALM_READ, RTC_WKALM_SET, RTC_WKALM_RD: set_alarm/read_alarm 函数将会被调用.&lt;br/&gt;
-</span><span class='line'>（8） RTC_IRQP_SET, RTC_IRQP_READ: irq_set_freq 函数将会调用，用来设置频率，RTC类构架会处理读请求，而频率保存在RTC设备结构中的irq_freq域。你的驱动需要在模块初始化的时候初始化irq_freq，你必须在irq_set_freq函数里检查设置的频率是否在硬件允许的范围。如果不是那么驱动应该返回-EINVAL。如果你不需要改变这个频率，那么不要定义irq_set_freq这个函数。&lt;br/&gt;
-</span><span class='line'>（7） RTC_PIE_ON, RTC_PIE_OFF: irq_set_state 函数会被调用。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;  如果所有的ioctl都失败了，用下面的rtc-test.c检查一下你的驱动吧！&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /*
-</span><span class='line'> *      Real Time Clock Driver Test/Example Program
-</span><span class='line'> *
-</span><span class='line'> *      Compile with:
-</span><span class='line'> *           gcc -s -Wall -Wstrict-prototypes rtctest.c -o rtctest
-</span><span class='line'> *
-</span><span class='line'> *      Copyright (C) 1996, Paul Gortmaker.
-</span><span class='line'> *
-</span><span class='line'> *      Released under the GNU General Public License, version 2,
-</span><span class='line'> *      included herein by reference.
-</span><span class='line'> *
-</span><span class='line'> */
-</span><span class='line'>
-</span><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;linux/rtc.h&gt;
-</span><span class='line'>#include &lt;sys/ioctl.h&gt;
-</span><span class='line'>#include &lt;sys/time.h&gt;
-</span><span class='line'>#include &lt;sys/types.h&gt;
-</span><span class='line'>#include &lt;fcntl.h&gt;
-</span><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>#include &lt;stdlib.h&gt;
-</span><span class='line'>#include &lt;errno.h&gt;
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'> * This expects the new RTC class driver framework, working with
-</span><span class='line'> * clocks that will often not be clones of what the PC-AT had.
-</span><span class='line'> * Use the command line to specify another RTC if you need one.
-</span><span class='line'> */
-</span><span class='line'>static const char default_rtc[] = "/dev/rtc0";
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>int main(int argc, char **argv)
-</span><span class='line'>{
-</span><span class='line'>    int i, fd, retval, irqcount = 0;
-</span><span class='line'>    unsigned long tmp, data;
-</span><span class='line'>    struct rtc_time rtc_tm;
-</span><span class='line'>    const char *rtc = default_rtc;
-</span><span class='line'>
-</span><span class='line'>    switch (argc) {
-</span><span class='line'>    case 2:
-</span><span class='line'>        rtc = argv[1];
-</span><span class='line'>        /* FALLTHROUGH */
-</span><span class='line'>    case 1:
-</span><span class='line'>        break;
-</span><span class='line'>    default:
-</span><span class='line'>        fprintf(stderr, "usage:  rtctest [rtcdev]\n");
-</span><span class='line'>        return 1;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fd = open(rtc, O_RDONLY);
-</span><span class='line'>
-</span><span class='line'>    if (fd ==  -1) {
-</span><span class='line'>        perror(rtc);
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "\n\t\t\tRTC Driver Test Example.\n\n");
-</span><span class='line'>
-</span><span class='line'>    /* Turn on update interrupts (one per second) */
-</span><span class='line'>    retval = ioctl(fd, RTC_UIE_ON, 0);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        if (errno == ENOTTY) {
-</span><span class='line'>            fprintf(stderr,
-</span><span class='line'>                "\n...Update IRQs not supported.\n");
-</span><span class='line'>            goto test_READ;
-</span><span class='line'>        }
-</span><span class='line'>        perror("RTC_UIE_ON ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "Counting 5 update (1/sec) interrupts from reading %s:",
-</span><span class='line'>            rtc);
-</span><span class='line'>    fflush(stderr);
-</span><span class='line'>    for (i=1; i&lt;6; i++) {
-</span><span class='line'>        /* This read will block */
-</span><span class='line'>        retval = read(fd, &amp;data, sizeof(unsigned long));
-</span><span class='line'>        if (retval == -1) {
-</span><span class='line'>            perror("read");
-</span><span class='line'>            exit(errno);
-</span><span class='line'>        }
-</span><span class='line'>        fprintf(stderr, " %d",i);
-</span><span class='line'>        fflush(stderr);
-</span><span class='line'>        irqcount++;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "\nAgain, from using select(2) on /dev/rtc:");
-</span><span class='line'>    fflush(stderr);
-</span><span class='line'>    for (i=1; i&lt;6; i++) {
-</span><span class='line'>        struct timeval tv = {5, 0};     /* 5 second timeout on select */
-</span><span class='line'>        fd_set readfds;
-</span><span class='line'>
-</span><span class='line'>        FD_ZERO(&amp;readfds);
-</span><span class='line'>        FD_SET(fd, &amp;readfds);
-</span><span class='line'>        /* The select will wait until an RTC interrupt happens. */
-</span><span class='line'>        retval = select(fd+1, &amp;readfds, NULL, NULL, &amp;tv);
-</span><span class='line'>        if (retval == -1) {
-</span><span class='line'>                perror("select");
-</span><span class='line'>                exit(errno);
-</span><span class='line'>        }
-</span><span class='line'>        /* This read won't block unlike the select-less case above. */
-</span><span class='line'>        retval = read(fd, &amp;data, sizeof(unsigned long));
-</span><span class='line'>        if (retval == -1) {
-</span><span class='line'>                perror("read");
-</span><span class='line'>                exit(errno);
-</span><span class='line'>        }
-</span><span class='line'>        fprintf(stderr, " %d",i);
-</span><span class='line'>        fflush(stderr);
-</span><span class='line'>        irqcount++;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    /* Turn off update interrupts */
-</span><span class='line'>    retval = ioctl(fd, RTC_UIE_OFF, 0);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        perror("RTC_UIE_OFF ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>test_READ:
-</span><span class='line'>    /* Read the RTC time/date */
-</span><span class='line'>    retval = ioctl(fd, RTC_RD_TIME, &amp;rtc_tm);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        perror("RTC_RD_TIME ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "\n\nCurrent RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
-</span><span class='line'>        rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
-</span><span class='line'>        rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
-</span><span class='line'>
-</span><span class='line'>    /* Set the alarm to 5 sec in the future, and check for rollover */
-</span><span class='line'>    rtc_tm.tm_sec += 5;
-</span><span class='line'>    if (rtc_tm.tm_sec &gt;= 60) {
-</span><span class='line'>        rtc_tm.tm_sec %= 60;
-</span><span class='line'>        rtc_tm.tm_min++;
-</span><span class='line'>    }
-</span><span class='line'>    if (rtc_tm.tm_min == 60) {
-</span><span class='line'>        rtc_tm.tm_min = 0;
-</span><span class='line'>        rtc_tm.tm_hour++;
-</span><span class='line'>    }
-</span><span class='line'>    if (rtc_tm.tm_hour == 24)
-</span><span class='line'>        rtc_tm.tm_hour = 0;
-</span><span class='line'>
-</span><span class='line'>    retval = ioctl(fd, RTC_ALM_SET, &amp;rtc_tm);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        if (errno == ENOTTY) {
-</span><span class='line'>            fprintf(stderr,
-</span><span class='line'>                "\n...Alarm IRQs not supported.\n");
-</span><span class='line'>            goto test_PIE;
-</span><span class='line'>        }
-</span><span class='line'>        perror("RTC_ALM_SET ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    /* Read the current alarm settings */
-</span><span class='line'>    retval = ioctl(fd, RTC_ALM_READ, &amp;rtc_tm);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        perror("RTC_ALM_READ ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "Alarm time now set to %02d:%02d:%02d.\n",
-</span><span class='line'>        rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
-</span><span class='line'>
-</span><span class='line'>    /* Enable alarm interrupts */
-</span><span class='line'>    retval = ioctl(fd, RTC_AIE_ON, 0);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        perror("RTC_AIE_ON ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "Waiting 5 seconds for alarm...");
-</span><span class='line'>    fflush(stderr);
-</span><span class='line'>    /* This blocks until the alarm ring causes an interrupt */
-</span><span class='line'>    retval = read(fd, &amp;data, sizeof(unsigned long));
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        perror("read");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>    irqcount++;
-</span><span class='line'>    fprintf(stderr, " okay. Alarm rang.\n");
-</span><span class='line'>
-</span><span class='line'>    /* Disable alarm interrupts */
-</span><span class='line'>    retval = ioctl(fd, RTC_AIE_OFF, 0);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        perror("RTC_AIE_OFF ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>test_PIE:
-</span><span class='line'>    /* Read periodic IRQ rate */
-</span><span class='line'>    retval = ioctl(fd, RTC_IRQP_READ, &amp;tmp);
-</span><span class='line'>    if (retval == -1) {
-</span><span class='line'>        /* not all RTCs support periodic IRQs */
-</span><span class='line'>        if (errno == ENOTTY) {
-</span><span class='line'>            fprintf(stderr, "\nNo periodic IRQ support\n");
-</span><span class='line'>            goto done;
-</span><span class='line'>        }
-</span><span class='line'>        perror("RTC_IRQP_READ ioctl");
-</span><span class='line'>        exit(errno);
-</span><span class='line'>    }
-</span><span class='line'>    fprintf(stderr, "\nPeriodic IRQ rate is %ldHz.\n", tmp);
-</span><span class='line'>
-</span><span class='line'>    fprintf(stderr, "Counting 20 interrupts at:");
-</span><span class='line'>    fflush(stderr);
-</span><span class='line'>
-</span><span class='line'>    /* The frequencies 128Hz, 256Hz, ... 8192Hz are only allowed for root. */
-</span><span class='line'>    for (tmp=2; tmp&lt;=64; tmp*=2) {
-</span><span class='line'>
-</span><span class='line'>        retval = ioctl(fd, RTC_IRQP_SET, tmp);
-</span><span class='line'>        if (retval == -1) {
-</span><span class='line'>            /* not all RTCs can change their periodic IRQ rate */
-</span><span class='line'>            if (errno == ENOTTY) {
-</span><span class='line'>                fprintf(stderr,
-</span><span class='line'>                    "\n...Periodic IRQ rate is fixed\n");
-</span><span class='line'>                goto done;
-</span><span class='line'>            }
-</span><span class='line'>            perror("RTC_IRQP_SET ioctl");
-</span><span class='line'>            exit(errno);
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        fprintf(stderr, "\n%ldHz:\t", tmp);
-</span><span class='line'>        fflush(stderr);
-</span><span class='line'>
-</span><span class='line'>        /* Enable periodic interrupts */
-</span><span class='line'>        retval = ioctl(fd, RTC_PIE_ON, 0);
-</span><span class='line'>        if (retval == -1) {
-</span><span class='line'>            perror("RTC_PIE_ON ioctl");
-</span><span class='line'>            exit(errno);
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        for (i=1; i&lt;21; i++) {
-</span><span class='line'>            /* This blocks */
-</span><span class='line'>            retval = read(fd, &amp;data, sizeof(unsigned long));
-</span><span class='line'>            if (retval == -1) {
-</span><span class='line'>                perror("read");
-</span><span class='line'>                exit(errno);
-</span><span class='line'>            }
-</span><span class='line'>            fprintf(stderr, " %d",i);
-</span><span class='line'>            fflush(stderr);
-</span><span class='line'>            irqcount++;
-</span><span class='line'>        }
-</span><span class='line'>
-</span><span class='line'>        /* Disable periodic interrupts */
-</span><span class='line'>        retval = ioctl(fd, RTC_PIE_OFF, 0);
-</span><span class='line'>        if (retval == -1) {
-</span><span class='line'>            perror("RTC_PIE_OFF ioctl");
-</span><span class='line'>            exit(errno);
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>done:
-</span><span class='line'>    fprintf(stderr, "\n\n\t\t\t *** Test complete ***\n");
-</span><span class='line'>
-</span><span class='line'>    close(fd);
-</span><span class='line'>
-</span><span class='line'>    return 0;
-</span><span class='line'>}
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Web压力测试工具]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/12/27/kernel-net-test-tool/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-12-27T02:51:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/12/27/kernel-net-test-tool&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://297020555.blog.51cto.com/1396304/592386"&gt;http://297020555.blog.51cto.com/1396304/592386&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;一、http_load&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;http_load以并行复用的方式运行，用以测试web服务器的吞吐量与负载。但是它不同于大多数压力测试工具，它可以以一个单一的进程运行，一般不会把客户机搞死。还可以测试HTTPS类的网站请求。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;下载地址：&lt;a href="http://www.acme.com/software/http_load/"&gt;http://www.acme.com/software/http_load/&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    ./http_load -verbose -proxy 192.168.99.6:80 -parallel 24 -seconds 1000 url.txt
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;二、webbench&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;webbench是Linux下的一个网站压力测试工具，最多可以模拟3万个并发连接去测试网站的负载能力。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>用法：webbench -c 并发数 -t 运行测试时间 URL
-</span><span class='line'>如：webbench -c 5000 -t 120 http://www.163.com
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;三、ab&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;ab是apache自带的一款功能强大的测试工具。安装了apache一般就自带了，用法可以查看它的说明&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;参数众多，一般我们用到的是-n 和-c&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;例如：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>./ab -c 1000 -n 100 http://www.vpser.net/index.php
-</span><span class='line'>&lt;/code&gt;
-</span><span class='line'>这个表示同时处理1000个请求并运行100次index.php文件.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;四、Siege&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;一款开源的压力测试工具，可以根据配置对一个WEB站点进行多用户的并发访问，记录每个用户所有请求过程的相应时间，并在一定数量的并发访问下重复进行。
-</span><span class='line'>官方：&lt;a href="http://www.joedog.org/"&gt;http://www.joedog.org/&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;使用
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>siege -c 200 -r 10 -f example.url
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;-c是并发量，-r是重复次数。 url文件就是一个文本，每行都是一个url，它会从里面随机访问的。&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[TCP拥塞控制窗口有效性验证机制]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/12/08/kernel-net-cwnd-test/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-12-08T15:49:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/12/08/kernel-net-cwnd-test&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;blog.csdn.net/zhangskd/article/details/7609465&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;概述&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;问题1：当发送方长时间受到应用程序的限制，不能发送数据时，会使拥塞窗口无效。TCP是根据拥塞窗口来动态地估计网络带宽的。发送方受到应用程序的限制后，没有数据可以发送。那么此时的拥塞窗口就不能准确的反应网络状况，因为这个拥塞窗口是很早之前的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;问题2：当发送方受到应用程序限制，不能利用完拥塞窗口，会使拥塞窗口的增长无效。TCP不断调整cwnd来测试网络带宽。如果不能完全使用掉cwnd，就不知道网络能否承受得了cwnd的数据量，这种情况下的cwnd增长是无效的。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;原理&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;TCP sender受到的两种限制&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;(1) application-limited ：when the sender sends less than is allowed by the congestion or receiver window.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;(2) network-limited：when the sender is limited by the TCP window. More precisely, we define a network-limited period as any period when the sender is sending a full window of data.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;问题1描述&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;TCP&rsquo;s congestion window controls the number of packets a TCP flow may have in the
-</span><span class='line'>network at any time. However, long periods when the sender is idle or application-limited
-</span><span class='line'>can lead to the invalidation of the congestion window, in that the congestion window no longer
-</span><span class='line'>reflects current information about the state of the network.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;The congestion window is set using an Additive-Increase, Multiplicative-Decrease(AIMD) mechanism
-</span><span class='line'>that probes for available bandwidth, dynamically adapting to changing network conditions. This AIMD
-</span><span class='line'>works well when the sender continually has data to send, as is typically the case for TCP used for
-</span><span class='line'>bulk-data transfer. In contrast, for TCP used with telnet applications, the data sender often has little
-</span><span class='line'>or no data to send, and the sending rate is often determined by the rate at which data is generated
-</span><span class='line'>by the user.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;问题2描述&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;An invalid congestion window also results when the congestion window is increased (i.e.,
-</span><span class='line'>in TCP&rsquo;s slow-start or congestion avoidance phases) during application-limited periods, when the
-</span><span class='line'>previous value of the congestion window might never have been fully utilized. As far as we know, all
-</span><span class='line'>current TCP implementations increase the congestion window when an acknowledgement arrives,
-</span><span class='line'>if allowed by the receiver&rsquo;s advertised window and the slow-start or congestion avoidance window
-</span><span class='line'>increase algorithm, without checking to see if the previous value of the congestion window has in
-</span><span class='line'>fact been used.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;This document proposes that the window increase algorithm not be invoked during application-
-</span><span class='line'>limited periods. This restriction prevents the congestion window from growing arbitrarily large,
-</span><span class='line'>in the absence of evidence that the congestion window can be supported by the network.&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;实现(1)&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;发送方在发送数据包时，如果发送的数据包有负载，则会检测拥塞窗口是否超时。如果超时，则会使拥塞窗口失效并重新计算拥塞窗口。然后根据最近接收段的时间，确定是否进入pingpong模式。</span></code></pre></td></tr></table></div></figure>
-    /<em> Congestion state accounting after a packet has been sent. </em>/<br/>
-    static void tcp_event_data_sent (struct tcp_sock <em>tp, struct sock </em>sk)<br/>
-    {<br/>
-        struct inet_connection_sock *icsk = inet_csk(sk);<br/>
-        const u32 now = tcp_time_stamp;</p>
+```
+    /<em> called with local bh disabled </em>/
+    static int <strong>inet_check_established(struct inet_timewait_death_row <em>death_row,
+                struct sock </em>sk, </strong>u16 lport,
+                struct inet_timewait_sock <em><em>twp)
+    {
+        struct inet_hashinfo </em>hinfo = death_row->hashinfo;
+        struct inet_sock </em>inet = inet_sk(sk);
+        <strong>be32 daddr = inet->rcv_saddr;
+        </strong>be32 saddr = inet->daddr;
+        int dif = sk->sk_bound_dev_if;
+        INET_ADDR_COOKIE(acookie, saddr, daddr)
+        const __portpair ports = INET_COMBINED_PORTS(inet->dport, lport);
+        struct net <em>net = sock_net(sk);
+        unsigned int hash = inet_ehashfn(net, daddr, lport, saddr, inet->dport);
+        struct inet_ehash_bucket </em>head = inet_ehash_bucket(hinfo, hash);
+        spinlock_t <em>lock = inet_ehash_lockp(hinfo, hash);
+        struct sock </em>sk2;
+        const struct hlist_nulls_node <em>node;
+        struct inet_timewait_sock </em>tw;</p>
 
-<pre><code>    if (sysctl_tcp_slow_start_after_idle &amp;&amp;   
-        (!tp-&gt;packets_out &amp;&amp; (s32) (now - tp-&gt;lsndtime) &gt; icsk-&gt;icsk_rto))  
-        tcp_cwnd_restart(sk, __sk_dst_get(sk)); /* 重置cnwd */  
+<pre><code>    spin_lock(lock);
 
-    tp-&gt;lsndtime = now; /* 更新最近发包的时间*/  
+    /* Check TIME-WAIT sockets first. */
+    sk_nulls_for_each(sk2, node, &amp;head-&gt;twchain) {
+        tw = inet_twsk(sk2);
 
-    /* If it is a reply for ato after last received packets,  
-     * enter pingpong mode. */  
-    if ((u32)(now - icsk-&gt;icsk_ack.lrcvtime) &lt; icsk.icsk_ack.ato)  
-        icsk-&gt;icsk_ack.pingpong = 1;  
-}  
+
+        if (INET_TW_MATCH(sk2, net, hash, acookie,
+                saddr, daddr, ports, dif)) {
+            if (twsk_unique(sk, sk2, twp))
+                goto unique;
+            else
+                goto not_unique;
+        }
+    }
+    tw = NULL;
+
+    /* And established part... */
+    sk_nulls_for_each(sk2, node, &amp;head-&gt;chain) {
+        if (INET_MATCH(sk2, net, hash, acookie,
+                saddr, daddr, ports, dif))
+            goto not_unique;
+    }
+
+unique:
+    ......
+    return 0;
+
+not_unique:
+    spin_unlock(lock);
+    return -EADDRNOTAVAIL;
+}
 </code></pre>
 
 <pre><code>
-tcp_event_data_sent()中，符合三个条件才重置cwnd：
-
-（1）tcp_slow_start_after_idle选项设置，这个内核默认置为1
-（2）tp-&gt;packets_out == 0，表示网络中没有未确认数据包
-（3）now - tp-&gt;lsndtime &gt; icsk-&gt;icsk_rto，距离上次发送数据包的时间超过了RTO
+如果是TCP套接字，twsk_uniqueue()中会调用tcp_twsk_uniqueue()来判断，返回true的条件如下所示：
 </code></pre>
 
-<pre><code>/* RFC2861. Reset CWND after idle period longer RTO to "restart window". 
- * This is the first part of cnwd validation mechanism. 
- */  
-static void tcp_cwnd_restart (struct sock *sk, const struct dst_entry *dst)  
-{  
-    struct tcp_sock *tp = tcp_sk(sk);  
-    s32 delta = tcp_time_stamp - tp-&gt;lsndtime;  
+<pre><code>int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
+{
+    const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
+    struct tcp_sock *tp = tcp_sk(sk);
 
-    /* 关于tcp_init_cwnd()可见上一篇blog.*/  
-    u32 restart_cwnd = tcp_init_cwnd(tp, dst);  
-    u32 cwnd = tp-&gt;snd_cwnd;  
+    if (tcptw-&gt;tw_ts_recent_stamp &amp;&amp;
+            (twp == NULL || (sysctl_tcp_tw_reuse &amp;&amp;
+            get_seconds() - tcptw-&gt;tw_ts_recent_stamp &gt; 1))) {
+        ......
+        return 1;
+    }
 
-    /* 触发拥塞窗口重置事件*/  
-    tcp_ca_event(sk, CA_EVENT_CWND_RESTART);  
+    return 0;
+}
+</code></pre>
 
-    /* 阈值保存下来，并没有重置。*/  
-    tp-&gt;snd_ssthresh = tcp_current_ssthresh(sk);  
-    restart_cwnd = min(restart_cwnd, cwnd);  
+<pre><code></code></pre>
 
-    /* 闲置时间每超过一个RTO且cwnd比重置后的大时，cwnd减半。*/  
-    while((delta -= inet_csk(sk)-&gt;icsk_rto) &gt; 0 &amp;&amp; cwnd &gt; restart_cwnd)  
-        cwnd &gt;&gt; 1;  
+<pre><code>/*
+ * Build a SYN and send it off.
+ */
+int tcp_connect(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *buff;
+    /* 初始化连接对应的INET socket结构的参数，为连接做准备 */
+    tcp_connect_init(sk);
+    /* 获取一个skb，由于是syn包，没有数据，所以大小是MAX_TCP_HEADER的16位对齐 */
+    buff = alloc_skb_fclone(MAX_TCP_HEADER + 15, sk-&gt;sk_allocation);
+    if (unlikely(buff == NULL))
+        return -ENOBUFS;
 
-    tp-&gt;snd_cwnd = max(cwnd, restart_cwnd); /* 取其大者！*/  
-    tp-&gt;snd_cwnd_stamp = tcp_time_stamp;  
-    tp-&gt;snd_cwnd_used = 0;  
-}  
+    /* Reserve space for headers. */
+    skb_reserve(buff, MAX_TCP_HEADER);
+
+    tp-&gt;snd_nxt = tp-&gt;write_seq;
+    /* 设置skb相关参数 */
+    tcp_init_nondata_skb(buff, tp-&gt;write_seq++, TCPCB_FLAG_SYN);
+    /* 设置ECN */
+    TCP_ECN_send_syn(sk, buff);
+
+    /* Send it off. */
+    /* 保存该数据包的发送时间*/
+    TCP_SKB_CB(buff)-&gt;when = tcp_time_stamp;
+    tp-&gt;retrans_stamp = TCP_SKB_CB(buff)-&gt;when;
+    skb_header_release(buff);
+    /* 加入发送队列，待确认后在丢弃*/
+    __tcp_add_write_queue_tail(sk, buff);
+    sk-&gt;sk_wmem_queued += buff-&gt;truesize;
+    sk_mem_charge(sk, buff-&gt;truesize);
+    tp-&gt;packets_out += tcp_skb_pcount(buff);
+    tcp_transmit_skb(sk, buff, 1, GFP_KERNEL);
+
+    /* We change tp-&gt;snd_nxt after the tcp_transmit_skb() call
+     * in order to make this packet get counted in tcpOutSegs.
+     */
+    tp-&gt;snd_nxt = tp-&gt;write_seq;
+    tp-&gt;pushed_seq = tp-&gt;write_seq;
+    TCP_INC_STATS(sock_net(sk), TCP_MIB_ACTIVEOPENS);
+
+    /* Timer for repeating the SYN until an answer. */
+    inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+                  inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
+    return 0;
+}
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>/*
+ * Do all connect socket setups that can be done AF independent.
+ */
+static void tcp_connect_init(struct sock *sk)
+{
+    struct dst_entry *dst = __sk_dst_get(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+    __u8 rcv_wscale;
+
+    /* We'll fix this up when we get a response from the other end.
+     * See tcp_input.c:tcp_rcv_state_process case TCP_SYN_SENT.
+     */
+    tp-&gt;tcp_header_len = sizeof(struct tcphdr) +
+        (sysctl_tcp_timestamps ? TCPOLEN_TSTAMP_ALIGNED : 0);
+
+#ifdef CONFIG_TCP_MD5SIG
+    if (tp-&gt;af_specific-&gt;md5_lookup(sk, sk) != NULL)
+        tp-&gt;tcp_header_len += TCPOLEN_MD5SIG_ALIGNED;
+#endif
+
+    /* If user gave his TCP_MAXSEG, record it to clamp */
+    if (tp-&gt;rx_opt.user_mss)
+        tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
+    tp-&gt;max_window = 0;
+    /* 初始化MTU probe*/
+    tcp_mtup_init(sk);
+    /* 设置mss */
+    tcp_sync_mss(sk, dst_mtu(dst));
+
+    if (!tp-&gt;window_clamp)
+        tp-&gt;window_clamp = dst_metric(dst, RTAX_WINDOW);
+    tp-&gt;advmss = dst_metric(dst, RTAX_ADVMSS);
+    if (tp-&gt;rx_opt.user_mss &amp;&amp; tp-&gt;rx_opt.user_mss &lt; tp-&gt;advmss)
+        tp-&gt;advmss = tp-&gt;rx_opt.user_mss;
+
+    tcp_initialize_rcv_mss(sk);
+    /* 根据接收空间大小初始化一个通告窗口 */
+    tcp_select_initial_window(tcp_full_space(sk),
+                  tp-&gt;advmss - (tp-&gt;rx_opt.ts_recent_stamp ? tp-&gt;tcp_header_len - sizeof(struct tcphdr) : 0),
+                  &amp;tp-&gt;rcv_wnd,
+                  &amp;tp-&gt;window_clamp,
+                  sysctl_tcp_window_scaling,
+                  &amp;rcv_wscale);
+
+    tp-&gt;rx_opt.rcv_wscale = rcv_wscale;
+    tp-&gt;rcv_ssthresh = tp-&gt;rcv_wnd;
+
+    sk-&gt;sk_err = 0;
+    sock_reset_flag(sk, SOCK_DONE);
+    tp-&gt;snd_wnd = 0;
+    /* 更新一些滑动窗口的成员*/
+    tcp_init_wl(tp, tp-&gt;write_seq, 0);
+    tp-&gt;snd_una = tp-&gt;write_seq;
+    tp-&gt;snd_sml = tp-&gt;write_seq;
+    tp-&gt;snd_up = tp-&gt;write_seq;
+    tp-&gt;rcv_nxt = 0;
+    tp-&gt;rcv_wup = 0;
+    tp-&gt;copied_seq = 0;
+
+    inet_csk(sk)-&gt;icsk_rto = TCP_TIMEOUT_INIT;
+    inet_csk(sk)-&gt;icsk_retransmits = 0;
+    tcp_clear_retrans(tp);
+}
 </code></pre>
 
 <pre><code>
-那么调用tcp_cwnd_restart()后，tp-&gt;snd_cwnd是多少呢？这个是不确定的，要看闲置时间delta、闲置前的cwnd、路由器中设置的initcwnd。当然，最大概率的是：拥塞窗口降为闲置前cwnd的一半。
+skb发送后，connect并没有返回，因为此时连接还没有建立，tcp进入等待状态，此时回到前面的inet_stream_connect函数
 
-#### 实现(2)
-
-在发送方成功发送一个数据包后，会检查从发送队列发出而未确认的数据包是否用完拥塞窗口。
-如果拥塞窗口被用完了，说明发送方收到网络限制；
-如果拥塞窗口没被用完，且距离上次检查时间超过了RTO，说明发送方收到应用程序限制。
+在发送syn后进入等待状态
 </code></pre>
 
-<pre><code>/* Congestion window validation.(RFC2861) */  
-static void tcp_cwnd_validate(struct sock *sk) {  
-    struct tcp_sock *tp = tcp_sk(sk);  
+<pre><code>static long inet_wait_for_connect(struct sock *sk, long timeo)
+{
+    DEFINE_WAIT(wait);
+    /* sk_sleep 保存此INET SOCKET的等待队列 */
+    prepare_to_wait(sk-&gt;sk_sleep, &amp;wait, TASK_INTERRUPTIBLE);
 
-    if (tp-&gt;packets_out &gt;= tp-&gt;snd_cwnd) {  
-        /* Network is feed fully. */  
-        tp-&gt;snd_cwnd_used = 0; /*不用这个变量*/  
-        tp-&gt;snd_cwnd_stamp = tcp_time_stamp; /* 更新检测时间*/  
-
-    } else {  
-        /* Network starves. */  
-        if (tp-&gt;packets_out &gt; tp-&gt;snd_cwnd_used)  
-            tp-&gt;snd_cwnd_used = tp-&gt;packets_out; /* 更新已使用窗口*/  
-
-            /* 如果距离上次检测的时间，即距离上次发包时间已经超过RTO*/  
-            if (sysctl_tcp_slow_start_after_idle &amp;&amp;  
-                (s32) (tcp_time_stamp - tp-&gt;snd_cwnd_stamp) &gt;= inet_csk(sk)-&gt;icsk_rto)  
-                tcp_cwnd_application_limited(sk);  
-    }  
-}  
-</code></pre>
-
-<pre><code>
-在发送方收到应用程序的限制期间，每隔RTO时间，都会调用tcp_cwnd_application_limited()来重新设置sshresh和cwnd，具体如下：
-</code></pre>
-
-<pre><code>/* RFC2861, slow part. Adjust cwnd, after it was not full during one rto. 
- * As additional protections, we do not touch cwnd in retransmission phases, 
- * and if application hit its sndbuf limit recently. 
- */  
-void tcp_cwnd_application_limited(struct sock *sk)  
-{  
-    struct tcp_sock *tp = tcp_sk(sk);  
-
-    /* 只有处于Open态，应用程序没受到sndbuf限制时，才进行 
-     * ssthresh和cwnd的重置。 
-     */  
-    if (inet_csk(sk)-&gt;icsk_ca_state == TCP_CA_Open &amp;&amp;   
-        sk-&gt;sk_socket &amp;&amp; !test_bit(SOCK_NOSPACE, &amp;sk-&gt;sk_socket-&gt;flags)) {  
-
-        /* Limited by application or receiver window. */  
-        u32 init_win = tcp_init_cwnd(tp, __sk_dst_get(sk));  
-        u32 win_used = max(tp-&gt;snd_cwnd_used, init_win);  
-
-        /* 没用完拥塞窗口*/  
-        if (win_used &lt; tp-&gt;snd_cwnd) {  
-            /* 并没有减小ssthresh，反而增大，保留了过去的信息，以便之后有数据发送 
-              * 时能快速增大到接近此时的窗口。 
-              */  
-            tp-&gt;snd_ssthresh = tcp_current_ssthresh(sk);   
-            /* 减小了snd_cwnd */  
-            tp-&gt;snd_cwnd = (tp-&gt;snd_cwnd + win_used) &gt;&gt; 1;  
-        }  
-        tp-&gt;snd_cwnd_used = 0;  
-    }  
-    tp-&gt;snd_cwnd_stamp = tcp_time_stamp; /* 更新最近的数据包发送时间*/  
-}  
+    /* Basic assumption: if someone sets sk-&gt;sk_err, he _must_
+     * change state of the socket from TCP_SYN_*.
+     * Connect() does not allow to get error notifications
+     * without closing the socket.
+     */
+    /* 定时等待知道状态变化 */
+    while ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
+        release_sock(sk);
+        timeo = schedule_timeout(timeo);
+        lock_sock(sk);
+        if (signal_pending(current) || !timeo)
+            break;
+        prepare_to_wait(sk-&gt;sk_sleep, &amp;wait, TASK_INTERRUPTIBLE);
+    }
+    finish_wait(sk-&gt;sk_sleep, &amp;wait);
+    return timeo;
+}
 </code></pre>
 
 <p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[udp checksum]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2016/01/21/kernel-net-udp-sum/"/>
+    <updated>2016-01-21T16:43:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2016/01/21/kernel-net-udp-sum</id>
+    <content type="html"><![CDATA[<p><a href="http://wenx05124561.blog.163.com/blog/static/124000805201242032041268/">http://wenx05124561.blog.163.com/blog/static/124000805201242032041268/</a></p>
 
-<p>发送方受到应用程序限制，且限制的时间每经过RTO后，就会调用以上函数来处理snd_ssthresh和snd_cwnd：</p>
+<h4>a. 网卡设备属性</h4>
 
-<p>（1）snd_ssthresh = max(snd_ssthresh, &frac34; cwnd)</p>
+<pre><code>    #define NETIF_F_IP_CSUM     2   /* 基于IPv4的L4层checksum. */  
+    #define NETIF_F_NO_CSUM     4   /* 设备可靠不需要L4层checksum. loopack. */  
+    #define NETIF_F_HW_CSUM     8   /* 基于所有协议的L4层checksum*/  
+    #define NETIF_F_IPV6_CSUM   16  /* 基于IPv6的L4层checksum*/  
+</code></pre>
 
-<p>慢启动阈值并没有减小，相反，如果此时cwnd较大，ssthresh会相应的增大。ssthresh是一个很重要的参数，它保留了旧的信息。这样一来，如果应用程序产生了大量的数据，发送方不再受到限制后，经过慢启动阶段，拥塞窗口就能快速恢复到接近以前的值了。</p>
+<p>通过ethtool -k eth0可以查看网卡是否支持硬件checksum，tx-checksumming: on  表明支持发送hardware checksum。</p>
 
-<p>（2）snd_cwnd = (snd_cwnd + snd_cwnd_used) / 2</p>
+<h4>b. linux UDP checksum数据结构</h4>
 
-<p>因为snd_cwnd_used &lt; snd_cwnd，所以snd_cwnd是减小了的。减小snd_cwnd是为了不让它盲目的增长。因为发送方没有利用完拥塞窗口，并不能检测到网络是否能承受该拥塞窗口，这时的增长是无根据的。</p>
+<pre><code>    union {
+        __wsum  csum;
+        struct {
+            __u16   csum_start;
+            __u16   csum_offset;
+        };
+    };
+</code></pre>
 
-<h4>结论</h4>
+<p>1） skb->csum和skb->ip_summed这两个域也是与4层校验相关的，这两个域的含义依赖于skb表示的是一个输入包还是一个输出包。</p>
 
-<p>在发送完数据包后，通过对拥塞窗口有效性的检验，能够避免使用不合理的拥塞窗口。</p>
+<p>2） 当网卡设备能提供硬件checksum并且作为输出包的时候，表示为skb->csum_start和skb->csum_offset</p>
 
-<p>拥塞窗口代表着网络的状况，通过避免使用不合理的拥塞窗口，就能得到正确的网络状况，而不会采取一些不恰当的措施。</p>
+<p>csum_start: Offset from skb->head where checksumming should start</p>
 
-<p>在上文的两种情况下，通过TCP的拥塞窗口有效性验证机制（TCP congestion window validationmechanism），能够更合理的利用网络、避免丢包，从而提高传输效率。</p>
+<p>csum_offset: Offset from csum_start where checksum should be stored</p>
 
-<h4>Reference</h4>
+<p>当数据包是一个输入包时</p>
 
-<p>RFC2861</p>
+<p>skb->ip_summed表示的是四层校验的状态，下面的几个宏定义表示了设备驱动传递给4层的一些信息。</p>
+
+<pre><code>    #define CHECKSUM_NONE 0
+    #define CHECKSUM_UNNECESSARY 1
+    #define CHECKSUM_COMPLETE 2
+</code></pre>
+
+<p>skb->csum:存放硬件或者软件计算的payload的checksum不包括伪头，但是是否有意义由skb->ip_summed的值决定。</p>
+
+<p>CHECKSUM_NONE表示csum域中的校验值是无意义的，需要L4层自己校验payload和伪头。有可能是硬件检验出错或者硬件没有校验功能，协议栈软件更改如pskb_trim_rcsum函数。</p>
+
+<p>CHECKSUM_UNNECESSARY表示网卡或者协议栈已经计算和验证了L4层的头和校验值。也就是计算了tcp udp的伪头。还有一种情况就是回环，因为在回环中错误发生的概率太低了，因此就不需要计算校验来节省cpu事件。</p>
+
+<p>CHECKSUM_COMPLETE表示网卡已经计算了L4层payload的校验，并且csum已经被赋值，此时L4层的接收者只需要加伪头并验证校验结果。</p>
+
+<p>1) 在L4层发现如果udp->check位段被设为0，那么skb->ip_summed直接设为CHECKSUM_UNNECESSARY，放行该报文。</p>
+
+<p>2) 如果skb->ip_summed为CHECKSUM_COMPLETE，则把skb->csum加上伪头进行校验，成功则将skb->ip_summed设为CHECKSUM_UNNECESSARY， 放行该数据包。</p>
+
+<p>3) 通过上述后skb->ip_summed还不是CHECKSUM_UNNECESSARY，那么重新计算伪头赋给skb->csum。</p>
+
+<p>4) 将还不是CHECKSUM_UNNECESSARY的数据报文的payload加上skb->csum进行checksum计算，成功将设为CHECKSUM_UNNECESSARY并放行，失败则丢弃。</p>
+
+<pre><code>    static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh, 
+                    int proto)
+    {
+        const struct iphdr *iph;
+        int err; 
+
+        UDP_SKB_CB(skb)-&gt;partial_cov = 0; 
+        UDP_SKB_CB(skb)-&gt;cscov = skb-&gt;len;
+
+        if (proto == IPPROTO_UDPLITE) {
+            err = udplite_checksum_init(skb, uh); 
+            if (err)
+                return err; 
+        }    
+
+        iph = ip_hdr(skb);
+        if (uh-&gt;check == 0) { 
+            skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+        } else if (skb-&gt;ip_summed == CHECKSUM_COMPLETE) {
+            if (!csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len,
+                    proto, skb-&gt;csum))
+                skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+        }    
+        if (!skb_csum_unnecessary(skb))
+            skb-&gt;csum = csum_tcpudp_nofold(iph-&gt;saddr, iph-&gt;daddr,
+                                skb-&gt;len, proto, 0);
+        /* Probably, we should checksum udp header (it should be in cache
+         * in any case) and data in tiny packets (&lt; rx copybreak).
+         */
+
+        return 0;
+    }
+</code></pre>
+
+<pre><code>    if (udp_lib_checksum_complete(skb))
+        goto csum_error;
+</code></pre>
+
+<pre><code>    static inline int udp_lib_checksum_complete(struct sk_buff *skb)
+    {
+        return !skb_csum_unnecessary(skb) &amp;&amp;
+            __udp_lib_checksum_complete(skb);
+    }
+
+    static inline __sum16 __udp_lib_checksum_complete(struct sk_buff *skb)
+    {
+        return __skb_checksum_complete_head(skb, UDP_SKB_CB(skb)-&gt;cscov);
+    }
+
+    __sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
+    {
+        __sum16 sum;
+
+        sum = csum_fold(skb_checksum(skb, 0, len, skb-&gt;csum));
+        if (likely(!sum)) {
+            if (unlikely(skb-&gt;ip_summed == CHECKSUM_COMPLETE))
+                netdev_rx_csum_fault(skb-&gt;dev);
+            skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+        }
+        return sum;
+    }
+</code></pre>
+
+<h4>当数据包是输出包时</h4>
+
+<p>skb->csum表示为csum_start和csum_offset，它表示硬件网卡存放将要计算的校验值的地址，和最后填充的便宜。这个域在输出包时使用，只在校验值在硬件计算的情况下才对于网卡真正有意义。硬件checksum功能只能用于非分片报文。
+而此时ip_summed可以被设置的值有下面两种：</p>
+
+<pre><code>    #define CHECKSUM_NONE       0
+    #define CHECKSUM_PARTIAL    3
+</code></pre>
+
+<p>CHECKSUM_NONE 表示协议栈计算好了校验值，设备不需要做任何事。CHECKSUM_PARTIAL表示协议栈算好了伪头需要硬件计算payload checksum。</p>
+
+<p>1）对于UDP socket开启了UDP_CSUM_NOXMIT /<em> UDP csum disabled </em>/</p>
+
+<pre><code>    uh-&gt;check = 0；
+    skb-&gt;ip_summed = CHECKSUM_NONE;
+</code></pre>
+
+<p>2）软件udp checksum
+<code>
+    struct iphdr *iph = ip_hdr(skb);
+    struct udphdr *uh = udp_hdr(skb);
+    uh-&gt;check = 0;
+    skb-&gt;csum = csum_partial(skb_transport_header (skb), skb-&gt;len, 0);//skb-&gt;data指向传输层头
+    uh-&gt;check = csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len, iph-&gt;protocol, skb-&gt;csum);
+    skb-&gt;ip_summed = CHECKSUM_NONE;
+    //Todo: scatter and gather
+</code></p>
+
+<p>3)  硬件checksum: 只能是ip报文长度小于mtu的数据报(没有分片的报文)。</p>
+
+<p>CHECKSUM_PARTIAL表示使用硬件checksum ，L4层的伪头的校验已经完毕，并且已经加入uh->check字段中，此时只需要设备计算整个头4层头的校验值。</p>
+
+<p>（对于支持scatter and gather的报文必须要传输层头在线性空间才能使用硬件checksum功能）</p>
+
+<pre><code>    uh-&gt;check = ~csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len, IPPROTO_UDP, 0);
+    skb-&gt;csum_start = skb_transport_header (skb) - skb-&gt;head;
+    skb-&gt;csum_offset = offsetof(struct udphdr, check);
+    skb-&gt;ip_summed = CHECKSUM_PARTIAL;
+</code></pre>
+
+<p>最后在dev_queue_xmit发送的时候发现设备不支持硬件checksum就会进行软件计算</p>
+
+<pre><code>    int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+                    struct netdev_queue *txq)
+
+    {
+        .......
+
+                /* If packet is not checksummed and device does not
+                 * support checksumming for this protocol, complete
+                 * checksumming here.
+                 */
+                if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
+                    skb_set_transport_header(skb, skb-&gt;csum_start -
+                            skb_headroom(skb));
+                    if (!dev_can_checksum(dev, skb) &amp;&amp;
+                            skb_checksum_help(skb))
+                        goto out_kfree_skb;
+                }
+        ........
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux 实时时钟（RTC）驱动]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2016/01/12/kernel-base-rtc/"/>
+    <updated>2016-01-12T15:53:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2016/01/12/kernel-base-rtc</id>
+    <content type="html"><![CDATA[<p><a href="/download/kernel/rtc.txt">Documentation/rtc.txt</a></p>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/yaozhenguo2006/article/details/6820218">http://blog.csdn.net/yaozhenguo2006/article/details/6820218</a></p>
+
+<p>这个是linux内核文档关于rtc实时时钟部分的说明，此文档主要描述了rtc实时时钟的作用和编程接口，分别介绍了老的rtc接口和新的rtc类架构。并给出了一个测试rtc驱动的程序。</p>
+
+<h3>linux 实时时钟（RTC）驱动</h3>
+
+<p>翻译：窗外云天<a href="&#x6d;&#x61;&#105;&#x6c;&#116;&#111;&#58;&#121;&#x61;&#x6f;&#x7a;&#104;&#101;&#110;&#x67;&#x75;&#x6f;&#x32;&#48;&#48;&#54;&#64;&#49;&#50;&#54;&#46;&#x63;&#111;&#109;">&#x79;&#x61;&#x6f;&#x7a;&#104;&#101;&#x6e;&#103;&#x75;&#x6f;&#x32;&#48;&#48;&#x36;&#64;&#49;&#50;&#x36;&#x2e;&#x63;&#x6f;&#109;</a>  最后矫正时间：2011.9.25</p>
+
+<p>当linux开发者提到“实时时钟”的时候，他们通常所指的就是墙钟时间，这个时间是电池供电的，所以在系统掉电的情况下还能正常工作。除非在MS-Windows启动的时候设置，否则这个时钟不会同步于本地时区和夏令时间。事实上，他被设置成格林威治时间。</p>
+
+<p>最新的非pc体系的硬件趋向于记秒数，比如time(2)系统调用的输出，但是实时时钟用公历和24小时表示日期与时间，比如gmtime(3)的输出。</p>
+
+<p>linux提供两类的rtc兼容性很高的用户空间系统调用接口，如下所示：<br/>
+（1） /dev/rtc &hellip; 这个RTC适合pc体系的系统，而并不适合非x86体系的系统<br/>
+（2） /dev/rtc0,/dev/rtc1 &hellip; 他们依赖一种架构，这种架构在所有的系统上被RTC芯片广泛的支持。</p>
+
+<p>程序员必须知道，PC/AT的功能不总是有效，其他的系统可能会有另外的实现。这种情况下，如果在相同的系统结构上使用同样的RTC API，那么硬件会有不同的反应。例如，不是每一个RTC都提供IRQ，所以这些不能处理报警中断；标准的PC系统RTC只能处理未来24小时以内的闹钟，而其他系统的RTC可能处理未来一个世纪的任何时间。</p>
+
+<h4>老的PC/AT驱动：/dev/rtc</h4>
+
+<p>所有基于PC的系统（甚至Alpha体系的机器）都有一个集成的实时时钟。通常他们集成在计算机的芯片组内，但是也有一些系统是在主板上焊接着摩托罗拉MC146818（或者类似的芯片），他们给系统提供时间和日期，这个时间和日期在系统掉电后仍然会保存。</p>
+
+<p>ACPT(高级配置与电源管理接口)对MC146818的功能进行了标准化，并且在一些方面进行了功能扩展（提供了更长的定时周期，睡眠唤醒功能）。然而这些扩展的功能不适合老的驱动程序。</p>
+
+<p>这个RTC还可以产生频率从 2HZ 到 8192HZ 的信号，以2的乘方增长。这些信号通过中断信号线8报告给系统。这个RTC还可以用作定时限制为24小时的闹钟，当定时时间到时产生8号中断。这个闹钟可以设置成任意一个可编程值的子集，这意味着可以设置成任意小时的任意分钟任意秒，例如，可以将这个时钟设置成在每个clk产生中断，从而产生1hz的信号。</p>
+
+<p>这些中断通过/dev/rtc报告给系统（主设备号10,次设备号135，只读字符设备），中断传回一个无符号整数类型的数据。最低的位包含中断的类型（更新，闹钟，或者期），其他的字节代表了最后一次读到现在中断发生的次数。状态信息由虚拟文件/proc/driver/rtc产生，前提条件是使能了/proc文件系统。驱动应该提供锁机制，保证在同一时刻只有一个进程访问/dev/rtc。</p>
+
+<p>用户进程通过系统调用read(2)或者select(2)读取/dev/rtc来获取这些中断。当调用这两个系统调用的时候，进程会阻塞或者退出直到下一个中断到来。这个功能用在需要不频繁的获取数据而又不希望通过轮询当前时间而占用CPU时间的情况下。</p>
+
+<p>在高频率中断或者高系统负载下，用户进程应该检查从上次读取到现在发生中断的次数以判断是否有未处理的中断。例如，一个典型的 486-33 对/dev/rtc以大于1024hz的频率进行循环读，偶尔会产生中断积累（从上次读取到现在发生大于一次的中断）。鉴于此你应该检查读取数据的高字节，特别是在频率高于普通定时器中断&ndash;100hz的情况下。</p>
+
+<p>中断频率是可编程的或可以让他超过64hz，但是只有root权限的用户可以这样做。这样做可能有点保守，但是我们不希望有恶意的用户在一个较慢的386sx-16机器上产生很多中断，这样会严重影响系统的性能。我们可以通过向/proc/sys/dev/rtc/max-user-freq写入值来修改这个64hz的限制。但是注意你一定要这样做，减少中断处理程序的代码才会亡羊补牢，使对系统性能的影响降到最小。</p>
+
+<p>如果内核时间是和外部时钟源同步的，那么内核将每隔11分钟就会将时间写回CMOS时钟。在这个过程中，内核会关闭rtc周期中断，如果你的程序在做一些关键的工作一定要注意到。如果你的内核不和外部时钟源同步，那么内核会一直处理rtc中断，处理方式根据你具体的应用。</p>
+
+<p>闹钟和中断频率可以通过系统调用ioctl(2)来设置，ioctl的命令定义在./include/linux/rtc.h。与其长篇大论的介绍怎么样使用这个系统调用，还不如写一个实例程序来的方便，这个程序用来演示驱动的功能，对很多人来说用驱动程序提供的功能来进行应用编程他们会更感兴趣。在这个文档的最后有这段程序。</p>
+
+<h4>新接口 “RTC类” 驱动：/dev/rtcn</h4>
+
+<p>因为linux支持许多非ACPI非PC平台，其中一些平台有不只一个RTC，所以需要更多可移植性的设计，而不是仅仅在每个系统都实现类似MC146818的接口。在这种情况下，新的“RTC类”构架产生了。他提供不同的用户空间接口：
+（1） /dev/rtcn 和老的接口一样
+（2）/dev/class/rtc/rtcn   sysfs 属性，一些属性是只读的
+（3） /dev/driver/rtc 第一个rtc会使用procfs接口。更多的信息会显示在这里而不是sysfs。</p>
+
+<p>RTC类构架支持很多类型的RTC，从集成在嵌入式SOC处理器内的RTC到通过I2C，SPI和其他总线连接到CPU的芯片。这个架构甚至还支持PC系统的RTC，包括使用ACPI，PC的一些新特性。</p>
+
+<p>新架构也打破了“每个系统只有一个RTC”的限制。例如，一个低功耗电池供电的RTC是一个分离的I2C接口的芯片，但是系统可能还集成了一个多功能的RTC。系统可能从分离的RTC读取系统时钟，但是对于其他任务用集成的RTC，因为这个RTC提供更多的功能。</p>
+
+<h4>SYSFS 接口</h4>
+
+<p>在/sys/class/rtc/rtcn下面的sysfs接口提供了操作rtc属性的方法，而不用通过Ioclt系统调用。所有的日期时间都是墙钟时间，而不是系统时间。
+<code>
+    date:           RTC提供的日期
+    hctosys:        如果在内核配置选项中配置了CONFIG_RTC_HCTOSYS，RTC会在系统启动的时候提供系统时间，这种情况下这个位就是1,否则为0
+    max_user_freq:  非特权用户可以从RTC得到的最大中断频率
+    name:           RTC的名字，与sysfs目录相关
+    since_epoch:    从纪元开始所经历的秒数
+    time:           RTC提供的时间
+    wakealarm:      唤醒时间的时间事件。 这是一种单次的唤醒事件，所以如果还需要唤醒，在唤醒发生后必须复位。这个域的数据结构或者是从纪元开始经历的妙数，或者是相对的秒数
+</code></p>
+
+<h4>IOCTL 接口</h4>
+
+<p>/dev/rtc支持的Ioctl系统调用，RTC类构架也支持。然而，因为芯片和系统没有一个统一的标准，一些PC/AT功能可能没有提供。以相同方式工作的一些新特性，&ndash;包括ACPI提供的，&ndash;在RTC类构架中表现出的，在老的驱动上不会工作。</p>
+
+<p>（1） RTC_RD_TIME,RTC_SET_TIME .. 每一个RTC都至少支持读时间这个命令，时间格式为公历和24小时制墙钟时间。最有用的特性是，这个时间可以更新。<br/>
+（2） RTC_ATE_ON,RTC_ATE_OFF,RTC_ALM_SET,RTC_ALM_READ &hellip; 当RTC连接了一条IRQ线，他还能处理在未来24小时的报警中断。<br/>
+（3） RTC_WKALM_SET，RTC_WKALM_RD 。。。 RTCs 使用一个功能更强大的api,他可以处理超过24小时的报警时间。这个API支持设置更长的报警时间，支持单次请求的IRQ中断。<br/>
+（4） RTC_UIE_ON,RTC_UIE_OFF &hellip; 如果RTC提供IRQ，他可能也提供每秒更新的IRQ中断。如果需要，RTC结构可以模仿这个机制。</p>
+
+<p>（5） RTC_PIE_ON,RTC_PIE_OFF,RTC_IRQP_SET,RTC_IRQP_READ &hellip; 如果一个IRQ是周期中断，那么这个IRQ还有可设置频率的特性（频率通常是2的n次方）</p>
+
+<p>很多情况下，RTC报警时钟通常是一个系统唤醒事件，用于将Linux从低功耗睡眠模式唤醒到正常的工作模式。例如，系统会处于低功耗的模式下，直到时间到了去执行一些任务。注意这些ioctl的一些功能不必在你的驱动程序中实现。如果一个ioctl调用，你的驱动返回ENOIOCTLCMD，那么这个Ioctl就由通用RTC设备接口处理。下面是一些通用的例子：<br/>
+（6） RTC_RD_TIME, RTC_SET_TIME: read_time/set_time 函数会被调用。<br/>
+（7） RTC_ALM_SET, RTC_ALM_READ, RTC_WKALM_SET, RTC_WKALM_RD: set_alarm/read_alarm 函数将会被调用.<br/>
+（8） RTC_IRQP_SET, RTC_IRQP_READ: irq_set_freq 函数将会调用，用来设置频率，RTC类构架会处理读请求，而频率保存在RTC设备结构中的irq_freq域。你的驱动需要在模块初始化的时候初始化irq_freq，你必须在irq_set_freq函数里检查设置的频率是否在硬件允许的范围。如果不是那么驱动应该返回-EINVAL。如果你不需要改变这个频率，那么不要定义irq_set_freq这个函数。<br/>
+（7） RTC_PIE_ON, RTC_PIE_OFF: irq_set_state 函数会被调用。</p>
+
+<p>  如果所有的ioctl都失败了，用下面的rtc-test.c检查一下你的驱动吧！</p>
+
+<pre><code>    /*
+     *      Real Time Clock Driver Test/Example Program
+     *
+     *      Compile with:
+     *           gcc -s -Wall -Wstrict-prototypes rtctest.c -o rtctest
+     *
+     *      Copyright (C) 1996, Paul Gortmaker.
+     *
+     *      Released under the GNU General Public License, version 2,
+     *      included herein by reference.
+     *
+     */
+
+    #include &lt;stdio.h&gt;
+    #include &lt;linux/rtc.h&gt;
+    #include &lt;sys/ioctl.h&gt;
+    #include &lt;sys/time.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;fcntl.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;stdlib.h&gt;
+    #include &lt;errno.h&gt;
+
+
+    /*
+     * This expects the new RTC class driver framework, working with
+     * clocks that will often not be clones of what the PC-AT had.
+     * Use the command line to specify another RTC if you need one.
+     */
+    static const char default_rtc[] = "/dev/rtc0";
+
+
+    int main(int argc, char **argv)
+    {
+        int i, fd, retval, irqcount = 0;
+        unsigned long tmp, data;
+        struct rtc_time rtc_tm;
+        const char *rtc = default_rtc;
+
+        switch (argc) {
+        case 2:
+            rtc = argv[1];
+            /* FALLTHROUGH */
+        case 1:
+            break;
+        default:
+            fprintf(stderr, "usage:  rtctest [rtcdev]\n");
+            return 1;
+        }
+
+        fd = open(rtc, O_RDONLY);
+
+        if (fd ==  -1) {
+            perror(rtc);
+            exit(errno);
+        }
+
+        fprintf(stderr, "\n\t\t\tRTC Driver Test Example.\n\n");
+
+        /* Turn on update interrupts (one per second) */
+        retval = ioctl(fd, RTC_UIE_ON, 0);
+        if (retval == -1) {
+            if (errno == ENOTTY) {
+                fprintf(stderr,
+                    "\n...Update IRQs not supported.\n");
+                goto test_READ;
+            }
+            perror("RTC_UIE_ON ioctl");
+            exit(errno);
+        }
+
+        fprintf(stderr, "Counting 5 update (1/sec) interrupts from reading %s:",
+                rtc);
+        fflush(stderr);
+        for (i=1; i&lt;6; i++) {
+            /* This read will block */
+            retval = read(fd, &amp;data, sizeof(unsigned long));
+            if (retval == -1) {
+                perror("read");
+                exit(errno);
+            }
+            fprintf(stderr, " %d",i);
+            fflush(stderr);
+            irqcount++;
+        }
+
+        fprintf(stderr, "\nAgain, from using select(2) on /dev/rtc:");
+        fflush(stderr);
+        for (i=1; i&lt;6; i++) {
+            struct timeval tv = {5, 0};     /* 5 second timeout on select */
+            fd_set readfds;
+
+            FD_ZERO(&amp;readfds);
+            FD_SET(fd, &amp;readfds);
+            /* The select will wait until an RTC interrupt happens. */
+            retval = select(fd+1, &amp;readfds, NULL, NULL, &amp;tv);
+            if (retval == -1) {
+                    perror("select");
+                    exit(errno);
+            }
+            /* This read won't block unlike the select-less case above. */
+            retval = read(fd, &amp;data, sizeof(unsigned long));
+            if (retval == -1) {
+                    perror("read");
+                    exit(errno);
+            }
+            fprintf(stderr, " %d",i);
+            fflush(stderr);
+            irqcount++;
+        }
+
+        /* Turn off update interrupts */
+        retval = ioctl(fd, RTC_UIE_OFF, 0);
+        if (retval == -1) {
+            perror("RTC_UIE_OFF ioctl");
+            exit(errno);
+        }
+
+    test_READ:
+        /* Read the RTC time/date */
+        retval = ioctl(fd, RTC_RD_TIME, &amp;rtc_tm);
+        if (retval == -1) {
+            perror("RTC_RD_TIME ioctl");
+            exit(errno);
+        }
+
+        fprintf(stderr, "\n\nCurrent RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
+            rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+            rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+
+        /* Set the alarm to 5 sec in the future, and check for rollover */
+        rtc_tm.tm_sec += 5;
+        if (rtc_tm.tm_sec &gt;= 60) {
+            rtc_tm.tm_sec %= 60;
+            rtc_tm.tm_min++;
+        }
+        if (rtc_tm.tm_min == 60) {
+            rtc_tm.tm_min = 0;
+            rtc_tm.tm_hour++;
+        }
+        if (rtc_tm.tm_hour == 24)
+            rtc_tm.tm_hour = 0;
+
+        retval = ioctl(fd, RTC_ALM_SET, &amp;rtc_tm);
+        if (retval == -1) {
+            if (errno == ENOTTY) {
+                fprintf(stderr,
+                    "\n...Alarm IRQs not supported.\n");
+                goto test_PIE;
+            }
+            perror("RTC_ALM_SET ioctl");
+            exit(errno);
+        }
+
+        /* Read the current alarm settings */
+        retval = ioctl(fd, RTC_ALM_READ, &amp;rtc_tm);
+        if (retval == -1) {
+            perror("RTC_ALM_READ ioctl");
+            exit(errno);
+        }
+
+        fprintf(stderr, "Alarm time now set to %02d:%02d:%02d.\n",
+            rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+
+        /* Enable alarm interrupts */
+        retval = ioctl(fd, RTC_AIE_ON, 0);
+        if (retval == -1) {
+            perror("RTC_AIE_ON ioctl");
+            exit(errno);
+        }
+
+        fprintf(stderr, "Waiting 5 seconds for alarm...");
+        fflush(stderr);
+        /* This blocks until the alarm ring causes an interrupt */
+        retval = read(fd, &amp;data, sizeof(unsigned long));
+        if (retval == -1) {
+            perror("read");
+            exit(errno);
+        }
+        irqcount++;
+        fprintf(stderr, " okay. Alarm rang.\n");
+
+        /* Disable alarm interrupts */
+        retval = ioctl(fd, RTC_AIE_OFF, 0);
+        if (retval == -1) {
+            perror("RTC_AIE_OFF ioctl");
+            exit(errno);
+        }
+
+    test_PIE:
+        /* Read periodic IRQ rate */
+        retval = ioctl(fd, RTC_IRQP_READ, &amp;tmp);
+        if (retval == -1) {
+            /* not all RTCs support periodic IRQs */
+            if (errno == ENOTTY) {
+                fprintf(stderr, "\nNo periodic IRQ support\n");
+                goto done;
+            }
+            perror("RTC_IRQP_READ ioctl");
+            exit(errno);
+        }
+        fprintf(stderr, "\nPeriodic IRQ rate is %ldHz.\n", tmp);
+
+        fprintf(stderr, "Counting 20 interrupts at:");
+        fflush(stderr);
+
+        /* The frequencies 128Hz, 256Hz, ... 8192Hz are only allowed for root. */
+        for (tmp=2; tmp&lt;=64; tmp*=2) {
+
+            retval = ioctl(fd, RTC_IRQP_SET, tmp);
+            if (retval == -1) {
+                /* not all RTCs can change their periodic IRQ rate */
+                if (errno == ENOTTY) {
+                    fprintf(stderr,
+                        "\n...Periodic IRQ rate is fixed\n");
+                    goto done;
+                }
+                perror("RTC_IRQP_SET ioctl");
+                exit(errno);
+            }
+
+            fprintf(stderr, "\n%ldHz:\t", tmp);
+            fflush(stderr);
+
+            /* Enable periodic interrupts */
+            retval = ioctl(fd, RTC_PIE_ON, 0);
+            if (retval == -1) {
+                perror("RTC_PIE_ON ioctl");
+                exit(errno);
+            }
+
+            for (i=1; i&lt;21; i++) {
+                /* This blocks */
+                retval = read(fd, &amp;data, sizeof(unsigned long));
+                if (retval == -1) {
+                    perror("read");
+                    exit(errno);
+                }
+                fprintf(stderr, " %d",i);
+                fflush(stderr);
+                irqcount++;
+            }
+
+            /* Disable periodic interrupts */
+            retval = ioctl(fd, RTC_PIE_OFF, 0);
+            if (retval == -1) {
+                perror("RTC_PIE_OFF ioctl");
+                exit(errno);
+            }
+        }
+
+    done:
+        fprintf(stderr, "\n\n\t\t\t *** Test complete ***\n");
+
+        close(fd);
+
+        return 0;
+    }
+</code></pre>
 ]]></content>
   </entry>
   
