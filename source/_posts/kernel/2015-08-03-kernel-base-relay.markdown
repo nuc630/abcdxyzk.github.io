@@ -121,46 +121,6 @@ Relay的基本结构和典型操作
 		relay_write(hello_rchan, msg, strlen(msg));
 		return 0;
 	}
-	#include <linux/module.h>
-	#include <linux/relay.h>
-	#include <linux/debugfs.h>
-
-	static struct dentry *create_buf_file_handler(const char *filename, struct dentry *parent, int mode, struct rchan_buf *buf, int *is_global)
-	{
-		return debugfs_create_file(filename, mode, parent, buf, &relay_file_operations);
-	}
-
-	static int remove_buf_file_handler(struct dentry *dentry)
-	{
-		debugfs_remove(dentry);
-		return 0;
-	}
-
-	static struct rchan_callbacks relay_callbacks =
-	{
-		.create_buf_file = create_buf_file_handler,
-		.remove_buf_file = remove_buf_file_handler,
-	};
-
-	static struct rchan *hello_rchan;
-	struct dentry *dir;
-
-	int init_module(void)
-	{
-		const char *msg="Hello world\n";
-		dir = debugfs_create_dir("test", NULL);
-	#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,32))
-		hello_rchan = relay_open("cpu", dir, 8192, 2, &relay_callbacks, NULL);
-	#else   
-		hello_rchan = relay_open("cpu", dir, 8192, 2, &relay_callbacks);
-	#endif  
-		if(!hello_rchan){
-			printk("relay_open() failed.\n");
-			return -ENOMEM;
-		}
-		relay_write(hello_rchan, msg, strlen(msg));
-		return 0;
-	}
 ```
 
 查看输出
