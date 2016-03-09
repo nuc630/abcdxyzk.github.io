@@ -11,12 +11,21 @@ categories:
 tags:
 ---
 
+```
+	$ ll /etc/rc.sysinit
+	/etc/rc.sysinit -> rc.d/rc.sysinit
+```
+
 el5在调用mkinitrd命令时，会将/dev/rtc生成好，放到initrd- x.x.x.img文件中。而el6的系统在 /etc/rc.sysinit的/sbin/start_udev 之前是有这两个文件，也没找到el6的系统是在哪里加的这两句。
 
 el5可选的一个做法是：修改/etc/rc.sysinit,在/sbin/start_udev这行之前加入两行：
 ```
 	mv /dev/rtc /dev/rtc0
 	ln -sf rtc0 /dev/rtc
+```
+在/sbin/start_udev这行之后加入一行
+```
+	[ -x /sbin/hwclock ] && /sbin/hwclock $CLOCKFLAGS
 ```
 这样el5系统用18、32内核都没问题了。
 
@@ -62,6 +71,10 @@ el5试着将这两句改在/sbin/mkinitrd里修改，但不知道为什么改完
 	 if [ "$(uname -m)" == "ia64" ]; then
 		 emit "mknod /dev/efirtc c 10 136"
 	 fi
+```
+然后重建img
+```
+	/sbin/new-kernel-pkg --package kernel --mkinitrd --depmod --install 2.6.32-XXX
 ```
 
 ------------------
