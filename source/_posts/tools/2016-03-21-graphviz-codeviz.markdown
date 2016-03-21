@@ -11,6 +11,31 @@ categories:
 tags:
 ---
 
+
+有时候genfull生成的full.graph没有函数调用关系，在CentOS6上生成的图只有那个函数，在CentOS5上会报一个错误
+```
+	Error: <stdin>: syntax error in line 4 near ';'
+```
+可以不用自带的genfull，自己写个脚本生成full.graph
+```
+	echo "digraph fullgraph {" > full.graph
+	echo "node [ fontname=Helvetica, fontsize=12 ];" >> full.graph
+
+	find . -name '*.c.cdepn' -exec cat {} \; | \
+		awk -F"[ {}]+" '{
+			if ($1 == "F") {
+				print "\""$2 "\" [label=\"" $2 "\\n" $3 ":\"];"
+			} else if ($1 == "C") {
+				print "\"" $2 "\" -> \"" $4 "\" [label=\"" $3 "\"];"
+			}
+		}' \
+	| sort | uniq -u >> full.graph
+
+	echo "}" >> full.graph
+```
+
+---------------
+
 http://blog.csdn.net/lanxuezaipiao/article/details/16991731
 
 ### 一、Graphviz + CodeViz简单介绍
