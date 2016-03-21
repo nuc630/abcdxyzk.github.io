@@ -62,6 +62,519 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/09/23/kernel-mm-buffer/">Linux中Buffer cache</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-23T17:15:00+08:00'><span class='date'>2015-09-23</span> <span class='time'>17:15:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2013-01/78140.htm">http://www.linuxidc.com/Linux/2013-01/78140.htm</a></p>
+
+<h4>buffer cache和page cache的区别</h4>
+
+<p>Page cache和buffer cache到底有什么区别呢？很多时候我们不知道系统在做IO操作的时候到底是走了page cache还是buffer cache？其实，buffer cache和page  cache是Linux中两个比较简单的概念，在此对其总结说明。</p>
+
+<p>Page cache是vfs文件系统层的cache，例如 对于一个ext3文件系统而言，每个文件都会有一棵radix树管理文件的缓存页，这些被管理的缓存页被称之为page cache。所以，page cache是针对文件系统而言的。例如，ext3文件系统的页缓存就是page cache。Buffer cache是针对设备的，每个设备都会有一棵radix树管理数据缓存块，这些缓存块被称之为buffer cache。通常对于ext3文件系统而言，page cache的大小为4KB，所以ext3每次操作的数据块大小都是4KB的整数倍。Buffer cache的缓存块大小通常由块设备的大小来决定，取值范围在512B~4KB之间，取块设备大小的最大公约数。</p>
+
+<hr />
+
+<p><a href="http://alanwu.blog.51cto.com/3652632/1112079">http://alanwu.blog.51cto.com/3652632/1112079</a></p>
+
+<h3>Linux中Buffer cache性能问题一探究竟</h3>
+
+<h4>1, Buffer cache的作用</h4>
+
+<p>为了提高磁盘设备的IO性能，我们采用内存作为磁盘设备的cache。用户操作磁盘设备的时候，首先将数据写入内存，然后再将内存中的脏数据定时刷新到磁盘。这个用作磁盘数据缓存的内存就是所谓的buffer cache。在以前的Linux系统中，有很完善的buffer cache软件层，专门负责磁盘数据的缓存。在磁盘设备的上层往往会架构文件系统，为了提高文件系统的性能，VFS层同样会提供文件系统级别的page cache。这样就导致系统中存在两个cache，并且重叠在一起，显得没有必要和冗余。为了解决这个问题，在现有的Linux系统中对buffer cache软件层进行了弱化，并且和page cache进行了整合。Buffer cache和page cache都采用radix tree进行维护，只有当访问裸设备的时候才会使用buffer cache，正常走文件系统的IO不会使用buffer cache。</p>
+
+<p>我们知道ext3文件系统的page cache都是以page页大小为单位的，那么buffer cache中缓存块大小究竟是多大呢？其对性能影响如何呢？这两天我在Linux-2.6.23平台上针对这个问题做了很多实验，得到了一些数据结果，并从源代码分析中得到设置缓存块大小的方法。在此对这个buffer cache的性能问题进行分析说明，供大家讨论。</p>
+
+<h4>2, Buffer cache的性能问题</h4>
+
+<h5>2.1 测试实验</h5>
+
+<p>首先让我们来做一个实验，在Linux-2.6.23平台上，采用dd工具对一个块设备进行顺序写操作，可以采用如下的命令格式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>dd if=/dev/zero of=/dev/sda2 bs=&lt;request_size&gt; count=100</span></code></pre></td></tr></table></div></figure>
+
+
+<p>采用该命令在不同buffer cache块（blk_size）大小配置的情况下测试不同请求大小（req_size）的IO性能，可以得到如下表所示的测试数据：</p>
+
+<p>表：不同buffer cache块大小配置下的吞吐量</p>
+
+<p><img src="/images/kernel/2015-09-23-1.jpg" alt="" /></p>
+
+<p>将表中的数据做成性能对比图，如下图所示：</p>
+
+<p><img src="/images/kernel/2015-09-23-2.jpg" alt="" /></p>
+
+<p>从图中可以看出，在请求大小小于Cache块大小的时候，Cache块越大，IO性能越高；但是，请求大小大于Cache块大小之后，性能都有明显的飞跃。</p>
+
+<p>例如，当buffer cache块大小被配置成2KB时，小于2KB的块性能基本都在19MB/s左右；当buffer cache块大小被配置成512B时，小于512B的写性能都保持在5MB/s；当buffer cache块大小被配置成1024B时，小于1KB的写性能基本都保持在9.5MB/s上下。这就说明对于小于cache块大小的small_write，buffer cache越大，其性能会越好，反之，性能越差，这就是buffer cache的作用。</p>
+
+<p>观察发现一旦请求大小大于等于cache块大小之后，性能急剧提升，由于测试工具的IO压力足够大，能够一下子将磁盘性能耗尽。这是为什么呢？其实，当请求块比较小时，对于cache块而言是“局部操作”，这种“局部操作”会引入buffer cache的数据读操作，并且数据读操作和用户写操作存在顺序关系，这就极大的影响了IO的写性能。因此，当请求大小大于cache块时，并且能够和Cache块对齐时，就能够充分利用磁盘的IO带宽，所以就产生了上图中所示的性能飞跃。</p>
+
+<p>看到上图中的测试结果之后，我们就会想在实际应用中，我们该如何选择buffer cache的块大小？如果请求大小是512B时，显然将buffer cache块设置成512比较合适；如果请求大小是256B时，显然将buffer cache块设置成2KB比较合适。所以，个人认为块大小的设置还需要根据实际的应用来决定，不同的应用需要设置不同的块大小，这样才能使整体性能达到最佳。</p>
+
+<h5>2.2 Buffer cache块大小</h5>
+
+<p>Linux系统在创建块设备的时候是如何设置块大小的呢？这里面涉及到Linux针对块大小设置的一个小小算法。在此结合源码对Linux的这个方法加以说明。</p>
+
+<p>总体来说，Linux决定buffer cache块大小采用的是“最大块大小”的设计思想。Linux根据块设备容量决定buffer cache的块大小，并且将值域限定在512B和4KB之间。当然，这个值域内的元素不是连续的，并且都是2的幂。在这个值域的基础上取块设备大小的最大公约数，这个值就是buffer cache的块大小。这种算法的指导思想就是buffer cache的块越大越好，因此，能够取2KB就不会选择512B。Linux中算法实现代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void bd_set_size(struct block_device *bdev, loff_t size)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned bsize = bdev_logical_block_size(bdev);
+</span><span class='line'>
+</span><span class='line'>&#9;bdev-&gt;bd_inode-&gt;i_size = size;      //size为块设备大小
+</span><span class='line'>&#9;while (bsize &lt; PAGE_CACHE_SIZE) {   //bsize不能大于Page size
+</span><span class='line'>&#9;&#9;if (size & bsize)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;bsize &lt;&lt;= 1;    //bsize只能取2的幂
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;bdev-&gt;bd_block_size = bsize;
+</span><span class='line'>&#9;/* 设置buffer cache块大小 */
+</span><span class='line'>&#9;bdev-&gt;bd_inode-&gt;i_blkbits = blksize_bits(bsize);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3, 小结</h4>
+
+<p>本文对buffer cache的性能问题进行了分析，通过实验发现当请求块比较小时，buffer cache块大小对IO性能有很大的影响。Linux根据块设备的容量采用“最大cache块”的思想决定buffer cache的块大小。在实际应用中，我们应该根据应用特征，通过实际测试来决定buffer cache块大小。</p>
+
+<hr />
+
+<p>通常Linux的“block size”指的是1024 bytes，Linux用1024-byte blocks 作为buffer cache的基本单位。但linux的文件系统的block确不一样。例如ext3系统，block size是4096。使用tune2fs可以查看带文件系统的磁盘分区的相关信息，包括block size。</p>
+
+<p>例如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tune2fs -l /dev/sda2 |grep "Block size"
+</span><span class='line'>Block size:               4096</span></code></pre></td></tr></table></div></figure>
+
+
+<p>另一个工具dumpe2fs也可以。 dumpe2fs /dev/sda2 | grep &ldquo;Block size&rdquo;</p>
+
+<p>其实本来这几个概念不是很难，主要是NND他们的名字都一样，都叫“Block Size”。</p>
+
+<p>1.硬件上的 block size, 应该是"sector size"，linux的扇区大小是512byte</p>
+
+<p>2.有文件系统的分区的block size, 是"block size"，大小不一，可以用工具查看</p>
+
+<p>3.没有文件系统的分区的block size，也叫“block size”，大小指的是1024 byte</p>
+
+<p>4.Kernel buffer cache 的block size, 就是"block size"，大部分PC是1024</p>
+
+<p>5.磁盘分区的"cylinder size"，用fdisk -l可以查看。</p>
+
+<p>我们来看看fdisk显示的不同的信息，理解一下这几个概念：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Disk /dev/hda: 250.0 GB, 250059350016 bytes
+</span><span class='line'>255 heads, 63 sectors/track, 30401 cylinders
+</span><span class='line'>Units = cylinders of 16065 * 512 = 8225280 bytes
+</span><span class='line'>   Device Boot    Start       End    Blocks   Id  System
+</span><span class='line'>/dev/hda1   *         1      1305  10482381   83  Linux
+</span><span class='line'>/dev/hda2          1306      1566   2096482+  82  Linux swap
+</span><span class='line'>/dev/hda3          1567     30401 231617137+  83  Linux</span></code></pre></td></tr></table></div></figure>
+
+
+<p>8225280就是cylinder size。一共有30401个cylinder。Start和End分别标记的是各个分区的起始cylinder。第4列显示的就是以1024为单位的block（这一列最容易把人搞晕）。为什么“2096482+”有个“+”号呢？因为啊，总size除1024除不尽，是个约数。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-swappiness/">Linux内核页回收 swappiness参数</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-18T11:21:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>11:21:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.douban.com/note/349467816/">http://www.douban.com/note/349467816/</a></p>
+
+<p>本文主要尝试解释两个问题：<br/>
+1. swappiness的确切含义是什么，它对内核进行页回收机制的影响。<br/>
+2. swappiness设置成0，为什么系统仍然可能会有swap发生。</p>
+
+<h4>一. 关于内存分配与页回收(page reclaim)</h4>
+
+<p>page reclaim发生的场景主要有两类，一个是kswapd后台线程进行的活动，另一个是direct reclaim，即分配页时没有空闲内存满足，需要立即直接进行的页回收。大体上内存分配的流程会分为两部分，一部分是fast path，另一部分是slow path，通常内存使用非紧张情况下，都会在fast path就可以满足要求。并且fast path下的内存分配不会出现dirty writeback及swap等页回收引起的IO阻塞情况。</p>
+
+<p>fast path大体流程如下：</p>
+
+<p>1.如果系统挂载使用了memory cgroup，则首先检查是否超过cgroup限额，如果超过则进行direct reclaim，通过do_try_to_free_pages完成。如果没超过则进行cgroup的charge工作（charge是通过两阶段提交完成的，这里不展开了）。</p>
+
+<p>2.从本地prefered zone内存节点查找空闲页，需要判断是否满足系统watermark及dirty ratio的要求，如果满足则从buddy system上摘取相应page,否则尝试对本地prefered zone进行页回收,本次fast path下页回收只会回收clean page，即不会考虑dirty page以及mapped page，这样就不会产生任何swap及writeback，即不会引起任何blocking的IO操作，如果这次回收仍然无法满足请求的内存页数目则进入slow path</p>
+
+<p>slow path大体流程如下：</p>
+
+<ol>
+<li><p>首先唤醒kswapd进行page reclaim后台操作。</p></li>
+<li><p>重新尝试本地prefered zone进行分配内存，如果失败会根据请求的GFP相关参数决定是否尝试忽略watermark, dirty ratio以及本地节点分配等要求进行再次重试，这一步中如果分配页时有指定<code>__GFP_NOFAIL</code>标记，则分配失败会一直等待重试。</p></li>
+<li><p>如果没有<code>__GFP_NOFAIL</code>标记，则会需开始进行page compact及page direct reclaim操作，之后如果仍然没有可用内存，则进入OOM流程。</p></li>
+</ol>
+
+
+<p>相关内容可以参阅内核代码<code>__alloc_pages</code>函数的逻辑，另外无论page reclaim是由谁发起的，最终都会统一入口到shrink_zone，即针对每个zone独立进行reclaim操作，最终会进入shrink_lruvec函数，进行每个zone相应page lru链表的扫描与回收操作。</p>
+
+<h4>二. 关于页回收的一些背景知识</h4>
+
+<p>页回收大体流程会先在每个zone上扫描相应的page链表，主要包括inactive anon/active anon(匿名页链表)以及inactive file/active file链表（file cache/映射页链表），一共四条链表，我们所有使用过的page在被回收前基本是保存在这四条链表中的某一条中的（还有一部分在unevictable链表中，忽略），根据其被引用的次数会决定其处于active还是inactive链表中，根据其类型决定处于anon还是file链表中。</p>
+
+<p>页回收总体会扫描逐个内存节点的所有zone，然后先扫描active，将不频繁访问的页挪到inactive链表中，随后扫描inactive链表，会将其中被频繁引用的页重新挪回到active中，确认不频繁的页则最终被回收，如果是file based的页则根据是否clean进行释放或回写(writeback，filecache则直接释放)，如果是anon则进行swap，所以本文实际关心的是swappiness参数对anon链表扫描的影响。</p>
+
+<p>另外还需要了解前面描述的四个链表原来是放在zone数据结构上的，后来引入了mem_cgroup则，重新定义了一组mem_cgroup_per_zone/mem_cgroup_per_node的数据结构，这四个链表同时定义在这组数据结构上，如果系统开启了mem cgroup则使用后者，否则用前者。</p>
+
+<p>另外再重点说下swap只是page reclaim的一种处理措施，主要针对anon page，我们最终来看下swappiness的确切含义</p>
+
+<h4>三. swappiness对page reclaim的确切影响</h4>
+
+<p>page reclaim逻辑中对前面所述四个链表进行扫描的逻辑在vmscan.c中的get_scan_count函数内，该函数大部分逻辑注释写得非常清楚，我们简单梳理下，主要关注scan_balance变量的取值：</p>
+
+<ol>
+<li>首先如果系统禁用了swap或者没有swap空间，则只扫描file based的链表，即不进行匿名页链表扫描
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;may_swap || (get_nr_swap_pages() &lt;= 0)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果当前进行的不是全局页回收（cgroup资源限额引起的页回收），并且swappiness设为0，则不进行匿名页链表扫描，这个是没得商量，这里swappiness值直接决定了是否有swap发生，设成0则肯定不会发生，另外需要注意，这种情况下需要设置的是cgroup配置文件memory.swappiness，而不是全局的sysctl vm.swappiness
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!global_reclaim(sc) && !vmscan_swappiness(sc)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果进行链表扫描前设置的priority(这个值决定扫描多少分之一的链表元素)为0，且swappiness非0，则可能会进行swap
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;priority && vmscan_swappiness(sc)) {
+</span><span class='line'>&#9;scan_balance = SCAN_EQUAL;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果是全局页回收，并且当前空闲内存和所有file based链表page数目的加和都小于系统的high watermark，则必须进行匿名页回收，则必然会发生swap,可以看到这里swappiness的值如何设置是完全无关的，这也解释了为什么其为0，系统也会进行swap的原因，另外最后我们会详细解释系统page watermark是如何计算的。
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>anon = get_lru_size(lruvec, LRU_ACTIVE_ANON) +
+</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_ANON);
+</span><span class='line'>file = get_lru_size(lruvec, LRU_ACTIVE_FILE) +
+</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_FILE);
+</span><span class='line'>
+</span><span class='line'>if (global_reclaim(sc)) {
+</span><span class='line'>&#9;free = zone_page_state(zone, NR_FREE_PAGES);
+</span><span class='line'>&#9;if (unlikely(file + free &lt;= high_wmark_pages(zone))) {
+</span><span class='line'>&#9;&#9;scan_balance = SCAN_ANON;
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果系统inactive file链表比较充足，则不考虑进行匿名页的回收，即不进行swap
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!inactive_file_is_low(lruvec)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>最后一种情况则要根据swappiness值与之前统计的file与anon哪个更有价值来综合决定file和anon链表扫描的比例，这时如果swappiness设置成0，则也不会扫描anon链表，即不进行swap,代码比较多，不再贴出。</li>
+</ol>
+
+
+<h4>四. 系统内存watermark的计算</h4>
+
+<p>前面看到系统内存watermark对页回收机制是有决定影响的，其实在内存分配中也会频繁用到这个值，确切的说它有三个值，分别是low,min和high,根据分配页时来指定用哪个，如果系统空闲内存低于相应watermark则分配会失败，这也是进入slow path或者wakeup kswapd的依据。</p>
+
+<p>实际这个值的计算是通过sysctl里的vm.min_free_kbytes来决定的，大体的计算公式如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pages_min = min_free_kbytes &gt;&gt; (PAGE_SHIFT - 10);
+</span><span class='line'>tmp = (u64)pages_min * zone-&gt;managed_pages;
+</span><span class='line'>do_div(tmp, lowmem_pages);
+</span><span class='line'>zone-&gt;watermark[WMARK_MIN] = tmp;
+</span><span class='line'>zone-&gt;watermark[WMARK_LOW] = min_wmark_pages(zone) + (tmp &gt;&gt; 2);
+</span><span class='line'>zone-&gt;watermark[WMARK_HIGH] = min_wmark_pages(zone) + (tmp &gt;&gt; 1);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即根据min_free_kbytes的值按照每个zone管理页面的比例算出zone的min_watermark，然后再加min的1/4就是low，加1/2就是high了</p>
+
+<h4>总结：</h4>
+
+<p>swappiness的值是个参考值，是否会发生swap跟当前是哪种page reclaim及系统当前状态都有关系，所以设置了swappiness=0并不代表一定没有swap发生，同时设为0也确实会可能发生OOM。</p>
+
+<p>个人仍然认为线上环境设置swappiness=0是没有任何问题的。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-swap/">Linux swap实现</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-18T11:16:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>11:16:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/freas_1990/article/details/9090601">http://blog.csdn.net/freas_1990/article/details/9090601</a></p>
+
+<p>swap是现代Unix操作系统一个非常重要的特性。尤其在大型数据库服务器上，swap往往是性能首要查看指标。</p>
+
+<p>通俗的说法，在Unix里，将开辟一个磁盘分区，用作swap，这块磁盘将作为内存的的替代品，在内存不够用的时候，把一部分内存空间交换到磁盘上去。</p>
+
+<p>而Unix的swap功能也成为了Unixer们认为Unix由于windows的一个论据（？）。在Unix里，swap一般被认为设置为内存的2倍大小。这个2倍大小的指标出自哪里，到目前为止我也没有找到（？如果你找到了可以留言或发私信）。</p>
+
+<p>不过，在内存不断掉价的今天，swap的功效已经越来越弱化了——在2013年6月13日23:01，如果一个OLTP系统的swap使用超过了2G以上，基本上可以对这个系统的性能产生怀疑了。swap并不是一种优化机制，而是一种不得已而为之的手段，防止在内存紧张的时刻，操作系统性能骤降以至瞬间崩溃。swap的价值主要体现在可以把这个崩溃的时间提升至几小时到几十个小时不等。</p>
+
+<p>本文主要关注CPU访问一个内存page时，发现该page不在内存中的情况。废话不多说了，先把swap的核心函数调用栈贴一下。</p>
+
+<p><img src="/images/kernel/2015-09-18-11.png" alt="" /></p>
+
+<p>当CPU检查一个页目录项/页表项的Present标志位时，如果发现该标志位为0，则表示相应的物理页面不在内存。此时，CPU会被激发“页面异常”（中断中的fault），而去执行一段代码。</p>
+
+<p>至于到底是这个内存页面需要重新构建、还是页面的内容是存储到磁盘上去了，CPU本身是不关心的，CPU只知道中断条件发生了，要根据中断描述符跳转到另外一段代码去执行，而真正的swap或者是真的缺页的智能判断是在这段中断服务程序里做的——真正的技术是在这段中断服务程序里。（所以我在《中断——一鞭一条痕（下）》里说，作为一个初学者，不必深究中断（interrupt）、异常（exception）、陷阱（trap）这三个概念）</p>
+
+<p>pte_present()函数会检查当前页面的描述entry的present标志位，查看该page是否在内存中。如果不在内存中，调用pte_none()判断是否建立了页目录、页表映射。如果连映射都没建立，说明是“真没在内存中”，需要从头建立映射关系。如果建立了映射关系，说明此时，该页面被暂时存储到磁盘上去了，应该到磁盘上去把该page取回来放到内存里。</p>
+
+<p>如何去取呢？</p>
+
+<p>如何到磁盘取一个page的数据到内存中去，这是一个多么熟悉的概念！思考一下Oracle的内存管理，一个block如何读入到SGA的buffer cache里去吧。其实这几十年来，核心的本源技术无论是在操作系统内核还是在数据库内核里，都是通用的，都是用来极大限度提升CPU任务管理能力、内存管理效率的，所有的理念、技术都是通用的——如果你站在一个系统程序猿的角度来思考，一定能明白的——不要把自己局限在一个产品里，无论这个产品是数据库、CPU、还是操作系统，这些看似绚烂神秘的技术在30年以前，已经被人反复的讨论和意淫过了。</p>
+
+<p>接下来就到了核心部分了——do_swap_page()函数。</p>
+
+<p>源代码如下（linux/mm/memory.c line 2022~1060）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_swap_page(struct mm_struct * mm,
+</span><span class='line'>&#9;struct vm_area_struct * vma, unsigned long address,
+</span><span class='line'>&#9;pte_t * page_table, swp_entry_t entry, int write_access)
+</span><span class='line'>{ 
+</span><span class='line'>&#9;struct page *page = lookup_swap_cache(entry);
+</span><span class='line'>&#9;pte_t pte;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!page) {
+</span><span class='line'>&#9;&#9;lock_kernel();
+</span><span class='line'>&#9;&#9;swapin_readahead(entry);
+</span><span class='line'>&#9;&#9;page = read_swap_cache(entry);
+</span><span class='line'>&#9;&#9;unlock_kernel();
+</span><span class='line'>&#9;&#9;if (!page)
+</span><span class='line'>&#9;&#9;&#9;return -1;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;flush_page_to_ram(page);
+</span><span class='line'>&#9;&#9;flush_icache_page(vma, page);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;mm-&gt;rss++;
+</span><span class='line'>
+</span><span class='line'>&#9;pte = mk_pte(page, vma-&gt;vm_page_prot);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Freeze the "shared"ness of the page, ie page_count + swap_count.
+</span><span class='line'>&#9; * Must lock page before transferring our swap count to already
+</span><span class='line'>&#9; * obtained page count.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;lock_page(page);
+</span><span class='line'>&#9;swap_free(entry);
+</span><span class='line'>&#9;if (write_access && !is_page_shared(page))
+</span><span class='line'>&#9;&#9;pte = pte_mkwrite(pte_mkdirty(pte));
+</span><span class='line'>&#9;UnlockPage(page);
+</span><span class='line'>
+</span><span class='line'>&#9;set_pte(page_table, pte);
+</span><span class='line'>&#9;/* No need to invalidate - it was non-present before */
+</span><span class='line'>&#9;update_mmu_cache(vma, address, pte);
+</span><span class='line'>&#9;return 1;   /* Minor fault */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里有2个参数需要重点关注，一个是<code>(pte_t *)page_table</code>，另外一个是<code>(swp_entry_t*)entry</code>。</p>
+
+<p>当一个page在内存中，不需要swap in时，描述该page的entry是pte_t类型的；反之，是swp_entry_t类型。</p>
+
+<p>swap_entry_t(include/linux/shmem_fs.h)定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>typedef struct {
+</span><span class='line'>&#9;unsigned long val;
+</span><span class='line'>} swp_entry_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>问题出来了，既然都进入do_swap_page()函数了，说明是需要swap in了，为什么还会传入一个pte_t类型的变量呢？</p>
+
+<p>答案是，当在do_swap_page()之前，page是在磁盘上的，描述类型是swp_entry_t，而do_swap_page()之后，页面已经从磁盘交换到内存了，这个时候描述类型就是pte_t了。</p>
+
+<p>至于lookup_swap_cache、swapin_readahead（预读——read ahead）等函数就不一一分析了，从名字就可以看出其技巧了。都是些在数据库server上的常用技巧。如果你是行家，一眼就能看出来。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-cache-base/">Linux Cache 机制探究</a></h2>
     
     
@@ -1277,2110 +1790,6 @@ int flags ：MS_ASYN: 异步写，MS_SYN : 同步写，MS_INVALIDAT : 无效的c
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/11/kernel-mm-vma-base/">linux进程地址空间--vma的基本操作</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-11T16:39:00+08:00'><span class='date'>2015-09-11</span> <span class='time'>16:39:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/vanbreaker/article/details/7855007">http://blog.csdn.net/vanbreaker/article/details/7855007</a></p>
-
-<p>在32位的系统上，线性地址空间可达到4GB，这4GB一般按照3:1的比例进行分配，也就是说用户进程享有前3GB线性地址空间，而内核独享最后1GB线性地址空间。由于虚拟内存的引入，每个进程都可拥有3GB的虚拟内存，并且用户进程之间的地址空间是互不可见、互不影响的，也就是说即使两个进程对同一个地址进行操作，也不会产生问题。在前面介绍的一些分配内存的途径中，无论是伙伴系统中分配页的函数，还是slab分配器中分配对象的函数，它们都会尽量快速地响应内核的分配请求，将相应的内存提交给内核使用，而内核对待用户空间显然不能如此。用户空间动态申请内存时往往只是获得一块线性地址的使用权，而并没有将这块线性地址区域与实际的物理内存对应上，只有当用户空间真正操作申请的内存时，才会触发一次缺页异常，这时内核才会分配实际的物理内存给用户空间。</p>
-
-<p>用户进程的虚拟地址空间包含了若干区域，这些区域的分布方式是特定于体系结构的，不过所有的方式都包含下列成分：</p>
-
-<p>  可执行文件的二进制代码，也就是程序的代码段<br/>
-  存储全局变量的数据段<br/>
-  用于保存局部变量和实现函数调用的栈<br/>
-  环境变量和命令行参数<br/>
-  程序使用的动态库的代码<br/>
-  用于映射文件内容的区域</p>
-
-<p>由此可以看到进程的虚拟内存空间会被分成不同的若干区域，每个区域都有其相关的属性和用途，一个合法的地址总是落在某个区域当中的，这些区域也不会重叠。在linux内核中，这样的区域被称之为虚拟内存区域(virtual memory areas),简称vma。一个vma就是一块连续的线性地址空间的抽象，它拥有自身的权限(可读，可写，可执行等等) ，每一个虚拟内存区域都由一个相关的struct vm_area_struct结构来描述</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct vm_area_struct {
-</span><span class='line'>&#9;struct mm_struct * vm_mm;   /* 所属的内存描述符 */
-</span><span class='line'>&#9;unsigned long vm_start;    /* vma的起始地址 */
-</span><span class='line'>&#9;unsigned long vm_end;       /* vma的结束地址 */
-</span><span class='line'>
-</span><span class='line'>&#9;/* 该vma的在一个进程的vma链表中的前驱vma和后驱vma指针，链表中的vma都是按地址来排序的*/
-</span><span class='line'>&#9;struct vm_area_struct *vm_next, *vm_prev;
-</span><span class='line'>
-</span><span class='line'>&#9;pgprot_t vm_page_prot;      /* vma的访问权限 */
-</span><span class='line'>&#9;unsigned long vm_flags;    /* 标识集 */
-</span><span class='line'>
-</span><span class='line'>&#9;struct rb_node vm_rb;      /* 红黑树中对应的节点 */
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * For areas with an address space and backing store,
-</span><span class='line'>&#9; * linkage into the address_space-&gt;i_mmap prio tree, or
-</span><span class='line'>&#9; * linkage to the list of like vmas hanging off its node, or
-</span><span class='line'>&#9; * linkage of vma in the address_space-&gt;i_mmap_nonlinear list.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;/* shared联合体用于和address space关联 */
-</span><span class='line'>&#9;union {
-</span><span class='line'>&#9;&#9;struct {
-</span><span class='line'>&#9;&#9;&#9;struct list_head list;/* 用于链入非线性映射的链表 */
-</span><span class='line'>&#9;&#9;&#9;void *parent;   /* aligns with prio_tree_node parent */
-</span><span class='line'>&#9;&#9;&#9;struct vm_area_struct *head;
-</span><span class='line'>&#9;&#9;} vm_set;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;struct raw_prio_tree_node prio_tree_node;/*线性映射则链入i_mmap优先树*/
-</span><span class='line'>&#9;} shared;
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
-</span><span class='line'>&#9; * list, after a COW of one of the file pages.  A MAP_SHARED vma
-</span><span class='line'>&#9; * can only be in the i_mmap tree.  An anonymous MAP_PRIVATE, stack
-</span><span class='line'>&#9; * or brk vma (with NULL file) can only be in an anon_vma list.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;/*anno_vma_node和annon_vma用于管理源自匿名映射的共享页*/
-</span><span class='line'>&#9;struct list_head anon_vma_node; /* Serialized by anon_vma-&gt;lock */
-</span><span class='line'>&#9;struct anon_vma *anon_vma;  /* Serialized by page_table_lock */
-</span><span class='line'>
-</span><span class='line'>&#9;/* Function pointers to deal with this struct. */
-</span><span class='line'>&#9;/*该vma上的各种标准操作函数指针集*/
-</span><span class='line'>&#9;const struct vm_operations_struct *vm_ops;
-</span><span class='line'>
-</span><span class='line'>&#9;/* Information about our backing store: */
-</span><span class='line'>&#9;unsigned long vm_pgoff;     /* 映射文件的偏移量，以PAGE_SIZE为单位 */
-</span><span class='line'>&#9;struct file * vm_file;          /* 映射的文件，没有则为NULL */
-</span><span class='line'>&#9;void * vm_private_data;     /* was vm_pte (shared mem) */
-</span><span class='line'>&#9;unsigned long vm_truncate_count;/* truncate_count or restart_addr */
-</span><span class='line'>
-</span><span class='line'>#ifndef CONFIG_MMU
-</span><span class='line'>&#9;struct vm_region *vm_region;    /* NOMMU mapping region */
-</span><span class='line'>#endif
-</span><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>&#9;struct mempolicy *vm_policy;    /* NUMA policy for the VMA */
-</span><span class='line'>#endif
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进程的若干个vma区域都得按一定的形式组织在一起，这些vma都包含在进程的内存描述符中，也就是struct mm_struct中，这些vma在mm_struct以两种方式进行组织，一种是链表方式，对应于mm_struct中的mmap链表头，一种是红黑树方式，对应于mm_struct中的mm_rb根节点，和内核其他地方一样，链表用于遍历，红黑树用于查找。</p>
-
-<p>下面以文件映射为例，来阐述文件的address_space和与其建立映射关系的vma是如何联系上的。首先来看看struct address_space中与vma相关的变量</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct address_space {
-</span><span class='line'>&#9;struct inode        *host;      /* owner: inode, block_device */
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;struct prio_tree_root   i_mmap;     /* tree of private and shared mappings */
-</span><span class='line'>&#9;struct list_head    i_mmap_nonlinear;          /*list VM_NONLINEAR mappings */
-</span><span class='line'>&#9;...
-</span><span class='line'>} __attr</span></code></pre></td></tr></table></div></figure>
-
-
-<p>与此同时，struct file和struct inode中都包含有一个struct address_space的指针，分别为f_mapping和i_mapping。struct file是一个特定于进程的数据结构，而struct inode则是一个特定于文件的数据结构。每当进程打开一个文件时，都会将file->f_mapping设置到inode->i_mapping,下图则给出了文件和与其建立映射关系的vma的联系</p>
-
-<p><img src="/images/kernel/2015-09-11-1.png" alt="" /></p>
-
-<p>下面来看几个vma的基本操作函数，这些函数都是后面实现具体功能的基础</p>
-
-<p>find_vma()用来寻找一个针对于指定地址的vma，该vma要么包含了指定的地址，要么位于该地址之后并且离该地址最近，或者说寻找第一个满足addr&lt;vma_end的vma</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct vm_area_struct *vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (mm) {
-</span><span class='line'>&#9;&#9;/* Check the cache first. */
-</span><span class='line'>&#9;&#9;/* (Cache hit rate is typically around 35%.) */
-</span><span class='line'>&#9;&#9;vma = mm-&gt;mmap_cache; //首先尝试mmap_cache中缓存的vma
-</span><span class='line'>&#9;&#9;/*如果不满足下列条件中的任意一个则从红黑树中查找合适的vma
-</span><span class='line'>&#9;&#9;  1.缓存vma不存在
-</span><span class='line'>&#9;&#9;  2.缓存vma的结束地址小于给定的地址
-</span><span class='line'>&#9;&#9;  3.缓存vma的起始地址大于给定的地址*/
-</span><span class='line'>&#9;&#9;if (!(vma && vma-&gt;vm_end &gt; addr && vma-&gt;vm_start &lt;= addr)) {
-</span><span class='line'>&#9;&#9;&#9;struct rb_node * rb_node;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;rb_node = mm-&gt;mm_rb.rb_node;//获取红黑树根节点
-</span><span class='line'>&#9;&#9;&#9;vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;while (rb_node) {
-</span><span class='line'>&#9;&#9;&#9;&#9;struct vm_area_struct * vma_tmp;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;vma_tmp = rb_entry(rb_node,   //获取节点对应的vma
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct vm_area_struct, vm_rb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;/*首先确定vma的结束地址是否大于给定地址，如果是的话，再确定
-</span><span class='line'>&#9;&#9;&#9;&#9;  vma的起始地址是否小于给定地址，也就是优先保证给定的地址是
-</span><span class='line'>&#9;&#9;&#9;&#9;  处于vma的范围之内的，如果无法保证这点，则只能找到一个距离
-</span><span class='line'>&#9;&#9;&#9;&#9;  给定地址最近的vma并且该vma的结束地址要大于给定地址*/
-</span><span class='line'>&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_end &gt; addr) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;vma = vma_tmp;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_start &lt;= addr)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_left;
-</span><span class='line'>&#9;&#9;&#9;&#9;} else
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_right;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;if (vma)
-</span><span class='line'>&#9;&#9;&#9;&#9;mm-&gt;mmap_cache = vma;//将结果保存在缓存中
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return vma;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>当一个新区域被加到进程的地址空间时，内核会检查它是否可以与一个或多个现存区域合并，vma_merge()函数在可能的情况下，将一个新区域与周边区域进行合并。参数：</p>
-
-<p>mm:新区域所属的进程地址空间<br/>
-prev:在地址上紧接着新区域的前面一个vma<br/>
-addr:新区域的起始地址<br/>
-end:新区域的结束地址<br/>
-vm_flags:新区域的标识集<br/>
-anon_vma:新区域所属的匿名映射<br/>
-file:新区域映射的文件<br/>
-pgoff:新区域映射文件的偏移<br/>
-policy:和NUMA相关</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct vm_area_struct *vma_merge(struct mm_struct *mm,
-</span><span class='line'>&#9;&#9;&#9;struct vm_area_struct *prev, unsigned long addr,
-</span><span class='line'>&#9;&#9;&#9;unsigned long end, unsigned long vm_flags,
-</span><span class='line'>&#9;&#9;&#9;struct anon_vma *anon_vma, struct file *file,
-</span><span class='line'>&#9;&#9;&#9;pgoff_t pgoff, struct mempolicy *policy)
-</span><span class='line'>{
-</span><span class='line'>&#9;pgoff_t pglen = (end - addr) &gt;&gt; PAGE_SHIFT;
-</span><span class='line'>&#9;struct vm_area_struct *area, *next;
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * We later require that vma-&gt;vm_flags == vm_flags,
-</span><span class='line'>&#9; * so this tests vma-&gt;vm_flags & VM_SPECIAL, too.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (vm_flags & VM_SPECIAL)
-</span><span class='line'>&#9;&#9;return NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (prev)//指定了先驱vma，则获取先驱vma的后驱vma
-</span><span class='line'>&#9;&#9;next = prev-&gt;vm_next;
-</span><span class='line'>&#9;else     //否则指定mm的vma链表中的第一个元素为后驱vma
-</span><span class='line'>&#9;&#9;next = mm-&gt;mmap;
-</span><span class='line'>&#9;area = next;
-</span><span class='line'>
-</span><span class='line'>&#9;/*后驱节点存在，并且后驱vma的结束地址和给定区域的结束地址相同，
-</span><span class='line'>&#9;  也就是说两者有重叠，那么调整后驱vma*/
-</span><span class='line'>&#9;if (next && next-&gt;vm_end == end)     /* cases 6, 7, 8 */
-</span><span class='line'>&#9;&#9;next = next-&gt;vm_next;
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * 先判断给定的区域能否和前驱vma进行合并，需要判断如下的几个方面:
-</span><span class='line'>&#9;   1.前驱vma必须存在
-</span><span class='line'>&#9;   2.前驱vma的结束地址正好等于给定区域的起始地址
-</span><span class='line'>&#9;   3.两者的struct mempolicy中的相关属性要相同，这项检查只对NUMA架构有意义
-</span><span class='line'>&#9;   4.其他相关项必须匹配，包括两者的vm_flags，是否映射同一个文件等等
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (prev && prev-&gt;vm_end == addr &&
-</span><span class='line'>&#9;&#9;&#9;mpol_equal(vma_policy(prev), policy) &&
-</span><span class='line'>&#9;&#9;&#9;can_vma_merge_after(prev, vm_flags,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;anon_vma, file, pgoff)) {
-</span><span class='line'>&#9;&#9;/*
-</span><span class='line'>&#9;&#9; *确定可以和前驱vma合并后再判断是否能和后驱vma合并，判断方式和前面一样，
-</span><span class='line'>&#9;&#9;  不过这里多了一项检查，在给定区域能和前驱、后驱vma合并的情况下还要检查
-</span><span class='line'>&#9;&#9;  前驱、后驱vma的匿名映射可以合并
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (next && end == next-&gt;vm_start &&
-</span><span class='line'>&#9;&#9;&#9;&#9;mpol_equal(policy, vma_policy(next)) &&
-</span><span class='line'>&#9;&#9;&#9;&#9;can_vma_merge_before(next, vm_flags,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;anon_vma, file, pgoff+pglen) &&
-</span><span class='line'>&#9;&#9;&#9;&#9;is_mergeable_anon_vma(prev-&gt;anon_vma,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;  next-&gt;anon_vma)) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;/* cases 1, 6 */
-</span><span class='line'>&#9;&#9;&#9;vma_adjust(prev, prev-&gt;vm_start,
-</span><span class='line'>&#9;&#9;&#9;&#9;next-&gt;vm_end, prev-&gt;vm_pgoff, NULL);
-</span><span class='line'>&#9;&#9;} else                  /* cases 2, 5, 7 */
-</span><span class='line'>&#9;&#9;&#9;vma_adjust(prev, prev-&gt;vm_start,
-</span><span class='line'>&#9;&#9;&#9;&#9;end, prev-&gt;vm_pgoff, NULL);
-</span><span class='line'>&#9;&#9;return prev;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * Can this new request be merged in front of next?
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9; /*如果前面的步骤失败，那么则从后驱vma开始进行和上面类似的步骤*/
-</span><span class='line'>&#9;if (next && end == next-&gt;vm_start &&
-</span><span class='line'>&#9;&#9;&#9;mpol_equal(policy, vma_policy(next)) &&
-</span><span class='line'>&#9;&#9;&#9;can_vma_merge_before(next, vm_flags,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;anon_vma, file, pgoff+pglen)) {
-</span><span class='line'>&#9;&#9;if (prev && addr &lt; prev-&gt;vm_end)  /* case 4 */
-</span><span class='line'>&#9;&#9;&#9;vma_adjust(prev, prev-&gt;vm_start,
-</span><span class='line'>&#9;&#9;&#9;&#9;addr, prev-&gt;vm_pgoff, NULL);
-</span><span class='line'>&#9;&#9;else                    /* cases 3, 8 */
-</span><span class='line'>&#9;&#9;&#9;vma_adjust(area, addr, next-&gt;vm_end,
-</span><span class='line'>&#9;&#9;&#9;&#9;next-&gt;vm_pgoff - pglen, NULL);
-</span><span class='line'>&#9;&#9;return area;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;return NULL;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>vma_adjust会执行具体的合并调整操作</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void vma_adjust(struct vm_area_struct *vma, unsigned long start,
-</span><span class='line'>&#9;unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct mm_struct *mm = vma-&gt;vm_mm;
-</span><span class='line'>&#9;struct vm_area_struct *next = vma-&gt;vm_next;
-</span><span class='line'>&#9;struct vm_area_struct *importer = NULL;
-</span><span class='line'>&#9;struct address_space *mapping = NULL;
-</span><span class='line'>&#9;struct prio_tree_root *root = NULL;
-</span><span class='line'>&#9;struct file *file = vma-&gt;vm_file;
-</span><span class='line'>&#9;struct anon_vma *anon_vma = NULL;
-</span><span class='line'>&#9;long adjust_next = 0;
-</span><span class='line'>&#9;int remove_next = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;if (next && !insert) {
-</span><span class='line'>&#9;&#9;/*指定的范围已经跨越了整个后驱vma，并且有可能超过后驱vma*/
-</span><span class='line'>&#9;&#9;if (end &gt;= next-&gt;vm_end) {
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * vma expands, overlapping all the next, and
-</span><span class='line'>&#9;&#9;&#9; * perhaps the one after too (mprotect case 6).
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>again:          remove_next = 1 + (end &gt; next-&gt;vm_end);//确定是否超过了后驱vma
-</span><span class='line'>&#9;&#9;&#9;end = next-&gt;vm_end;
-</span><span class='line'>&#9;&#9;&#9;anon_vma = next-&gt;anon_vma;
-</span><span class='line'>&#9;&#9;&#9;importer = vma;
-</span><span class='line'>&#9;&#9;} else if (end &gt; next-&gt;vm_start) {/*指定的区域和后驱vma部分重合*/
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * vma expands, overlapping part of the next:
-</span><span class='line'>&#9;&#9;&#9; * mprotect case 5 shifting the boundary up.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;adjust_next = (end - next-&gt;vm_start) &gt;&gt; PAGE_SHIFT;
-</span><span class='line'>&#9;&#9;&#9;anon_vma = next-&gt;anon_vma;
-</span><span class='line'>&#9;&#9;&#9;importer = vma;
-</span><span class='line'>&#9;&#9;} else if (end &lt; vma-&gt;vm_end) {/*指定的区域没到达后驱vma的结束处*/
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * vma shrinks, and !insert tells it's not
-</span><span class='line'>&#9;&#9;&#9; * split_vma inserting another: so it must be
-</span><span class='line'>&#9;&#9;&#9; * mprotect case 4 shifting the boundary down.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;adjust_next = - ((vma-&gt;vm_end - end) &gt;&gt; PAGE_SHIFT);
-</span><span class='line'>&#9;&#9;&#9;anon_vma = next-&gt;anon_vma;
-</span><span class='line'>&#9;&#9;&#9;importer = next;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (file) {//如果有映射文件
-</span><span class='line'>&#9;&#9;mapping = file-&gt;f_mapping;//获取文件对应的address_space
-</span><span class='line'>&#9;&#9;if (!(vma-&gt;vm_flags & VM_NONLINEAR))
-</span><span class='line'>&#9;&#9;&#9;root = &mapping-&gt;i_mmap;
-</span><span class='line'>&#9;&#9;spin_lock(&mapping-&gt;i_mmap_lock);
-</span><span class='line'>&#9;&#9;if (importer &&
-</span><span class='line'>&#9;&#9;&#9;vma-&gt;vm_truncate_count != next-&gt;vm_truncate_count) {
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * unmap_mapping_range might be in progress:
-</span><span class='line'>&#9;&#9;&#9; * ensure that the expanding vma is rescanned.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;importer-&gt;vm_truncate_count = 0;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;/*如果指定了待插入的vma，则根据vma是否以非线性的方式映射文件来选择是将
-</span><span class='line'>&#9;&#9;vma插入file对应的address_space的优先树(对应线性映射)还是双向链表(非线性映射)*/
-</span><span class='line'>&#9;&#9;if (insert) {
-</span><span class='line'>&#9;&#9;&#9;insert-&gt;vm_truncate_count = vma-&gt;vm_truncate_count;
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * Put into prio_tree now, so instantiated pages
-</span><span class='line'>&#9;&#9;&#9; * are visible to arm/parisc __flush_dcache_page
-</span><span class='line'>&#9;&#9;&#9; * throughout; but we cannot insert into address
-</span><span class='line'>&#9;&#9;&#9; * space until vma start or end is updated.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;__vma_link_file(insert);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * When changing only vma-&gt;vm_end, we don't really need
-</span><span class='line'>&#9; * anon_vma lock.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (vma-&gt;anon_vma && (insert || importer || start != vma-&gt;vm_start))
-</span><span class='line'>&#9;&#9;anon_vma = vma-&gt;anon_vma;
-</span><span class='line'>&#9;if (anon_vma) {
-</span><span class='line'>&#9;&#9;spin_lock(&anon_vma-&gt;lock);
-</span><span class='line'>&#9;&#9;/*
-</span><span class='line'>&#9;&#9; * Easily overlooked: when mprotect shifts the boundary,
-</span><span class='line'>&#9;&#9; * make sure the expanding vma has anon_vma set if the
-</span><span class='line'>&#9;&#9; * shrinking vma had, to cover any anon pages imported.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (importer && !importer-&gt;anon_vma) {
-</span><span class='line'>&#9;&#9;&#9;importer-&gt;anon_vma = anon_vma;
-</span><span class='line'>&#9;&#9;&#9;__anon_vma_link(importer);//将importer插入importer的anon_vma匿名映射链表中
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (root) {
-</span><span class='line'>&#9;&#9;flush_dcache_mmap_lock(mapping);
-</span><span class='line'>&#9;&#9;vma_prio_tree_remove(vma, root);
-</span><span class='line'>&#9;&#9;if (adjust_next)
-</span><span class='line'>&#9;&#9;&#9;vma_prio_tree_remove(next, root);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/*调整vma的相关量*/
-</span><span class='line'>&#9;vma-&gt;vm_start = start;
-</span><span class='line'>&#9;vma-&gt;vm_end = end;
-</span><span class='line'>&#9;vma-&gt;vm_pgoff = pgoff;
-</span><span class='line'>&#9;if (adjust_next) {//调整后驱vma的相关量
-</span><span class='line'>&#9;&#9;next-&gt;vm_start += adjust_next &lt;&lt; PAGE_SHIFT;
-</span><span class='line'>&#9;&#9;next-&gt;vm_pgoff += adjust_next;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (root) {
-</span><span class='line'>&#9;&#9;if (adjust_next)//如果后驱vma被调整了，则重新插入到优先树中
-</span><span class='line'>&#9;&#9;&#9;vma_prio_tree_insert(next, root);
-</span><span class='line'>&#9;&#9;vma_prio_tree_insert(vma, root);//将vma插入到优先树中
-</span><span class='line'>&#9;&#9;flush_dcache_mmap_unlock(mapping);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (remove_next) {//给定区域与后驱vma有重合
-</span><span class='line'>&#9;&#9;/*
-</span><span class='line'>&#9;&#9; * vma_merge has merged next into vma, and needs
-</span><span class='line'>&#9;&#9; * us to remove next before dropping the locks.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;__vma_unlink(mm, next, vma);//将后驱vma从红黑树中删除
-</span><span class='line'>&#9;&#9;if (file)//将后驱vma从文件对应的address space中删除
-</span><span class='line'>&#9;&#9;&#9;__remove_shared_vm_struct(next, file, mapping);
-</span><span class='line'>&#9;&#9;if (next-&gt;anon_vma)//将后驱vma从匿名映射链表中删除
-</span><span class='line'>&#9;&#9;&#9;__anon_vma_merge(vma, next);
-</span><span class='line'>&#9;} else if (insert) {
-</span><span class='line'>&#9;&#9;/*
-</span><span class='line'>&#9;&#9; * split_vma has split insert from vma, and needs
-</span><span class='line'>&#9;&#9; * us to insert it before dropping the locks
-</span><span class='line'>&#9;&#9; * (it may either follow vma or precede it).
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;__insert_vm_struct(mm, insert);//将待插入的vma插入mm的红黑树，双向链表以及
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;//匿名映射链表
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (anon_vma)
-</span><span class='line'>&#9;&#9;spin_unlock(&anon_vma-&gt;lock);
-</span><span class='line'>&#9;if (mapping)
-</span><span class='line'>&#9;&#9;spin_unlock(&mapping-&gt;i_mmap_lock);
-</span><span class='line'>
-</span><span class='line'>&#9;if (remove_next) {
-</span><span class='line'>&#9;&#9;if (file) {
-</span><span class='line'>&#9;&#9;&#9;fput(file);
-</span><span class='line'>&#9;&#9;&#9;if (next-&gt;vm_flags & VM_EXECUTABLE)
-</span><span class='line'>&#9;&#9;&#9;&#9;removed_exe_file_vma(mm);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;mm-&gt;map_count--;
-</span><span class='line'>&#9;&#9;mpol_put(vma_policy(next));
-</span><span class='line'>&#9;&#9;kmem_cache_free(vm_area_cachep, next);
-</span><span class='line'>&#9;&#9;/*
-</span><span class='line'>&#9;&#9; * In mprotect's case 6 (see comments on vma_merge),
-</span><span class='line'>&#9;&#9; * we must remove another next too. It would clutter
-</span><span class='line'>&#9;&#9; * up the code too much to do both in one go.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (remove_next == 2) {//还有待删除的区域
-</span><span class='line'>&#9;&#9;&#9;next = vma-&gt;vm_next;
-</span><span class='line'>&#9;&#9;&#9;goto again;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;validate_mm(mm);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>insert_vm_struct()函数用于插入一块新区域</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int insert_vm_struct(struct mm_struct * mm, struct vm_area_struct * vma)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct vm_area_struct * __vma, * prev;
-</span><span class='line'>&#9;struct rb_node ** rb_link, * rb_parent;
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * The vm_pgoff of a purely anonymous vma should be irrelevant
-</span><span class='line'>&#9; * until its first write fault, when page's anon_vma and index
-</span><span class='line'>&#9; * are set.  But now set the vm_pgoff it will almost certainly
-</span><span class='line'>&#9; * end up with (unless mremap moves it elsewhere before that
-</span><span class='line'>&#9; * first wfault), so /proc/pid/maps tells a consistent story.
-</span><span class='line'>&#9; *
-</span><span class='line'>&#9; * By setting it to reflect the virtual start address of the
-</span><span class='line'>&#9; * vma, merges and splits can happen in a seamless way, just
-</span><span class='line'>&#9; * using the existing file pgoff checks and manipulations.
-</span><span class='line'>&#9; * Similarly in do_mmap_pgoff and in do_brk.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (!vma-&gt;vm_file) {
-</span><span class='line'>&#9;&#9;BUG_ON(vma-&gt;anon_vma);
-</span><span class='line'>&#9;&#9;vma-&gt;vm_pgoff = vma-&gt;vm_start &gt;&gt; PAGE_SHIFT;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;/*__vma用来保存和vma-&gt;start对应的vma(与find_vma()一样)，同时获取以下信息:
-</span><span class='line'>&#9;  1.prev用来保存对应的前驱vma
-</span><span class='line'>&#9;  2.rb_link保存该vma区域插入对应的红黑树节点
-</span><span class='line'>&#9;  3.rb_parent保存该vma区域对应的父节点*/
-</span><span class='line'>&#9;__vma = find_vma_prepare(mm,vma-&gt;vm_start,&prev,&rb_link,&rb_parent);
-</span><span class='line'>&#9;if (__vma && __vma-&gt;vm_start &lt; vma-&gt;vm_end)
-</span><span class='line'>&#9;&#9;return -ENOMEM;
-</span><span class='line'>&#9;if ((vma-&gt;vm_flags & VM_ACCOUNT) &&
-</span><span class='line'>&#9;&#9; security_vm_enough_memory_mm(mm, vma_pages(vma)))
-</span><span class='line'>&#9;&#9;return -ENOMEM;
-</span><span class='line'>&#9;vma_link(mm, vma, prev, rb_link, rb_parent);//将vma关联到所有的数据结构中
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
-</span><span class='line'>&#9;&#9;&#9;struct vm_area_struct *prev, struct rb_node **rb_link,
-</span><span class='line'>&#9;&#9;&#9;struct rb_node *rb_parent)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct address_space *mapping = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (vma-&gt;vm_file)//如果存在文件映射则获取文件对应的地址空间
-</span><span class='line'>&#9;&#9;mapping = vma-&gt;vm_file-&gt;f_mapping;
-</span><span class='line'>
-</span><span class='line'>&#9;if (mapping) {
-</span><span class='line'>&#9;&#9;spin_lock(&mapping-&gt;i_mmap_lock);
-</span><span class='line'>&#9;&#9;vma-&gt;vm_truncate_count = mapping-&gt;truncate_count;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;anon_vma_lock(vma);
-</span><span class='line'>
-</span><span class='line'>&#9;/*将vma插入到相应的数据结构中--双向链表，红黑树和匿名映射链表*/
-</span><span class='line'>&#9;__vma_link(mm, vma, prev, rb_link, rb_parent);
-</span><span class='line'>&#9;__vma_link_file(vma);//将vma插入到文件地址空间的相应数据结构中
-</span><span class='line'>
-</span><span class='line'>&#9;anon_vma_unlock(vma);
-</span><span class='line'>&#9;if (mapping)
-</span><span class='line'>&#9;&#9;spin_unlock(&mapping-&gt;i_mmap_lock);
-</span><span class='line'>
-</span><span class='line'>&#9;mm-&gt;map_count++;
-</span><span class='line'>&#9;validate_mm(mm);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在创建新的vma区域之前先要寻找一块足够大小的空闲区域，该项工作由get_unmapped_area()函数完成，而实际的工作将会由mm_struct中定义的辅助函数来完成。根据进程虚拟地址空间的布局，会选择使用不同的映射函数，在这里考虑大多数系统上采用的标准函数arch_get_unmapped_area();</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned long
-</span><span class='line'>arch_get_unmapped_area(struct file *filp, unsigned long addr,
-</span><span class='line'>&#9;&#9;unsigned long len, unsigned long pgoff, unsigned long flags)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct mm_struct *mm = current-&gt;mm;
-</span><span class='line'>&#9;struct vm_area_struct *vma;
-</span><span class='line'>&#9;unsigned long start_addr;
-</span><span class='line'>
-</span><span class='line'>&#9;if (len &gt; TASK_SIZE)
-</span><span class='line'>&#9;&#9;return -ENOMEM;
-</span><span class='line'>
-</span><span class='line'>&#9;if (flags & MAP_FIXED)
-</span><span class='line'>&#9;&#9;return addr;
-</span><span class='line'>
-</span><span class='line'>&#9;if (addr) {
-</span><span class='line'>&#9;&#9;addr = PAGE_ALIGN(addr);//将地址按页对齐
-</span><span class='line'>&#9;&#9;vma = find_vma(mm, addr);//获取一个vma，该vma可能包含了addr也可能在addr后面并且离addr最近
-</span><span class='line'>&#9;&#9;/*这里确定是否有一块适合的空闲区域，先要保证addr+len不会
-</span><span class='line'>&#9;&#9;  超过进程地址空间的最大允许范围，然后如果前面vma获取成功的话则要保证
-</span><span class='line'>&#9;&#9;  vma位于addr的后面并且addr+len不会延伸到该vma的区域*/
-</span><span class='line'>&#9;&#9;if (TASK_SIZE - len &gt;= addr &&
-</span><span class='line'>&#9;&#9;&#9;(!vma || addr + len &lt;= vma-&gt;vm_start))
-</span><span class='line'>&#9;&#9;&#9;return addr;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;/*前面获取不成功的话则要调整起始地址了，根据情况选择缓存的空闲区域地址
-</span><span class='line'>&#9;  或者TASK_UNMAPPED_BASE=TASK_SIZE/3*/
-</span><span class='line'>&#9;if (len &gt; mm-&gt;cached_hole_size) {
-</span><span class='line'>&#9;&#9;&#9;start_addr = addr = mm-&gt;free_area_cache;
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;&#9;start_addr = addr = TASK_UNMAPPED_BASE;
-</span><span class='line'>&#9;&#9;&#9;mm-&gt;cached_hole_size = 0;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>full_search:
-</span><span class='line'>&#9;/*从addr开始遍历用户地址空间*/
-</span><span class='line'>&#9;for (vma = find_vma(mm, addr); ; vma = vma-&gt;vm_next) {
-</span><span class='line'>&#9;&#9;/* At this point:  (!vma || addr &lt; vma-&gt;vm_end). */
-</span><span class='line'>&#9;&#9;if (TASK_SIZE - len &lt; addr) {//这里判断是否已经遍历到了用户地址空间的末端
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * Start a new search - just in case we missed
-</span><span class='line'>&#9;&#9;&#9; * some holes.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9; //如果上次不是从TAKS_UNMAPPED_BASE开始遍历的，则尝试从TASK_UNMAPPED_BASE开始遍历
-</span><span class='line'>&#9;&#9;&#9;if (start_addr != TASK_UNMAPPED_BASE) {
-</span><span class='line'>&#9;&#9;&#9;&#9;addr = TASK_UNMAPPED_BASE;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;start_addr = addr;
-</span><span class='line'>&#9;&#9;&#9;&#9;mm-&gt;cached_hole_size = 0;
-</span><span class='line'>&#9;&#9;&#9;&#9;goto full_search;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;return -ENOMEM;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;if (!vma || addr + len &lt;= vma-&gt;vm_start) {//判断是否有空闲区域
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; *找到空闲区域的话则记住我们搜索的结束处，以便下次搜索
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;mm-&gt;free_area_cache = addr + len;
-</span><span class='line'>&#9;&#9;&#9;return addr;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;/*该空闲区域不符合大小要求，但是如果这个空闲区域大于之前保存的最大值的话
-</span><span class='line'>&#9;&#9;  则将这个空闲区域保存，这样便于前面确定从哪里开始搜索*/
-</span><span class='line'>&#9;&#9;if (addr + mm-&gt;cached_hole_size &lt; vma-&gt;vm_start)
-</span><span class='line'>&#9;&#9;&#9;&#9;mm-&gt;cached_hole_size = vma-&gt;vm_start - addr;
-</span><span class='line'>&#9;&#9;addr = vma-&gt;vm_end;
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/09/kernel-mm-find-page/">查看某进程内存</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-09T17:54:00+08:00'><span class='date'>2015-09-09</span> <span class='time'>17:54:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>test.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;sys/mman.h&gt;
-</span><span class='line'>#include&lt;sys/types.h&gt;
-</span><span class='line'>#include&lt;fcntl.h&gt;
-</span><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>#include&lt;unistd.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;time.h&gt;
-</span><span class='line'>#include &lt;string.h&gt;
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{   
-</span><span class='line'>&#9;int i,j,k,l;
-</span><span class='line'>&#9;char *mp;
-</span><span class='line'>&#9;mp = (char*)mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); 
-</span><span class='line'>&#9;strcpy(mp, "ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK");
-</span><span class='line'>&#9;strcpy(mp+4096, "AAAAAAAAAAAAAAAAAAABBBBBBBBBBBBCCCCCCCCCCC");
-</span><span class='line'>&#9;sleep(10000000);
-</span><span class='line'>&#9;munmap(mp, 8192);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># strace ./test
-</span><span class='line'>execve("./test", ["./test"], [/* 23 vars */]) = 0
-</span><span class='line'>brk(0)                                  = 0x1bdf000
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f166000
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f165000
-</span><span class='line'>access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
-</span><span class='line'>open("/etc/ld.so.cache", O_RDONLY)      = 3
-</span><span class='line'>fstat(3, {st_mode=S_IFREG|0644, st_size=72203, ...}) = 0
-</span><span class='line'>mmap(NULL, 72203, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f133f153000
-</span><span class='line'>close(3)                                = 0
-</span><span class='line'>open("/lib64/libc.so.6", O_RDONLY)      = 3
-</span><span class='line'>read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0&gt;\0\1\0\0\0\360\332a\2217\0\0\0"..., 832) = 832
-</span><span class='line'>fstat(3, {st_mode=S_IFREG|0755, st_size=1726296, ...}) = 0
-</span><span class='line'>mmap(0x3791600000, 3506520, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x3791600000
-</span><span class='line'>mprotect(0x379174f000, 2097152, PROT_NONE) = 0
-</span><span class='line'>mmap(0x379194f000, 20480, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x14f000) = 0x379194f000
-</span><span class='line'>mmap(0x3791954000, 16728, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x3791954000
-</span><span class='line'>close(3)                                = 0
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f152000
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f151000
-</span><span class='line'>arch_prctl(ARCH_SET_FS, 0x7f133f1516e0) = 0
-</span><span class='line'>mprotect(0x379194f000, 16384, PROT_READ) = 0
-</span><span class='line'>mprotect(0x379141c000, 4096, PROT_READ) = 0
-</span><span class='line'>munmap(0x7f133f153000, 72203)           = 0
-</span><span class='line'>mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f163000
-</span><span class='line'>rt_sigprocmask(SIG_BLOCK, [CHLD], [], 8) = 0
-</span><span class='line'>rt_sigaction(SIGCHLD, NULL, {SIG_DFL, [], 0}, 8) = 0
-</span><span class='line'>rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
-</span><span class='line'>nanosleep({10000000, 0},</span></code></pre></td></tr></table></div></figure>
-
-
-<p>基本确定最后一个mmap就是我们申请的，它的起始虚拟地址是0x7f133f163000，所以要在对应tast的mm中找到相应的vma。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash&gt; ps
-</span><span class='line'>...
-</span><span class='line'>  58674  58673   0  ffff88003d388ae0  IN   0.0    3672    316  test
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_7.0.8&gt; task_struct ffff88003d388ae0
-</span><span class='line'>struct task_struct {
-</span><span class='line'>...
-</span><span class='line'>mm = 0xffff88003d80ba00,
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_7.0.8&gt; mm_struct 0xffff88003d80ba00
-</span><span class='line'>struct mm_struct {
-</span><span class='line'>  mmap = 0xffff88002a4d5ed0,
-</span><span class='line'>  mm_rb = {
-</span><span class='line'>&#9;rb_node = 0xffff88003c2fad38
-</span><span class='line'>  },
-</span><span class='line'>  mmap_cache = 0xffff880029332788,
-</span><span class='line'>  get_unmapped_area = 0xffffffff81010410 &lt;arch_get_unmapped_area_topdown&gt;,
-</span><span class='line'>  get_unmapped_exec_area = 0x0,
-</span><span class='line'>  unmap_area = 0xffffffff8113aed0 &lt;arch_unmap_area_topdown&gt;,
-</span><span class='line'>  mmap_base = 139720639541248,
-</span><span class='line'>  task_size = 140737488351232,
-</span><span class='line'>  cached_hole_size = 0,   
-</span><span class='line'>  free_area_cache = 139720639524864,
-</span><span class='line'>  pgd = 0xffff88000c952000,
-</span><span class='line'>  ...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>先看mmap，mmap_cache是不是，不是的话从mm_rb.rb_node开始找，这个是平衡二叉树的根。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define rb_entry(ptr, type, member) container_of(ptr, type, member)
-</span><span class='line'>
-</span><span class='line'>vma_tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以rb_node的地址减去vm_rb在struct vm_area_struct的偏移就是对应struct vm_area_struct的地址（2.6.32-358是0x38）</p>
-
-<p>所以rb_node = 0xffff88003c2fad38 => struct vm_area_struct = 0xffff88003c2fad00</p>
-
-<p>根据find_vma函数方法，直到找到</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Look up the first VMA which satisfies  addr &lt; vm_end,  NULL if none. */
-</span><span class='line'>struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct vm_area_struct *vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (mm) {
-</span><span class='line'>&#9;&#9;/* Check the cache first. */
-</span><span class='line'>&#9;&#9;/* (Cache hit rate is typically around 35%.) */
-</span><span class='line'>&#9;&#9;vma = mm-&gt;mmap_cache;
-</span><span class='line'>&#9;&#9;if (!(vma && vma-&gt;vm_end &gt; addr && vma-&gt;vm_start &lt;= addr)) {
-</span><span class='line'>&#9;&#9;&#9;struct rb_node * rb_node;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;rb_node = mm-&gt;mm_rb.rb_node;
-</span><span class='line'>&#9;&#9;&#9;vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;while (rb_node) {
-</span><span class='line'>&#9;&#9;&#9;&#9;struct vm_area_struct * vma_tmp;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;vma_tmp = rb_entry(rb_node,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct vm_area_struct, vm_rb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_end &gt; addr) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;vma = vma_tmp;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_start &lt;= addr)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_left;
-</span><span class='line'>&#9;&#9;&#9;&#9;} else 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_right;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;if (vma)
-</span><span class='line'>&#9;&#9;&#9;&#9;mm-&gt;mmap_cache = vma; 
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return vma; 
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_7.0.8&gt; vm_area_struct 0xffff88002d29c5f8
-</span><span class='line'>struct vm_area_struct {
-</span><span class='line'>  vm_mm = 0xffff88003d80ba00,
-</span><span class='line'>  vm_start = 139720639524864,
-</span><span class='line'>  vm_end = 139720639541248,
-</span><span class='line'>  vm_next = 0xffff880029332788,
-</span><span class='line'>  vm_prev = 0xffff88003c2fa918,
-</span><span class='line'>  vm_page_prot = {
-</span><span class='line'>&#9;pgprot = 9223372036854775845
-</span><span class='line'>  },
-</span><span class='line'>  vm_flags = 1048691,
-</span><span class='line'>  vm_rb = {
-</span><span class='line'>&#9;rb_parent_color = 18446612133323974193,
-</span><span class='line'>&#9;rb_right = 0xffff8800293327c0,
-</span><span class='line'>&#9;rb_left = 0xffff88003c2fa950
-</span><span class='line'>  },
-</span><span class='line'>  ...
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>crash_7.0.8&gt; p/x 139720639524864
-</span><span class='line'>$4 = 0x7f133f163000</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以对应的vma就是0xffff88002d29c5f8，用内核函数follow_page找到对应page</p>
-
-<p>follow_page.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt;
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/sysctl.h&gt;
-</span><span class='line'>#include &lt;linux/timer.h&gt;
-</span><span class='line'>#include &lt;linux/hardirq.h&gt;
-</span><span class='line'>#include &lt;linux/bottom_half.h&gt;
-</span><span class='line'>#include &lt;linux/preempt.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;linux/file.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/kprobes.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/mm.h&gt;
-</span><span class='line'>#include &lt;linux/mm_types.h&gt;
-</span><span class='line'>
-</span><span class='line'>static int __init test_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;int i;
-</span><span class='line'>&#9;struct page *(*follow_page_p)(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-</span><span class='line'>&#9;&#9;= (struct page *(*)(struct vm_area_struct *vma, unsigned long address, unsigned int flags))0xffffffff81133ab0;
-</span><span class='line'>&#9;struct vm_area_struct *vma = (struct vm_area_struct *)0xffff88002d29c5f8;
-</span><span class='line'>&#9;unsigned long address = 139720639524864UL;
-</span><span class='line'>&#9;struct page *pa;  
-</span><span class='line'>&#9;char ch[4096+10]; 
-</span><span class='line'>&#9;pa = follow_page_p(vma, address, 0);
-</span><span class='line'>&#9;memcpy(ch, page_address(pa), 4096); 
-</span><span class='line'>&#9;printk("page = %p\n", pa);
-</span><span class='line'>&#9;printk("%s\n", ch);   
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __exit test_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;printk("test exit\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_init);
-</span><span class='line'>module_exit(test_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>obj-m := follow_page.o
-</span><span class='line'>KDIR:=/lib/modules/$(shell uname -r)/build/
-</span><span class='line'>PWD=$(shell pwd)
-</span><span class='line'>
-</span><span class='line'>all:
-</span><span class='line'>&#9;make -C $(KDIR) M=$(PWD) modules
-</span><span class='line'>clean:
-</span><span class='line'>&#9;make -C $(KDIR) M=$(PWD) clean</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># insmod ./follow_page.ko
-</span><span class='line'># rmmod follow_page
-</span><span class='line'># dmesg
-</span><span class='line'>page = ffffea000077a1a8
-</span><span class='line'>ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK
-</span><span class='line'>test exit</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt; 
-</span><span class='line'>#include &lt;linux/kernel.h&gt; 
-</span><span class='line'>#include &lt;linux/init.h&gt;   
-</span><span class='line'>#include &lt;linux/types.h&gt;  
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/sysctl.h&gt; 
-</span><span class='line'>#include &lt;linux/timer.h&gt;  
-</span><span class='line'>#include &lt;linux/hardirq.h&gt;
-</span><span class='line'>#include &lt;linux/bottom_half.h&gt;
-</span><span class='line'>#include &lt;linux/preempt.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/types.h&gt;  
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;linux/file.h&gt;   
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/kprobes.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/mm.h&gt;
-</span><span class='line'>#include &lt;linux/mm_types.h&gt;
-</span><span class='line'>
-</span><span class='line'>static int __init test_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct page *(*follow_page_p)(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-</span><span class='line'>&#9;&#9;= (struct page *(*)(struct vm_area_struct *vma, unsigned long address, unsigned int flags))0xffffffff81133ab0;
-</span><span class='line'>&#9;struct vm_area_struct *vma = (struct vm_area_struct *)0xffff88002d29c5f8;
-</span><span class='line'>&#9;unsigned long address = 139720639524864UL;
-</span><span class='line'>&#9;struct page *pa;  
-</span><span class='line'>&#9;char ch[4096+10]; 
-</span><span class='line'>&#9;pa = follow_page_p(vma, address, 0);
-</span><span class='line'>&#9;memcpy(ch, page_address(pa), 4096);
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;pgd_t *pgd;
-</span><span class='line'>&#9;&#9;pud_t *pud;
-</span><span class='line'>&#9;&#9;pmd_t *pmd;
-</span><span class='line'>&#9;&#9;pte_t *pte;
-</span><span class='line'>&#9;&#9;unsigned long pfn;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;pgd = pgd_offset(vma-&gt;vm_mm, address);
-</span><span class='line'>&#9;&#9;pud = pud_offset(pgd, address);
-</span><span class='line'>&#9;&#9;pmd = pmd_offset(pud, address);
-</span><span class='line'>&#9;&#9;pte = pte_offset_map(pmd, address);
-</span><span class='line'>&#9;&#9;pfn = pte_pfn(*pte);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("follow_page=%p\n\n", pa);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("PTE_PFN_MASK=0x%lx PAGE_OFFSET=%lx __va(x)=x+PAGE_OFFSET\n\n", PTE_PFN_MASK, PAGE_OFFSET);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("mm-&gt;pgd=%p\n", vma-&gt;vm_mm-&gt;pgd);
-</span><span class='line'>&#9;&#9;printk("PGDIR_SHIFT=%u PTRS_PER_PGD=%u pgd_index*8=0x%lx mm-&gt;pgd+index==pgd=%p\n\n", PGDIR_SHIFT, PTRS_PER_PGD, pgd_index(address)*8, pgd);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pgd=0x%lx *pgd&MASK=0x%lx __va=%p\n", (*pgd).pgd, ((*pgd).pgd)&PTE_PFN_MASK, __va(((*pgd).pgd)&PTE_PFN_MASK));
-</span><span class='line'>&#9;&#9;printk("PUD_SHIFT=%u PTRS_PER_PUD=%u pud_index*8=0x%lx __va+index==pud=%p\n\n", PUD_SHIFT, PTRS_PER_PUD, pud_index(address)*8, pud);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pud=0x%lx *pud&MASK=0x%lx __va=%p\n", (*pud).pud, ((*pud).pud)&PTE_PFN_MASK, __va(((*pud).pud)&PTE_PFN_MASK));
-</span><span class='line'>&#9;&#9;printk("PMD_SHIFT=%d PTRS_PER_PMD=%d pmd_index*8=0x%lx __va+index==pmd=%p\n\n", PMD_SHIFT, PTRS_PER_PMD, pmd_index(address)*8, pmd);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pmd=0x%lx *pmd&MASK=0x%lx __va=%p\n", (*pmd).pmd, ((*pmd).pmd)&PTE_PFN_MASK, __va(((*pmd).pmd)&PTE_PFN_MASK));
-</span><span class='line'>&#9;&#9;printk("PAGE_SHIFT=%d PTRS_PER_PTE=%d pte_index*8=0x%lx __va+index==pte=%p\n\n", PAGE_SHIFT, PTRS_PER_PTE, pte_index(address)*8, pte);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pte=0x%lx *pte&MASK=0x%lx pte_pfn=%lx pfn=%lx\n", (*pte).pte, ((*pte).pte)&PTE_PFN_MASK, (((*pte).pte)&PTE_PFN_MASK)&gt;&gt;PAGE_SHIFT, pfn);
-</span><span class='line'>&#9;&#9;printk("vmemmap=%p pfn*sizeof(page)=0x%lx cal_page=%p==follow_page\n\n", vmemmap, pfn*sizeof(struct page), vmemmap+pfn);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;printk("%s\n", ch);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __exit test_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;printk("test exit\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_init);   
-</span><span class='line'>module_exit(test_exit);   
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># dmesg
-</span><span class='line'>follow_page=ffffea000077a1a8
-</span><span class='line'>
-</span><span class='line'>PTE_PFN_MASK=0x3ffffffff000 PAGE_OFFSET=ffff880000000000 __va(x)=x+PAGE_OFFSET
-</span><span class='line'>
-</span><span class='line'>mm-&gt;pgd=ffff88000c952000
-</span><span class='line'>PGDIR_SHIFT=39 PTRS_PER_PGD=512 pgd_index*8=0x7f0 mm-&gt;pgd+index==pgd=ffff88000c9527f0
-</span><span class='line'>
-</span><span class='line'>*pgd=0x30bee067 *pgd&MASK=0x30bee000 __va=ffff880030bee000
-</span><span class='line'>PUD_SHIFT=30 PTRS_PER_PUD=512 pud_index*8=0x260 __va+index==pud=ffff880030bee260
-</span><span class='line'>
-</span><span class='line'>*pud=0x323b1067 *pud&MASK=0x323b1000 __va=ffff8800323b1000
-</span><span class='line'>PMD_SHIFT=21 PTRS_PER_PMD=512 pmd_index*8=0xfc0 __va+index==pmd=ffff8800323b1fc0
-</span><span class='line'>
-</span><span class='line'>*pmd=0xc934067 *pmd&MASK=0xc934000 __va=ffff88000c934000
-</span><span class='line'>PAGE_SHIFT=12 PTRS_PER_PTE=512 pte_index*8=0xb18 __va+index==pte=ffff88000c934b18
-</span><span class='line'>
-</span><span class='line'>*pte=0x80000000222e3047 *pte&MASK=0x222e3000 pte_pfn=222e3 pfn=222e3
-</span><span class='line'>vmemmap=ffffea0000000000 pfn*sizeof(page)=0x77a1a8 cal_page=ffffea000077a1a8==follow_page
-</span><span class='line'>
-</span><span class='line'>ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK
-</span><span class='line'>test exit</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>dfs all vma, 虚拟地址连续，物理地址不连续</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>...
-</span><span class='line'>mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f90fd1e3000
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt; 
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/sysctl.h&gt;
-</span><span class='line'>#include &lt;linux/timer.h&gt;
-</span><span class='line'>#include &lt;linux/hardirq.h&gt;
-</span><span class='line'>#include &lt;linux/bottom_half.h&gt;
-</span><span class='line'>#include &lt;linux/preempt.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;linux/file.h&gt; 
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/kprobes.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/mm.h&gt;   
-</span><span class='line'>#include &lt;linux/mm_types.h&gt;
-</span><span class='line'>
-</span><span class='line'>#define N 10000000
-</span><span class='line'>char ch[N];
-</span><span class='line'>
-</span><span class='line'>void dfs(struct rb_node *rb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct page *(*follow_page_p)(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-</span><span class='line'>&#9;&#9;= (struct page *(*)(struct vm_area_struct *vma, unsigned long address, unsigned int flags))0xffffffff81133ab0;
-</span><span class='line'>&#9;struct vm_area_struct *vma;
-</span><span class='line'>&#9;unsigned long start, end, addr = 0x7f90fd1e3000;
-</span><span class='line'>&#9;struct page *pa;
-</span><span class='line'>&#9;if (!rb)
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;vma = rb_entry(rb, struct vm_area_struct, vm_rb);
-</span><span class='line'>&#9;start = vma-&gt;vm_start;
-</span><span class='line'>&#9;end = vma-&gt;vm_end;
-</span><span class='line'>&#9;if (addr &gt;= start && addr &lt; end && end-start &lt;= N) {
-</span><span class='line'>&#9;&#9;pa = follow_page_p(vma, addr, 0);
-</span><span class='line'>&#9;&#9;if (pa) {
-</span><span class='line'>&#9;&#9;&#9;memcpy(ch, page_address(pa), 4096);
-</span><span class='line'>&#9;&#9;&#9;printk("page=%p ch=%s\n", pa, ch);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;pa = follow_page_p(vma, addr+4096, 0);
-</span><span class='line'>&#9;&#9;if (pa) {
-</span><span class='line'>&#9;&#9;&#9;memcpy(ch, page_address(pa), 4096);
-</span><span class='line'>&#9;&#9;&#9;printk("page=%p ch=%s\n", pa, ch);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;dfs(rb-&gt;rb_left);
-</span><span class='line'>&#9;dfs(rb-&gt;rb_right);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static int __init test_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct mm_struct *mm = (struct mm_struct*)0xffff8800303a3880;
-</span><span class='line'>&#9;printk("test start task-&gt;mm=%p\n", mm-&gt;mm_rb.rb_node);
-</span><span class='line'>&#9;dfs(mm-&gt;mm_rb.rb_node);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>static void __exit test_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;printk("test exit\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_init);
-</span><span class='line'>module_exit(test_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>test start task-&gt;mm=ffff88002cc05e40
-</span><span class='line'>page=ffffea000066e618 ch=ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK
-</span><span class='line'>page=ffffea000062bec0 ch=AAAAAAAAAAAAAAAAAAABBBBBBBBBBBBCCCCCCCCCCC
-</span><span class='line'>test exit</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/09/kernel-mm-vm_area/">vm_area_struct （VMA）</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-09T17:41:00+08:00'><span class='date'>2015-09-09</span> <span class='time'>17:41:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>Linux内核中，关于虚存管理的最基本的管理单元应该是struct vm_area_struct了，它描述的是一段连续的、具有相同访问属性的虚存空间，该虚存空间的大小为物理内存页面的整数倍。</p>
-
-<p>下面是struct vm_area_struct结构体的定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * This struct defines a memory VMM memory area. There is one of these
-</span><span class='line'> * per VM-area/task.  A VM area is any part of the process virtual memory
-</span><span class='line'> * space that has a special rule for the page-fault handlers (ie a shared
-</span><span class='line'> * library, the executable area etc).
-</span><span class='line'> */
-</span><span class='line'>vm_area_struct { 
-</span><span class='line'>&#9;struct mm_struct * vm_mm; /* VM area parameters */  
-</span><span class='line'>&#9;unsigned long vm_start;  
-</span><span class='line'>&#9;unsigned long vm_end;  
-</span><span class='line'>&#9;  
-</span><span class='line'>&#9;/* linked list of VM areas per task, sorted by address */  
-</span><span class='line'>&#9;struct vm_area_struct *vm_next;  
-</span><span class='line'>&#9;  
-</span><span class='line'>&#9;pgprot_t vm_page_prot;  
-</span><span class='line'>&#9;unsigned long vm_flags;  
-</span><span class='line'>&#9;  
-</span><span class='line'>&#9;/* AVL tree of VM areas per task, sorted by address */  
-</span><span class='line'>&#9;short vm_avl_height;  
-</span><span class='line'>&#9;struct vm_area_struct * vm_avl_left;  
-</span><span class='line'>&#9;struct vm_area_struct * vm_avl_right;  
-</span><span class='line'>&#9;  
-</span><span class='line'>&#9;/* For areas with an address space and backing store, 
-</span><span class='line'>&#9;* font-size: 10px;"&gt;vm_area_struct *vm_next_share; 
-</span><span class='line'>&#9;struct vm_area_struct **vm_pprev_share; 
-</span><span class='line'>&#9; 
-</span><span class='line'>&#9;struct vm_operations_struct * vm_ops; 
-</span><span class='line'>&#9;unsigned long vm_pgoff; /* offset in PAGE_SIZE units, *not* PAGE_CACHE_SIZE */  
-</span><span class='line'>&#9;struct file * vm_file;  
-</span><span class='line'>&#9;unsigned long vm_raend;  
-</span><span class='line'>&#9;void * vm_private_data; /* was vm_pte (shared mem) */  
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>vm_area_struct结构所描述的虚存空间以vm_start、vm_end成员表示，它们分别保存了该虚存空间的首地址和末地址后第一个字节的地址，以字节为单位，所以虚存空间范围可以用[vm_start, vm_end)表示。</p>
-
-<p>通常，进程所使用到的虚存空间不连续，且各部分虚存空间的访问属性也可能不同。所以一个进程的虚存空间需要多个vm_area_struct结构来描述。在vm_area_struct结构的数目较少的时候，各个vm_area_struct按照升序排序，以单链表的形式组织数据（通过vm_next指针指向下一个vm_area_struct结构）。但是当vm_area_struct结构的数据较多的时候，仍然采用链表组织的化，势必会影响到它的搜索速度。针对这个问题，vm_area_struct还添加了vm_avl_hight（树高）、vm_avl_left（左子节点）、vm_avl_right（右子节点）三个成员来实现AVL树，以提高vm_area_struct的搜索速度。</p>
-
-<p>假如该vm_area_struct描述的是一个文件映射的虚存空间，成员vm_file便指向被映射的文件的file结构，vm_pgoff是该虚存空间起始地址在vm_file文件里面的文件偏移，单位为物理页面。</p>
-
-<p>一个程序可以选择MAP_SHARED或MAP_PRIVATE共享模式将一个文件的某部分数据映射到自己的虚存空间里面。这两种映射方式的区别在于：MAP_SHARED映射后在内存中对该虚存空间的数据进行修改会影响到其他以同样方式映射该部分数据的进程，并且该修改还会被写回文件里面去，也就是这些进程实际上是在共用这些数据。而MAP_PRIVATE映射后对该虚存空间的数据进行修改不会影响到其他进程，也不会被写入文件中。</p>
-
-<p>来自不同进程，所有映射同一个文件的vm_area_struct结构都会根据其共享模式分别组织成两个链表。链表的链头分别是：vm_file->f_dentry->d_inode->i_mapping->i_mmap_shared,vm_file->f_dentry->d_inode->i_mapping->i_mmap。而vm_area_struct结构中的vm_next_share指向链表中的下一个节点；vm_pprev_share是一个指针的指针，它的值是链表中上一个节点（头节点）结构的vm_next_share（i_mmap_shared或i_mmap）的地址。</p>
-
-<p>进程建立vm_area_struct结构后，只是说明进程可以访问这个虚存空间，但有可能还没有分配相应的物理页面并建立好页面映射。在这种情况下，若是进程执行中有指令需要访问该虚存空间中的内存，便会产生一次缺页异常。这时候，就需要通过vm_area_struct结构里面的vm_ops->nopage所指向的函数来将产生缺页异常的地址对应的文件数据读取出来。</p>
-
-<p>vm_flags主要保存了进程对该虚存空间的访问权限，然后还有一些其他的属性。vm_page_prot是新映射的物理页面的页表项pgprot的默认值。</p>
-
-<hr />
-
-<p>原文：<a href="http://oss.org.cn/kernel-book/ch06/6.4.2.htm">http://oss.org.cn/kernel-book/ch06/6.4.2.htm</a></p>
-
-<p>6.4.2 进程的虚拟空间</p>
-
-<p>如前所述,每个进程拥有3G字节的用户虚存空间。但是，这并不意味着用户进程在这3G的范围内可以任意使用，因为虚存空间最终得映射到某个物理存储空间（内存或磁盘空间），才真正可以使用。</p>
-
-<p>那么，内核怎样管理每个进程3G的虚存空间呢？概括地说，用户进程经过编译、链接后形成的映象文件有一个代码段和数据段（包括data段和bss段），其中代码段在下，数据段在上。数据段中包括了所有静态分配的数据空间，即全局变量和所有申明为static的局部变量，这些空间是进程所必需的基本要求，这些空间是在建立一个进程的运行映像时就分配好的。除此之外，堆栈使用的空间也属于基本要求，所以也是在建立进程时就分配好的，如图6.16所示：</p>
-
-<p><img src="/images/kernel/2015-09-09-11.gif" alt="" />进程虚拟空间（3G）!</p>
-
-<p> 图6.16  进程虚拟空间的划分</p>
-
-<p>由图可以看出，堆栈空间安排在虚存空间的顶部，运行时由顶向下延伸；代码段和数据段则在低部，运行时并不向上延伸。从数据段的顶部到堆栈段地址的下沿这个区间是一个巨大的空洞，这就是进程在运行时可以动态分配的空间（也叫动态内存）。</p>
-
-<p>进程在运行过程中，可能会通过系统调用mmap动态申请虚拟内存或释放已分配的内存，新分配的虚拟内存必须和进程已有的虚拟地址链接起来才能使用；Linux 进程可以使用共享的程序库代码或数据，这样，共享库的代码和数据也需要链接到进程已有的虚拟地址中。在后面我们还会看到，系统利用了请页机制来避免对物理内存的过分使用。因为进程可能会访问当前不在物理内存中的虚拟内存，这时，操作系统通过请页机制把数据从磁盘装入到物理内存。为此，系统需要修改进程的页表，以便标志虚拟页已经装入到物理内存中，同时，Linux 还需要知道进程虚拟空间中任何一个虚拟地址区间的来源和当前所在位置，以便能够装入物理内存。</p>
-
-<p>由于上面这些原因，Linux 采用了比较复杂的数据结构跟踪进程的虚拟地址。在进程的 task_struct结构中包含一个指向 mm_struct 结构的指针。进程的mm_struct 则包含装入的可执行映象信息以及进程的页目录指针pgd。该结构还包含有指向 vm_area_struct 结构的几个指针，每个 vm_area_struct 代表进程的一个虚拟地址区间。</p>
-
-<p><img src="/images/kernel/2015-09-09-12.gif" alt="" /></p>
-
-<p>图6.17  进程虚拟地址示意图</p>
-
-<p>图 6.17是某个进程的虚拟内存简化布局以及相应的几个数据结构之间的关系。从图中可以看出，系统以虚拟内存地址的降序排列 vm_area_struct。在进程的运行过程中，Linux 要经常为进程分配虚拟地址区间，或者因为从交换文件中装入内存而修改虚拟地址信息，因此，vm_area_struct结构的访问时间就成了性能的关键因素。为此，除链表结构外，Linux 还利用 红黑（Red_black）树来组织 vm_area_struct。通过这种树结构，Linux 可以快速定位某个虚拟内存地址。</p>
-
-<p>当进程利用系统调用动态分配内存时，Linux 首先分配一个 vm_area_struct 结构，并链接到进程的虚拟内存链表中，当后续的指令访问这一内存区间时，因为 Linux 尚未分配相应的物理内存，因此处理器在进行虚拟地址到物理地址的映射时会产生缺页异常(请看请页机制)，当 Linux 处理这一缺页异常时，就可以为新的虚拟内存区分配实际的物理内存。</p>
-
-<p>在内核中，经常会用到这样的操作：给定一个属于某个进程的虚拟地址，要求找到其所属的区间以及vma_area_struct结构，这是由find_vma（）来实现的，其实现代码在mm/mmap.c中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Look up the first VMA which satisfies  addr &lt; vm_end,  NULL if none. */
-</span><span class='line'>struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct vm_area_struct *vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (mm) {
-</span><span class='line'>&#9;&#9;/* Check the cache first. */
-</span><span class='line'>&#9;&#9;/* (Cache hit rate is typically around 35%.) */
-</span><span class='line'>&#9;&#9;vma = mm-&gt;mmap_cache;
-</span><span class='line'>&#9;&#9;if (!(vma && vma-&gt;vm_end &gt; addr && vma-&gt;vm_start &lt;= addr)) {
-</span><span class='line'>&#9;&#9;&#9;struct rb_node * rb_node;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;rb_node = mm-&gt;mm_rb.rb_node;
-</span><span class='line'>&#9;&#9;&#9;vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;while (rb_node) {
-</span><span class='line'>&#9;&#9;&#9;&#9;struct vm_area_struct * vma_tmp;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;vma_tmp = rb_entry(rb_node,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct vm_area_struct, vm_rb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_end &gt; addr) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;vma = vma_tmp;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_start &lt;= addr)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_left;
-</span><span class='line'>&#9;&#9;&#9;&#9;} else 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_right;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;if (vma)
-</span><span class='line'>&#9;&#9;&#9;&#9;mm-&gt;mmap_cache = vma; 
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return vma; 
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个函数比较简单，我们对其主要点给予解释：</p>
-
-<p>·参数的含义：函数有两个参数，一个是指向mm_struct结构的指针，这表示一个进程的虚拟地址空间；一个是地址，表示该进程虚拟地址空间中的一个地址。</p>
-
-<p>·条件检查：首先检查这个地址是否恰好落在上一次（最近一次）所访问的区间中。根据代码作者的注释，命中率一般达到35％，这也是mm_struct结构中设置mmap_cache指针的原因。如果没有命中，那就要在红黑树中进行搜索，红黑树与AVL树类似。</p>
-
-<p>·查找节点：如果已经建立了红黑树结构（rb_rode不为空），就在红黑树中搜索。</p>
-
-<p>·如果找到指定地址所在的区间，就把mmap_cache指针设置成指向所找到的vm_area_struct结构。</p>
-
-<p>·如果没有找到，说明该地址所在的区间还没有建立，此时，就得建立一个新的虚拟区间，再调用insert_vm_struct()函数将新建立的区间插入到vm_struct中的线性队列或红黑树中。</p>
-
-<hr />
-
-<p>原文：<a href="http://bbs.chinaunix.net/archiver/?tid-2058683.html">http://bbs.chinaunix.net/archiver/?tid-2058683.html</a></p>
-
-<p>Linux sys_exec中可执行文件映射的建立及读取</p>
-
-<ol>
-<li>创建一个vm_area_struct；</li>
-<li>圈定一个虚用户空间，将其起始结束地址(elf段中已设置好)保存到vm_start和vm_end中；</li>
-<li>将磁盘file句柄保存在vm_file中；</li>
-<li>将对应段在磁盘file中的偏移值(elf段中已设置好)保存在vm_pgoff中；</li>
-<li>将操作该磁盘file的磁盘操作函数保存在vm_ops中；</li>
-<li>注意这里没有为对应的页目录表项创建页表，更不存在设置页表项了；</li>
-</ol>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/9">&larr; Older</a>
@@ -3434,7 +1843,7 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(51)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(54)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
@@ -3443,13 +1852,17 @@ if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/tools~git/?opendiv=tools'>git</a><a href='##' onmousedown=showDiv('tools~git') id='aexp_tools~git'><span class='exp_style' id='exp_tools~git'>[+]</span></a><span class='right_span'>6</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~git')) document.getElementById('aexp_tools~git').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/tools~graphviz,-codeviz/?opendiv=tools'>graphviz、codeviz</a><a href='##' onmousedown=showDiv('tools~graphviz、codeviz') id='aexp_tools~graphviz、codeviz'><span class='exp_style' id='exp_tools~graphviz、codeviz'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('tools~graphviz、codeviz')) document.getElementById('aexp_tools~graphviz、codeviz').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/tools~haproxy/?opendiv=tools'>haproxy</a><a href='##' onmousedown=showDiv('tools~haproxy') id='aexp_tools~haproxy'><span class='exp_style' id='exp_tools~haproxy'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
@@ -3635,8 +2048,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(12)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
@@ -3729,23 +2142,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/03/21/graphviz-codeviz/">用Graphviz + CodeViz生成C/C++函数调用图(call graph)</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2016/03/21/command-sed/">sed命令</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2016/03/21/command-awk/">awk命令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/03/09/kernel-net-bonding-source/">bonding的源代码分析</a>
       </li>
     
       <li class="post">
         <a href="/blog/2016/03/09/kernel-net-bonding/">七种网卡绑定模式详解</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/02/29/kernel-net-connect/">socket建立连接 sys_connect</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/01/21/kernel-net-udp-sum/">udp checksum</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/01/21/system-base-init/">Linux系统启动过程分析</a>
       </li>
     
   </ul>
