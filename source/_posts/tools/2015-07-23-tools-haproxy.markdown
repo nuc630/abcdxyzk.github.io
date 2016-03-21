@@ -114,7 +114,8 @@ CentOS5编译新的haproxy需要在Makefile中禁掉USE_ACCEPT4
 	errorfile 504 /home/haproxy/haproxy/errorfiles/504.http
 
 	########frontend前端配置##############
-	bind *:80         #这里建议使用bind *:80的方式，要不然做集群高可用的时候有问题，vip切换到其他机器就不能访问了。
+	frontend main
+		bind *:80         #这里建议使用bind *:80的方式，要不然做集群高可用的时候有问题，vip切换到其他机器就不能访问了。
 		acl web hdr(host) -i www.abc.com  #acl后面是规则名称，-i是要访问的域名，如果访问www.abc.com这个域名就分发到下面的webserver 的作用域。
 		acl img hdr(host) -i img.abc.com  #如果访问img.abc.com.cn就分发到imgserver这个作用域。
 		use_backend webserver if web
