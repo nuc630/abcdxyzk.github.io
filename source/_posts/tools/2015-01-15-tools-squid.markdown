@@ -10,8 +10,23 @@ categories:
 - tools~base
 tags:
 ---
+
+好像改这行就能直接用了
 ```
-yum install squid
+	610c610
+	< # http_access deny all
+	---
+	>  http_access allow all
+```
+
+一个centos5上不干扰系统haproxy、squid独立运行的提取 [haproxy_squid.tar.gz](/download/tools/haproxy_squid.tar.gz)
+
+------------------
+
+### 安装
+
+```
+	yum install squid
 ```
 
 ### centos 5
