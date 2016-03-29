@@ -62,7 +62,7 @@ if (query != null) {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/06/06/kernel-mod-compiler/">内核编译模块</a></h2>
+      <h2 class="entry-title"><a href="/blog/2013/07/01/kernel-timer/">内核定时器的使用</a></h2>
     
     
       <p class="meta">
@@ -71,14 +71,114 @@ if (query != null) {
 
 
 
-<time class='entry-date' datetime='2013-06-06T14:28:00+08:00'><span class='date'>2013-06-06</span> <span class='time'>14:28:00</span></time>
+<time class='entry-date' datetime='2013-07-01T09:46:00+08:00'><span class='date'>2013-07-01</span> <span class='time'>09:46:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+  <div class="entry-content"><p>LINUX内核定时器是内核用来控制在未来某个时间点（基于jiffies）调度执行某个函数的一种机制，其实现位于 &lt;linux/timer.h> 和 kernel/timer.c 文件中。</p>
+
+<p>被调度的函数肯定是异步执行的，它类似于一种“软件中断”，而且是处于非进程的上下文中，所以调度函数必须遵守以下规则：<br/>
+1. 没有 current 指针、不允许访问用户空间。因为没有进程上下文，相关代码和被中断的进程没有任何联系。<br/>
+2. 不能执行休眠（或可能引起休眠的函数）和调度。<br/>
+3. 任何被访问的数据结构都应该针对并发访问进行保护，以防止竞争条件。</p>
+
+<p>内核定时器的调度函数运行过一次后就不会再被运行了（相当于自动注销），但可以通过在被调度的函数中重新调度自己来周期运行。</p>
+
+<p>在SMP系统中，调度函数总是在注册它的同一CPU上运行，以尽可能获得缓存的局域性。</p>
+
+<h4>定时器API</h4>
+
+<p>内核定时器的数据结构</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list {
+</span><span class='line'>  struct list_head entry;
+</span><span class='line'> 
+</span><span class='line'>  unsigned long expires;
+</span><span class='line'>  void (*function)(unsigned long);
+</span><span class='line'>  unsigned long data;
+</span><span class='line'> 
+</span><span class='line'>  struct tvec_base *base;
+</span><span class='line'>  /* ... */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中 expires 字段表示期望定时器执行的 jiffies 值，到达该 jiffies 值时，将调用 function 函数，并传递  data 作为参数。当一个定时器被注册到内核之后，entry 字段用来连接该定时器到一个内核链表中。base 字段是内核内部实现所用的。
+需要注意的是 expires 的值是32位的，因为内核定时器并不适用于长的未来时间点。</p>
+
+<h5>初始化</h5>
+
+<p>在使用 struct timer_list 之前，需要初始化该数据结构，确保所有的字段都被正确地设置。初始化有两种方法。</p>
+
+<h5>方法一：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_TIMER(timer_name, function_name, expires_value, data);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该宏会静态创建一个名叫 timer_name 内核定时器，并初始化其 function, expires, name 和 base 字段。</p>
+
+<h5>方法二：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list mytimer;
+</span><span class='line'>setup_timer(&mytimer, (*function)(unsigned long), unsigned long data);
+</span><span class='line'>mytimer.expires = jiffies + 5*HZ;</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>方法三：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list mytimer;
+</span><span class='line'>init_timer(&mytimer);
+</span><span class='line'>  mytimer -&gt;timer.expires = jiffies + 5*HZ;
+</span><span class='line'>  mytimer -&gt;timer.data = (unsigned long) dev;
+</span><span class='line'>  mytimer -&gt;timer.function = &corkscrew_timer; /* timer handler */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过init_timer()动态地定义一个定时器，此后，将处理函数的地址和参数绑定给一个timer_list，<br/>
+注意，无论用哪种方法初始化，其本质都只是给字段赋值，所以只要在运行 add_timer() 之前，expires, function 和 data 字段都可以直接再修改。<br/>
+关于上面这些宏和函数的定义，参见 include/linux/timer.h。</p>
+
+<h5>注册</h5>
+
+<p>定时器要生效，还必须被连接到内核专门的链表中，这可以通过 add_timer(struct timer_list *timer) 来实现。</p>
+
+<h5>重新注册</h5>
+
+<p>要修改一个定时器的调度时间，可以通过调用 mod_timer(struct timer_list *timer, unsigned long expires)。mod_timer() 会重新注册定时器到内核，而不管定时器函数是否被运行过。</p>
+
+<h5>注销</h5>
+
+<p>注销一个定时器，可以通过 del_timer(struct timer_list <em>timer) 或  del_timer_sync(struct timer_list </em>timer)。其中 del_timer_sync 是用在 SMP  系统上的（在非SMP系统上，它等于del_timer），当要被注销的定时器函数正在另一个 cpu 上运行时，del_timer_sync()  会等待其运行完，所以这个函数会休眠。另外还应避免它和被调度的函数争用同一个锁。对于一个已经被运行过且没有重新注册自己的定时器而言，注销函数其实也 没什么事可做。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int timer_pending(const struct timer_list *timer)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个函数用来判断一个定时器是否被添加到了内核链表中以等待被调度运行。注意，当一个定时器函数即将要被运行前，内核会把相应的定时器从内核链表中删除（相当于注销）</p>
+
+<h5>例子1：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
@@ -97,55 +197,40 @@ if (query != null) {
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*filename: test.c*/
-</span><span class='line'>#include &lt;linux/init.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>
-</span><span class='line'>staticintdummy_init(void)
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/timer.h&gt;
+</span><span class='line'>#include &lt;linux/jiffies.h&gt;
+</span><span class='line'> 
+</span><span class='line'>struct timer_list mytimer;
+</span><span class='line'>static void myfunc(unsigned long data)
 </span><span class='line'>{
-</span><span class='line'>    printk("hello,world.\n");
-</span><span class='line'>    return0;
+</span><span class='line'>&#9;printk("%s/n", (char *)data);
+</span><span class='line'>&#9;mod_timer(&mytimer, jiffies + 2*HZ);
 </span><span class='line'>}
-</span><span class='line'>staticvoiddummy_exit(void)
+</span><span class='line'> 
+</span><span class='line'>static int __init mytimer_init(void)
 </span><span class='line'>{
-</span><span class='line'>    return;
+</span><span class='line'>&#9;setup_timer(&mytimer, myfunc, (unsigned long)"Hello, world!");
+</span><span class='line'>&#9;mytimer.expires = jiffies + HZ;
+</span><span class='line'>&#9;add_timer(&mytimer);
+</span><span class='line'>&#9;return 0;
 </span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(dummy_init);
-</span><span class='line'>module_exit(dummy_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL")</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'> 
+</span><span class='line'>static void __exit mytimer_exit(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;del_timer(&mytimer);
+</span><span class='line'>}
+</span><span class='line'>module_init(mytimer_init);
+</span><span class='line'>module_exit(mytimer_exit);</span></code></pre></td></tr></table></div></figure>
 
 
-<p>执行如下命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ gcc -c -O2 -DMODULE -D__KERNEL__ -I/usr/src/linux test.c
-</span><span class='line'>$ insmod test.o</span></code></pre></td></tr></table></div></figure>
-
-
-<p>No module found in object<br/>
-insmod: error inserting &lsquo;test.o&rsquo;: -1 Invalid module format</p>
-
-<p>正确的做法是写一个Makefile,由内核的Kbuild来帮你编译。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ cat Makefile
-</span><span class='line'>obj-m :=test.o
-</span><span class='line'>KDIR :=/lib/modules/$(shell uname -r)/build
-</span><span class='line'>PWD :=$(shell pwd)
-</span><span class='line'>default:
-</span><span class='line'>    $(MAKE)-C $(KDIR)SUBDIRS=$(PWD)modules</span></code></pre></td></tr></table></div></figure>
-
-
-<p>执行如下命令：</p>
+<h5>例子2：</h5>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -162,30 +247,92 @@ insmod: error inserting &lsquo;test.o&rsquo;: -1 Invalid module format</p>
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$make
-</span><span class='line'>make -C /lib/modules/2.6.5-1.358/build SUBDIRS=/test modules
-</span><span class='line'>make[1]:Entering directory `/lib/modules/2.6.5-1.358/build'
-</span><span class='line'>  CC [M]  /test/modinject/test.o
-</span><span class='line'>  Building modules, stage 2.
-</span><span class='line'>  MODPOST
-</span><span class='line'>  CC      /test/modinject/test.mod.o
-</span><span class='line'>  LD [M]  /test/modinject/test.ko
-</span><span class='line'>make[1]: Leaving directory `/lib/modules/2.6.5-1.358/build'
-</span><span class='line'>$ls -l
-</span><span class='line'>-rw-r--r--1 root root   268 Jan  7 08:31 test.c
-</span><span class='line'>-rw-r--r--1 root root  2483 Jan  8 09:19 test.ko
-</span><span class='line'>-rw-r--r--1 root root   691 Jan  8 09:19 test.mod.c
-</span><span class='line'>-rw-r--r--1 root root  1964 Jan  8 09:19 test.mod.o
-</span><span class='line'>-rw-r--r--1 root root  1064 Jan  8 09:19 test.o</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct timer_list power_button_poll_timer;
+</span><span class='line'>static void power_button_poll(unsigned long dummy)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (gpio_line_get(N2100_POWER_BUTTON) == 0) {
+</span><span class='line'>&#9;&#9;ctrl_alt_del();
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;power_button_poll_timer.expires = jiffies + (HZ / 10);
+</span><span class='line'>&#9;add_timer(&power_button_poll_timer);
+</span><span class='line'>}
+</span><span class='line'>static void __init n2100_init_machine(void)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>&#9;init_timer(&power_button_poll_timer);
+</span><span class='line'>&#9;power_button_poll_timer.function = power_button_poll;
+</span><span class='line'>&#9;power_button_poll_timer.expires = jiffies + (HZ / 10);
+</span><span class='line'>&#9;add_timer(&power_button_poll_timer);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>其实上边的test.o就是用gcc生成的test.o,而test.ko是使用下列命令来生成的。</p>
+<h5>例子3：</h5>
+
+<p>设备open时初始化和注册定时器</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ld -m elf_i386  -r -o test.ko test.o  test.mod.o</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int corkscrew_open(struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>&#9;  init_timer(&vp-&gt;timer);    
+</span><span class='line'>&#9;  vp-&gt;timer.expires = jiffies + media_tbl[dev-&gt;if_port].wait;
+</span><span class='line'>&#9;  vp-&gt;timer.data = (unsigned long) dev;
+</span><span class='line'>&#9;  vp-&gt;timer.function = &corkscrew_timer; /* timer handler */
+</span><span class='line'>&#9;  add_timer(&vp-&gt;timer);
+</span><span class='line'>...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>再来看看test.mod.c，它是由/usr/src/linux/scripts/modpost.c来生成的。</p>
+<p>定时器超时处理函数，对定时器的超时时间重新赋值</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void corkscrew_timer(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>&#9;vp-&gt;timer.expires = jiffies + media_tbl[dev-&gt;if_port].wait;
+</span><span class='line'>&#9;add_timer(&vp-&gt;timer);
+</span><span class='line'>...
+</span><span class='line'>}
+</span><span class='line'> 
+</span><span class='line'>设备close时删除定时器
+</span><span class='line'>static int corkscrew_close(struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>...
+</span><span class='line'>&#9;del_timer(&vp-&gt;timer);
+</span><span class='line'>...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>例子4：</h5>
+
+<p>本例子用DEFINE_TIMER静态创建定时器</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -217,155 +364,57 @@ insmod: error inserting &lsquo;test.o&rsquo;: -1 Invalid module format</p>
 <span class='line-number'>28</span>
 <span class='line-number'>29</span>
 <span class='line-number'>30</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ cat test.mod.c
-</span><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/vermagic.h&gt;
-</span><span class='line'>#include &lt;linux/compiler.h&gt;
-</span><span class='line'>
-</span><span class='line'>MODULE_INFO(vermagic,VERMAGIC_STRING);
-</span><span class='line'>#undef unix
-</span><span class='line'>
-</span><span class='line'>struct module __this_module
-</span><span class='line'>__attribute__((section(".gnu.linkonce.this_module")))={
-</span><span class='line'>.name =__stringify(KBUILD_MODNAME),
-</span><span class='line'>.init =init_module,
-</span><span class='line'>#ifdef CONFIG_MODULE_UNLOAD
-</span><span class='line'>
-</span><span class='line'>.exit=cleanup_module,
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>};
-</span><span class='line'>static const struct modversion_info ____versions[]
-</span><span class='line'>__attribute_used__
-</span><span class='line'>__attribute__((section("__versions")))={
-</span><span class='line'>&#9;{0,"cleanup_module"},
-</span><span class='line'>&#9;{0,"init_module"},
-</span><span class='line'>&#9;{0,"struct_module"},
-</span><span class='line'>&#9;{0,"printk"},
-</span><span class='line'>};
-</span><span class='line'>static const char __module_depends[]
-</span><span class='line'>__attribute_used__
-</span><span class='line'>__attribute__((section(".modinfo")))=
-</span><span class='line'>"depends=";</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/jiffies.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/init.h&gt;
+</span><span class='line'>#include &lt;linux/timer.h&gt;
+</span><span class='line'>#include &lt;linux/leds.h&gt;
+</span><span class='line'>static void ledtrig_ide_timerfunc(unsigned long data);
+</span><span class='line'>DEFINE_LED_TRIGGER(ledtrig_ide);
+</span><span class='line'>static DEFINE_TIMER(ledtrig_ide_timer, ledtrig_ide_timerfunc, 0, 0);
+</span><span class='line'>static int ide_activity;
+</span><span class='line'>static int ide_lastactivity;
+</span><span class='line'>void ledtrig_ide_activity(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;ide_activity++;
+</span><span class='line'>&#9;if (!timer_pending(&ledtrig_ide_timer))
+</span><span class='line'>&#9;&#9;mod_timer(&ledtrig_ide_timer, jiffies + msecs_to_jiffies(10));
+</span><span class='line'>}
+</span><span class='line'>EXPORT_SYMBOL(ledtrig_ide_activity);
+</span><span class='line'>static void ledtrig_ide_timerfunc(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (ide_lastactivity != ide_activity) {
+</span><span class='line'>&#9;&#9;ide_lastactivity = ide_activity;
+</span><span class='line'>&#9;&#9;led_trigger_event(ledtrig_ide, LED_FULL);
+</span><span class='line'>&#9;&#9;mod_timer(&ledtrig_ide_timer, jiffies + msecs_to_jiffies(10));
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;led_trigger_event(ledtrig_ide, LED_OFF);
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>static int __init ledtrig_ide_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;led_trigger_register_simple("ide-disk", &ledtrig_ide);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>static void __exit ledtrig_ide_exit(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;led_trigger_unregister_simple(ledtrig_ide);
+</span><span class='line'>}
+</span><span class='line'>module_init(ledtrig_ide_init);
+</span><span class='line'>module_exit(ledtrig_ide_exit);</span></code></pre></td></tr></table></div></figure>
 
 
-<p>可见，test.mod.o只是产生了几个ELF的节，分别是modinfo,  .gun.linkonce.this_module(用于重定位，引进了rel.gnu.linkonce.this_module),  __versions。而test.ko是test.o和test.mod.o合并的结果。</p>
-
-<p>通常我们安装一个新的模块,先是编译出相应的ko文件，然后移动</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/lib/modules/`uname -r`/</span></code></pre></td></tr></table></div></figure>
-
-
-<p>目录或者某个子目录下，locate xxx.ko确定该模块确实在上面提到的目录下面，执行depmod -a，depmod将会检查</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/lib/modules/`uname -r`/</span></code></pre></td></tr></table></div></figure>
-
-
-<p>目录及其子目录中的所有模块文件，并根据相依性生成新的modules.dep文件，这时我们执行modprobe xxx.ko，该模块就会被正常加载了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/06/06/kprobe-list/">查看注册的kprobe列表</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-06-06T10:45:00+08:00'><span class='date'>2013-06-06</span> <span class='time'>10:45:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -t debugfs none mount_dir/
-</span><span class='line'>
-</span><span class='line'>#cat mount_dir/kprobes/list
-</span><span class='line'>c015d71a  k  vfs_read+0x0
-</span><span class='line'>c011a316  j  do_fork+0x0
-</span><span class='line'>c03dedc5  r  tcp_v4_rcv+0x0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第一列表示探测点插入的内核地址，第二列表示内核探测的类型，k表示kprobe，r表示kretprobe，j表示jprobe，第三列指定探测点的"符号+偏移"。如果被探测的函数属于一个模块，模块名也被指定。</p>
-
-<p>打开和关闭kprobe的方法列出如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#echo ‘1’ mount_dir/kprobes/enabled
-</span><span class='line'>#echo ‘0’ mount_dir/kprobes/enabled</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/06/03/compiler-makefile-vars/">Makefile预定义变量、自动变量</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-06-03T15:22:00+08:00'><span class='date'>2013-06-03</span> <span class='time'>15:22:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>Makefile中常见自动变量</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>命令格式     含     义
-</span><span class='line'>$*        不包含扩展名的目标文件名称
-</span><span class='line'>$+        所有的依赖文件，以空格分开，并以出现的先后为序，可能包含重复的依赖文件
-</span><span class='line'>$&lt;     第一个依赖文件的名称
-</span><span class='line'>$?        所有时间戳比目标文件晚的依赖文件，并以空格分开 
-</span><span class='line'>$@        目标文件的完整名称
-</span><span class='line'>$^        所有不重复的依赖文件，以空格分开
-</span><span class='line'>$%        如果目标是归档成员，则该变量表示目标的归档成员名称</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>Makefile中常见预定义变量</h4>
+<hr />
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -381,29 +430,89 @@ insmod: error inserting &lsquo;test.o&rsquo;: -1 Invalid module format</p>
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>命 令 格 式  含     义
-</span><span class='line'>AR                库文件维护程序的名称，默认值为ar
-</span><span class='line'>AS                汇编程序的名称，默认值为as
-</span><span class='line'>CC                C编译器的名称，默认值为cc
-</span><span class='line'>CPP               C预编译器的名称，默认值为$(CC) –E
-</span><span class='line'>CXX               C++编译器的名称，默认值为g++
-</span><span class='line'>FC                FORTRAN编译器的名称，默认值为f77
-</span><span class='line'>RM                文件删除程序的名称，默认值为rm –f
-</span><span class='line'>ARFLAGS           库文件维护程序的选项，无默认值
-</span><span class='line'>ASFLAGS           汇编程序的选项，无默认值
-</span><span class='line'>CFLAGS            C编译器的选项，无默认值
-</span><span class='line'>CPPFLAGS      C预编译的选项，无默认值
-</span><span class='line'>CXXFLAGS      C++编译器的选项，无默认值
-</span><span class='line'>FFLAGS            FORTRAN编译器的选项，无默认值</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>add_timer() -- 将定时器添加到定时器等待队列中
+</span><span class='line'>用add_timer()函数来看timer_base的作用
+</span><span class='line'>static inline void add_timer(struct timer_list *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;BUG_ON(timer_pending(timer));
+</span><span class='line'>&#9;__mod_timer(timer, timer-&gt;expires);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int __mod_timer(struct timer_list *timer, unsigned long expires)
+</span><span class='line'>{
+</span><span class='line'>&#9;tvec_base_t *base, *new_base;
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;int ret = 0;
+</span><span class='line'>&#9;timer_stats_timer_set_start_info(timer);
+</span><span class='line'>&#9;BUG_ON(!timer-&gt;function);
+</span><span class='line'>&#9;base = lock_timer_base(timer, &flags);
+</span><span class='line'>如果timer已经放到定时链表中,则释放开
+</span><span class='line'>|--------------------------------|
+</span><span class='line'>|   if (timer_pending(timer)) { -|
+</span><span class='line'>|       detach_timer(timer, 0); -|
+</span><span class='line'>|       ret = 1;                 |
+</span><span class='line'>|   }                            |
+</span><span class='line'>|--------------------------------|
+</span><span class='line'>获取当前CPU的timer base
+</span><span class='line'>|-----------------------------------------|
+</span><span class='line'>|   new_base = __get_cpu_var(tvec_bases); |
+</span><span class='line'>|-----------------------------------------|
+</span><span class='line'>如果当前CPU的timer base不是当前timer中的base, 更新timer的base
+</span><span class='line'>|----------------------------------------------------|
+</span><span class='line'>|   if (base != new_base) {                          |
+</span><span class='line'>|       if (likely(base-&gt;running_timer != timer)) { -|
+</span><span class='line'>|           timer-&gt;base = NULL;                      |
+</span><span class='line'>|           spin_unlock(&base-&gt;lock);                |
+</span><span class='line'>|           base = new_base;                         |
+</span><span class='line'>|           spin_lock(&base-&gt;lock);                  |
+</span><span class='line'>|           timer-&gt;base = base;                      |
+</span><span class='line'>|       }                                            |
+</span><span class='line'>|   }                                                |
+</span><span class='line'>|----------------------------------------------------|
+</span><span class='line'>给定时器timer设置超时时间；并添加该时钟
+</span><span class='line'>|-------------------------------------|
+</span><span class='line'>|   timer-&gt;expires = expires;         |
+</span><span class='line'>|   internal_add_timer(base, timer); -|
+</span><span class='line'>|-------------------------------------|
+</span><span class='line'>&#9;spin_unlock_irqrestore(&base-&gt;lock, flags);
+</span><span class='line'>&#9;return ret;
+</span><span class='line'>}
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
 
-
-<h5>在Makefile中我们可以通过宏定义来控制源程序的编译。</h5>
-
-<p>只要在Makefile中的CFLAGS中通过选项-D来指定你于定义的宏即可。<br/>
-如:<br/>
-CFLAGS += -D <strong>KK</strong><br/>
-或<br/>
-CFLAGS += -D <strong>KK</strong>=<strong>XX</strong></p>
 </div>
   
   
@@ -416,7 +525,7 @@ CFLAGS += -D <strong>KK</strong>=<strong>XX</strong></p>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/06/03/kernel-read-file/">linux内核文件读取</a></h2>
+      <h2 class="entry-title"><a href="/blog/2013/06/27/kernel-sysctl/">用户空间和内核空间数据交换方式-sysctl</a></h2>
     
     
       <p class="meta">
@@ -425,14 +534,303 @@ CFLAGS += -D <strong>KK</strong>=<strong>XX</strong></p>
 
 
 
-<time class='entry-date' datetime='2013-06-03T11:32:00+08:00'><span class='date'>2013-06-03</span> <span class='time'>11:32:00</span></time>
+<time class='entry-date' datetime='2013-06-27T17:20:00+08:00'><span class='date'>2013-06-27</span> <span class='time'>17:20:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+  <div class="entry-content"><p>  sysctl是一种用户应用来设置和获得运行时内核的配置参数的一种有效方式，通过这种 方式，用户应用可以在内核运行的任何时刻来改变内核的配置参数，也可以在任何时候获得内核的配置参数，通常，内核的这些配置参数也出现在proc文件系统 的/proc/sys目录下，用户应用可以直接通过这个目录下的文件来实现内核配置的读写操作，例如，用户可以通过</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/sys/net/ipv4/ip_forward </span></code></pre></td></tr></table></div></figure>
+
+
+<p>来得知内核IP层是否允许转发IP包，用户可以通过</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/ip_forward </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  把内核 IP 层设置为允许转发 IP 包，即把该机器配置成一个路由器或网关。 一般地，所有的 Linux 发布也提供了一个系统工具  sysctl，它可以设置和读取内核的配置参数，但是该工具依赖于 proc 文件系统，为了使用该工具，内核必须支持 proc 文件系统。下面是使用  sysctl 工具来获取和设置内核配置参数的例子：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># sysctl net.ipv4.ip_forward
+</span><span class='line'>net.ipv4.ip_forward = 0
+</span><span class='line'># sysctl -w net.ipv4.ip_forward=1
+</span><span class='line'>net.ipv4.ip_forward = 1
+</span><span class='line'># sysctl net.ipv4.ip_forward
+</span><span class='line'>net.ipv4.ip_forward = 1 </span></code></pre></td></tr></table></div></figure>
+
+
+<p>  注意，参数 net.ipv4.ip_forward 实际被转换到对应的 proc  文件/proc/sys/net/ipv4/ip_forward，选项 -w 表示设置该内核配置参数，没有选项表示读内核配置参数，用户可以使用  sysctl -a 来读取所有的内核配置参数，对应更多的 sysctl 工具的信息，请参考手册页 sysctl(8)。</p>
+
+<p>  但是 proc 文件系统对 sysctl 不是必须的，在没有 proc 文件系统的情况下，仍然可以，这时需要使用内核提供的系统调用 sysctl 来实现对内核配置参数的设置和读取。</p>
+
+<p>  在源代码中给出了一个实际例子程序，它说明了如何在内核和用户态使用sysctl。头文件 sysctl-exam.h 定义了 sysctl  条目 ID，用户态应用和内核模块需要这些 ID 来操作和注册 sysctl 条目。内核模块在文件 sysctl-exam-kern.c  中实现，在该内核模块中，每一个 sysctl 条目对应一个 struct ctl_table 结构，该结构定义了要注册的 sysctl 条目的  ID(字段 ctl_name)，在 proc  下的名称（字段procname），对应的内核变量（字段data，注意该该字段的赋值必须是指针），条目允许的最大长度（字段maxlen，它主要用于 字符串内核变量，以便在对该条目设置时，对超过该最大长度的字符串截掉后面超长的部分），条目在proc文件系统下的访问权限（字段mode），在通过  proc设置时的处理函数（字段proc_handler，对于整型内核变量，应当设置为&amp;proc_dointvec，而对于字符串内核变量， 则设置为 &amp;proc_dostring），字符串处理策略（字段strategy，一般这是为&amp;sysctl_string）。</p>
+
+<p>  sysctl 条目可以是目录，此时 mode 字段应当设置为 0555，否则通过 sysctl 系统调用将无法访问它下面的 sysctl  条目，child 则指向该目录条目下面的所有条目，对于在同一目录下的多个条目，不必一一注册，用户可以把它们组织成一个 struct  ctl_table 类型的数组，然后一次注册就可以，但此时必须把数组的最后一个结构设置为NULL，即</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;.ctl_name = 0
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  注册sysctl条目使用函数register_sysctl_table(struct ctl_table *,  int)，第一个参数为定义的struct  ctl_table结构的sysctl条目或条目数组指针，第二个参数为插入到sysctl条目表中的位置，如果插入到末尾，应当为0，如果插入到开头， 则为非0。内核把所有的sysctl条目都组织成sysctl表。</p>
+
+<p>  当模块卸载时，需要使用函数unregister_sysctl_table(struct ctl_table_header  *)解注册通过函数register_sysctl_table注册的sysctl条目，函数register_sysctl_table在调用成功时返  回结构struct ctl_table_header，它就是sysctl表的表头，解注册函数使用它来卸载相应的sysctl条目。  用户态应用sysctl-exam-user.c通过sysctl系统调用来查看和设置前面内核模块注册的sysctl条目（当然如果用户的系统内核已经 支持proc文件系统，可以直接使用文件操作应用如cat, echo等直接查看和设置这些sysctl条目）。</p>
+
+<h5>下面是运行该模块与应用的输出结果示例：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># insmod ./sysctl-exam-kern.ko
+</span><span class='line'># cat /proc/sys/mysysctl/myint
+</span><span class='line'>0
+</span><span class='line'># cat /proc/sys/mysysctl/mystring
+</span><span class='line'># ./sysctl-exam-user
+</span><span class='line'>mysysctl.myint =0
+</span><span class='line'>mysysctl.mystring =""
+</span><span class='line'># ./sysctl-exam-user 100"Hello, World"
+</span><span class='line'>old value: mysysctl.myint =0
+</span><span class='line'>newvalue: mysysctl.myint =100
+</span><span class='line'>old vale: mysysctl.mystring =""
+</span><span class='line'>newvalue: mysysctl.mystring ="Hello, World"
+</span><span class='line'># cat /proc/sys/mysysctl/myint
+</span><span class='line'>100
+</span><span class='line'># cat /proc/sys/mysysctl/mystring
+</span><span class='line'>Hello, World
+</span><span class='line'>#</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>struct ctl_table是相关的主要的数据结构。定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct ctl_table
+</span><span class='line'>{
+</span><span class='line'>&#9;int ctl_name;            /* Binary ID */
+</span><span class='line'>&#9;const char *procname;        /* Text ID for /proc/sys, or zero */
+</span><span class='line'>&#9;void *data;
+</span><span class='line'>&#9;int maxlen;
+</span><span class='line'>&#9;mode_t mode;
+</span><span class='line'>&#9;struct ctl_table *child;
+</span><span class='line'>&#9;struct ctl_table *parent;    /* Automatically set */
+</span><span class='line'>&#9;proc_handler *proc_handler;    /* Callback for text formatting */
+</span><span class='line'>&#9;ctl_handler *strategy;        /* Callback function for all r/w */
+</span><span class='line'>&#9;void *extra1;
+</span><span class='line'>&#9;void *extra2;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>每个这样的数据结构，都对应了/proc/sys目录下的一项内核参数。</p>
+
+<p>其中各字段的意义如下：<br/>
+  ctl_name: 唯一标识此表项的一个整数。<br/>
+  proc_name: 相对于/proc/sys目录下对应的参数名称。<br/>
+  data: 一个void *指针，指向与这个表项相关联的数据的指针。<br/>
+  maxlen: 可以读取或者写入data的最大字节数。eg：data指向的是一个int型参数，则maxlen一般为sizeof(int)。<br/>
+  mode: 文件的权限。<br/>
+  child: 如果此数据结构对应的表项为一目录，则chind是指向其子表项的指针。<br/>
+  parent: 同child，指向其所在目录对应的ctl_table。<br/>
+  proc_handler: 如果是通过/proc/sys文件读写内核运行时的参数，则执行此操作。<br/>
+  strategy: 如果是通过系统调用sysctl对内核参数进行读写，则调用此函数。<br/>
+  extra1和extra2可以指向处理这个表项时的任何补充数据。</p>
+
+<p>下面分别简单说下这两个函数大概的执行流程：<br/>
+proc_handler:<br/>
+一般情况下，proc_handler指向proc_dostring（操作数为string）或者proc_dointvec（操作数为int）。</p>
+
+<p>strategy:<br/>
+sysctl ==> sys_sysctl ==> do_sysctl ==> parse_table ==> do_sysctl_strategy ==> ctl_table中strategy对应的操作。</p>
+
+<hr />
+
+<h5>示例：</h5>
+
+<p>头文件：sysctl-exam.h：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//header: sysctl-exam.h
+</span><span class='line'>#ifndef _SYSCTL_EXAM_H
+</span><span class='line'>#define _SYSCTL_EXAM_H
+</span><span class='line'>#include &lt;linux/sysctl.h&gt;
+</span><span class='line'>#define MY_ROOT (CTL_CPU + 10)
+</span><span class='line'>#define MY_MAX_SIZE 256
+</span><span class='line'>enum {
+</span><span class='line'>&#9;MY_INT_EXAM = 1,
+</span><span class='line'>&#9;MY_STRING_EXAM = 2,
+</span><span class='line'>};
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>内核模块代码  sysctl-exam-kern.c：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//kernel module: sysctl-exam-kern.c
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/sysctl.h&gt;
+</span><span class='line'>#include "sysctl-exam.h"
+</span><span class='line'>
+</span><span class='line'>static char mystring[256];
+</span><span class='line'>static int myint;
+</span><span class='line'>
+</span><span class='line'>static struct ctl_table my_sysctl_exam[] = {
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.ctl_name       = MY_INT_EXAM,
+</span><span class='line'>&#9;&#9;.procname       = "myint",
+</span><span class='line'>&#9;&#9;.data           = &myint,
+</span><span class='line'>&#9;&#9;.maxlen         = sizeof(int),
+</span><span class='line'>&#9;&#9;.mode           = 0666,
+</span><span class='line'>&#9;&#9;.proc_handler   = &proc_dointvec,
+</span><span class='line'>&#9;},
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.ctl_name       = MY_STRING_EXAM,
+</span><span class='line'>&#9;&#9;.procname       = "mystring",
+</span><span class='line'>&#9;&#9;.data           = mystring,
+</span><span class='line'>&#9;&#9;.maxlen         = MY_MAX_SIZE,
+</span><span class='line'>&#9;&#9;.mode           = 0666,
+</span><span class='line'>&#9;&#9;.proc_handler   = &proc_dostring,
+</span><span class='line'>&#9;&#9;.strategy       = &sysctl_string,
+</span><span class='line'>&#9;}，
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.ctl_name = 0
+</span><span class='line'>&#9;}
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static struct ctl_table my_root = {
+</span><span class='line'>&#9;.ctl_name       = MY_ROOT,
+</span><span class='line'>&#9;.procname       = "mysysctl",
+</span><span class='line'>&#9;.mode           = 0555,
+</span><span class='line'>&#9;.child          = my_sysctl_exam,
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static struct ctl_table_header * my_ctl_header;
+</span><span class='line'>
+</span><span class='line'>static int __init sysctl_exam_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;my_ctl_header = register_sysctl_table(&my_root, 0);
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __exit sysctl_exam_exit(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;unregister_sysctl_table(my_ctl_header);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(sysctl_exam_init);
+</span><span class='line'>module_exit(sysctl_exam_exit);
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
+
+
+<p>用户程序 sysctl-exam-user.c：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
@@ -492,135 +890,137 @@ CFLAGS += -D <strong>KK</strong>=<strong>XX</strong></p>
 <span class='line-number'>58</span>
 <span class='line-number'>59</span>
 <span class='line-number'>60</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// test_file.c
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt;
-</span><span class='line'>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//application: sysctl-exam-user.c
+</span><span class='line'>#include &lt;linux/unistd.h&gt;
 </span><span class='line'>#include &lt;linux/types.h&gt;
+</span><span class='line'>#include &lt;linux/sysctl.h&gt;
+</span><span class='line'>#include "sysctl-exam.h"
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;errno.h&gt;
 </span><span class='line'>
-</span><span class='line'>#include &lt;linux/fs.h&gt;
-</span><span class='line'>#include &lt;linux/string.h&gt;
-</span><span class='line'>#include &lt;asm/uaccess.h&gt; /* get_fs(),set_fs(),get_ds() */
+</span><span class='line'>_syscall1(int, _sysctl, struct __sysctl_args *, args);
 </span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>static int __init file_test_init(void)
+</span><span class='line'>int sysctl(int *name, int nlen, void *oldval, size_t *oldlenp, void *newval, size_t newlen)
 </span><span class='line'>{
-</span><span class='line'>&#9;char *FILE_DIR = "/root/test.txt";
-</span><span class='line'>&#9;char *buff = "module read/write test";
-</span><span class='line'>&#9;char tmp[100];
-</span><span class='line'>&#9;struct file *filp = NULL;
-</span><span class='line'>&#9;mm_segment_t old_fs;
-</span><span class='line'>&#9;ssize_t ret;
-</span><span class='line'>   
-</span><span class='line'>&#9;filp = filp_open(FILE_DIR, O_RDWR | O_CREAT, 0644);
-</span><span class='line'>   
-</span><span class='line'>&#9;if(IS_ERR(filp)) {
-</span><span class='line'>&#9;&#9;printk("open error...\n");
-</span><span class='line'>&#9;&#9;return -2;
-</span><span class='line'>&#9;}
-</span><span class='line'>   
-</span><span class='line'>&#9;old_fs = get_fs();
-</span><span class='line'>&#9;set_fs(get_ds());
-</span><span class='line'>
-</span><span class='line'>&#9;filp-&gt;f_op-&gt;write(filp, buff, strlen(buff), &filp-&gt;f_pos);
-</span><span class='line'>&#9;filp-&gt;f_op-&gt;llseek(filp, 0, 0);
-</span><span class='line'>&#9;ret = filp-&gt;f_op-&gt;read(filp, tmp, strlen(buff), &filp-&gt;f_pos);
-</span><span class='line'>
-</span><span class='line'>&#9;set_fs(old_fs);
-</span><span class='line'>&#9;   
-</span><span class='line'>&#9;if(ret &gt; 0)
-</span><span class='line'>&#9;&#9;printk("%s\n", tmp);
-</span><span class='line'>&#9;else if(ret == 0)
-</span><span class='line'>&#9;&#9;printk("read nothing.............\n");
-</span><span class='line'>&#9;else {
-</span><span class='line'>&#9;&#9;printk("read error\n");
-</span><span class='line'>&#9;&#9;return -1;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;filp_close(filp, NULL);
-</span><span class='line'>&#9;return 0;
+</span><span class='line'>&#9;struct __sysctl_args args={name,nlen,oldval,oldlenp,newval,newlen};
+</span><span class='line'>&#9;return _sysctl(&args);
 </span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>static void __exit file_test_exit(void)
+</span><span class='line'>#define SIZE(x) sizeof(x)/sizeof(x[0])
+</span><span class='line'>#define OSNAMESZ 100
+</span><span class='line'>
+</span><span class='line'>int oldmyint;
+</span><span class='line'>int oldmyintlen;
+</span><span class='line'>
+</span><span class='line'>int newmyint;
+</span><span class='line'>int newmyintlen;
+</span><span class='line'>
+</span><span class='line'>char oldmystring[MY_MAX_SIZE];
+</span><span class='line'>int oldmystringlen;
+</span><span class='line'>
+</span><span class='line'>char newmystring[MY_MAX_SIZE];
+</span><span class='line'>int newmystringlen;
+</span><span class='line'>
+</span><span class='line'>int myintctl[] = {MY_ROOT, MY_INT_EXAM};
+</span><span class='line'>int mystringctl[] = {MY_ROOT, MY_STRING_EXAM};
+</span><span class='line'>
+</span><span class='line'>int main(int argc, char ** argv)
 </span><span class='line'>{
-</span><span class='line'>&#9;printk("file test exit\n");
-</span><span class='line'>}
+</span><span class='line'>&#9;if (argc &lt; 2) 
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;oldmyintlen = sizeof(int);
+</span><span class='line'>&#9;&#9;if (sysctl(myintctl, SIZE(myintctl), &oldmyint, &oldmyintlen, 0, 0)) {
+</span><span class='line'>&#9;&#9;&#9;perror("sysctl");
+</span><span class='line'>&#9;&#9;&#9;exit(-1);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;else {
+</span><span class='line'>&#9;&#9;&#9;printf("mysysctl.myint = %d\n", oldmyint);
+</span><span class='line'>&#9;&#9;}
 </span><span class='line'>
-</span><span class='line'>module_init(file_test_init);
-</span><span class='line'>module_exit(file_test_exit);
+</span><span class='line'>&#9;&#9;oldmystringlen = MY_MAX_SIZE;
+</span><span class='line'>&#9;&#9;if (sysctl(mystringctl, SIZE(mystringctl), oldmystring, &oldmystringlen, 0, 0)) {
+</span><span class='line'>&#9;&#9;&#9;perror("sysctl");
+</span><span class='line'>&#9;&#9;&#9;exit(-1);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;else {
+</span><span class='line'>&#9;&#9;&#9;printf("mysysctl.mystring = \"%s\"\n", oldmystring);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;else if (argc != 3) 
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;printf("Usage:\n");
+</span><span class='line'>&#9;&#9;printf("\tsysctl-exam-user\n");
+</span><span class='line'>&#9;&#9;printf("Or\n");
+</span><span class='line'>&#9;&#9;printf("\tsysctl-exam-user aint astring\n");
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;else 
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;newmyint = atoi(argv[1]);
+</span><span class='line'>&#9;&#9;newmyintlen = sizeof(int);
+</span><span class='line'>&#9;&#9;oldmyintlen = sizeof(int);
 </span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// Makefile
+</span><span class='line'>&#9;&#9;strcpy(newmystring, argv[2]);
+</span><span class='line'>&#9;&#9;newmystringlen = strlen(newmystring);
+</span><span class='line'>&#9;&#9;oldmystringlen = MY_MAX_SIZE;
 </span><span class='line'>
-</span><span class='line'>obj-m := test_file.o
+</span><span class='line'>&#9;&#9;if (sysctl(myintctl, SIZE(myintctl), &oldmyint, &oldmyintlen, &newmyint, newmyintlen)) {
+</span><span class='line'>&#9;&#9;&#9;perror("sysctl");
+</span><span class='line'>&#9;&#9;&#9;exit(-1);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;else {
+</span><span class='line'>&#9;&#9;&#9;printf("old value: mysysctl.myint = %d\n", oldmyint);
+</span><span class='line'>&#9;&#9;&#9;printf("new value: mysysctl.myint = %d\n", newmyint);
+</span><span class='line'>&#9;&#9;}
 </span><span class='line'>
-</span><span class='line'>KDIR := /lib/modules/$(uname -r)/build/
-</span><span class='line'>PWD := $(shellpwd)
 </span><span class='line'>
-</span><span class='line'>all:
-</span><span class='line'>      make -C $(KDIR) M=$(PWD) modules
-</span><span class='line'>clean:
-</span><span class='line'>      make -C $(KDIR) M=$(PWD) clean</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;&#9;if (sysctl(mystringctl, SIZE(mystringctl), oldmystring, &oldmystringlen, newmystring, newmystringlen)) {
+</span><span class='line'>&#9;&#9;&#9;perror("sysctl");
+</span><span class='line'>&#9;&#9;&#9;exit(-1);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;else {
+</span><span class='line'>&#9;&#9;&#9;printf("old vale: mysysctl.mystring = \"%s\"\n", oldmystring);
+</span><span class='line'>&#9;&#9;&#9;printf("new value: mysysctl.mystring = \"%s\"\n", newmystring);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;exit(0);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>注意：</h4>
 
-<p>在调用filp->f_op->read和filp->f_op->write等对文件的操作之前，应该先设置FS。<br/>
-默认情况下，filp->f_op->read或者filp->f_op->write会对传进来的参数buff进行指针检查。如果不是在用户空间会拒绝访问。因为是在内核模块中，所以buff肯定不在用户空间，所以要增大其寻址范围。</p>
-
-<p>拿filp->f_op->write为例来说明：<br/>
-filp->f_op->write最终会调用access_ok ==> range_ok.<br/>
-而range_ok会判断访问的地址是否在0 ～ addr_limit之间。如果在，则ok，继续。如果不在，则禁止访问。而内核空间传过来的buff肯定大于addr_limit。所以要set_fs(get_ds())。<br/>
-这些函数在asm/uaccess.h中定义。以下是这个头文件中的部分内容：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MAKE_MM_SEG(s)   ((mm_segment_t) { (s) })
-</span><span class='line'>
-</span><span class='line'>#define KERNEL_DS MAKE_MM_SEG(-1UL)
-</span><span class='line'>#define USER_DS       MAKE_MM_SEG(PAGE_OFFSET)
-</span><span class='line'>
-</span><span class='line'>#define get_ds()  (KERNEL_DS)
-</span><span class='line'>#define get_fs()  (current_thread_info()-&gt;addr_limit)
-</span><span class='line'>#define set_fs(x) (current_thread_info()-&gt;addr_limit = (x))
-</span><span class='line'>
-</span><span class='line'>#define segment_eq(a, b)  ((a).seg == (b).seg)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到set_fs(get_ds())改变了addr_limit的值。这样就使得从模块中传递进去的参数也可以正常使用了。</p>
-
-<p>在写测试模块的时候，要实现的功能是写进去什么，然后读出来放在tmp数组中。但写完了以后filp->f_ops已经在末尾了，这个时候读是什么也 读不到的，如果想要读到数据，则应该改变filp->f-ops的值，这就要用到filp->f_op->llseek函数了。其中的参数需要记下笔记：<br/>
-系统调用：<br/>
-off_t sys_lseek(unsigned int fd, off_t offset, unsigned int origin)<br/>
-offset是偏移量。<br/>
-若origin是SEEK_SET(0)，则将该文件的位移量设置为距文件开始处offset 个字节。<br/>
-若origin是SEEK_CUR(1)，则将该文件的位移量设置为其当前值加offset, offset可为正或负。<br/>
-若origin是SEEK_END(2)，则将该文件的位移量设置为文件长度加offset, offset可为正或负。</p>
 </div>
   
   
@@ -633,7 +1033,7 @@ offset是偏移量。<br/>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/05/28/centos-versions/">RedHat/CentOS发行版本号及内核版本号对照表</a></h2>
+      <h2 class="entry-title"><a href="/blog/2013/06/21/compiler-makefile-shell/">Makefile与Shell的问题</a></h2>
     
     
       <p class="meta">
@@ -642,14 +1042,232 @@ offset是偏移量。<br/>
 
 
 
-<time class='entry-date' datetime='2013-05-28T15:35:00+08:00'><span class='date'>2013-05-28</span> <span class='time'>15:35:00</span></time>
+<time class='entry-date' datetime='2013-06-21T18:28:00+08:00'><span class='date'>2013-06-21</span> <span class='time'>18:28:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+  <div class="entry-content"><p>  大概只要知 道Makefile的人，都知道Makefile可以调用Shell脚本。但是在实际使用时，并不那么简单，一些模棱两可的地方可能会让你抓狂。你若不信，可以先看几个例子，想象一下这些这些例子会打印什么内容，记下你想象的结果，然后在计算机上运行这些例子，对照看一下。</p>
+
+<p>示例一：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if [ "$(BUILD)" = "debug" ]; then
+</span><span class='line'>&#9;echo "build debug"; 
+</span><span class='line'>else
+</span><span class='line'>&#9;echo "build release";
+</span><span class='line'>fi
+</span><span class='line'>all:
+</span><span class='line'>&#9;echo "done"</span></code></pre></td></tr></table></div></figure>
+
+
+<p>示例二：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>all:
+</span><span class='line'>&#9;@CC=arm-linux-gcc
+</span><span class='line'>&#9;@echo $(CC)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>示例三：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>CC=arm-linux-gcc
+</span><span class='line'>all:
+</span><span class='line'>&#9;@echo $(CC)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>示例四：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>SUBDIR=src example
+</span><span class='line'>all:
+</span><span class='line'>&#9;@for subdir in $(SUBDIR);
+</span><span class='line'>&#9;do
+</span><span class='line'>&#9;&#9;echo "building " $(subdir);
+</span><span class='line'>&#9;done</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>说明：</h4>
+
+<p>1.Shell脚本在target里才有效，其它地方都被忽略掉了。所以示例一中，”build debug”之类的字符串根本打印不出来。示例一的正确写法是：
+示例一：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>all:
+</span><span class='line'>&#9;if [ "$(BUILD)" = "debug" ]; then
+</span><span class='line'>&#9;&#9;echo "build debug";
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;echo "build release";
+</span><span class='line'>&#9;fi
+</span><span class='line'>&#9;echo "done"</span></code></pre></td></tr></table></div></figure>
+
+
+<p>2.make把每一行Shell脚本当作一个独立的单元，它们在单独的进程中运行。示例二中，两行Shell脚本在两个莫不相干的进程里运行，第一个进程把 CC设置为arm-linux-gcc，第二个进程是不知道的，所以打印的结果自然不是arm-linux-gcc了。示例二的正确写法是：<br/>
+示例二：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>all:
+</span><span class='line'>&#9;@CC=arm-linux-gcc; echo $(CC)
+</span><span class='line'>或者：
+</span><span class='line'>all:
+</span><span class='line'>&#9;@CC=arm-linux-gcc;
+</span><span class='line'>&#9;echo $(CC)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>3.make在调用Shell之前先进行预处理，即展开所有Makefile的变量和函数。这些变量和函数都以$开头。示例三中，Shell拿的脚本实际上是echo arm-linux-gcc，所以打印结果正确。</p>
+
+<p>4.make预处理时，所有以$开头的，它都不会放过。要想引用Shell自己的变量，应该以$$开头。另外要注意，Shell自己的变量是不需要括号的。示例四的正确写法是：<br/>
+示例四：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>SUBDIR=src example
+</span><span class='line'>all:
+</span><span class='line'>&#9;@for subdir in $(SUBDIR);
+</span><span class='line'>&#9;do
+</span><span class='line'>&#9;&#9;echo "building " $$subdir;
+</span><span class='line'>&#9;done</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/06/20/lang-c-B_b_byte/">字节序和比特序</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-06-20T18:23:00+08:00'><span class='date'>2013-06-20</span> <span class='time'>18:23:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>字节序和比特序，因为比特序对所有代码（包括汇编）是透明的，所以对于小端系统，有说是用大端比特序，也有说是用小端比特序。<br/>
+下面是copy一部分觉得靠谱的内容：<br/>
+大小端
+我们对"endianness"这个名词估计都很熟悉了。它首先被Danny Cohen于1980引入，用来表述计算机系统表示多字节整数的方式。
+endianness分为两种：大端和小端。(从字节序的角度来看)大端方式是将整数中最高位byte存放在最低地址中。而小端方式则相反，将整数中的最高位byte存放在最高地址中。
+对于某个确定的计算机系统，比特序通常与字节序保持一致。换言之，在大端系统中，每个byte中最高位bit存放在内存最低位；在小端系统中，最低位bit存放在内存最低位。
+正如大部分人是按照从左至右的顺序书写数字，一个多字节整数的内存布局也应该遵循同样的方式，即从左至右为数值的最高位至最低位。正如我们在下面的例子中所看到的，这是书写整数最清晰的方式。</p>
+
+<p>根据上述规则，我们按以下方式分别在大端和小端系统中值为0x0a0b0c0d的整数。
+在大端系统中书写整数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>byte  addr   0   1   2   3
+</span><span class='line'>bit offset  01234567 01234567 01234567 01234567
+</span><span class='line'>
+</span><span class='line'>    binary  00001010 00001011 00001100 00001101
+</span><span class='line'>      hex      0a       0b       0c       0d</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在小端系统中书写整数(认真看)</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>byte  addr   0   1   2   3
+</span><span class='line'>bit offset  01234567 01234567 01234567 01234567
+</span><span class='line'>
+</span><span class='line'>    binary  10110000 00110000 11010000 01010000
+</span><span class='line'>      hex      d0       c0       b0       a0</span></code></pre></td></tr></table></div></figure>
+
+
+<p>说明字节序：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;  
+</span><span class='line'>int main (void)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;union b  
+</span><span class='line'>&#9;{  
+</span><span class='line'>&#9;&#9;short k;  //测试环境short占2字节  
+</span><span class='line'>&#9;&#9;char i[2];  //测试环境char占1字节  
+</span><span class='line'>&#9;}*s,a;  
+</span><span class='line'>&#9;s=&a;  
+</span><span class='line'>&#9;s-&gt;i[0]=0x41;  
+</span><span class='line'>&#9;s-&gt;i[1]=0x52;  
+</span><span class='line'>&#9;printf("%x\n",s-&gt;k);  
+</span><span class='line'>&#9;return 0;  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>
+输出：5241</p>
+
+<hr />
+
+<p>self code:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
@@ -679,37 +1297,102 @@ offset是偏移量。<br/>
 <span class='line-number'>28</span>
 <span class='line-number'>29</span>
 <span class='line-number'>30</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Redhat 9.0———————————————2.4.20-8
-</span><span class='line'>RHEL 3 Update 8————————————2.4.21-47
-</span><span class='line'>RHEL 4 ————————————————2.6.9-5
-</span><span class='line'>RHEL 4 Update 1————————————2.6.9-11
-</span><span class='line'>RHEL 4 Update 2————————————2.6.9-22
-</span><span class='line'>RHEL 4 Update 3————————————2.6.9-34
-</span><span class='line'>RHEL 4 Update 4————————————2.6.9-42
-</span><span class='line'>RHEL 4 Update 5————————————2.6.9-55
-</span><span class='line'>RHEL 4 Update 6————————————2.6.9-67
-</span><span class='line'>RHEL 4 Update 7————————————2.6.9-78
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>union W
+</span><span class='line'>{
+</span><span class='line'>&#9;struct Y
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;unsigned int s1:4;
+</span><span class='line'>&#9;&#9;unsigned int s2:8;
+</span><span class='line'>&#9;&#9;unsigned int s3:20;
+</span><span class='line'>&#9;} y;
+</span><span class='line'>&#9;unsigned int c;
+</span><span class='line'>} w;
 </span><span class='line'>
-</span><span class='line'>CENTOS 5/RHEL 5 ———————————2.6.18-8
-</span><span class='line'>CENTOS 5.1/RHEL 5 Update 1——————2.6.18-53
-</span><span class='line'>CENTOS 5.2/RHEL 5 Update 2——————2.6.18-92
-</span><span class='line'>CENTOS 5.3/RHEL 5 Update 3——————2.6.18-128
-</span><span class='line'>CENTOS 5.4/RHEL 5 Update 4——————2.6.18-164
-</span><span class='line'>CENTOS 5.5/RHEL 5 Update 5——————2.6.18-194
-</span><span class='line'>CENTOS 5.6/RHEL 5 Update 6——————2.6.18-238
-</span><span class='line'>CENTOS 5.7/RHEL 5 Update 7——————2.6.18-274
-</span><span class='line'>CENTOS 5.8/RHEL 5 Update 8——————2.6.18-308
+</span><span class='line'>union V 
+</span><span class='line'>{
+</span><span class='line'>&#9;struct X
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;unsigned char s1:3;
+</span><span class='line'>&#9;&#9;unsigned char s2:3;
+</span><span class='line'>&#9;&#9;unsigned char s3:2;
+</span><span class='line'>&#9;} x;
+</span><span class='line'>&#9;unsigned char c;
+</span><span class='line'>} v;
 </span><span class='line'>
-</span><span class='line'>CENTOS 6.0/RHEL 6 Update 0——————2.6.32-71
-</span><span class='line'>CENTOS 6.1/RHEL 6 Update 1——————2.6.32-131
-</span><span class='line'>CENTOS 6.2/RHEL 6 Update 2——————2.6.32-220
-</span><span class='line'>CENTOS 6.3/RHEL 6 Update 3——————2.6.32-279
-</span><span class='line'>CENTOS 6.4/RHEL 6 Update 4——————2.6.32-358
-</span><span class='line'>CENTOS 6.5/RHEL 6 Update 5——————2.6.32-431
-</span><span class='line'>CENTOS 6.6/RHEL 6 Update 6——————2.6.32-504
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;w.c = 0x12345678;
+</span><span class='line'>&#9;printf("%x %x %x %x\n", w.c, w.y.s1, w.y.s2, w.y.s3); 
 </span><span class='line'>
-</span><span class='line'>CENTOS 7.0/RHEL 7 Update 0——————3.10.0-123</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;v.c = 100;
+</span><span class='line'>&#9;printf("%d %x %x %x\n", v.c, v.x.s1, v.x.s2, v.x.s3); 
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
+
+<p>输出：<br/>
+12345678 8 67 12345<br/>
+100 4 4 1</p>
+
+<p>100 = （01100100）2<br/>
+因为字节序是小端的所以第一行输出说明：位域变量从左到右分配位，所以第二行的输出的位域变量也应该从左到右分配位。所以<br/>
+100 = 001 001 10  （小端比特序二进制）<br/>
+对应:  s1  s2  s3  （位域变量从左到右分配位）</p>
+
+<p>符合。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/06/18/assembly-jmp-addr/">jmp指令对应的机器码</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-06-18T15:53:00+08:00'><span class='date'>2013-06-18</span> <span class='time'>15:53:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>  短跳转和近跳转指令中包含的操作数都是相对于(E)IP的偏移，而远跳转指令中包含的是目标的绝对地址，所以短/近跳转会出现跳至同一目标的指令机器码不同，不仅会不同，而且应该不同。而远跳转中包含的是绝对地址，因此转移到同一地址的指令机器码相同</p>
+
+<p>  绝对跳转/调用指令中的内存操作数必须以’*’为前缀，否则gas总是认为是相对跳转/调用指令,而且gas汇编程序自动对跳转指令进行优化，总是使用尽可能小的跳转偏移量。如果8比特的偏移量无法满足要求的话，as会使用一个32位的偏移量，as汇编程序暂时还不支持16位的跳转偏移量，所以对跳转指令使用’addr16’前缀是无效的。还有一些跳转指令只支持8位的跳转偏移量，这些指令是：’jcxz’,’jecxz’,’loop’,’loopz’,’loope’,’loopnz’’loopne’如果你在汇编中使用了这些指令，用gas的汇编可能会出错，因为gcc在编译过程中不产生这些指令，所以在c语言中不必担心这些问题。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ffffffff88873036      e8 ff ff 5f c6   =&gt;  call XX        // e8 = call
+</span><span class='line'>ffffffff8887303a      ......</span></code></pre></td></tr></table></div></figure>
+
+
+<p>相当于：目标地址 - ffffffff8887303a(RIP, 指向下一条指令) = ffffffffffff5fc6 (这个是负数，以补码形式展示）<br/>
+所以：   目标地址 = ffffffff88869000</p>
+
+<ul>
+<li>即：  ffffffff88869000 - ffffffff8887303a + ffffffffffffffff + 1 = ffffffffffff5fc6</li>
+<li>可以用 unsigned long 类型来计算，让它自然溢出就好了，(unsigned long)func1 - ((unsigned long)func2 + 0x偏移)</li>
+</ul>
+
+
+<p>先计算好偏移，再替换call地址，就偷偷的改了调用。</p>
+
+<p>附：若为e8 00 00 00 00 则可以同过模块读取 00 00 00 00 的实际值</p>
 </div>
   
   
@@ -770,8 +1453,8 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(54)</span></li>
-<div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>13</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(55)</span></li>
+<div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
 </script>
@@ -882,12 +1565,12 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(70)</span></li>
-<div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>18</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(75)</span></li>
+<div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~dwarf/?opendiv=debug'>dwarf</a><a href='##' onmousedown=showDiv('debug~dwarf') id='aexp_debug~dwarf'><span class='exp_style' id='exp_debug~dwarf'>[+]</span></a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/debug~dwarf/?opendiv=debug'>dwarf</a><a href='##' onmousedown=showDiv('debug~dwarf') id='aexp_debug~dwarf'><span class='exp_style' id='exp_debug~dwarf'>[+]</span></a><span class='right_span'>5</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
@@ -906,6 +1589,10 @@ if (!document.getElementById('debug~kgdb')) document.getElementById('aexp_debug~
 <li><a href='/blog/cats/debug~kprobe/?opendiv=debug'>kprobe</a><a href='##' onmousedown=showDiv('debug~kprobe') id='aexp_debug~kprobe'><span class='exp_style' id='exp_debug~kprobe'>[+]</span></a><span class='right_span'>4</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~kprobe')) document.getElementById('aexp_debug~kprobe').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/debug~ksplice/?opendiv=debug'>ksplice</a><a href='##' onmousedown=showDiv('debug~ksplice') id='aexp_debug~ksplice'><span class='exp_style' id='exp_debug~ksplice'>[+]</span></a><span class='right_span'>3</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('debug~ksplice')) document.getElementById('aexp_debug~ksplice').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/debug~mark/?opendiv=debug'>mark</a><a href='##' onmousedown=showDiv('debug~mark') id='aexp_debug~mark'><span class='exp_style' id='exp_debug~mark'>[+]</span></a><span class='right_span'>17</span></li>
 <script language='javascript' type='text/javascript'>
@@ -975,8 +1662,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(12)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(18)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
@@ -1069,23 +1756,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2016/03/21/graphviz-codeviz/">用Graphviz + CodeViz生成C/C++函数调用图(call graph)</a>
+        <a href="/blog/2016/03/29/debug-ksplice-detail/">理解Ksplice执行过程</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2016/03/21/command-sed/">sed命令</a>
+        <a href="/blog/2016/03/29/debug-ksplice-base/">内核热补丁技术揭秘</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2016/03/21/command-awk/">awk命令</a>
+        <a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2016/03/09/kernel-net-bonding-source/">bonding的源代码分析</a>
+        <a href="/blog/2016/03/28/debug-ftrace/">ftrace 简介</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2016/03/09/kernel-net-bonding/">七种网卡绑定模式详解</a>
+        <a href="/blog/2016/03/28/debug-debugedit_el7/">debugedit，find-debuginfo 改进及el7</a>
       </li>
     
   </ul>
