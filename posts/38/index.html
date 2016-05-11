@@ -62,6 +62,156 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-rcv_wnd/">TCP接收窗口的调整算法</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-19T17:42:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>17:42:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/8588202">TCP接收窗口的调整算法（上）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8602493">TCP接收窗口的调整算法（中）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8603099">TCP接收窗口的调整算法（下）</a></p>
+
+<hr />
+
+<h3>TCP接收窗口的调整算法（上）</h3>
+
+<p>我们知道TCP首部中有一个16位的接收窗口字段，它可以告诉对端：我现在能接收多少数据。TCP的流控制主要就是通过调整接收窗口的大小来进行的。</p>
+
+<p>本文内容：分析TCP接收窗口的调整算法，包括一些相关知识和初始接收窗口的取值。</p>
+
+<p>内核版本：3.2.12</p>
+
+<h4>数据结构</h4>
+
+<p>以下是涉及到的数据结构。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;/* 最早接收但未确认的段的序号，即当前接收窗口的左端*/  
+</span><span class='line'>&#9;u32 rcv_wup; /* rcv_nxt on last window update sent */  
+</span><span class='line'>&#9;u16 advmss; /* Advertised MSS. 本端能接收的MSS上限，建立连接时用来通告对端*/  
+</span><span class='line'>&#9;u32 rcv_ssthresh; /* Current window clamp. 当前接收窗口大小的阈值*/  
+</span><span class='line'>&#9;u32 rcv_wnd; /* Current receiver window，当前的接收窗口大小*/  
+</span><span class='line'>&#9;u32 window_clamp; /* 接收窗口的最大值，这个值也会动态调整*/  
+</span><span class='line'>&#9;...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;&#9;snd_wscale : 4, /* Window scaling received from sender, 对端接收窗口扩大因子 */  
+</span><span class='line'>&#9;&#9;rcv_wscale : 4; /* Window scaling to send to receiver, 本端接收窗口扩大因子 */  
+</span><span class='line'>&#9;u16 user_mss; /* mss requested by user in ioctl */  
+</span><span class='line'>&#9;u16 mss_clamp; /* Maximal mss, negotiated at connection setup，对端的最大mss */  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * struct sock - network layer representation of sockets 
+</span><span class='line'> * @sk_rcvbuf: size of receive buffer in bytes 
+</span><span class='line'> * @sk_receive_queue: incoming packets 
+</span><span class='line'> * @sk_write_queue: packet sending queue 
+</span><span class='line'> * @sk_sndbuf: size of send buffer in bytes 
+</span><span class='line'> */  
+</span><span class='line'>struct sock {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;struct sk_buff_head sk_receive_queue;  
+</span><span class='line'>&#9;/* 表示接收队列sk_receive_queue中所有段的数据总长度*/  
+</span><span class='line'>#define sk_rmem_alloc sk_backlog.rmem_alloc  
+</span><span class='line'>  
+</span><span class='line'>&#9;int sk_rcvbuf; /* 接收缓冲区长度的上限*/  
+</span><span class='line'>&#9;int sk_sndbuf; /* 发送缓冲区长度的上限*/  
+</span><span class='line'>  
+</span><span class='line'>&#9;struct sk_buff_head sk_write_queue;  
+</span><span class='line'>&#9;...  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>struct sk_buff_head {  
+</span><span class='line'>&#9;/* These two members must be first. */  
+</span><span class='line'>&#9;struct sk_buff *next;  
+</span><span class='line'>&#9;struct sk_buff *prev;  
+</span><span class='line'>&#9;__u32 qlen;  
+</span><span class='line'>&#9;spinlock_t lock;  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+</div>
+  
+  
+    <footer>
+      <a rel="full-article" target="_blank" href="/blog/2015/03/19/kernel-net-rcv_wnd/">Read on &rarr;</a>
+    </footer>
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-sack-dsack/">TCP的核心系列 — SACK和DSACK的实现</a></h2>
     
     
@@ -92,7 +242,7 @@ if (query != null) {
 
 <p>TCP的实现中，SACK和DSACK是比较重要的一部分。</p>
 
-<p>SACK和DSACK的处理部分由Ilpo Järvinen (<a href="&#x6d;&#97;&#x69;&#108;&#x74;&#x6f;&#58;&#105;&#108;&#x70;&#x6f;&#x2e;&#106;&#x61;&#114;&#118;&#x69;&#110;&#101;&#110;&#64;&#x68;&#101;&#x6c;&#115;&#x69;&#110;&#x6b;&#105;&#46;&#x66;&#x69;">&#105;&#x6c;&#x70;&#x6f;&#46;&#x6a;&#x61;&#114;&#118;&#x69;&#x6e;&#x65;&#110;&#64;&#x68;&#x65;&#108;&#x73;&#x69;&#110;&#107;&#105;&#x2e;&#102;&#x69;</a>) 维护。</p>
+<p>SACK和DSACK的处理部分由Ilpo Järvinen (<a href="&#109;&#97;&#105;&#x6c;&#x74;&#x6f;&#58;&#x69;&#x6c;&#112;&#x6f;&#x2e;&#106;&#97;&#x72;&#x76;&#x69;&#x6e;&#x65;&#x6e;&#x40;&#104;&#101;&#108;&#x73;&#x69;&#110;&#107;&#105;&#46;&#x66;&#105;">&#105;&#108;&#112;&#x6f;&#x2e;&#106;&#x61;&#114;&#118;&#105;&#110;&#x65;&#110;&#x40;&#104;&#x65;&#x6c;&#x73;&#x69;&#110;&#107;&#x69;&#x2e;&#x66;&#x69;</a>) 维护。</p>
 
 <p>tcp_ack()处理接收到的带有ACK标志的数据段时，如果此ACK处于慢速路径，且此ACK的记分牌不为空，则调用<br/>
 tcp_sacktag_write_queue()来根据SACK选项标记发送队列中skb的记分牌状态。</p>
@@ -1986,503 +2136,6 @@ int sched_setparam (pid_t pid, const struct sched_param *sp);</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/03/04/kernel-net-tcp_retransmit_skb/">tcp重传数据包 tcp_retransmit_skb 函数</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-03-04T17:39:00+08:00'><span class='date'>2015-03-04</span> <span class='time'>17:39:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/shanshanpt/article/details/22202999">http://blog.csdn.net/shanshanpt/article/details/22202999</a></p>
-
-<p>基于CentOS6.5  2.6.32-504.16.2.el6.x86_64</p>
-
-<h4>tcp_retransmit_skb 重传数据</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* This retransmits one SKB.  Policy decisions and retransmit queue
-</span><span class='line'> * state updates are done by the caller.  Returns non-zero if an
-</span><span class='line'> * error occurred which prevented the send.
-</span><span class='line'> */ // 如果消耗很多的内存做其他事，那么就没有多余的来做队列的处理了
-</span><span class='line'>int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>&#9;unsigned int cur_mss;
-</span><span class='line'>&#9;int err;
-</span><span class='line'>
-</span><span class='line'>&#9;/* Inconslusive MTU probe */
-</span><span class='line'>&#9;if (icsk-&gt;icsk_mtup.probe_size) {
-</span><span class='line'>&#9;&#9;icsk-&gt;icsk_mtup.probe_size = 0;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/* Do not sent more than we queued. 1/4 is reserved for possible
-</span><span class='line'>&#9; * copying overhead: fragmentation, tunneling, mangling etc.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt;                                    // sk_wmem_alloc：传输队列大小
-</span><span class='line'>&#9;&#9;min(sk-&gt;sk_wmem_queued + (sk-&gt;sk_wmem_queued &gt;&gt; 2), sk-&gt;sk_sndbuf))  // sk_wmem_queud：固定的队列大小
-</span><span class='line'>&#9;&#9;return -EAGAIN;
-</span><span class='line'>
-</span><span class='line'>&#9;if (before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una)) {         // 若这样，说明是有一部分数据才需要重传，形如：seq---snd_una---end_seq，前面一半已收到ACK
-</span><span class='line'>&#9;&#9;if (before(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una))   // 若这样，说明全部ACK，无需重传，BUG
-</span><span class='line'>&#9;&#9;&#9;BUG();
-</span><span class='line'>&#9;&#9;if (tcp_trim_head(sk, skb, tp-&gt;snd_una - TCP_SKB_CB(skb)-&gt;seq))      // 将无须重传的部分去掉
-</span><span class='line'>&#9;&#9;&#9;return -ENOMEM;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (inet_csk(sk)-&gt;icsk_af_ops-&gt;rebuild_header(sk))
-</span><span class='line'>&#9;&#9;return -EHOSTUNREACH; /* Routing failure or similar. */
-</span><span class='line'>
-</span><span class='line'>&#9;cur_mss = tcp_current_mss(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;/* If receiver has shrunk his window, and skb is out of
-</span><span class='line'>&#9; * new window, do not retransmit it. The exception is the
-</span><span class='line'>&#9; * case, when window is shrunk to zero. In this case
-</span><span class='line'>&#9; * our retransmit serves as a zero window probe.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (!before(TCP_SKB_CB(skb)-&gt;seq, tcp_wnd_end(tp))       // 如果数据在窗口后面，不会发送
-</span><span class='line'>&#9;&#9;&& TCP_SKB_CB(skb)-&gt;seq != tp-&gt;snd_una)
-</span><span class='line'>&#9;&#9;return -EAGAIN;
-</span><span class='line'>&#9;if (skb-&gt;len &gt; cur_mss) {                                // 如果skb长度 &gt; MSS
-</span><span class='line'>&#9;&#9;if (tcp_fragment(sk, skb, cur_mss, cur_mss))         // 先分片，并调整packet_out等统计值。再传送
-</span><span class='line'>&#9;&#9;&#9;return -ENOMEM; /* We'll try again later. */
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;int oldpcount = tcp_skb_pcount(skb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (unlikely(oldpcount &gt; 1)) {
-</span><span class='line'>&#9;&#9;&#9;tcp_init_tso_segs(sk, skb, cur_mss);             // 按当前mss重置skb-&gt;gso_XXX
-</span><span class='line'>&#9;&#9;&#9;tcp_adjust_pcount(sk, skb, oldpcount - tcp_skb_pcount(skb)); // 调整packet_out等统计值
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_retrans_try_collapse(sk, skb, cur_mss);              // 尝试和后几个包合并后一起重传出去，加快速度
-</span><span class='line'>
-</span><span class='line'>&#9;/* Some Solaris stacks overoptimize and ignore the FIN on a
-</span><span class='line'>&#9; * retransmit when old data is attached.  So strip it off
-</span><span class='line'>&#9; * since it is cheap to do so and saves bytes on the network.
-</span><span class='line'>&#9; */ //Solaris系统的协议栈有时候会忽略重传SKB上带有的FIN标志的payload，将payload全部剥离掉，节省网络流量
-</span><span class='line'>&#9;if (skb-&gt;len &gt; 0 &&
-</span><span class='line'>&#9;&#9;(TCP_SKB_CB(skb)-&gt;tcp_flags & TCPHDR_FIN) &&
-</span><span class='line'>&#9;&#9;tp-&gt;snd_una == (TCP_SKB_CB(skb)-&gt;end_seq - 1)) {
-</span><span class='line'>&#9;&#9;if (!pskb_trim(skb, 0)) {
-</span><span class='line'>&#9;&#9;&#9;/* Reuse, even though it does some unnecessary work */
-</span><span class='line'>&#9;&#9;&#9;tcp_init_nondata_skb(skb, TCP_SKB_CB(skb)-&gt;end_seq - 1,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; TCP_SKB_CB(skb)-&gt;tcp_flags);
-</span><span class='line'>&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_NONE;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/* Make a copy, if the first transmission SKB clone we made
-</span><span class='line'>&#9; * is still in somebody's hands, else make a clone.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;
-</span><span class='line'>
-</span><span class='line'>&#9;/* make sure skb-&gt;data is aligned on arches that require it
-</span><span class='line'>&#9; * and check if ack-trimming & collapsing extended the headroom
-</span><span class='line'>&#9; * beyond what csum_start can cover.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (unlikely((NET_IP_ALIGN && ((unsigned long)skb-&gt;data & 3)) ||
-</span><span class='line'>&#9;&#9;&#9; skb_headroom(skb) &gt;= 0xFFFF)) {
-</span><span class='line'>&#9;&#9;struct sk_buff *nskb = __pskb_copy(skb, MAX_TCP_HEADER,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;   GFP_ATOMIC);
-</span><span class='line'>&#9;&#9;err = nskb ? tcp_transmit_skb(sk, nskb, 0, GFP_ATOMIC) :
-</span><span class='line'>&#9;&#9;&#9;&#9; -ENOBUFS;
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);     // 这个才是正在的传输函数
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (err == 0) {                                         // 发送成功，那么就需要更新TCP统计信息
-</span><span class='line'>&#9;&#9;/* Update global TCP statistics. */
-</span><span class='line'>&#9;&#9;TCP_INC_STATS(sock_net(sk), TCP_MIB_RETRANSSEGS);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;tp-&gt;total_retrans++;                                // 整体重传数量++
-</span><span class='line'>
-</span><span class='line'>#if FASTRETRANS_DEBUG &gt; 0
-</span><span class='line'>&#9;&#9;if (TCP_SKB_CB(skb)-&gt;sacked & TCPCB_SACKED_RETRANS) {
-</span><span class='line'>&#9;&#9;&#9;if (net_ratelimit())
-</span><span class='line'>&#9;&#9;&#9;&#9;printk(KERN_DEBUG "retrans_out leaked.\n");
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>#endif
-</span><span class='line'>&#9;&#9;if (!tp-&gt;retrans_out)
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;lost_retrans_low = tp-&gt;snd_nxt;
-</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_RETRANS;
-</span><span class='line'>&#9;&#9;tp-&gt;retrans_out += tcp_skb_pcount(skb);             // 重传出去的数量+=。。。
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Save stamp of the first retransmit. */
-</span><span class='line'>&#9;&#9;if (!tp-&gt;retrans_stamp)
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;retrans_stamp = TCP_SKB_CB(skb)-&gt;when;      // 第一次重传时间戳
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;tp-&gt;undo_retrans += tcp_skb_pcount(skb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* snd_nxt is stored to detect loss of retransmitted segment,
-</span><span class='line'>&#9;&#9; * see tcp_input.c tcp_sacktag_write_queue().
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;ack_seq = tp-&gt;snd_nxt;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_retrans_try_collapse 重传时尝试和后几个包合并后传出去</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 只做简单合并，所以条件设置严格
-</span><span class='line'>/* Check if coalescing SKBs is legal. */
-</span><span class='line'>static int tcp_can_collapse(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (tcp_skb_pcount(skb) &gt; 1)         // skb只包含一个数据包，没有TSO分包
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;/* TODO: SACK collapsing could be used to remove this condition */
-</span><span class='line'>&#9;if (skb_shinfo(skb)-&gt;nr_frags != 0)  // 数据都在线性空间，非线性空间中没有数据
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;if (skb_cloned(skb))                 // 不是clone
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;if (skb == tcp_send_head(sk))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;/* Some heurestics for collapsing over SACK'd could be invented */
-</span><span class='line'>&#9;if (TCP_SKB_CB(skb)-&gt;sacked & TCPCB_SACKED_ACKED)  // 已经被sack的当然不用重传
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/* Collapse packets in the retransmit queue to make to create
-</span><span class='line'> * less packets on the wire. This is only done on retransmission.
-</span><span class='line'> */
-</span><span class='line'>static void tcp_retrans_try_collapse(struct sock *sk, struct sk_buff *to,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; int space)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct sk_buff *skb = to, *tmp;
-</span><span class='line'>&#9;int first = 1;
-</span><span class='line'>
-</span><span class='line'>&#9;if (!sysctl_tcp_retrans_collapse)
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;if (TCP_SKB_CB(skb)-&gt;tcp_flags & TCPHDR_SYN)  // SYN包不合并
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_for_write_queue_from_safe(skb, tmp, sk) {
-</span><span class='line'>&#9;&#9;if (!tcp_can_collapse(sk, skb))           // 要和并的包判断是否符合条件
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;space -= skb-&gt;len;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (first) {
-</span><span class='line'>&#9;&#9;&#9;first = 0;
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (space &lt; 0)
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;/* Punt if not enough space exists in the first SKB for
-</span><span class='line'>&#9;&#9; * the data in the second
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (skb-&gt;len &gt; skb_tailroom(to))          // 第一个包的tailroom空间足够容下该包
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (after(TCP_SKB_CB(skb)-&gt;end_seq, tcp_wnd_end(tp))) // 大于窗口不合并
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;tcp_collapse_retrans(sk, to);             // 进行两个包的合并
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_collapse_retrans 重传合并</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Collapses two adjacent SKB's during retransmission. */
-</span><span class='line'>static void tcp_collapse_retrans(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct sk_buff *next_skb = tcp_write_queue_next(sk, skb);
-</span><span class='line'>&#9;int skb_size, next_skb_size;
-</span><span class='line'>
-</span><span class='line'>&#9;skb_size = skb-&gt;len;
-</span><span class='line'>&#9;next_skb_size = next_skb-&gt;len;
-</span><span class='line'>
-</span><span class='line'>&#9;BUG_ON(tcp_skb_pcount(skb) != 1 || tcp_skb_pcount(next_skb) != 1);
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_highest_sack_combine(sk, next_skb, skb);
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_unlink_write_queue(next_skb, sk);    // 将要合并的包从队列中删掉
-</span><span class='line'>
-</span><span class='line'>&#9;skb_copy_from_linear_data(next_skb, skb_put(skb, next_skb_size),
-</span><span class='line'>&#9;&#9;&#9;&#9;  next_skb_size);            // 将数据copy到前一个包上，调整前一个的len，tail
-</span><span class='line'>
-</span><span class='line'>&#9;if (next_skb-&gt;ip_summed == CHECKSUM_PARTIAL)
-</span><span class='line'>&#9;&#9;skb-&gt;ip_summed = CHECKSUM_PARTIAL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (skb-&gt;ip_summed != CHECKSUM_PARTIAL)
-</span><span class='line'>&#9;&#9;skb-&gt;csum = csum_block_add(skb-&gt;csum, next_skb-&gt;csum, skb_size);
-</span><span class='line'>
-</span><span class='line'>&#9;/* Update sequence range on original skb. */
-</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;end_seq = TCP_SKB_CB(next_skb)-&gt;end_seq;  // end_seq 等于后一个包的end_seq，所以如果skb-&gt;end_seq &gt; next_skb-&gt;seq，就会合并出一个len&gt;end_seq-seq的异常数据(内核保证了sk_write_queue不会出现这情况)
-</span><span class='line'>
-</span><span class='line'>&#9;/* Merge over control information. This moves PSH/FIN etc. over */
-</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;tcp_flags |= TCP_SKB_CB(next_skb)-&gt;tcp_flags;
-</span><span class='line'>
-</span><span class='line'>&#9;/* All done, get rid of second SKB and account for it so
-</span><span class='line'>&#9; * packet counting does not break.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;sacked |= TCP_SKB_CB(next_skb)-&gt;sacked & TCPCB_EVER_RETRANS;
-</span><span class='line'>
-</span><span class='line'>&#9;/* changed transmit queue under us so clear hints */
-</span><span class='line'>&#9;tcp_clear_retrans_hints_partial(tp);
-</span><span class='line'>&#9;if (next_skb == tp-&gt;retransmit_skb_hint)
-</span><span class='line'>&#9;&#9;tp-&gt;retransmit_skb_hint = skb;
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_adjust_pcount(sk, next_skb, tcp_skb_pcount(next_skb)); // 调整pcount
-</span><span class='line'>
-</span><span class='line'>&#9;sk_wmem_free_skb(sk, next_skb);        // 合并到了前一个包上，所以释放这个包
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/39">&larr; Older</a>
@@ -2648,7 +2301,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(75)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(76)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -2657,7 +2310,7 @@ if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -2745,8 +2398,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(18)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
@@ -2825,7 +2479,7 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <section>
 <h1>Tags</h1>
 <ul class="tag-cloud">
-<a style="font-size: 131%" href="/tags/gdb/">gdb(6)</a>
+<a style="font-size: 134%" href="/tags/gdb/">gdb(7)</a>
 <a style="font-size: 100%" href="/tags/hello/">hello(1)</a>
 <a style="font-size: 150%" href="/tags/koj/">koj(18)</a>
 <a style="font-size: 112%" href="/tags/nvidia/">nvidia(2)</a>
@@ -2837,6 +2491,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2016/05/11/debug-gdb-thread/">gdb线程</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-detail/">理解Ksplice执行过程</a>
@@ -2852,10 +2510,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/28/debug-ftrace/">ftrace 简介</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/28/debug-debugedit_el7/">debugedit，find-debuginfo 改进及el7</a>
       </li>
     
   </ul>

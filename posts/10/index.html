@@ -62,6 +62,257 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-cache-base/">Linux Cache 机制探究</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-18T10:57:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>10:57:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.penglixun.com/tech/system/linux_cache_discovery.html">http://www.penglixun.com/tech/system/linux_cache_discovery.html</a></p>
+
+<p>相关源码主要在：<br/>
+./fs/fscache/cache.c    Cache实现的代码<br/>
+./mm/slab.c             SLAB管理器代码<br/>
+./mm/swap.c             缓存替换算法代码<br/>
+./mm/mmap.c             内存管理器代码<br/>
+./mm/mempool.c          内存池实现代码</p>
+
+<h4>0. 预备：Linux内存管理基础</h4>
+
+<p>创建进程fork()、程序载入execve()、映射文件mmap()、动态内存分配malloc()/brk()等进程相关操作都需要分配内存给进程。不过这时进程申请和获得的还不是实际内存，而是虚拟内存，准确的说是“内存区域”。Linux除了内核以外，App都不能直接使用内存，因为Linux采用Memory Map的管理方式，App拿到的全部是内核映射自物理内存的一块虚拟内存。malloc分配很少会失败，因为malloc只是通知内存App需要内存，在没有正式使用之前，这段内存其实只在真正开始使用的时候才分配，所以malloc成功了并不代表使用的时候就真的可以拿到这么多内存。据说Google的tcmalloc改进了这一点。</p>
+
+<p>进程对内存区域的分配最终多会归结到do_mmap()函数上来（brk调用被单独以系统调用实现，不用do_mmap()）。内核使用do_mmap()函数创建一个新的线性地址区间，如果创建的地址区间和一个已经存在的地址区间相邻，并且它们具有相同的访问权限的话，那么两个区间将合并为一个。如果不能合并，那么就确实需要创建一个新的VMA了。但无论哪种情况， do_mmap()函数都会将一个地址区间加入到进程的地址空间中，无论是扩展已存在的内存区域还是创建一个新的区域。同样释放一个内存区域使用函数do_ummap()，它会销毁对应的内存区域。</p>
+
+<p>另一个重要的部分是SLAB分配器。在Linux中以页为最小单位分配内存对于内核管理系统物理内存来说是比较方便的，但内核自身最常使用的内存却往往是很小（远远小于一页）的内存块，因为大都是一些描述符。一个整页中可以聚集多个这种这些小块内存，如果一样按页分配，那么会被频繁的创建/销毁，开始是非常大的。</p>
+
+<p>为了满足内核对这种小内存块的需要，Linux系统采用了SLAB分配器。Slab分配器的实现相当复杂，但原理不难，其核心思想就是Memory Pool。内存片段（小块内存）被看作对象，当被使用完后，并不直接释放而是被缓存到Memory Pool里，留做下次使用，这就避免了频繁创建与销毁对象所带来的额外负载。</p>
+
+<p>Slab技术不但避免了内存内部分片带来的不便，而且可以很好利用硬件缓存提高访问速度。但Slab仍然是建立在页面基础之上，Slab将页面分成众多小内存块以供分配，Slab中的对象分配和销毁使用kmem_cache_alloc与kmem_cache_free。</p>
+
+<p>关于SALB分配器有一份资料：<a href="http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch08s02.html">http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch08s02.html</a></p>
+
+<p>关于内存管理的两份资料：<a href="http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch15.html">http://lsec.cc.ac.cn/~tengfei/doc/ldd3/ch15.html</a></p>
+
+<p><a href="http://memorymyann.javaeye.com/blog/193061">http://memorymyann.javaeye.com/blog/193061</a></p>
+
+<h4>1. Linux Cache的体系</h4>
+
+<p>在 Linux 中，当App需要读取Disk文件中的数据时，Linux先分配一些内存，将数据从Disk读入到这些内存中，然后再将数据传给App。当需要往文件中写数据时，Linux先分配内存接收用户数据，然后再将数据从内存写到Disk上。Linux Cache 管理指的就是对这些由Linux分配，并用来存储文件数据的内存的管理。</p>
+
+<p>下图描述了 Linux 中文件 Cache 管理与内存管理以及文件系统的关系。从图中可以看到，在 Linux 中，具体的文件系统，如 ext2/ext3/ext4 等，负责在文件 Cache和存储设备之间交换数据，位于具体文件系统之上的虚拟文件系统VFS负责在应用程序和文件 Cache 之间通过 read/write 等接口交换数据，而内存管理系统负责文件 Cache 的分配和回收，同时虚拟内存管理系统(VMM)则允许应用程序和文件 Cache 之间通过 memory map的方式交换数据，FS Cache底层通过SLAB管理器来管理内存。</p>
+
+<p><img src="/images/kernel/2015-09-18-1.jpg" alt="" /></p>
+
+<p>下图则非常清晰的描述了Cache所在的位置，磁盘与VFS之间的纽带。</p>
+
+<p><img src="/images/kernel/2015-09-18-2.jpg" alt="" /></p>
+
+<h4>2. Linux Cache的结构</h4>
+
+<p>在 Linux 中，文件 Cache 分为两层，一是 Page Cache，另一个 Buffer Cache，每一个 Page Cache 包含若干 Buffer Cache。内存管理系统和 VFS 只与 Page Cache 交互，内存管理系统负责维护每项 Page Cache 的分配和回收，同时在使用 memory map 方式访问时负责建立映射；VFS 负责 Page Cache 与用户空间的数据交换。而具体文件系统则一般只与 Buffer Cache 交互，它们负责在外围存储设备和 Buffer Cache 之间交换数据。读缓存以Page Cache为单位，每次读取若干个Page Cache，回写磁盘以Buffer Cache为单位，每次回写若干个Buffer Cache。
+Page Cache、Buffer Cache、文件以及磁盘之间的关系如下图所示。</p>
+
+<p><img src="/images/kernel/2015-09-18-3.jpg" alt="" /></p>
+
+<p>Page 结构和 buffer_head 数据结构的关系如下图所示。Page指向一组Buffer的头指针，Buffer的头指针指向磁盘块。在这两个图中，假定了 Page 的大小是 4K，磁盘块的大小是 1K。</p>
+
+<p><img src="/images/kernel/2015-09-18-4.jpg" alt="" /></p>
+
+<p>在 Linux 内核中，文件的每个数据块最多只能对应一个 Page Cache 项，它通过两个数据结构来管理这些 Cache 项，一个是 Radix Tree，另一个是双向链表。Radix Tree 是一种搜索树，Linux 内核利用这个数据结构来通过文件内偏移快速定位 Cache 项，图 4 是 radix tree的一个示意图，该 radix tree 的分叉为4(22)，树高为4，用来快速定位8位文件内偏移。Linux(2.6.7) 内核中的分叉为 64(26)，树高为 6(64位系统)或者 11(32位系统)，用来快速定位 32 位或者 64 位偏移，Radix tree 中的每一个到叶子节点的路径上的Key所拼接起来的字串都是一个地址，指向文件内相应偏移所对应的Cache项。</p>
+
+<p><img src="/images/kernel/2015-09-18-5.gif" alt="" /></p>
+
+<p>查看Page Cache的核心数据结构struct address_space就可以看到上述结构（略去了无关结构）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct address_space  {
+</span><span class='line'>&#9;struct inode             *host;              /* owner: inode, block_device */
+</span><span class='line'>&#9;struct radix_tree_root      page_tree;         /* radix tree of all pages */
+</span><span class='line'>&#9;unsigned long           nrpages;  /* number of total pages */
+</span><span class='line'>&#9;struct address_space       *assoc_mapping;      /* ditto */
+</span><span class='line'>&#9;......
+</span><span class='line'>} __attribute__((aligned(sizeof(long))));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面是一个Radix Tree实例：</p>
+
+<p><img src="/images/kernel/2015-09-18-6.jpg" alt="" /></p>
+
+<p>另一个数据结构是双向链表，Linux内核为每一片物理内存区域(zone) 维护active_list和inactive_list两个双向链表，这两个list主要用来实现物理内存的回收。这两个链表上除了文件Cache之 外，还包括其它匿名(Anonymous)内存，如进程堆栈等。</p>
+
+<p><img src="/images/kernel/2015-09-18-7.png" alt="" /></p>
+
+<p>相关数据结构如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>truct page{
+</span><span class='line'>&#9;struct list_head list;   //通过使用它进入下面的数据结构free_area_struct结构中的双向链队列
+</span><span class='line'>&#9;struct address_space * mapping;   //用于内存交换的数据结构
+</span><span class='line'>&#9;unsigned long index;//当页面进入交换文件后
+</span><span class='line'>&#9;struct page *next_hash; //自身的指针，这样就可以链接成一个链表
+</span><span class='line'>&#9;atomic t count; //用于页面交换的计数,若页面为空闲则为0，分配就赋值1，没建立或恢复一次映射就加1，断开映射就减一
+</span><span class='line'>&#9;unsigned long flags;//反应页面各种状态，例如活跃，不活跃脏，不活跃干净，空闲
+</span><span class='line'>&#9;struct list_head lru;
+</span><span class='line'>&#9;unsigned long age; //表示页面寿命
+</span><span class='line'>&#9;wait_queue_head_t wait;
+</span><span class='line'>&#9;struct page ** pprev_hash;
+</span><span class='line'>&#9;struct buffer_head * buffers;
+</span><span class='line'>&#9;void * virtual
+</span><span class='line'>&#9;struct zone_struct * zone; //指向所属的管理区
+</span><span class='line'>}
+</span><span class='line'>typedef struct free_area_struct {
+</span><span class='line'>&#9;struct list_head free_list;   //linux 中通用的双向链队列
+</span><span class='line'>&#9;unsigned int * map;
+</span><span class='line'>} free_area_t;
+</span><span class='line'>typedef struct zone_struct{
+</span><span class='line'>&#9;spinlock_t        lock;
+</span><span class='line'>&#9;unsigned long offset;  //表示该管理区在mem-map数组中，起始的页号
+</span><span class='line'>&#9;unsigned long free pages;
+</span><span class='line'>&#9;unsigned long inactive_clean_pages;
+</span><span class='line'>&#9;unsigned long inactive_dirty_pages;
+</span><span class='line'>&#9;unsigned pages_min, pages_low, pages_high;
+</span><span class='line'>&#9;struct list_head inactive_clean_list;   //用于页面交换的队列，基于linux页面交换的机制。这里存贮的是不活动“干净”页面
+</span><span class='line'>&#9;free_area_t free_area[MAX_ORDER]; //一组“空闲区间”队列，free_area_t定义在上面，其中空闲下标表示的是页面大小，例如：数组第一个元素0号，表示所有区间大小为2的 0次方的页面链接成的双向队列，1号表示所有2的1次方页面链接链接成的双向队列，2号表示所有2的2次方页面链接成的队列，其中要求是这些页面地址连续
+</span><span class='line'>&#9;char * name;
+</span><span class='line'>&#9;unsigned long size;
+</span><span class='line'>&#9;struct pglist_data * zone_pgdat;   //用于指向它所属的存贮节点，及下面的数据结构
+</span><span class='line'>&#9;unsigned  long  zone_start_paddr;
+</span><span class='line'>&#9;unsigned  long    zone_start_mapnr;
+</span><span class='line'>&#9;struct page * zone_mem_map;
+</span><span class='line'>} zone_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. Cache预读与换出</h4>
+
+<p>Linux 内核中文件预读算法的具体过程是这样的：
+对于每个文件的第一个读请求，系统读入所请求的页面并读入紧随其后的少数几个页面(不少于一个页面，通常是三个页 面)，这时的预读称为同步预读。对于第二次读请求，如果所读页面不在Cache中，即不在前次预读的group中，则表明文件访问不是顺序访问，系统继续 采用同步预读；如果所读页面在Cache中，则表明前次预读命中，操作系统把预读group扩大一倍，并让底层文件系统读入group中剩下尚不在 Cache中的文件数据块，这时的预读称为异步预读。无论第二次读请求是否命中，系统都要更新当前预读group的大小。</p>
+
+<p>此外，系统中定义了一个 window，它包括前一次预读的group和本次预读的group。任何接下来的读请求都会处于两种情况之一：</p>
+
+<p>第一种情况是所请求的页面处于预读 window中，这时继续进行异步预读并更新相应的window和group；</p>
+
+<p>第二种情况是所请求的页面处于预读window之外，这时系统就要进行同步 预读并重置相应的window和group。</p>
+
+<p>下图是Linux内核预读机制的一个示意图，其中a是某次读操作之前的情况，b是读操作所请求页面不在 window中的情况，而c是读操作所请求页面在window中的情况。</p>
+
+<p><img src="/images/kernel/2015-09-18-8.gif" alt="" /></p>
+
+<p>Linux内核中文件Cache替换的具体过程是这样的：刚刚分配的Cache项链入到inactive_list头部，并将其状态设置为active，当内存不够需要回收Cache时，系统首先从尾部开始反向扫描 active_list并将状态不是referenced的项链入到inactive_list的头部，然后系统反向扫描inactive_list，如果所扫描的项的处于合适的状态就回收该项，直到回收了足够数目的Cache项。其中Active_list的含义是热访问数据，及多次被访问的，inactive_list是冷访问数据，表示尚未被访问的。如果数据被访问了，Page会被打上一个Refrence标记，如果Page没有被访问过，则打上Unrefrence标记。这些处理在swap.c中可以找到。
+下图也描述了这个过程。</p>
+
+<p><img src="/images/kernel/2015-09-18-7.png" alt="" /></p>
+
+<p>下面的代码描述了一个Page被访问它的标记为变化：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * Mark a page as having seen activity.
+</span><span class='line'> *
+</span><span class='line'> * inactive,unreferenced        -&gt;      inactive,referenced
+</span><span class='line'> * inactive,referenced          -&gt;      active,unreferenced
+</span><span class='line'> * active,unreferenced          -&gt;      active,referenced
+</span><span class='line'> */
+</span><span class='line'>void mark_page_accessed(struct page *page)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (!PageActive(page) &amp;&amp; !PageUnevictable(page) &amp;&amp;
+</span><span class='line'>&#9;&#9;&#9;PageReferenced(page) &amp;&amp; PageLRU(page)) {
+</span><span class='line'>&#9;&#9;activate_page(page);
+</span><span class='line'>&#9;&#9;ClearPageReferenced(page);
+</span><span class='line'>&#9;} else if (!PageReferenced(page)) {
+</span><span class='line'>&#9;&#9;SetPageReferenced(page);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>参考文章：</h4>
+
+<p><a href="http://lsec.cc.ac.cn/~tengfei/doc/ldd3/">http://lsec.cc.ac.cn/~tengfei/doc/ldd3/</a></p>
+
+<p><a href="http://memorymyann.javaeye.com/blog/193061">http://memorymyann.javaeye.com/blog/193061</a></p>
+
+<p><a href="http://www.cublog.cn/u/20047/showart.php?id=121850">http://www.cublog.cn/u/20047/showart.php?id=121850</a></p>
+
+<p><a href="http://blog.chinaunix.net/u2/74194/showart_1089736.html">http://blog.chinaunix.net/u2/74194/showart_1089736.html</a></p>
+
+<p>关于内存管理，Linux有一个网页：<a href="http://linux-mm.org/">http://linux-mm.org/</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/09/11/kernel-mm-mmap/">linux mmap 详解</a></h2>
     
     
@@ -3130,581 +3381,6 @@ policy:和NUMA相关</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/09/kernel-mm-base/">Linux内存管理--基本概念</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-09T17:32:00+08:00'><span class='date'>2015-09-09</span> <span class='time'>17:32:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/myarrow/article/details/8624687">http://blog.csdn.net/myarrow/article/details/8624687</a></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>PTE_PFN_MASK=0x3ffffffff000 PAGE_OFFSET=ffff880000000000
-</span><span class='line'>PGDIR_SHIFT=39 PTRS_PER_PGD=512
-</span><span class='line'>PUD_SHIFT=30 PTRS_PER_PUD=512
-</span><span class='line'>PMD_SHIFT=21 PTRS_PER_PMD=512
-</span><span class='line'>PAGE_SHIFT=12 PTRS_PER_PTE=512</span></code></pre></td></tr></table></div></figure>
-
-
-<p><img src="/images/kernel/2015-09-09-1.png" alt="" /></p>
-
-<p>对于内存管理，Linux采用了与具体体系架构不相关的设计模型，实现了良好的可伸缩性。它主要由内存节点node、内存区域zone和物理页框page三级架构组成。</p>
-
-<h4>• 内存节点node</h4>
-
-<p>内存节点node是计算机系统中对物理内存的一种描述方法，一个总线主设备访问位于同一个节点中的任意内存单元所花的代价相同，而访问任意两个不同节点中的内存单元所花的代价不同。在一致存储结构(Uniform Memory Architecture，简称UMA)计算机系统中只有一个节点，而在非一致性存储结构(NUMA)计算机系统中有多个节点。Linux内核中使用数据结构pg_data_t来表示内存节点node。如常用的ARM架构为UMA架构。</p>
-
-<h4>•  内存区域zone</h4>
-
-<p>内存区域位于同一个内存节点之内，由于各种原因它们的用途和使用方法并不一样。如基于IA32体系结构的个人计算机系统中，由于历史原因使得ISA设备只能使用最低16MB来进行DMA传输。又如，由于Linux内核采用</p>
-
-<h4>•  物理页框page</h4>
-
-<ol>
-<li>Linux虚拟内存三级页表</li>
-</ol>
-
-
-<p>Linux虚拟内存三级管理由以下三级组成：<br/>
-  • PGD: Page Global Directory (页目录)<br/>
-  • PMD: Page Middle Directory (页目录)<br/>
-  • PTE:  Page Table Entry  (页表项)</p>
-
-<p>每一级有以下三个关键描述宏：<br/>
-  • SHIFT<br/>
-  • SIZE<br/>
-  • MASK</p>
-
-<p>如页的对应描述为：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* PAGE_SHIFT determines the page size  asm/page.h */  
-</span><span class='line'>#define PAGE_SHIFT      12  
-</span><span class='line'>#define PAGE_SIZE       (_AC(1,UL) &lt;&lt; PAGE_SHIFT)  
-</span><span class='line'>#define PAGE_MASK       (~(PAGE_SIZE-1))  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>数据结构定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* asm/page.h */  
-</span><span class='line'>typedef unsigned long pteval_t;  
-</span><span class='line'>  
-</span><span class='line'>typedef pteval_t pte_t;  
-</span><span class='line'>typedef unsigned long pmd_t;  
-</span><span class='line'>typedef unsigned long pgd_t[2];  
-</span><span class='line'>typedef unsigned long pgprot_t;  
-</span><span class='line'>  
-</span><span class='line'>#define pte_val(x)      (x)  
-</span><span class='line'>#define pmd_val(x)      (x)  
-</span><span class='line'>#define pgd_val(x)  ((x)[0])  
-</span><span class='line'>#define pgprot_val(x)   (x)  
-</span><span class='line'>  
-</span><span class='line'>#define __pte(x)        (x)  
-</span><span class='line'>#define __pmd(x)        (x)  
-</span><span class='line'>#define __pgprot(x)     (x)  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2.1 Page Directory (PGD and PMD)</h4>
-
-<p>每个进程有它自己的PGD( Page Global Directory)，它是一个物理页，并包含一个pgd_t数组。其定义见&lt;asm/page.h>。 进程的pgd_t数据见 task_struct -> mm_struct -> pgd_t * pgd;</p>
-
-<p>ARM架构的PGD和PMD的定义如下&lt;arch/arm/include/asm/pgtable.h>：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define PTRS_PER_PTE  512    // PTE中可包含的指针&lt;u32&gt;数 (21-12=9bit)  
-</span><span class='line'>#define PTRS_PER_PMD  1  
-</span><span class='line'>#define PTRS_PER_PGD  2048   // PGD中可包含的指针&lt;u32&gt;数 (32-21=11bit)&lt;/p&gt;&lt;p&gt;#define PTE_HWTABLE_PTRS (PTRS_PER_PTE)  
-</span><span class='line'>#define PTE_HWTABLE_OFF  (PTE_HWTABLE_PTRS * sizeof(pte_t))  
-</span><span class='line'>#define PTE_HWTABLE_SIZE (PTRS_PER_PTE * sizeof(u32))&lt;/p&gt;&lt;p&gt;/*  
-</span><span class='line'> * PMD_SHIFT determines the size of the area a second-level page table can map  
-</span><span class='line'> * PGDIR_SHIFT determines what a third-level page table entry can map  
-</span><span class='line'> */  
-</span><span class='line'>#define PMD_SHIFT  21  
-</span><span class='line'>#define PGDIR_SHIFT  21</span></code></pre></td></tr></table></div></figure>
-
-
-<p>
-虚拟地址SHIFT宏图：</p>
-
-<p><img src="/images/kernel/2015-09-09-2.png" alt="" /></p>
-
-<p>虚拟地址MASK和SIZE宏图：</p>
-
-<p><img src="/images/kernel/2015-09-09-3.png" alt="" /></p>
-
-<h4>2.2 Page Table Entry</h4>
-
-<p>PTEs, PMDs和PGDs分别由pte_t, pmd_t 和pgd_t来描述。为了存储保护位，pgprot_t被定义，它拥有相关的flags并经常被存储在page table entry低位(lower bits)，其具体的存储方式依赖于CPU架构。</p>
-
-<p>每个pte_t指向一个物理页的地址，并且所有的地址都是页对齐的。因此在32位地址中有PAGE_SHIFT(12)位是空闲的，它可以为PTE的状态位。</p>
-
-<p>PTE的保护和状态位如下图所示：</p>
-
-<p><img src="/images/kernel/2015-09-09-4.png" alt="" /></p>
-
-<h4>2.3 如何通过3级页表访问物理内存</h4>
-
-<p>为了通过PGD、PMD和PTE访问物理内存，其相关宏在asm/pgtable.h中定义。</p>
-
-<p>• pgd_offset</p>
-
-<p>根据当前虚拟地址和当前进程的mm_struct获取pgd项的宏定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* to find an entry in a page-table-directory */  
-</span><span class='line'>#define pgd_index(addr)     ((addr) &gt;&gt; PGDIR_SHIFT)  //获得在pgd表中的索引  
-</span><span class='line'>  
-</span><span class='line'>#define pgd_offset(mm, addr)    ((mm)-&gt;pgd + pgd_index(addr)) //获得pmd表的起始地址  
-</span><span class='line'>  
-</span><span class='line'>/* to find an entry in a kernel page-table-directory */  
-</span><span class='line'>#define pgd_offset_k(addr)  pgd_offset(&init_mm, addr)  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>• pmd_offset</p>
-
-<p>根据通过pgd_offset获取的pgd 项和虚拟地址，获取相关的pmd项(即pte表的起始地址)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Find an entry in the second-level page table.. */  
-</span><span class='line'>#define pmd_offset(dir, addr)   ((pmd_t *)(dir))   //即为pgd项的值  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>• pte_offset</p>
-
-<p>根据通过pmd_offset获取的pmd项和虚拟地址，获取相关的pte项(即物理页的起始地址)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#ifndef CONFIG_HIGHPTE  
-</span><span class='line'>#define __pte_map(pmd)      pmd_page_vaddr(*(pmd))  
-</span><span class='line'>#define __pte_unmap(pte)    do { } while (0)  
-</span><span class='line'>#else  
-</span><span class='line'>#define __pte_map(pmd)      (pte_t *)kmap_atomic(pmd_page(*(pmd)))  
-</span><span class='line'>#define __pte_unmap(pte)    kunmap_atomic(pte)  
-</span><span class='line'>#endif  
-</span><span class='line'>  
-</span><span class='line'>#define pte_index(addr)     (((addr) &gt;&gt; PAGE_SHIFT) & (PTRS_PER_PTE - 1))  
-</span><span class='line'>  
-</span><span class='line'>#define pte_offset_kernel(pmd,addr) (pmd_page_vaddr(*(pmd)) + pte_index(addr))  
-</span><span class='line'>  
-</span><span class='line'>#define pte_offset_map(pmd,addr)    (__pte_map(pmd) + pte_index(addr))  
-</span><span class='line'>#define pte_unmap(pte)          __pte_unmap(pte)  
-</span><span class='line'>  
-</span><span class='line'>#define pte_pfn(pte)        (pte_val(pte) &gt;&gt; PAGE_SHIFT)  
-</span><span class='line'>#define pfn_pte(pfn,prot)   __pte(__pfn_to_phys(pfn) | pgprot_val(prot))  
-</span><span class='line'>  
-</span><span class='line'>#define pte_page(pte)       pfn_to_page(pte_pfn(pte))  
-</span><span class='line'>#define mk_pte(page,prot)   pfn_pte(page_to_pfn(page), prot)  
-</span><span class='line'>  
-</span><span class='line'>#define set_pte_ext(ptep,pte,ext) cpu_set_pte_ext(ptep,pte,ext)  
-</span><span class='line'>#define pte_clear(mm,addr,ptep) set_pte_ext(ptep, __pte(0), 0)  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>其示意图如下图所示：</p>
-
-<p><img src="/images/kernel/2015-09-09-5.png" alt="" /></p>
-
-<h4>2.4 根据虚拟地址获取物理页的示例代码</h4>
-
-<p>根据虚拟地址获取物理页的示例代码详见&lt;mm/memory.c中的函数follow_page>。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
-</span><span class='line'> * follow_page - look up a page descriptor from a user-virtual address 
-</span><span class='line'> * @vma: vm_area_struct mapping @address 
-</span><span class='line'> * @address: virtual address to look up 
-</span><span class='line'> * @flags: flags modifying lookup behaviour 
-</span><span class='line'> * 
-</span><span class='line'> * @flags can have FOLL_ flags set, defined in &lt;linux/mm.h&gt; 
-</span><span class='line'> * 
-</span><span class='line'> * Returns the mapped (struct page *), %NULL if no mapping exists, or 
-</span><span class='line'> * an error pointer if there is a mapping to something not represented 
-</span><span class='line'> * by a page descriptor (see also vm_normal_page()). 
-</span><span class='line'> */  
-</span><span class='line'>struct page *follow_page(struct vm_area_struct *vma, unsigned long address,  
-</span><span class='line'>&#9;&#9;&#9;unsigned int flags)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;pgd_t *pgd;  
-</span><span class='line'>&#9;pud_t *pud;  
-</span><span class='line'>&#9;pmd_t *pmd;  
-</span><span class='line'>&#9;pte_t *ptep, pte;  
-</span><span class='line'>&#9;spinlock_t *ptl;  
-</span><span class='line'>&#9;struct page *page;  
-</span><span class='line'>&#9;struct mm_struct *mm = vma-&gt;vm_mm;  
-</span><span class='line'>  
-</span><span class='line'>&#9;page = follow_huge_addr(mm, address, flags & FOLL_WRITE);  
-</span><span class='line'>&#9;if (!IS_ERR(page)) {  
-</span><span class='line'>&#9;&#9;BUG_ON(flags & FOLL_GET);  
-</span><span class='line'>&#9;&#9;goto out;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;page = NULL;  
-</span><span class='line'>&#9;pgd = pgd_offset(mm, address);  
-</span><span class='line'>&#9;if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))  
-</span><span class='line'>&#9;&#9;goto no_page_table;  
-</span><span class='line'>  
-</span><span class='line'>&#9;pud = pud_offset(pgd, address);  
-</span><span class='line'>&#9;if (pud_none(*pud))  
-</span><span class='line'>&#9;&#9;goto no_page_table;  
-</span><span class='line'>&#9;if (pud_huge(*pud) && vma-&gt;vm_flags & VM_HUGETLB) {  
-</span><span class='line'>&#9;&#9;BUG_ON(flags & FOLL_GET);  
-</span><span class='line'>&#9;&#9;page = follow_huge_pud(mm, address, pud, flags & FOLL_WRITE);  
-</span><span class='line'>&#9;&#9;goto out;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;if (unlikely(pud_bad(*pud)))  
-</span><span class='line'>&#9;&#9;goto no_page_table;  
-</span><span class='line'>  
-</span><span class='line'>&#9;pmd = pmd_offset(pud, address);  
-</span><span class='line'>&#9;if (pmd_none(*pmd))  
-</span><span class='line'>&#9;&#9;goto no_page_table;  
-</span><span class='line'>&#9;if (pmd_huge(*pmd) && vma-&gt;vm_flags & VM_HUGETLB) {  
-</span><span class='line'>&#9;&#9;BUG_ON(flags & FOLL_GET);  
-</span><span class='line'>&#9;&#9;page = follow_huge_pmd(mm, address, pmd, flags & FOLL_WRITE);  
-</span><span class='line'>&#9;&#9;goto out;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;if (pmd_trans_huge(*pmd)) {  
-</span><span class='line'>&#9;&#9;if (flags & FOLL_SPLIT) {  
-</span><span class='line'>&#9;&#9;&#9;split_huge_page_pmd(mm, pmd);  
-</span><span class='line'>&#9;&#9;&#9;goto split_fallthrough;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;spin_lock(&mm-&gt;page_table_lock);  
-</span><span class='line'>&#9;&#9;if (likely(pmd_trans_huge(*pmd))) {  
-</span><span class='line'>&#9;&#9;&#9;if (unlikely(pmd_trans_splitting(*pmd))) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;spin_unlock(&mm-&gt;page_table_lock);  
-</span><span class='line'>&#9;&#9;&#9;&#9;wait_split_huge_page(vma-&gt;anon_vma, pmd);  
-</span><span class='line'>&#9;&#9;&#9;} else {  
-</span><span class='line'>&#9;&#9;&#9;&#9;page = follow_trans_huge_pmd(mm, address,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;pmd, flags);  
-</span><span class='line'>&#9;&#9;&#9;&#9;spin_unlock(&mm-&gt;page_table_lock);  
-</span><span class='line'>&#9;&#9;&#9;&#9;goto out;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;} else  
-</span><span class='line'>&#9;&#9;&#9;spin_unlock(&mm-&gt;page_table_lock);  
-</span><span class='line'>&#9;&#9;/* fall through */  
-</span><span class='line'>&#9;}  
-</span><span class='line'>split_fallthrough:  
-</span><span class='line'>&#9;if (unlikely(pmd_bad(*pmd)))  
-</span><span class='line'>&#9;&#9;goto no_page_table;  
-</span><span class='line'>  
-</span><span class='line'>&#9;ptep = pte_offset_map_lock(mm, pmd, address, &ptl);  
-</span><span class='line'>  
-</span><span class='line'>&#9;pte = *ptep;  
-</span><span class='line'>&#9;if (!pte_present(pte))  
-</span><span class='line'>&#9;&#9;goto no_page;  
-</span><span class='line'>&#9;if ((flags & FOLL_WRITE) && !pte_write(pte))  
-</span><span class='line'>&#9;&#9;goto unlock;  
-</span><span class='line'>  
-</span><span class='line'>&#9;page = vm_normal_page(vma, address, pte);  
-</span><span class='line'>&#9;if (unlikely(!page)) {  
-</span><span class='line'>&#9;&#9;if ((flags & FOLL_DUMP) ||  
-</span><span class='line'>&#9;&#9;&#9;!is_zero_pfn(pte_pfn(pte)))  
-</span><span class='line'>&#9;&#9;&#9;goto bad_page;  
-</span><span class='line'>&#9;&#9;page = pte_page(pte);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (flags & FOLL_GET)  
-</span><span class='line'>&#9;&#9;get_page(page);  
-</span><span class='line'>&#9;if (flags & FOLL_TOUCH) {  
-</span><span class='line'>&#9;&#9;if ((flags & FOLL_WRITE) &&  
-</span><span class='line'>&#9;&#9;&#9;!pte_dirty(pte) && !PageDirty(page))  
-</span><span class='line'>&#9;&#9;&#9;set_page_dirty(page);  
-</span><span class='line'>&#9;&#9;/* 
-</span><span class='line'>&#9;&#9; * pte_mkyoung() would be more correct here, but atomic care 
-</span><span class='line'>&#9;&#9; * is needed to avoid losing the dirty bit: it is easier to use 
-</span><span class='line'>&#9;&#9; * mark_page_accessed(). 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;mark_page_accessed(page);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;if ((flags & FOLL_MLOCK) && (vma-&gt;vm_flags & VM_LOCKED)) {  
-</span><span class='line'>&#9;&#9;/* 
-</span><span class='line'>&#9;&#9; * The preliminary mapping check is mainly to avoid the 
-</span><span class='line'>&#9;&#9; * pointless overhead of lock_page on the ZERO_PAGE 
-</span><span class='line'>&#9;&#9; * which might bounce very badly if there is contention. 
-</span><span class='line'>&#9;&#9; * 
-</span><span class='line'>&#9;&#9; * If the page is already locked, we don't need to 
-</span><span class='line'>&#9;&#9; * handle it now - vmscan will handle it later if and 
-</span><span class='line'>&#9;&#9; * when it attempts to reclaim the page. 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;if (page-&gt;mapping && trylock_page(page)) {  
-</span><span class='line'>&#9;&#9;&#9;lru_add_drain();  /* push cached pages to LRU */  
-</span><span class='line'>&#9;&#9;&#9;/* 
-</span><span class='line'>&#9;&#9;&#9; * Because we lock page here and migration is 
-</span><span class='line'>&#9;&#9;&#9; * blocked by the pte's page reference, we need 
-</span><span class='line'>&#9;&#9;&#9; * only check for file-cache page truncation. 
-</span><span class='line'>&#9;&#9;&#9; */  
-</span><span class='line'>&#9;&#9;&#9;if (page-&gt;mapping)  
-</span><span class='line'>&#9;&#9;&#9;&#9;mlock_vma_page(page);  
-</span><span class='line'>&#9;&#9;&#9;unlock_page(page);  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>unlock:  
-</span><span class='line'>&#9;pte_unmap_unlock(ptep, ptl);  
-</span><span class='line'>out:  
-</span><span class='line'>&#9;return page;  
-</span><span class='line'>  
-</span><span class='line'>bad_page:  
-</span><span class='line'>&#9;pte_unmap_unlock(ptep, ptl);  
-</span><span class='line'>&#9;return ERR_PTR(-EFAULT);  
-</span><span class='line'>  
-</span><span class='line'>no_page:  
-</span><span class='line'>&#9;pte_unmap_unlock(ptep, ptl);  
-</span><span class='line'>&#9;if (!pte_none(pte))  
-</span><span class='line'>&#9;&#9;return page;  
-</span><span class='line'>  
-</span><span class='line'>no_page_table:  
-</span><span class='line'>&#9;/* 
-</span><span class='line'>&#9; * When core dumping an enormous anonymous area that nobody 
-</span><span class='line'>&#9; * has touched so far, we don't want to allocate unnecessary pages or 
-</span><span class='line'>&#9; * page tables.  Return error instead of NULL to skip handle_mm_fault, 
-</span><span class='line'>&#9; * then get_dump_page() will return NULL to leave a hole in the dump. 
-</span><span class='line'>&#9; * But we can only make this optimization where a hole would surely 
-</span><span class='line'>&#9; * be zero-filled if handle_mm_fault() actually did handle it. 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if ((flags & FOLL_DUMP) &&  
-</span><span class='line'>&#9;&#9;(!vma-&gt;vm_ops || !vma-&gt;vm_ops-&gt;fault))  
-</span><span class='line'>&#9;&#9;return ERR_PTR(-EFAULT);  
-</span><span class='line'>&#9;return page;  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/11">&larr; Older</a>
@@ -3870,7 +3546,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(75)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(76)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -3879,7 +3555,7 @@ if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -3967,8 +3643,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(18)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
@@ -4047,7 +3724,7 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <section>
 <h1>Tags</h1>
 <ul class="tag-cloud">
-<a style="font-size: 131%" href="/tags/gdb/">gdb(6)</a>
+<a style="font-size: 134%" href="/tags/gdb/">gdb(7)</a>
 <a style="font-size: 100%" href="/tags/hello/">hello(1)</a>
 <a style="font-size: 150%" href="/tags/koj/">koj(18)</a>
 <a style="font-size: 112%" href="/tags/nvidia/">nvidia(2)</a>
@@ -4059,6 +3736,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2016/05/11/debug-gdb-thread/">gdb线程</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-detail/">理解Ksplice执行过程</a>
@@ -4074,10 +3755,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/28/debug-ftrace/">ftrace 简介</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/28/debug-debugedit_el7/">debugedit，find-debuginfo 改进及el7</a>
       </li>
     
   </ul>

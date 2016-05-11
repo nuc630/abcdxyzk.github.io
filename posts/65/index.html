@@ -62,6 +62,542 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2014/04/22/kernel-sched-3/">内核抢占与中断返回</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2014-04-22T11:00:00+08:00'><span class='date'>2014-04-22</span> <span class='time'>11:00:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>1、上下文</h4>
+
+<p>一般来说，CPU在任何时刻都处于以下三种情况之一：<br/>
+(1)运行于用户空间，执行用户进程；<br/>
+(2)运行于内核空间，处于进程上下文；<br/>
+(3)运行于内核空间，处于中断上下文。<br/>
+应用程序通过系统调用陷入内核，此时处于进程上下文。现代几乎所有的CPU体系结构都支持中断。当外部设备产生中断，向CPU发送一个异步信号，CPU调用相应的中断处理程序来处理该中断，此时CPU处于中断上下文。</p>
+
+<p>在进程上下文中，可以通过current关联相应的任务。进程以进程上下文的形式运行在内核空间，可以发生睡眠，所以在进程上下文中，可以使作信号量(semaphore)。实际上，内核经常在进程上下文中使用信号量来完成任务之间的同步，当然也可以使用锁。</p>
+
+<p>中断上下文不属于任何进程，它与current没有任何关系(尽管此时current指向被中断的进程)。由于没有进程背景，在中断上下文中不能发生睡眠，否则又如何对它进行调度。所以在中断上下文中只能使用锁进行同步，正是因为这个原因，中断上下文也叫做原子上下文(atomic context)(关于同步以后再详细讨论)。在中断处理程序中，通常会禁止同一中断，甚至会禁止整个本地中断，所以中断处理程序应该尽可能迅速，所以又把中断处理分成上部和下部(关于中断以后再详细讨论)。</p>
+
+<h4>2、上下文切换</h4>
+
+<p>上下文切换，也就是从一个可执行进程切换到另一个可执行进程。上下文切换由函数context_switch()函数完成，该函数位于kernel/sched.c中，它由进程调度函数schedule()调用。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline
+</span><span class='line'>task_t * context_switch(runqueue_t *rq, task_t *prev, task_t *next)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct mm_struct *mm = next-&gt;mm;
+</span><span class='line'>&#9;struct mm_struct *oldmm = prev-&gt;active_mm;
+</span><span class='line'>
+</span><span class='line'>&#9;if (unlikely(!mm)) {
+</span><span class='line'>&#9;&#9;next-&gt;active_mm = oldmm;
+</span><span class='line'>&#9;&#9;atomic_inc(&oldmm-&gt;mm_count);
+</span><span class='line'>&#9;&#9;enter_lazy_tlb(oldmm, next);
+</span><span class='line'>&#9;} else
+</span><span class='line'>&#9;&#9;switch_mm(oldmm, mm, next);
+</span><span class='line'>
+</span><span class='line'>&#9;if (unlikely(!prev-&gt;mm)) {
+</span><span class='line'>&#9;&#9;prev-&gt;active_mm = NULL;
+</span><span class='line'>&#9;&#9;WARN_ON(rq-&gt;prev_mm);
+</span><span class='line'>&#9;&#9;rq-&gt;prev_mm = oldmm;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* Here we just switch the register state and the stack. */
+</span><span class='line'>&#9;switch_to(prev, next, prev);
+</span><span class='line'>
+</span><span class='line'>&#9;return prev;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中，switch_mm()将虚拟内存映射到新的进程；switch_to完成最终的进程切换，它保存原进程的所有寄存器信息，恢复新进程的所有寄存器信息，并执行新的进程。无论何时，内核想要进行任务切换，都通过调用schedule()完成任务切换。</p>
+
+<h5>2.2、用户抢占</h5>
+
+<p>当内核即将返回用户空间时，内核会检查need_resched是否设置，如果设置，则调用schedule()，此时，发生用户抢占。一般来说，用户抢占发生几下情况：<br/>
+(1)从系统调用返回用户空间；<br/>
+(2)从中断(异常)处理程序返回用户空间。</p>
+
+<h5>2.3、内核抢占</h5>
+
+<p>内核从2.6开始就支持内核抢占，对于非内核抢占系统，内核代码可以一直执行，直到完成，也就是说当进程处于内核态时，是不能被抢占的（当然，运行于内核态的进程可以主动放弃CPU，比如，在系统调用服务例程中，由于内核代码由于等待资源而放弃CPU，这种情况叫做计划性进程切换（planned process switch））。但是，对于由异步事件(比如中断)引起的进程切换，抢占式内核与非抢占式是有区别的，对于前者叫做强制性进程切换(forced process switch)。</p>
+
+<p>为了支持内核抢占，内核引入了preempt_count字段，该计数初始值为0，每当使用锁时加1，释放锁时减1。当preempt_count为0时，表示内核可以被安全的抢占，大于0时，则禁止内核抢占。该字段对应三个不同的计数器(见软中断一节)，也就是说在以下三种任何一种情况，该字段的值都会大于0。</p>
+
+<p>(1) 内核执行中断处理程序时，通过irq_enter增加中断计数器的值；<br/>
+    <code>#define irq_enter()        (preempt_count() += HARDIRQ_OFFSET)</code><br/>
+(2) 可延迟函数被禁止(执行软中断和tasklet时经常如此，由local_bh_disable完成；<br/>
+(3) 通过把抢占计数器设置为正而显式禁止内核抢占，由preempt_disable完成。</p>
+
+<p>  当从中断返回内核空间时，内核会检preempt_count和need_resched的值(返回用户空间时只需要检查need_resched)，如查preempt_count为0且need_resched设置，则调用schedule()，完成任务抢占。一般来说，内核抢占发生以下情况：<br/>
+(1) 从中断(异常)返回时，preempt_count为0且need_resched置位(见从中断返回)；<br/>
+(2) 在异常处理程序中(特别是系统调用)调用preempt_enable()来允许内核抢占发生；</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//incude/linux/preempt.h
+</span><span class='line'>#define preempt_enable() \
+</span><span class='line'>do { \
+</span><span class='line'>&#9;//抢占计数器值减1
+</span><span class='line'>&#9;preempt_enable_no_resched(); \
+</span><span class='line'>&#9;//检查是否需要进行内核抢占调度,见(3)
+</span><span class='line'>&#9;preempt_check_resched(); \
+</span><span class='line'>} while (0)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>(3) 启用可延迟函数时，即调用local_bh_enable()时发生；</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//kernel/softirq.c
+</span><span class='line'>void local_bh_enable(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;WARN_ON(irqs_disabled());
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Keep preemption disabled until we are done with
+</span><span class='line'>&#9; * softirq processing:
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;//软中断计数器值减1
+</span><span class='line'>&#9;preempt_count() -= SOFTIRQ_OFFSET - 1;
+</span><span class='line'>
+</span><span class='line'>&#9;if (unlikely(!in_interrupt() && local_softirq_pending()))
+</span><span class='line'>&#9;&#9;do_softirq(); //软中断处理
+</span><span class='line'>&#9;//抢占计数据器值减1
+</span><span class='line'>&#9;dec_preempt_count();
+</span><span class='line'>&#9;
+</span><span class='line'>&#9;//检查是否需要进行内核抢占调度
+</span><span class='line'>&#9;preempt_check_resched();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>//include/linux/preempt.h
+</span><span class='line'>#define preempt_check_resched() \
+</span><span class='line'>do { \
+</span><span class='line'>&#9;//检查need_resched
+</span><span class='line'>&#9;if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) \
+</span><span class='line'>&#9;&#9;//抢占调度
+</span><span class='line'>&#9;&#9;preempt_schedule(); \
+</span><span class='line'>} while (0)
+</span><span class='line'>
+</span><span class='line'>//kernel/sched.c
+</span><span class='line'>asmlinkage void __sched preempt_schedule(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct thread_info *ti = current_thread_info();
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * If there is a non-zero preempt_count or interrupts are disabled,
+</span><span class='line'>&#9; * we do not want to preempt the current task.  Just return..
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; //检查是否允许抢占,本地中断关闭,或者抢占计数器值不为0时不允许抢占
+</span><span class='line'>&#9;if (unlikely(ti-&gt;preempt_count || irqs_disabled()))
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>need_resched:
+</span><span class='line'>&#9;ti-&gt;preempt_count = PREEMPT_ACTIVE;
+</span><span class='line'>&#9;//发生调度
+</span><span class='line'>&#9;schedule();
+</span><span class='line'>&#9;ti-&gt;preempt_count = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;/* we could miss a preemption opportunity between schedule and now */
+</span><span class='line'>&#9;barrier();
+</span><span class='line'>&#9;if (unlikely(test_thread_flag(TIF_NEED_RESCHED)))
+</span><span class='line'>&#9;&#9;goto need_resched;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>(4) 内核任务显示调用schedule()，例如内核任务阻塞时，就会显示调用schedule()，该情况属于内核自动放弃CPU。</p>
+
+<h4>5、从中断返回</h4>
+
+<p>当内核从中断返回时，应当考虑以下几种情况：<br/>
+(1) 内核控制路径并发执行的数量：如果为1，则CPU返回用户态。<br/>
+(2) 挂起进程的切换请求：如果有挂起请求，则进行进程调度；否则，返回被中断的进程。<br/>
+(3) 待处理信号：如果有信号发送给当前进程，则必须进行信号处理。<br/>
+(4) 单步调试模式：如果调试器正在跟踪当前进程，在返回用户态时必须恢复单步模式。<br/>
+(5) Virtual-8086模式：如果中断时CPU处于虚拟8086模式，则进行特殊的处理。</p>
+
+<h5>4.1从中断返回</h5>
+
+<p>中断返回点为ret_from-intr：
+// 从中断返回</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ret_from_intr:
+</span><span class='line'>&#9;GET_THREAD_INFO(%ebp)
+</span><span class='line'>&#9;movl EFLAGS(%esp), %eax        # mix EFLAGS and CS
+</span><span class='line'>&#9;movb CS(%esp), %al
+</span><span class='line'>&#9;testl $(VM_MASK | 3), %eax #是否运行在VM86模式或者用户态
+</span><span class='line'>&#9;/*中断或异常发生时,处于内核空间,则返回内核空间;否则返回用户空间*/
+</span><span class='line'>&#9;jz resume_kernel        # returning to kernel or vm86-space</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从中断返回时，有两种情况，一是返回内核态，二是返回用户态。</p>
+
+<h6>5.1.1、返回内核态</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_PREEMPT 
+</span><span class='line'>/*返回内核空间,先检查preempt_count,再检查need_resched*/
+</span><span class='line'>ENTRY(resume_kernel)
+</span><span class='line'>&#9;/*是否可以抢占,即preempt_count是否为0*/
+</span><span class='line'>&#9;cmpl $0,TI_preempt_count(%ebp)    # non-zero preempt_count ?
+</span><span class='line'>&#9;jnz restore_all #不能抢占,则恢复被中断时处理器状态
+</span><span class='line'>&#9;
+</span><span class='line'>need_resched:
+</span><span class='line'>&#9;movl TI_flags(%ebp), %ecx    # need_resched set ?
+</span><span class='line'>&#9;testb $_TIF_NEED_RESCHED, %cl #是否需要重新调度
+</span><span class='line'>&#9;jz restore_all #不需要重新调度
+</span><span class='line'>&#9;testl $IF_MASK,EFLAGS(%esp)     # 发生异常则不调度
+</span><span class='line'>&#9;jz restore_all
+</span><span class='line'>&#9;#将最大值赋值给preempt_count，表示不允许再次被抢占
+</span><span class='line'>&#9;movl $PREEMPT_ACTIVE,TI_preempt_count(%ebp)
+</span><span class='line'>&#9;sti
+</span><span class='line'>&#9;call schedule #调度函数
+</span><span class='line'>&#9;cli
+</span><span class='line'>&#9;movl $0,TI_preempt_count(%ebp) #preempt_count还原为0
+</span><span class='line'>&#9;#跳转到need_resched，判断是否又需要发生被调度
+</span><span class='line'>&#9;jmp need_resched
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<h6>5.1.2、返回用户态</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*返回用户空间,只需要检查need_resched*/
+</span><span class='line'>ENTRY(resume_userspace)  #返回用户空间,中断或异常发生时,任务处于用户空间
+</span><span class='line'>&#9; cli                # make sure we don't miss an interrupt
+</span><span class='line'>&#9;&#9;            # setting need_resched or sigpending
+</span><span class='line'>&#9;&#9;            # between sampling and the iret
+</span><span class='line'>&#9;movl TI_flags(%ebp), %ecx
+</span><span class='line'>&#9;andl $_TIF_WORK_MASK, %ecx    # is there any work to be done on
+</span><span class='line'>&#9;&#9;            # int/exception return?
+</span><span class='line'>&#9;jne work_pending #还有其它工作要做
+</span><span class='line'>&#9;jmp restore_all #所有工作都做完,则恢复处理器状态
+</span><span class='line'>
+</span><span class='line'>#恢复处理器状态
+</span><span class='line'>restore_all:
+</span><span class='line'>&#9;RESTORE_ALL
+</span><span class='line'>
+</span><span class='line'>&#9;# perform work that needs to be done immediately before resumption
+</span><span class='line'>&#9;ALIGN
+</span><span class='line'>&#9;
+</span><span class='line'>&#9;#完成其它工作
+</span><span class='line'>work_pending:
+</span><span class='line'>&#9;testb $_TIF_NEED_RESCHED, %cl #检查是否需要重新调度
+</span><span class='line'>&#9;jz work_notifysig #不需要重新调度
+</span><span class='line'> #需要重新调度
+</span><span class='line'>work_resched:
+</span><span class='line'>&#9;call schedule #调度进程
+</span><span class='line'>&#9;cli                # make sure we don't miss an interrupt
+</span><span class='line'>&#9;&#9;            # setting need_resched or sigpending
+</span><span class='line'>&#9;&#9;            # between sampling and the iret
+</span><span class='line'>&#9;movl TI_flags(%ebp), %ecx
+</span><span class='line'>&#9;/*检查是否还有其它的事要做*/
+</span><span class='line'>&#9;andl $_TIF_WORK_MASK, %ecx    # is there any work to be done other
+</span><span class='line'>&#9;&#9;            # than syscall tracing?
+</span><span class='line'>&#9;jz restore_all #没有其它的事,则恢复处理器状态
+</span><span class='line'>&#9;testb $_TIF_NEED_RESCHED, %cl
+</span><span class='line'>&#9;jnz work_resched #如果need_resched再次置位,则继续调度
+</span><span class='line'>#VM和信号检测
+</span><span class='line'>work_notifysig:                # deal with pending signals and
+</span><span class='line'>&#9;&#9;            # notify-resume requests
+</span><span class='line'>&#9;testl $VM_MASK, EFLAGS(%esp) #检查是否是VM模式
+</span><span class='line'>&#9;movl %esp, %eax
+</span><span class='line'>&#9;jne work_notifysig_v86        # returning to kernel-space or
+</span><span class='line'>&#9;&#9;            # vm86-space
+</span><span class='line'>&#9;xorl %edx, %edx
+</span><span class='line'>&#9;#进行信号处理
+</span><span class='line'>&#9;call do_notify_resume
+</span><span class='line'>&#9;jmp restore_all
+</span><span class='line'>
+</span><span class='line'>&#9;ALIGN
+</span><span class='line'>work_notifysig_v86:
+</span><span class='line'>&#9;pushl %ecx            # save ti_flags for do_notify_resume
+</span><span class='line'>&#9;call save_v86_state        # %eax contains pt_regs pointer
+</span><span class='line'>&#9;popl %ecx
+</span><span class='line'>&#9;movl %eax, %esp
+</span><span class='line'>&#9;xorl %edx, %edx
+</span><span class='line'>&#9;call do_notify_resume #信号处理
+</span><span class='line'>&#9;jmp restore_all</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>5.2、从异常返回</h5>
+
+<p>异常返回点为ret_from_exception：
+  #从异常返回<br/>
+  ALIGN<br/>
+ret_from_exception:<br/>
+  preempt_stop /<em>相当于cli,从中断返回时,在handle_IRQ_event已经关中断,不需要这步</em>/</p>
+
+<h4>6、从系统调用返回</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;#系统调用入口
+</span><span class='line'>ENTRY(system_call)
+</span><span class='line'>&#9;pushl %eax            # save orig_eax
+</span><span class='line'>&#9;SAVE_ALL
+</span><span class='line'>&#9;GET_THREAD_INFO(%ebp)
+</span><span class='line'>&#9;&#9;            # system call tracing in operation
+</span><span class='line'>&#9;testb $(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT),TI_flags(%ebp)
+</span><span class='line'>&#9;jnz syscall_trace_entry
+</span><span class='line'>&#9;cmpl $(nr_syscalls), %eax
+</span><span class='line'>&#9;jae syscall_badsys
+</span><span class='line'>syscall_call:
+</span><span class='line'>&#9;#调用相应的函数
+</span><span class='line'>&#9;call *sys_call_table(,%eax,4)
+</span><span class='line'>&#9;movl %eax,EAX(%esp)        # store the return value,返回值保存到eax
+</span><span class='line'>#系统调用返回
+</span><span class='line'>syscall_exit:
+</span><span class='line'>&#9;cli                # make sure we don't miss an interrupt
+</span><span class='line'>&#9;&#9;            # setting need_resched or sigpending
+</span><span class='line'>&#9;&#9;            # between sampling and the iret
+</span><span class='line'>&#9;movl TI_flags(%ebp), %ecx
+</span><span class='line'>&#9;testw $_TIF_ALLWORK_MASK, %cx    # current-&gt;work,检查是否还有其它工作要完成
+</span><span class='line'>&#9;jne syscall_exit_work
+</span><span class='line'>#恢复处理器状态
+</span><span class='line'>restore_all:
+</span><span class='line'>&#9;RESTORE_ALL
+</span><span class='line'>
+</span><span class='line'>#做其它工作
+</span><span class='line'>syscall_exit_work:
+</span><span class='line'>&#9; #检查是否系统调用跟踪,审计,单步执行,不需要则跳到work_pending(进行调度,信号处理)
+</span><span class='line'>&#9;testb $(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT|_TIF_SINGLESTEP), %cl
+</span><span class='line'>&#9;jz work_pending
+</span><span class='line'>&#9;sti                # could let do_syscall_trace() call
+</span><span class='line'>&#9;&#9;            # schedule() instead
+</span><span class='line'>&#9;movl %esp, %eax
+</span><span class='line'>&#9;movl $1, %edx
+</span><span class='line'>&#9;#系统调用跟踪
+</span><span class='line'>&#9;call do_syscall_trace
+</span><span class='line'>&#9;#返回用户空间
+</span><span class='line'>&#9;jmp resume_userspace</span></code></pre></td></tr></table></div></figure>
+
+
+<p>整个中断、异常和系统调用返回流程如下：</p>
+
+<p><img src="/images/kernel/2014-04-22.jpg" alt="" /></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2014/04/22/kernel-kmalloc/">kmalloc 函数详解</a></h2>
     
     
@@ -394,7 +930,7 @@ height数组是应用后缀数组解题是的核心，基本上使用后缀数�
 
 <p>  对于两个字符串的问题，一般情况下均将它们连起来，构造height数组。然后，最长公共子串问题等价于后缀的最长公共前缀问题。只不过，并非所有的lcp值都能作为问题的答案。只有当两个后缀分属两个字符串时，它们的lcp值才能作为答案。与问题3一样，本题的答案必然是某个height值，因为lcp值是某段height值中的最小值。当区间长度为1时，lcp值等于某个height值。所以，本题只要扫描一遍后缀，找出后缀分属两个字符串的height值中的最大值就可以了。判断方法这里就不说明了，留给大家自己思考&hellip;<br/>
 题目及题解：<br/>
-<a href="http://hi.baidu.com/fhnstephen/blog/item/8666a400cd949d7b3812bb44.html">http://hi.baidu.com/fhnstephen/blog/item/8666a400cd949d7b3812bb44.html</a><br/>
+<a href="http://hi.baidu.com/fhnstephen/blog/item/8666a400cd949d7b3812bb44.html  ">http://hi.baidu.com/fhnstephen/blog/item/8666a400cd949d7b3812bb44.html  </a>
 <a href="http://hi.baidu.com/fhnstephen/blog/item/b5c7585600cadfc8b645aebe.html">http://hi.baidu.com/fhnstephen/blog/item/b5c7585600cadfc8b645aebe.html</a></p>
 
 <h5>9、重复次数最多的重复子串 SPOJ 687，Pku3693</h5>
@@ -1603,55 +2139,6 @@ CPU中用来执行具体操作的功能部件是有限的，假设CPU只有一�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/02/28/debug-kgdb-ttys/">VMware配置KGDB串口</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-02-28T18:23:00+08:00'><span class='date'>2014-02-28</span> <span class='time'>18:23:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>在配置KGDB时,必须通过串口才能调试一台测试Linux, 如果通过本机是Linux的话, 就可以使用应用直接链接上VMware的linux,进行通讯.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1: VM-&gt;Settings-&gt;Hardware-&gt;Add
-</span><span class='line'>2: 选择Serial Port-&gt;next-&gt; Output to socket -&gt; next
-</span><span class='line'>3: Socket=/tmp/ttyS1, From: Server To: An Application
-</span><span class='line'>4: Finesh
-</span><span class='line'>5: 在本机Linux,运行socat TCP-LISTEN:5555,fork /tmp/ttyS1 &, 绑定本地端口5555到vmware的socket文件.
-</span><span class='line'>6: telnet 0:5555
-</span><span class='line'>aaa
-</span><span class='line'>bbb
-</span><span class='line'>7: 在target Linux上, cat /dev/ttyS1, 如果有aaa bbb,则通讯成功.</span></code></pre></td></tr></table></div></figure>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/66">&larr; Older</a>
@@ -1817,7 +2304,7 @@ if (!document.getElementById('android~nx403a')) document.getElementById('aexp_an
 if (!document.getElementById('android')) document.getElementById('aexp_android').style.visibility = 'hidden';
 if (!document.getElementById('android~s5830')) document.getElementById('aexp_android~s5830').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(75)</span></li>
+<li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(76)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~base').style.visibility = 'hidden';
@@ -1826,7 +2313,7 @@ if (!document.getElementById('debug~base')) document.getElementById('aexp_debug~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~dwarf')) document.getElementById('aexp_debug~dwarf').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/debug~gdb/?opendiv=debug'>gdb</a><a href='##' onmousedown=showDiv('debug~gdb') id='aexp_debug~gdb'><span class='exp_style' id='exp_debug~gdb'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('debug~gdb')) document.getElementById('aexp_debug~gdb').style.visibility = 'hidden';
 </script>
@@ -1914,8 +2401,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(18)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
 </div><li class='catclass'><a href='/blog/cats/2015/'>2015</a><a href='##' onmousedown=showDiv('2015')><span class='exp_style' id='exp_2015'>[+]</span></a><span class='right_span'>(207)</span></li>
@@ -1994,7 +2482,7 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <section>
 <h1>Tags</h1>
 <ul class="tag-cloud">
-<a style="font-size: 131%" href="/tags/gdb/">gdb(6)</a>
+<a style="font-size: 134%" href="/tags/gdb/">gdb(7)</a>
 <a style="font-size: 100%" href="/tags/hello/">hello(1)</a>
 <a style="font-size: 150%" href="/tags/koj/">koj(18)</a>
 <a style="font-size: 112%" href="/tags/nvidia/">nvidia(2)</a>
@@ -2006,6 +2494,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2016/05/11/debug-gdb-thread/">gdb线程</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-detail/">理解Ksplice执行过程</a>
@@ -2021,10 +2513,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/28/debug-ftrace/">ftrace 简介</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/28/debug-debugedit_el7/">debugedit，find-debuginfo 改进及el7</a>
       </li>
     
   </ul>
