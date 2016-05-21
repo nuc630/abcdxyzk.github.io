@@ -62,6 +62,570 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/06/03/kernel-net-rps/">Receive packet steering patch详解</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-03T15:39:00+08:00'><span class='date'>2015-06-03</span> <span class='time'>15:39:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://simohayha.iteye.com/blog/720850">http://simohayha.iteye.com/blog/720850</a></p>
+
+<p>Receive packet steering简称rps，是google贡献给linux kernel的一个patch，主要的功能是解决多核情况下，网络协议栈的软中断的负载均衡。这里的负载均衡也就是指能够将软中断均衡的放在不同的cpu核心上运行。</p>
+
+<p>简介在这里：<br/>
+<a href="http://lwn.net/Articles/362339/">http://lwn.net/Articles/362339/</a></p>
+
+<p>linux现在网卡的驱动支持两种模式，一种是NAPI，一种是非NAPI模式，这两种模式的区别，我前面的blog都有介绍，这里就再次简要的介绍下。</p>
+
+<p>在NAPI中，中断收到数据包后调用__napi_schedule调度软中断，然后软中断处理函数中会调用注册的poll回掉函数中调用netif_receive_skb将数据包发送到3层，没有进行任何的软中断负载均衡。</p>
+
+<p>在非NAPI中，中断收到数据包后调用netif_rx，这个函数会将数据包保存到input_pkt_queue，然后调度软中断，这里为了兼容NAPI的驱动，他的poll方法默认是process_backlog，最终这个函数会从input_pkt_queue中取得数据包然后发送到3层。</p>
+
+<p>通过比较我们可以看到，不管是NAPI还是非NAPI的话都无法做到软中断的负载均衡，因为软中断此时都是运行在在硬件中断相应的cpu上。也就是说如果始终是cpu0相应网卡的硬件中断，那么始终都是cpu0在处理软中断，而此时cpu1就被浪费了，因为无法并行的执行多个软中断。</p>
+
+<p>google的这个patch的基本原理是这样的,根据数据包的源地址，目的地址以及目的和源端口(这里它是将两个端口组合成一个4字节的无符数进行计算的，后面会看到)计算出一个hash值，然后根据这个hash值来选择软中断运行的cpu，从上层来看，也就是说将每个连接和cpu绑定，并通过这个hash值，来均衡软中断在多个cpu上。</p>
+
+<p>这个介绍比较简单，我们来看代码是如何实现的。</p>
+
+<p>它这里主要是hook了两个内核的函数，一个是netif_rx主要是针对非NAPI的驱动，一个是netif_receive_skb这个主要是针对NAPI的驱动，这两个函数我前面blog都有介绍过，想了解可以看我前面的blog，现在这里我只介绍打过patch的实现。</p>
+
+<p>在看netif_rx和netif_receive_skb之前，我们先来看这个patch中两个重要的函数get_rps_cpu和enqueue_to_backlog，我们一个个看。</p>
+
+<p>先来看相关的两个数据结构，首先是netdev_rx_queue，它表示对应的接收队列，因为有的网卡可能硬件上就支持多队列的模式，此时对应就会有多个rx队列，这个结构是挂载在net_device中的，也就是每个网络设备最终都会有一个或者多个rx队列。这个结构在sys文件系统中的表示类似这样的/sys/class/net/<device>/queues/rx-<n> 几个队列就是rx-n.</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct netdev_rx_queue {
+</span><span class='line'>&#9;// 保存了当前队列的rps map
+</span><span class='line'>&#9;struct rps_map *rps_map;
+</span><span class='line'>&#9;// 对应的kobject
+</span><span class='line'>&#9;struct kobject kobj;
+</span><span class='line'>&#9;// 指向第一个rx队列
+</span><span class='line'>&#9;struct netdev_rx_queue *first;
+</span><span class='line'>&#9;// 引用计数
+</span><span class='line'>&#9;atomic_t count;
+</span><span class='line'>} ____cacheline_aligned_in_smp;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后就是rps_map，其实这个也就是保存了能够执行数据包的cpu。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct rps_map {
+</span><span class='line'>&#9;// cpu的个数，也就是cpus数组的个数
+</span><span class='line'>&#9;unsigned int len;
+</span><span class='line'>&#9;// RCU锁
+</span><span class='line'>&#9;struct rcu_head rcu;
+</span><span class='line'>&#9;// 保存了cpu的id.
+</span><span class='line'>&#9;u16 cpus[0];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>看完上面的结构，我们来看函数的实现。
+get_rps_cpu主要是通过传递进来的skb然后来选择这个skb所应该被处理的cpu。它的逻辑很简单，就是通过skb计算hash，然后通过hash从对应的队列的rps_mapping中取得对应的cpu id。</p>
+
+<p>这里有个要注意的就是这个hash值是可以交给硬件网卡去计算的，作者自己说是最好交由硬件去计算这个hash值，因为如果是软件计算的话会导致CPU 缓存不命中，带来一定的性能开销。</p>
+
+<p>还有就是rps_mapping这个值是可以通过sys 文件系统设置的，位置在这里：
+/sys/class/net/<device>/queues/rx-<n>/rps_cpus 。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct ipv6hdr *ip6;
+</span><span class='line'>&#9;struct iphdr *ip;
+</span><span class='line'>&#9;struct netdev_rx_queue *rxqueue;
+</span><span class='line'>&#9;struct rps_map *map;
+</span><span class='line'>&#9;int cpu = -1;
+</span><span class='line'>&#9;u8 ip_proto;
+</span><span class='line'>&#9;u32 addr1, addr2, ports, ihl;
+</span><span class='line'>&#9;// rcu锁
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'>&#9;// 取得设备对应的rx 队列
+</span><span class='line'>&#9;if (skb_rx_queue_recorded(skb)) {
+</span><span class='line'>&#9;..........................................
+</span><span class='line'>&#9;&#9;rxqueue = dev-&gt;_rx + index;
+</span><span class='line'>&#9;} else
+</span><span class='line'>&#9;&#9;rxqueue = dev-&gt;_rx;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!rxqueue-&gt;rps_map)
+</span><span class='line'>&#9;&#9;goto done;
+</span><span class='line'>&#9;// 如果硬件已经计算，则跳过计算过程
+</span><span class='line'>&#9;if (skb-&gt;rxhash)
+</span><span class='line'>&#9;&#9;goto got_hash; /* Skip hash computation on packet header */
+</span><span class='line'>
+</span><span class='line'>&#9;switch (skb-&gt;protocol) {
+</span><span class='line'>&#9;case __constant_htons(ETH_P_IP):
+</span><span class='line'>&#9;&#9;if (!pskb_may_pull(skb, sizeof(*ip)))
+</span><span class='line'>&#9;&#9;&#9;goto done;
+</span><span class='line'>&#9;&#9;// 得到计算hash的几个值
+</span><span class='line'>&#9;&#9;ip = (struct iphdr *) skb-&gt;data;
+</span><span class='line'>&#9;&#9;ip_proto = ip-&gt;protocol;
+</span><span class='line'>&#9;&#9;// 两个地址
+</span><span class='line'>&#9;&#9;addr1 = ip-&gt;saddr;
+</span><span class='line'>&#9;&#9;addr2 = ip-&gt;daddr;
+</span><span class='line'>&#9;&#9;// 得到ip头
+</span><span class='line'>&#9;&#9;ihl = ip-&gt;ihl;
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;case __constant_htons(ETH_P_IPV6):
+</span><span class='line'>&#9;&#9;..........................................
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;default:
+</span><span class='line'>&#9;&#9;goto done;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;ports = 0;
+</span><span class='line'>&#9;switch (ip_proto) {
+</span><span class='line'>&#9;case IPPROTO_TCP:
+</span><span class='line'>&#9;case IPPROTO_UDP:
+</span><span class='line'>&#9;case IPPROTO_DCCP:
+</span><span class='line'>&#9;case IPPROTO_ESP:
+</span><span class='line'>&#9;case IPPROTO_AH:
+</span><span class='line'>&#9;case IPPROTO_SCTP:
+</span><span class='line'>&#9;case IPPROTO_UDPLITE:
+</span><span class='line'>&#9;&#9;if (pskb_may_pull(skb, (ihl * 4) + 4))
+</span><span class='line'>&#9;&#9;// 我们知道tcp头的前4个字节就是源和目的端口，因此这里跳过ip头得到tcp头的前4个字节
+</span><span class='line'>&#9;&#9;&#9;ports = *((u32 *) (skb-&gt;data + (ihl * 4)));
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;default:
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;// 计算hash
+</span><span class='line'>&#9;skb-&gt;rxhash = jhash_3words(addr1, addr2, ports, hashrnd);
+</span><span class='line'>&#9;if (!skb-&gt;rxhash)
+</span><span class='line'>&#9;&#9;skb-&gt;rxhash = 1;
+</span><span class='line'>
+</span><span class='line'>got_hash:
+</span><span class='line'>&#9;// 通过rcu得到对应rps map
+</span><span class='line'>&#9;map = rcu_dereference(rxqueue-&gt;rps_map);
+</span><span class='line'>&#9;if (map) {
+</span><span class='line'>&#9;&#9;// 取得对应的cpu
+</span><span class='line'>&#9;&#9;u16 tcpu = map-&gt;cpus[((u64) skb-&gt;rxhash * map-&gt;len) &gt;&gt; 32];
+</span><span class='line'>&#9;&#9;// 如果cpu是online的，则返回计算出的这个cpu，否则跳出循环。
+</span><span class='line'>&#9;&#9;if (cpu_online(tcpu)) {
+</span><span class='line'>&#9;&#9;&#9;cpu = tcpu;
+</span><span class='line'>&#9;&#9;&#9;goto done;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>done:
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'>&#9;// 如果上面失败，则返回-1.
+</span><span class='line'>&#9;return cpu;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是enqueue_to_backlog这个方法，首先我们知道在每个cpu都有一个softnet结构，而他有一个input_pkt_queue的队列，以前这个主要是用于非NAPi的驱动的，而这个patch则将这个队列也用与NAPI的处理中了。也就是每个cpu现在都会有一个input_pkt_queue队列，用于保存需要处理的数据包队列。这个队列作用现在是，如果发现不属于当前cpu处理的数据包，则我们可以直接将数据包挂载到他所属的cpu的input_pkt_queue中。</p>
+
+<p>enqueue_to_backlog接受一个skb和cpu为参数，通过cpu来判断skb如何处理。要么加入所属的input_pkt_queue中，要么schecule 软中断。</p>
+
+<p>还有个要注意就是我们知道NAPI为了兼容非NAPI模式，有个backlog的napi_struct结构，也就是非NAPI驱动会schedule backlog这个napi结构，而在enqueue_to_backlog中则是利用了这个结构，也就是它会schedule backlog，因为它会将数据放到input_pkt_queue中，而backlog的pool方法process_backlog就是从input_pkt_queue中取得数据然后交给上层处理。</p>
+
+<p>这里还有一个会用到结构就是 rps_remote_softirq_cpus，它主要是保存了当前cpu上需要去另外的cpu schedule 软中断的cpu 掩码。因为我们可能将要处理的数据包放到了另外的cpu的input queue上，因此我们需要schedule 另外的cpu上的napi(也就是软中断),所以我们需要保存对应的cpu掩码，以便于后面遍历，然后schedule。</p>
+
+<p>而这里为什么mask有两个元素，注释写的很清楚：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * This structure holds the per-CPU mask of CPUs for which IPIs are scheduled
+</span><span class='line'> * to be sent to kick remote softirq processing.  There are two masks since
+</span><span class='line'> * the sending of IPIs must be done with interrupts enabled.  The select field
+</span><span class='line'> * indicates the current mask that enqueue_backlog uses to schedule IPIs.
+</span><span class='line'> * select is flipped before net_rps_action is called while still under lock,
+</span><span class='line'> * net_rps_action then uses the non-selected mask to send the IPIs and clears
+</span><span class='line'> * it without conflicting with enqueue_backlog operation.
+</span><span class='line'> */
+</span><span class='line'>struct rps_remote_softirq_cpus {
+</span><span class='line'>&#9;// 对应的cpu掩码
+</span><span class='line'>&#9;cpumask_t mask[2];
+</span><span class='line'>&#9;// 表示应该使用的数组索引
+</span><span class='line'>&#9;int select;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int enqueue_to_backlog(struct sk_buff *skb, int cpu)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct softnet_data *queue;
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;// 取出传递进来的cpu的softnet-data结构
+</span><span class='line'>&#9;queue = &per_cpu(softnet_data, cpu);
+</span><span class='line'>
+</span><span class='line'>&#9;local_irq_save(flags);
+</span><span class='line'>&#9;__get_cpu_var(netdev_rx_stat).total++;
+</span><span class='line'>&#9;// 自旋锁
+</span><span class='line'>&#9;spin_lock(&queue-&gt;input_pkt_queue.lock);
+</span><span class='line'>&#9;// 如果保存的队列还没到上限
+</span><span class='line'>&#9;if (queue-&gt;input_pkt_queue.qlen &lt;= netdev_max_backlog) {
+</span><span class='line'>&#9;// 如果当前队列的输入队列长度不为空
+</span><span class='line'>&#9;&#9;if (queue-&gt;input_pkt_queue.qlen) {
+</span><span class='line'>enqueue:
+</span><span class='line'>&#9;&#9;&#9;// 将数据包加入到input_pkt_queue中,这里会有一个小问题，我们后面再说。
+</span><span class='line'>&#9;&#9;&#9;__skb_queue_tail(&queue-&gt;input_pkt_queue, skb);
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irqrestore(&queue-&gt;input_pkt_queue.lock,
+</span><span class='line'>&#9;&#9;&#9;&#9;flags);
+</span><span class='line'>&#9;&#9;&#9;return NET_RX_SUCCESS;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Schedule NAPI for backlog device */
+</span><span class='line'>&#9;&#9;// 如果可以调度软中断
+</span><span class='line'>&#9;&#9;if (napi_schedule_prep(&queue-&gt;backlog)) {
+</span><span class='line'>&#9;&#9;&#9;// 首先判断数据包该不该当前的cpu处理
+</span><span class='line'>&#9;&#9;&#9;if (cpu != smp_processor_id()) {
+</span><span class='line'>&#9;&#9;&#9;&#9;// 如果不该，
+</span><span class='line'>&#9;&#9;&#9;&#9;struct rps_remote_softirq_cpus *rcpus =
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&__get_cpu_var(rps_remote_softirq_cpus);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;cpu_set(cpu, rcpus-&gt;mask[rcpus-&gt;select]);
+</span><span class='line'>&#9;&#9;&#9;&#9;__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+</span><span class='line'>&#9;&#9;&#9;} else
+</span><span class='line'>&#9;&#9;&#9;&#9;// 如果就是应该当前cpu处理，则直接schedule 软中断，这里可以看到传递进去的是backlog
+</span><span class='line'>&#9;&#9;&#9;&#9;__napi_schedule(&queue-&gt;backlog);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;goto enqueue;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;spin_unlock(&queue-&gt;input_pkt_queue.lock);
+</span><span class='line'>
+</span><span class='line'>&#9;__get_cpu_var(netdev_rx_stat).dropped++;
+</span><span class='line'>&#9;local_irq_restore(flags);
+</span><span class='line'>
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return NET_RX_DROP;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里会有一个小问题，那就是假设此时一个属于cpu0的包进入处理，此时我们运行在cpu1,此时将数据包加入到input队列，然后cpu0上面刚好又来了一个cpu0需要处理的数据包，此时由于qlen不为0则又将数据包加入到input队列中，我们会发现cpu0上的napi没机会进行调度了。</p>
+
+<p>google的patch对这个是这样处理的，在软中断处理函数中当数据包处理完毕，会调用net_rps_action来调度前面保存到其他cpu上的input队列。</p>
+
+<p>下面就是代码片断（net_rx_action）</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>// 得到对应的rcpus.
+</span><span class='line'>rcpus = &__get_cpu_var(rps_remote_softirq_cpus);
+</span><span class='line'>&#9;select = rcpus-&gt;select;
+</span><span class='line'>&#9;// 翻转select，防止和enqueue_backlog冲突
+</span><span class='line'>&#9;rcpus-&gt;select ^= 1;
+</span><span class='line'>
+</span><span class='line'>&#9;// 打开中断，此时下面的调度才会起作用.
+</span><span class='line'>&#9;local_irq_enable();
+</span><span class='line'>&#9;// 这个函数里面调度对应的远程cpu的napi.
+</span><span class='line'>&#9;net_rps_action(&rcpus-&gt;mask[select]);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后就是net_rps_action，这个函数很简单，就是遍历所需要处理的cpu，然后调度napi</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void net_rps_action(cpumask_t *mask)
+</span><span class='line'>{
+</span><span class='line'>&#9;int cpu;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Send pending IPI's to kick RPS processing on remote cpus. */
+</span><span class='line'>&#9;// 遍历
+</span><span class='line'>&#9;for_each_cpu_mask_nr(cpu, *mask) {
+</span><span class='line'>&#9;&#9;struct softnet_data *queue = &per_cpu(softnet_data, cpu);
+</span><span class='line'>&#9;&#9;if (cpu_online(cpu))
+</span><span class='line'>&#9;&#9;&#9;// 到对应的cpu调用csd方法。
+</span><span class='line'>&#9;&#9;&#9;__smp_call_function_single(cpu, &queue-&gt;csd, 0);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;// 清理mask
+</span><span class='line'>&#9;cpus_clear(*mask);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面我们看到会调用csd方法，而上面的csd回掉就是被初始化为trigger_softirq函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void trigger_softirq(void *data)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct softnet_data *queue = data;
+</span><span class='line'>&#9;// 调度napi可以看到依旧是backlog 这个napi结构体。
+</span><span class='line'>&#9;__napi_schedule(&queue-&gt;backlog);
+</span><span class='line'>&#9;__get_cpu_var(netdev_rx_stat).received_rps++;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的函数都分析完毕了，剩下的就很简单了。</p>
+
+<p>首先来看netif_rx如何被修改的，它被修改的很简单，首先是得到当前skb所应该被处理的cpu id，然后再通过比较这个cpu和当前正在处理的cpu id进行比较来做不同的处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int netif_rx(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;int cpu;
+</span><span class='line'>
+</span><span class='line'>&#9;/* if netpoll wants it, pretend we never saw it */
+</span><span class='line'>&#9;if (netpoll_rx(skb))
+</span><span class='line'>&#9;&#9;return NET_RX_DROP;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!skb-&gt;tstamp.tv64)
+</span><span class='line'>&#9;&#9;net_timestamp(skb);
+</span><span class='line'>&#9;// 得到cpu id。
+</span><span class='line'>&#9;cpu = get_rps_cpu(skb-&gt;dev, skb);
+</span><span class='line'>&#9;if (cpu &lt; 0)
+</span><span class='line'>&#9;&#9;cpu = smp_processor_id();
+</span><span class='line'>&#9;// 通过cpu进行队列不同的处理
+</span><span class='line'>&#9;return enqueue_to_backlog(skb, cpu);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后是netif_receive_skb,这里patch将内核本身的这个函数改写为__netif_receive_skb。然后当返回值小于0,则说明不需要对队列进行处理，此时直接发送到3层。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int netif_receive_skb(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;int cpu;
+</span><span class='line'>
+</span><span class='line'>&#9;cpu = get_rps_cpu(skb-&gt;dev, skb);
+</span><span class='line'>
+</span><span class='line'>&#9;if (cpu &lt; 0)
+</span><span class='line'>&#9;&#9;return __netif_receive_skb(skb);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;return enqueue_to_backlog(skb, cpu);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后来总结一下，可以看到input_pkt_queue是一个FIFO的队列，而且如果当qlen有值的时候，也就是在另外的cpu有数据包放到input_pkt_queue中，则当前cpu不会调度napi，而是将数据包放到input_pkt_queue中，然后等待trigger_softirq来调度napi。</p>
+
+<p>因此这个patch完美的解决了软中断在多核下的均衡问题，并且没有由于是同一个连接会map到相同的cpu，并且input_pkt_queue的使用，因此乱序的问题也不会出现。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/06/03/kernel-net-mem/">内核协议栈tcp层的内存管理</a></h2>
     
     
@@ -4326,810 +4890,6 @@ VmallocChunk:     118788kB</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-mm-alloc-numa/">Linux-2.6.32 NUMA架构之内存和调度</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-02T15:32:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>15:32:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-7295895-id-3076420.html">http://blog.chinaunix.net/uid-7295895-id-3076420.html</a></p>
-
-<p>Linux-2.6.32 NUMA架构之内存和调度</p>
-
-<p>  本文将以XLP832通过ICI互连形成的NUMA架构进行分析，主要包括内存管理和调度两方面，参考内核版本2.6.32.9；NUMA架构常见配置选项有：CONFIG_SMP, CONFIG_NUMA, CONFIG_NEED_MULTIPLE_NODES, CONFIG_NODES_SHIFT, CONFIG_SPARSEMEM, CONFIG_CGROUPS, CONFIG_CPUSETS, CONFIG_MIGRATION等。</p>
-
-<p>本文试图从原理上介绍，尽量避免涉及代码的实现细节。</p>
-
-<h3>1 NUMA架构简介</h3>
-
-<p>NUMA(Non Uniform Memory Access)即非一致内存访问架构，市面上主要有X86_64(JASPER)和MIPS64(XLP)体系。</p>
-
-<h4>1.1 概念</h4>
-
-<p>NUMA具有多个节点(Node)，每个节点可以拥有多个CPU(每个CPU可以具有多个核或线程)，节点内使用共有的内存控制器，因此节点的所有内存对于本节点的所有CPU都是等同的，而对于其它节点中的所有CPU都是不同的。节点可分为本地节点(Local Node)、邻居节点(Neighbour Node)和远端节点(Remote Node)三种类型。</p>
-
-<p>本地节点：对于某个节点中的所有CPU，此节点称为本地节点；<br/>
-邻居节点：与本地节点相邻的节点称为邻居节点；<br/>
-远端节点：非本地节点或邻居节点的节点，称为远端节点。</p>
-
-<p>邻居节点和远端节点，称作非本地节点(Off Node)。</p>
-
-<p>CPU访问不同类型节点内存的速度是不相同的：本地节点>邻居节点>远端节点。访问本地节点的速度最快，访问远端节点的速度最慢，即访问速度与节点的距离有关，距离越远访问速度越慢，此距离称作Node Distance。</p>
-
-<p>常用的NUMA系统中：硬件设计已保证系统中所有的Cache是一致的(Cache Coherent, ccNUMA)；不同类型节点间的Cache同步时间不一样，会导致资源竞争不公平，对于某些特殊的应用，可以考虑使用FIFO Spinlock保证公平性。</p>
-
-<h4>1.2 关键信息</h4>
-
-<p>1) 物理内存区域与Node号之间的映射关系；<br/>
-2) 各Node之间的Node Distance；<br/>
-3) 逻辑CPU号与Node号之间的映射关系。</p>
-
-<h3>2 XLP832 NUMA初始化</h3>
-
-<p>首先需要完成1.2节中描述的3个关键信息的初始化。</p>
-
-<h4>2.1 CPU和Node的关系</h4>
-
-<p>start_kernel()->setup_arch()->prom_init():</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>&#9;build_node_cpu_map();
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>build_node_cpu_map()函数工作：</p>
-
-<p>a) 确定CPU与Node的相互关系，做法很简单：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define cpu_to_node(cpu)       (cpu &gt;&gt; 5)
-</span><span class='line'>#define cpumask_of_node    (NODE_CPU_MASK(node)) /* node0:0~31; node1: 32~63 */</span></code></pre></td></tr></table></div></figure>
-
-
-<p>说明：XLP832每个节点有1个物理CPU，每个物理CPU有8个核，每个核有4个超线程，因此每个节点对应32个逻辑CPU，按节点依次展开。另外，实际物理存在的CPU数目是通过DTB传递给内核的；numa_node_id()可以获取当前CPU所处的Node号。</p>
-
-<p>b) 设置每个物理存在的节点的在线状态，具体是通过node_set_online()函数来设置全局变量</p>
-
-<p>nodemask_t node_states[];</p>
-
-<p>这样，类似于CPU号，Node号也就具有如下功能宏：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_node(node);
-</span><span class='line'>for_each_online_node(node);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>详细可参考include/linux/nodemask.h</p>
-
-<h4>2.2 Node Distance确立</h4>
-
-<p>作用：建立buddy时用，可以依此来构建zonelist，以及zone relaim(zone_reclaim_mode)使用，详见后面的4.2.2节。</p>
-
-<h4>2.3 内存区域与Node的关系</h4>
-
-<p>start_kernel()->setup_arch()->arch_mem_init->bootmem_init()->nlm_numa_bootmem_init():</p>
-
-<p>nlm_get_dram_mapping();</p>
-
-<p>XLP832上电后的默认memory-mapped物理地址空间分布：</p>
-
-<p><img src="/images/kernel/2015-06-02-30.jpg" alt="" /></p>
-
-<p>  其中PCIE配置空间映射地址范围为[0x1800_0000, 0x1BFF_FFFF]，由寄存器ECFG_BASE和ECFG_LIMIT指定(注：但这2个寄存器本身是处于PCIE配置空间之中的)。</p>
-
-<p>PCIE配置空间：<br/>
-  PCIE配置空间与memory-mapped物理地址的映射方式：</p>
-
-<p><img src="/images/kernel/2015-06-02-31.jpg" alt="" /></p>
-
-<p>XLP832实现了所有设备都位于虚拟总线0上，每个节点有8个设备，按节点依次排开。</p>
-
-<p>DRAM映射寄存器组：<br/>
-  每个节点都独立实现有几组不同类型的DRAM(每组有8个相同类型的)寄存器可以配置DRAM空间映射到物理地址空间中的基址和大小，以及所属的节点信息(这些寄存器的值事先会由bootloader设好)；这组寄存器位于虚拟总线0的设备0/8/16/24(依次对应每个节点的第一个设备号)的Function0(每个设备最多可定义8个Function，每个Function有着独立的PCIE 4KB的配置空间)的PCIE配置空间中(这个配置空间实现的是DRAM/Bridge控制器)。</p>
-
-<p>本小节涉及到的3组不同类型的寄存器(注：按索引对应即DRAM_BAR<n>,DRAM_LIMIT<n>和 DRAM_NODE_TRANSLATION<n>描述一个内存区域属性)：</p>
-
-<p>第一组(DRAM空间映射物理空间基址)：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>DRAM_BAR0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x54
-</span><span class='line'>DRAM_BAR1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x55
-</span><span class='line'>DRAM_BAR2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x56
-</span><span class='line'>DRAM_BAR3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x57
-</span><span class='line'>DRAM_BAR4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x58
-</span><span class='line'>DRAM_BAR5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x59
-</span><span class='line'>DRAM_BAR6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5A
-</span><span class='line'>DRAM_BAR7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5B</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第二组(DRAM空间映射物理空间长度)：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>DRAM_LIMIT0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5C
-</span><span class='line'>DRAM_LIMIT1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5D
-</span><span class='line'>DRAM_LIMIT2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5E
-</span><span class='line'>DRAM_LIMIT3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5F
-</span><span class='line'>DRAM_LIMIT4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x60
-</span><span class='line'>DRAM_LIMIT5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x61
-</span><span class='line'>DRAM_LIMIT6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x62
-</span><span class='line'>DRAM_LIMIT7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x63</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第三组(节点相关)：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>DRAM_NODE_TRANSLATION0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x64
-</span><span class='line'>DRAM_NODE_TRANSLATION1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x65
-</span><span class='line'>DRAM_NODE_TRANSLATION2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x66
-</span><span class='line'>DRAM_NODE_TRANSLATION3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x67
-</span><span class='line'>DRAM_NODE_TRANSLATION4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x68
-</span><span class='line'>DRAM_NODE_TRANSLATION5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x69
-</span><span class='line'>DRAM_NODE_TRANSLATION6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6A
-</span><span class='line'>DRAM_NODE_TRANSLATION7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6B</span></code></pre></td></tr></table></div></figure>
-
-
-<p>根据上述的PCIE配置空间memory-mapped映射方式便可直接获取寄存器中的值，就可以建立各个节点中的所有内存区域(最多8个区域)信息。关于这些寄存器的使用可以参考“XLP® Processor Family Programming Reference Manual”的“Chapter 7 Memory and I/O Subsystem”。</p>
-
-<h3>3 Bootmem初始化</h3>
-
-<p>bootmem_init()->…->init_bootmem_node()->init_bootmem_core():</p>
-
-<p><img src="/images/kernel/2015-06-02-32.jpg" alt="" /></p>
-
-<p>每个节点拥有各自的bootmem管理(code&amp;data之前可以为空闲页面)。</p>
-
-<h3>4 Buddy初始化</h3>
-
-<p>初始化流程最后会设置全局struct node_active_region early_node_map[]用于初始化Buddy系统，for_each_online_node()遍历所有在线节点调用free_area_init_node()初始化，主要初始化每个zone的大小和所涉及页面的struct page结构(flags中初始化有所属zone和node信息，由set_page_links()函数设置)等。</p>
-
-<h4>4.1 NUMA带来的变化</h4>
-
-<p>1) pglist_data</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>typedef struct pglist_data {
-</span><span class='line'>&#9;struct zone node_zones[MAX_NR_ZONES];
-</span><span class='line'>&#9;struct zonelist node_zonelists[MAX_ZONELISTS];
-</span><span class='line'>&#9;int nr_zones;
-</span><span class='line'>&#9;struct bootmem_data *bdata;
-</span><span class='line'>&#9;unsigned long node_start_pfn;
-</span><span class='line'>&#9;unsigned long node_present_pages; /* total number of physical pages */
-</span><span class='line'>&#9;unsigned long node_spanned_pages; /* total size of physical pagerange, including holes */
-</span><span class='line'>&#9;int node_id;
-</span><span class='line'>&#9;wait_queue_head_t kswapd_wait;
-</span><span class='line'>&#9;struct task_struct *kswapd;
-</span><span class='line'>&#9;int kswapd_max_order;
-</span><span class='line'>} pg_data_t;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>a)上节的bootmem结构的描述信息存放在NODE_DATA(node)-> bdata中；NODE_DATA(i)宏返回节点i的struct pglist_data结构，需要在架构相关的mmzone.h中实现；<br/>
-b) #define MAX_ZONELISTS 2，请参考后面的“zonelist初始化”。</p>
-
-<p>2) zone</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct zone {
-</span><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>&#9;int node;
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * zone reclaim becomes active if more unmapped pages exist.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;unsigned long        min_unmapped_pages;
-</span><span class='line'>&#9;unsigned long        min_slab_pages;
-</span><span class='line'>&#9;struct per_cpu_pageset   *pageset[NR_CPUS];
-</span><span class='line'>#else
-</span><span class='line'>&#9;… …
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>a)最终调用kmalloc_node()为pageset成员在每个CPU的对应的内存节点分配内存；<br/>
-b)min_unmapped_pages 对应/proc/sys/vm/min_unmapped_ratio，默认值为1；<br/>
-  min_slab_pages对应/proc/sys/vm/min_slab_ratio，默认值为5；<br/>
-  作用：当剩余可回收的非文件映射和SLAB页面超过这2个值时，才激活当前zone回收；</p>
-
-<p>c) 增加了zone对应的节点号。</p>
-
-<h4>4.2 zonelist初始化</h4>
-
-<p>  本节讲述zonelist的构建方式，实现位于start_kernel()->build_all_zonelists()中，zonelist的组织方式非常关键(这一点与以前的2.6.21内核版本不一样，2.6.32组织得更清晰)。</p>
-
-<h5>4.2.1 zonelist order</h5>
-
-<p>NUMA系统中存在多个节点，每个节点对应一个struct pglist_data结构，此结构中可以包含多个zone，如：ZONE_DMA, ZONE_NORMAL，这样就产生几种排列顺序，以2个节点2个zone为例(zone从高到低排列, ZONE_DMA0表示节点0的ZONE_DMA，其它类似)：</p>
-
-<p>a) Legacy方式<br/>
-<img src="/images/kernel/2015-06-02-33.jpg" alt="" /><br/>
-  每个节点只排列自己的zone；</p>
-
-<p>b)Node方式<br/>
-<img src="/images/kernel/2015-06-02-34.jpg" alt="" /><br/>
-  按节点顺序依次排列，先排列本地节点的所有zone，再排列其它节点的所有zone。</p>
-
-<p>c) Zone方式<br/>
-<img src="/images/kernel/2015-06-02-35.jpg" alt="" /><br/>
-  按zone类型从高到低依次排列各节点的同相类型zone。</p>
-
-<p>可通过启动参数“numa_zonelist_order”来配置zonelist order，内核定义了3种配置：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define ZONELIST_ORDER_DEFAULT  0 /* 智能选择Node或Zone方式 */
-</span><span class='line'>#define ZONELIST_ORDER_NODE     1 /* 对应Node方式 */
-</span><span class='line'>#define ZONELIST_ORDER_ZONE     2 /* 对应Zone方式 */</span></code></pre></td></tr></table></div></figure>
-
-
-<p>默认配置为ZONELIST_ORDER_DEFAULT，由内核通过一个算法来判断选择Node或Zone方式，算法思想：</p>
-
-<p>a) alloc_pages()分配内存是按照ZONE从高到低的顺序进行的，例如上节“Node方式”的图示中，从ZONE_NORMAL0中分配内存时，ZONE_NORMAL0中无内存时将落入较低的ZONE_DMA0中分配，这样当ZONE_DMA0比较小的时候，很容易将ZONE_DMA0中的内存耗光，这样是很不理智的，因为还有更好的分配方式即从ZONE_NORMAL1中分配；</p>
-
-<p>b) 内核会检测各ZONE的页面数来选择Zone组织方式，当ZONE_DMA很小时，选择ZONELIST_ORDER_DEFAULT时，内核将倾向于选择ZONELIST_ORDER_ZONE方式，否则选择ZONELIST_ORDER_NODE方式。</p>
-
-<p>另外，可以通过/proc/sys/vm/numa_zonelist_order动态改变zonelist order的分配方式。</p>
-
-<h5>4.2.2 Node Distance</h5>
-
-<p>上节中的例子是以2个节点为例，如果有>2个节点存在，就需要考虑不同节点间的距离来安排节点，例如以4个节点2个ZONE为例，各节点的布局(如4个XLP832物理CPU级联)值如下：</p>
-
-<p><img src="/images/kernel/2015-06-02-36.jpg" alt="" /></p>
-
-<p>上图中，Node0和Node2的Node Distance为25，Node1和Node3的Node Distance为25，其它的Node Distance为15。</p>
-
-<h6>4.2.2.1 优先进行Zone Reclaim</h6>
-
-<p>另外，当Node Distance超过20的时候，内核会在某个zone分配内存不足的时候，提前激活本zone的内存回收工作，由全局变量zone_reclaim_mode控制，build_zonelists()中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * If another node is sufficiently far away then it is better
-</span><span class='line'> * to reclaim pages in a zone before going off node.
-</span><span class='line'> */
-</span><span class='line'>if (distance &gt; RECLAIM_DISTANCE)
-</span><span class='line'>&#9;zone_reclaim_mode = 1;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>通过/proc/sys/vm/zone_reclaim_mode可以动态调整zone_reclaim_mode的值来控制回收模式，含义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define RECLAIM_OFF    0
-</span><span class='line'>#define RECLAIM_ZONE  (1&lt;&lt;0)     /* Run shrink_inactive_list on the zone */
-</span><span class='line'>#define RECLAIM_WRITE (1&lt;&lt;1)     /* Writeout pages during reclaim */
-</span><span class='line'>#define RECLAIM_SWAP  (1&lt;&lt;2)     /* Swap pages out during reclaim */</span></code></pre></td></tr></table></div></figure>
-
-
-<h6>4.2.2.2 影响zonelist方式</h6>
-
-<p>采用Node方式组织的zonelist为：</p>
-
-<p><img src="/images/kernel/2015-06-02-37.jpg" alt="" /></p>
-
-<p>  即各节点按照与本节点的Node Distance距离大小来排序，以达到更优的内存分配。</p>
-
-<h5>4.2.3 zonelist[2]</h5>
-
-<p>配置NUMA后，每个节点将关联2个zonelist：<br/>
-  1) zonelist[0]中存放以Node方式或Zone方式组织的zonelist，包括所有节点的zone；<br/>
-  2) zonelist[1]中只存放本节点的zone即Legacy方式；</p>
-
-<p>zonelist[1]用来实现仅从节点自身zone中的内存分配(参考<code>__GFP_THISNODE</code>标志)。</p>
-
-<h3>5 SLAB初始化</h3>
-
-<p>配置NUMA后对SLAB(本文不涉及SLOB或SLUB)的初始化影响不大，只是在分配一些变量采用类似Buddy系统的per_cpu_pageset(单面页缓存)在CPU本地节点进行内存分配。</p>
-
-<h4>5.1 NUMA带来的变化</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache {
-</span><span class='line'>&#9;struct array_cache *array[NR_CPUS];
-</span><span class='line'>&#9;… …
-</span><span class='line'>&#9;struct kmem_list3 *nodelists[MAX_NUMNODES];
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct kmem_list3 {
-</span><span class='line'>&#9;… …
-</span><span class='line'>&#9;struct array_cache *shared;    /* shared per node */
-</span><span class='line'>&#9;struct array_cache **alien;    /* on other nodes */
-</span><span class='line'>&#9;… …
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct slab {
-</span><span class='line'>&#9;… …
-</span><span class='line'>&#9;unsigned short nodeid;
-</span><span class='line'>&#9;… …
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的4种类型的指针变量在SLAB初始化完毕后将改用kmalloc_node()分配的内存。具体实现请参考enable_cpucache()，此函数最终调用alloc_arraycache()和alloc_kmemlist()来分配这些变量代表的空间。</p>
-
-<p>  nodelists[MAX_NUMNODES]存放的是所有节点对应的相关数据，本文称作SLAB节点。每个节点拥有各自的数据；</p>
-
-<p>注：有些非NUMA系统比如非连续内存系统可能根据不同的内存区域定义多个节点(实际上Node Distance都是0即物理内存访问速度相同)，所以这些变量并没有采用CONFIG_NUMA宏来控制，本文暂称为NUMA带来的变化。</p>
-
-<h4>5.2 SLAB缓存</h4>
-
-<p>配置NUMA后，SLAB将有三种类型的缓存：本地缓存(当前CPU的缓存)，共享缓存(节点内的缓存)和外部缓存(节点间的缓存)。</p>
-
-<p>SLAB系统分配对象时，先从本地缓存中查找，如果本地缓存为空，则将共享缓存中的缓存搬运本地缓存中，重新从本地缓存中分配；如果共享缓存为空，则从SLAB中进行分配；如果SLAB中已经无空闲对象，则分配新的SLAB后重新分配本地缓存。</p>
-
-<p>SLAB系统释放对象时，先不归还给SLAB (简化分配流程，也可充分利用CPU Cache)，如果是同节点的SLAB对象先放入本地缓存中，如果本地缓存溢出(满)，则转移一部分(以batch为单位)至共享缓存中；如果是跨节点释放，则先放入外部缓存中，如果外部缓存溢出，则转移一部分至共享缓存中，以供后续分配时使用；如果共享缓存溢出，则调用free_block()函数释放溢出的缓存对象。</p>
-
-<p>关于这三种类型缓存的大小以及参数设置，不在本文的讨论范围。</p>
-
-<p>本地缓存<br/>
-  kmem_cache-> array[] 中缓存每个CPU的SLAB cached objects；</p>
-
-<p>共享缓存<br/>
-  kmem_list3[]->shared(如果存在shared缓存)中缓存与当前CPU同节点的所有CPU (如XLP832 NUMA系统中的Node0包含为CPU0~CPU31) 本地缓存溢出的缓存，详细实现请参考cache_flusharray()；另外，大对象SLAB不存在共享缓存。</p>
-
-<p>外部缓存<br/>
-  kmem_list3[]->alien中存放其它节点的SLAB cached objects，当在某个节点上分配的SLAB 的object在另外一个节点上被释放的时候(即slab->nodeid与numa_node_id()当前节点不相等时)，将加入到对象所在节点的alien缓存中(如果不存在此alien缓存，此对象不会被缓存，而是直接释放给此对象所属SLAB)，否则加入本地缓存或共享缓存(本地缓存溢出且存在shared缓存时)；当alien缓存满的时候，会调用cache_free_alien()搬迁至shared缓存中(如果不存在shared缓存，直接释放给SLAB)；</p>
-
-<p>slab->nodeid记录本SLAB内存块(若干个页面)所在的节点。</p>
-
-<p>示例</p>
-
-<p>例如2个节点，CPU0~31位于Node0，CPU32~CPU63位于Node1：</p>
-
-<p>64个(依次对应于CPU0~CPU63)本地缓存<br/>
-kmem_cache->array[0~31]:在Node0分配“array_cache结构+cached Objs指针”；<br/>
-kmem_cache->array[32~63]:在Node1分配“array_cache结构+cached Objs指针”；</p>
-
-<p>2个SLAB节点<br/>
-kmem_cache->nodelists[0]:在Node0分配“kmem_list3结构”；<br/>
-kmem_cache->nodelists[1]:在Node1分配“kmem_list3结构”；</p>
-
-<p>SLAB节点0(CPU0~CPU31)共享缓存和外部缓存alien[1]<br/>
-kmem_cache->nodelists[0]->shared:在Node0分配“array_cache结构+cached Objs指针”；<br/>
-kmem_cache->nodelists[0]->alien:在Node0分配“节点数<em>sizeof(void</em>)”；<br/>
-kmem_cache->nodelists[0]->alien[0]:置为NULL；<br/>
-kmem_cache->nodelists[0]->alien[1]:在Node0分配“array_cache结构+cached Objs指针”；</p>
-
-<p>SLAB节点1(CPU32~CPU63)共享缓存和外部缓存alien[0]<br/>
-kmem_cache->nodelists[1]->shared:在Node1分配“array_cache结构+cached Objs指针”；<br/>
-kmem_cache->nodelists[1]->alien:在Node1分配“节点数<em>sizeof(void</em>)”；<br/>
-kmem_cache->nodelists[1]->alien[0]:在Node1分配“array_cache结构+cached Objs指针”；<br/>
-kmem_cache->nodelists[1]->alien[1]:置为NULL；</p>
-
-<p>另外，可以用内核启动参数“use_alien_caches”来控制是否开启alien缓存：默认值为1，当系统中的节点数目为1时，use_alien_caches初始化为0；use_alien_caches目的是用于某些多节点非连续内存(访问速度相同)的非NUMA系统。</p>
-
-<p>由上可见，随着节点个数的增加，SLAB明显会开销越来越多的缓存，这也是SLUB涎生的一个重要原因。</p>
-
-<h4>5.3 __GFP_THISNODE</h4>
-
-<p>SLAB在某个节点创建新的SLAB时，都会置<code>__GFP_THISNODE</code>标记向Buddy系统提交页面申请，Buddy系统中看到此标记，选用申请节点的Legacy zonelist[1]，仅从申请节点的zone中分配内存，并且不会走内存不足流程，也不会重试或告警，这一点需要引起注意。</p>
-
-<p>SLAB在申请页面的时候会置GFP_THISNODE标记后调用cache_grow()来增长SLAB；</p>
-
-<p>GFP_THISNODE定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_NUMA
-</span><span class='line'>#define GFP_THISNODE     (__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>6 调度初始化</h3>
-
-<p>配置NUMA后负载均衡会多一层NUMA调度域，根据需要在topology.h中定义，示例：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define SD_NODE_INIT (struct sched_domain) {                 \
-</span><span class='line'>&#9;.parent             = NULL,                              \
-</span><span class='line'>&#9;.child              = NULL,                              \
-</span><span class='line'>&#9;.groups             = NULL,                              \
-</span><span class='line'>&#9;.min_interval       = 8,                                 \
-</span><span class='line'>&#9;.max_interval       = 32,                                \
-</span><span class='line'>&#9;.busy_factor        = 32,                                \
-</span><span class='line'>&#9;.imbalance_pct      = 125,                               \
-</span><span class='line'>&#9;.cache_nice_tries   = 1,                                 \
-</span><span class='line'>&#9;.flags              = SD_LOAD_BALANCE | SD_BALANCE_EXEC, \
-</span><span class='line'>&#9;.last_balance       = jiffies,                           \
-</span><span class='line'>&#9;.balance_interval   = 1,                                 \
-</span><span class='line'>&#9;.nr_balance_failed  = 0,                                 \
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  顺便提一下，2.6.32对于实时任务不走负载均衡流程，采用了全局优先级调度的思想，保证实时任务的及时运行；这样的做法同时也解决了低版本内核在处理同一个逻辑CPU上相同最高优先级实时任务的负载均衡的时延。</p>
-
-<h3>7 NUMA内存分配</h3>
-
-<p>Zonelist[2]组织方式在NUMA内存分配过程中起着至关重要的作用，它决定了整个页面在不同节点间的申请顺序和流程。</p>
-
-<h4>7.1显式分配</h4>
-
-<p>显式分配即指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages_node()和SLAB系统的kmem_cache_alloc_node()，其它的函数都可以从这2个派生出来。</p>
-
-<p>例如，kmalloc_node()最终调用kmem_cache_alloc_node()进行分配。</p>
-
-<h5>7.1.1 Buddy显式分配</h5>
-
-<p>alloc_pages_node(node, gfp_flags, order)分配流程：<br/>
-  1) 如果node小于0，node取本地节点号(node = numa_node_id())；<br/>
-  2) NODE_DATA(node)得到node对应的struct pglist_data结构，从而得到zonelist[2]；<br/>
-  3) 如果gfp_flags含有<code>__GFP_THISNODE</code>标志，仅在此节点分配内存，使用node节点的Legacy zonelist[1]，否则使用其包含所有节点zone的zonelist[0] (见4.2.2.3节)；<br/>
-  4) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如<code>__GFP_HIGHMEM</code>表示最高的zone为ZONE_HIGH；<br/>
-  5) 分配结束。</p>
-
-<h5>7.1.2 SLAB显式分配</h5>
-
-<p>kmem_cache_alloc_node(cachep, gfp_flags, node)分配流程：<br/>
-  1) 如果node值为-1，node取本地节点号(node = numa_node_id())；<br/>
-  2) 如果node &lt; -1，则执行fall back行为，此行为与用户策略有关，有点类似隐式分配：<br/>
-   a) 根据用户策略(包括CPUSET和内存策略)依次选取节点，根据gfp_flags选取合适的zonelist进行分配；<br/>
-   b) 如果内存不足分配失败，则跳过内存策略直接进行隐式Buddy页面分配(仍受CPUSET的限定，关于CPUSET和内存策略后面会介绍)，最终构建成新的SLAB并完成本次分配；转5)；<br/>
-  3) 如果node是正常节点号，则先在node节点上根据gfp_flags选取合适的zonelist进行分配；<br/>
-  4) 如果3)中node节点内存不足分配失败，转2) a)执行fall back行为。<br/>
-  5) 分配结束。</p>
-
-<p>注：fall back行为指的是某个节点上内存不足时会落到此节点的zonelist[0]中定义的其它节点zone分配。</p>
-
-<h5>7.1.3 设备驱动</h5>
-
-<p>配置CONFIG_NUMA后，设备会关联一个NUMA节点信息，struct device结构中会多一个numa_node字段记录本设备所在的节点，这个结构嵌套在各种类型的驱动中，如struct net_device结构。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct device {
-</span><span class='line'>&#9;… …
-</span><span class='line'>&#9;#ifdef CONFIG_NUMA
-</span><span class='line'>&#9;&#9;int          numa_node;    /* NUMA node this device is close to */
-</span><span class='line'>&#9;#endif
-</span><span class='line'>&#9;… …
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>附<code>__netdev_alloc_skb()</code>的实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
-</span><span class='line'>&#9;&#9;unsigned int length, gfp_t gfp_mask)
-</span><span class='line'>{
-</span><span class='line'>&#9;int node = dev-&gt;dev.parent ? dev_to_node(dev-&gt;dev.parent) : -1;
-</span><span class='line'>&#9;struct sk_buff *skb;
-</span><span class='line'>
-</span><span class='line'>&#9;skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, node);
-</span><span class='line'>&#9;if (likely(skb)) {
-</span><span class='line'>&#9;&#9;skb_reserve(skb, NET_SKB_PAD);
-</span><span class='line'>&#9;&#9;skb-&gt;dev = dev;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return skb;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p><code>__alloc_skb()</code>最终调用kmem_cache_alloc_node()和kmalloc_node()在此node上分配内存。</p>
-
-<h4>7.2 隐式分配和内存策略</h4>
-
-<p>隐式分配即不指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages()和SLAB系统的kmem_cache_alloc()，其它的函数都可以从这2个派生出来。</p>
-
-<p>隐式分配涉及到NUMA内存策略(Memory Policy)，内核定义了四种内存策略。</p>
-
-<p>注：隐式分配还涉及到CPUSET，本文后面会介绍。</p>
-
-<h5>7.2.1 内存策略</h5>
-
-<p>内核mm/mempolicy.c中实现了NUMA内存的四种内存分配策略：MPOL_DEFAULT, MPOL_PREFERRED, MPOL_INTERLEAVE和MPOL_BIND，内存策略会从父进程继承。</p>
-
-<p>MPOL_DEFAULT：使用本地节点的zonelist；<br/>
-MPOL_PREFERRED：使用指定节点的zonelist；<br/>
-MPOL_BIND： 设置一个节点集合，只能从这个集合中节点的zone申请内存：</p>
-
-<p>  1)无<code>__GFP_THISNODE</code>申请标记，使用本地节点的zonelist[0]；<br/>
-  2)置有<code>__GFP_THISNODE</code>申请标记，如果本地节点：<br/>
-   a)在集合中，使用本地节点的zonelist[1]；<br/>
-   b)不在集合中，使用集合中最小节点号的zonelist[1]；</p>
-
-<p>MPOL_INTERLEAVE：采用Round-Robin方式从设定的节点集合中选出某个节点，使用此节点的zonelist；</p>
-
-<p>内核实现的内存策略，用struct mempolicy结构来描述：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct mempolicy {
-</span><span class='line'>&#9;atomic_t refcnt;
-</span><span class='line'>&#9;unsigned short mode;              /* See MPOL_* above */
-</span><span class='line'>&#9;unsigned short flags;             /* See set_mempolicy() MPOL_F_* above */
-</span><span class='line'>&#9;union {
-</span><span class='line'>&#9;&#9;short         preferred_node; /* preferred */
-</span><span class='line'>&#9;&#9;nodemask_t    nodes;          /* interleave/bind */
-</span><span class='line'>&#9;&#9;/* undefined for default */
-</span><span class='line'>&#9;} v;
-</span><span class='line'>&#9;union {
-</span><span class='line'>&#9;&#9;nodemask_t cpuset_mems_allowed;     /* relative to these nodes */
-</span><span class='line'>&#9;&#9;nodemask_t user_nodemask;           /* nodemask passed by user */
-</span><span class='line'>&#9;} w;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>成员mode表示使用四种分配策略中的哪一种，联合体v根据不同的分配策略记录相应的分配信息。</p>
-
-<p>另外，MPOL_PREFERRED策略有一种特殊的模式，当其flags置上MPOL_F_LOCAL标志后，将等同于MPOL_DEFAULT策略，内核默认使用此种策略，见全局变量default_policy。</p>
-
-<p>内存策略涉及的分配函数有2个：alloc_pages_current()和alloc_page_vma()，可以分别为不同任务以及任务的不同VMA设置内存策略。</p>
-
-<h5>7.2.2 Buddy隐式分配</h5>
-
-<p>以默认的NUMA内存策略为例讲解，alloc_pages(gfp_flags, order)分配流程：<br/>
-  1) 得到本地节点对应的struct pglist_data结构，从而得到zonelist[2]；<br/>
-  2) 如果gfp_flags含有<code>__GFP_THISNODE</code>标志，仅在此节点分配内存即使用本地节点的Legacy zonelist[1]，否则使用zonelist[0] (见4.2.2.3节)；<br/>
-  3) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如<code>__GFP_HIGHMEM</code>表示最高的zone为ZONE_HIGH；<br/>
-  4) 分配结束。</p>
-
-<h5>7.2.3 SLAB隐式分配</h5>
-
-<p>以默认的NUMA内存策略为例讲解，kmem_cache_alloc(cachep, gfp_flags)分配流程：<br/>
-  1) 调用<code>____cache_alloc()</code>函数在本地节点local_node分配，此函数无fall back行为；<br/>
-  2) 如果1)中本地节点内存不足分配失败，调用<code>____cache_alloc_node</code>(cachep, gfp_flags,local_node)再次尝试在本地节点分配，如果还失败此函数会进行fall back行为；<br/>
-  3) 分配结束。</p>
-
-<h4>7.3 小结</h4>
-
-<p>上文提到的所有的内存分配函数都允许fall back行为，但有2种情况例外：<br/>
-  1) <code>__GFP_THISNODE</code>分配标记限制了只能从某一个节点上分配内存；<br/>
-  2) MPOL_BIND策略，限制了只能从一个节点集合中的节点上分配内存；<br/>
-   (gfp_zone(gfp_flags) &lt; policy_zone的情况，MPOL_BIND不限制节点)。</p>
-
-<p>注：还有一种情况，CPUSET限制的内存策略，后面会介绍。</p>
-
-<h3>8 CPUSET</h3>
-
-<p>CPUSET基于CGROUP的框架构建的子系统，有如下特点：<br/>
-  1) 限定一组任务所允许使用的内存Node和CPU资源；<br/>
-  2) CPUSET在内核各子系统中添加的检测代码很少，对内核没有性能影响；<br/>
-  3) CPUSET的限定优先级高于内存策略(针对于Node)和绑定(针对于CPU)；<br/>
-  4) 没有额外实现系统调用接口，只能通过/proc文件系统和用户交互。</p>
-
-<p>本节只讲述CPUSET的使用方法和说明。</p>
-
-<h4>8.1 创建CPUSET</h4>
-
-<p>因为CPUSET只能使用/proc文件系统访问，所以第一步就要先mount cpuset文件系统，配置CONFIG_CGROUPS和CONFIG_CPUSETS后/proc/filesystems中将有这个文件系统。</p>
-
-<p>CPUSET是分层次的，可以在cpuset文件系统根目录是最顶层的CPUSET，可以在其下创建CPUSET子项，创建方式很简单即创建一个新的目录。</p>
-
-<p>mount命令：mount nodev –t cpuset /your_dir或mount nodev –t cgroup –o cpuset /your_dir</p>
-
-<p>Mount成功后，进入mount目录，这个就是最顶层的CPUSET了(top_cpuset)，下面附一个演示例子：</p>
-
-<p><img src="/images/kernel/2015-06-02-38.jpg" alt="" /></p>
-
-<h4>8.2 CPUSET文件</h4>
-
-<p>介绍几个重要的CPUSET文件：<br/>
-1) tasks，实际上是CGROUPS文件，为此CPUSET包含的线程pid集合；<br/>
-  echo 100 > tasks</p>
-
-<p>2) cgroup.procs是CGROUPS文件，为此CPUSET包含的线程组tgid集合；<br/>
-  echo 100 > cgroup.procs</p>
-
-<p>3) cpus是CPUSET文件，表示此CPUSET允许的CPU；<br/>
-  echo 0-8 > cpus</p>
-
-<p>4) mems是CPUSET文件，表示此CPUSET允许的内存节点；
-  echo 0-1 > mems  (对应于struct task_struct中的mems_allowed字段)</p>
-
-<p>5) sched_load_balance，为CPUSET文件，设置cpus集合的CPU是否参与负载均衡；
-  echo 0 > sched_load_balance (禁止负载均衡)；默认值为1表示开启负载均衡；</p>
-
-<p>6) sched_relax_domain_level，为CPUSET文件，数值代表某个调度域级别，大于此级别的调度域层次将禁用闲时均衡和唤醒均衡，而其余级别的调度域都开启；
-也可以通过启动参数“relax_domain_level”设置，其值含义：<br/>
-  -1 : 无效果，此为默认值<br/>
-   0 - 设置此值会禁用所有调度域的闲时均衡和唤醒均衡<br/>
-   1 - 超线程域<br/>
-   2 - 核域<br/>
-   3 - 物理域<br/>
-   4 - NUMA域<br/>
-   5 - ALLNODES模式的NUMA域</p>
-
-<p>7) mem_exclusive和mem_hardwall，为CPUSET文件，表示内存硬墙标记；默认为0，表示软墙；有关CPUSET的内存硬墙(HardWall)和内存软墙(SoftWall)，下文会介绍；</p>
-
-<p>8) memory_spread_page和memory_spread_slab，为CPUSET文件，设定CPUSET中的任务PageCache和SLAB(创建时置有SLAB_MEM_SPREAD)以Round-Robin方式使用内存节点(类似于MPOL_INTERLEAVE)；默认为0，表示未开启；struct task_struct结构中增加成员cpuset_mem_spread_rotor记录下次使用的节点号；</p>
-
-<p>9) memory_migrate，为CPUSET文件，表明开启此CPUSET的内存迁移，默认为0；</p>
-
-<p>  当一个任务从一个CPUSET1(mems值为0)迁移至另一个CPUSET2(mems值为1)的时候，此任务在节点0上分配的页面内容将迁移至节点1上分配新的页面(将数据同步到新页面)，这样就避免了此任务的非本地节点的内存访问。</p>
-
-<p><img src="/images/kernel/2015-06-02-39.jpg" alt="" /></p>
-
-<p>上图为单Node，8个CPU的系统。</p>
-
-<p>1) 顶层CPUSET包含了系统中的所有CPU以及Node，而且是只读的，不能更改；<br/>
-2) 顶层CPUSET包含了系统中的所有任务，可以更改；<br/>
-3) child为新创建的子CPUSET，子CPUSET的资源不能超过父CPUSET的资源；<br/>
-4) 新创建的CPUSET的mems和cpus都是空的，使用前必须先初始化；<br/>
-5) 添加任务：设置tasks和cgroup.procs文件；<br/>
-6) 删除任务：将任务重新添加至其它CPUSET(如顶层)就可以从本CPUSET删除任务。</p>
-
-<h4>8.3 利用CPUSET限定CPU和Node</h4>
-
-<p>设置步骤：<br/>
-1) 在某个父CPUSET中创建子CPUSET；<br/>
-2) 在子CPUSET目录下，输入指定的Node号至mems文件；<br/>
-3) 在子CPUSET目录下，输入指定的Node号至mems文件；<br/>
-4) 在子CPUSET目录下，设定任务至tasks或group.procs文件；<br/>
-5) 还可以设置memory_migrate为1，激活内存页面的迁移功能。</p>
-
-<p>这样限定后，此CPUSET中所有的任务都将使用限定的CPU和Node，但毕竟系统中的任务并不能完全孤立，比如还是可能会全局共享Page Cache，动态库等资源，因此内核在某些情况下还是可以允许打破这个限制，如果不允许内核打破这个限制，需要设定CPUSET的内存硬墙标志即mem_exclusive或mem_hardwall置1即可；CPUSET默认是软墙。</p>
-
-<p>硬软墙用于Buddy系统的页面分配，优先级高于内存策略，请参考内核函数：</p>
-
-<p>cpuset_zone_allowed_hardwall()和cpuset_zone_allowed_softwall()</p>
-
-<p>另外，当内核分不到内存将导致Oops的时候，CPUSET所有规则将被打破，毕竟一个系统的正常运行才是最重要的：<br/>
-  1) <code>__GFP_THISNODE</code>标记分配内存的时候(通常是SLAB系统)；<br/>
-  2) 中断中分配内存的时候；<br/>
-  3) 任务置有TIF_MEMDIE标记即被内核OOM杀死的任务。</p>
-
-<h4>8.4 利用CPUSET动态改变调度域结构</h4>
-
-<p>利用sched_load_balance文件可以禁用掉某些CPU的负载均衡，同时重新构建调度域，此功能类似启动参数“isolcpus”的功能。</p>
-
-<p>8个CPU的系统中，系统中存在一个物理域，现需要禁掉CPU4~CPU7的负载均衡，配置步骤为：<br/>
-  1) “mkdir child”在顶层CPUSET中创建子CPUSET，记为child；<br/>
-  2) “echo 0-3 > child/cpus ”(新建CPUSET的sched_load_balance默认是是打开的)；<br/>
-  3) “echo 0 > sched_load_balance”关闭顶层CPUSET的负载均衡。</p>
-
-<p>操作过程见下图：</p>
-
-<p><img src="/images/kernel/2015-06-02-40.jpg" alt="" /></p>
-
-<p>由图可见，CPU4~CPU7的调度域已经不存在了，具体效果是将CPU4~CPU7从负载均衡中隔离出来。</p>
-
-<h3>9 NUMA杂项</h3>
-
-<p>1) /sys/devices/system/node/中记录有系统中的所有内存节点信息；<br/>
-2)任务额外关联一个/proc/<tid>/numa_smaps文件信息；<br/>
-3) tmpfs可以指定在某个Node上创建；<br/>
-4) libnuma库和其numactl小工具可以方便操作NUMA内存；<br/>
-5) … …</p>
-
-<h3>10 参考资料</h3>
-
-<ol>
-<li>www.kernel.org</li>
-<li>ULK3</li>
-<li>XLP® Processor Family Programming Reference Manual</li>
-</ol>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/26">&larr; Older</a>
@@ -5243,7 +5003,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(163)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(164)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -5252,7 +5012,7 @@ if (!document.getElementById('kernel~base')) document.getElementById('aexp_kerne
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~fs')) document.getElementById('aexp_kernel~fs').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~irq/?opendiv=kernel'>irq</a><a href='##' onmousedown=showDiv('kernel~irq') id='aexp_kernel~irq'><span class='exp_style' id='exp_kernel~irq'>[+]</span></a><span class='right_span'>10</span></li>
+<li><a href='/blog/cats/kernel~irq/?opendiv=kernel'>irq</a><a href='##' onmousedown=showDiv('kernel~irq') id='aexp_kernel~irq'><span class='exp_style' id='exp_kernel~irq'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~irq')) document.getElementById('aexp_kernel~irq').style.visibility = 'hidden';
 </script>
@@ -5392,8 +5152,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(19)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(20)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
@@ -5487,6 +5247,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/05/11/debug-gdb-thread/">gdb线程</a>
       </li>
     
@@ -5500,10 +5264,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/28/debug-ftrace/">ftrace 简介</a>
       </li>
     
   </ul>
