@@ -62,6 +62,203 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-swappiness/">Linux内核页回收 swappiness参数</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-18T11:21:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>11:21:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.douban.com/note/349467816/">http://www.douban.com/note/349467816/</a></p>
+
+<p>本文主要尝试解释两个问题：<br/>
+1. swappiness的确切含义是什么，它对内核进行页回收机制的影响。<br/>
+2. swappiness设置成0，为什么系统仍然可能会有swap发生。</p>
+
+<h4>一. 关于内存分配与页回收(page reclaim)</h4>
+
+<p>page reclaim发生的场景主要有两类，一个是kswapd后台线程进行的活动，另一个是direct reclaim，即分配页时没有空闲内存满足，需要立即直接进行的页回收。大体上内存分配的流程会分为两部分，一部分是fast path，另一部分是slow path，通常内存使用非紧张情况下，都会在fast path就可以满足要求。并且fast path下的内存分配不会出现dirty writeback及swap等页回收引起的IO阻塞情况。</p>
+
+<p>fast path大体流程如下：</p>
+
+<p>1.如果系统挂载使用了memory cgroup，则首先检查是否超过cgroup限额，如果超过则进行direct reclaim，通过do_try_to_free_pages完成。如果没超过则进行cgroup的charge工作（charge是通过两阶段提交完成的，这里不展开了）。</p>
+
+<p>2.从本地prefered zone内存节点查找空闲页，需要判断是否满足系统watermark及dirty ratio的要求，如果满足则从buddy system上摘取相应page,否则尝试对本地prefered zone进行页回收,本次fast path下页回收只会回收clean page，即不会考虑dirty page以及mapped page，这样就不会产生任何swap及writeback，即不会引起任何blocking的IO操作，如果这次回收仍然无法满足请求的内存页数目则进入slow path</p>
+
+<p>slow path大体流程如下：</p>
+
+<ol>
+<li><p>首先唤醒kswapd进行page reclaim后台操作。</p></li>
+<li><p>重新尝试本地prefered zone进行分配内存，如果失败会根据请求的GFP相关参数决定是否尝试忽略watermark, dirty ratio以及本地节点分配等要求进行再次重试，这一步中如果分配页时有指定<code>__GFP_NOFAIL</code>标记，则分配失败会一直等待重试。</p></li>
+<li><p>如果没有<code>__GFP_NOFAIL</code>标记，则会需开始进行page compact及page direct reclaim操作，之后如果仍然没有可用内存，则进入OOM流程。</p></li>
+</ol>
+
+
+<p>相关内容可以参阅内核代码<code>__alloc_pages</code>函数的逻辑，另外无论page reclaim是由谁发起的，最终都会统一入口到shrink_zone，即针对每个zone独立进行reclaim操作，最终会进入shrink_lruvec函数，进行每个zone相应page lru链表的扫描与回收操作。</p>
+
+<h4>二. 关于页回收的一些背景知识</h4>
+
+<p>页回收大体流程会先在每个zone上扫描相应的page链表，主要包括inactive anon/active anon(匿名页链表)以及inactive file/active file链表（file cache/映射页链表），一共四条链表，我们所有使用过的page在被回收前基本是保存在这四条链表中的某一条中的（还有一部分在unevictable链表中，忽略），根据其被引用的次数会决定其处于active还是inactive链表中，根据其类型决定处于anon还是file链表中。</p>
+
+<p>页回收总体会扫描逐个内存节点的所有zone，然后先扫描active，将不频繁访问的页挪到inactive链表中，随后扫描inactive链表，会将其中被频繁引用的页重新挪回到active中，确认不频繁的页则最终被回收，如果是file based的页则根据是否clean进行释放或回写(writeback，filecache则直接释放)，如果是anon则进行swap，所以本文实际关心的是swappiness参数对anon链表扫描的影响。</p>
+
+<p>另外还需要了解前面描述的四个链表原来是放在zone数据结构上的，后来引入了mem_cgroup则，重新定义了一组mem_cgroup_per_zone/mem_cgroup_per_node的数据结构，这四个链表同时定义在这组数据结构上，如果系统开启了mem cgroup则使用后者，否则用前者。</p>
+
+<p>另外再重点说下swap只是page reclaim的一种处理措施，主要针对anon page，我们最终来看下swappiness的确切含义</p>
+
+<h4>三. swappiness对page reclaim的确切影响</h4>
+
+<p>page reclaim逻辑中对前面所述四个链表进行扫描的逻辑在vmscan.c中的get_scan_count函数内，该函数大部分逻辑注释写得非常清楚，我们简单梳理下，主要关注scan_balance变量的取值：</p>
+
+<ol>
+<li>首先如果系统禁用了swap或者没有swap空间，则只扫描file based的链表，即不进行匿名页链表扫描
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;may_swap || (get_nr_swap_pages() &lt;= 0)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果当前进行的不是全局页回收（cgroup资源限额引起的页回收），并且swappiness设为0，则不进行匿名页链表扫描，这个是没得商量，这里swappiness值直接决定了是否有swap发生，设成0则肯定不会发生，另外需要注意，这种情况下需要设置的是cgroup配置文件memory.swappiness，而不是全局的sysctl vm.swappiness
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!global_reclaim(sc) && !vmscan_swappiness(sc)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果进行链表扫描前设置的priority(这个值决定扫描多少分之一的链表元素)为0，且swappiness非0，则可能会进行swap
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;priority && vmscan_swappiness(sc)) {
+</span><span class='line'>&#9;scan_balance = SCAN_EQUAL;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果是全局页回收，并且当前空闲内存和所有file based链表page数目的加和都小于系统的high watermark，则必须进行匿名页回收，则必然会发生swap,可以看到这里swappiness的值如何设置是完全无关的，这也解释了为什么其为0，系统也会进行swap的原因，另外最后我们会详细解释系统page watermark是如何计算的。
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>anon = get_lru_size(lruvec, LRU_ACTIVE_ANON) +
+</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_ANON);
+</span><span class='line'>file = get_lru_size(lruvec, LRU_ACTIVE_FILE) +
+</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_FILE);
+</span><span class='line'>
+</span><span class='line'>if (global_reclaim(sc)) {
+</span><span class='line'>&#9;free = zone_page_state(zone, NR_FREE_PAGES);
+</span><span class='line'>&#9;if (unlikely(file + free &lt;= high_wmark_pages(zone))) {
+</span><span class='line'>&#9;&#9;scan_balance = SCAN_ANON;
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果系统inactive file链表比较充足，则不考虑进行匿名页的回收，即不进行swap
+代码：</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!inactive_file_is_low(lruvec)) {
+</span><span class='line'>&#9;scan_balance = SCAN_FILE;
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>最后一种情况则要根据swappiness值与之前统计的file与anon哪个更有价值来综合决定file和anon链表扫描的比例，这时如果swappiness设置成0，则也不会扫描anon链表，即不进行swap,代码比较多，不再贴出。</li>
+</ol>
+
+
+<h4>四. 系统内存watermark的计算</h4>
+
+<p>前面看到系统内存watermark对页回收机制是有决定影响的，其实在内存分配中也会频繁用到这个值，确切的说它有三个值，分别是low,min和high,根据分配页时来指定用哪个，如果系统空闲内存低于相应watermark则分配会失败，这也是进入slow path或者wakeup kswapd的依据。</p>
+
+<p>实际这个值的计算是通过sysctl里的vm.min_free_kbytes来决定的，大体的计算公式如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pages_min = min_free_kbytes &gt;&gt; (PAGE_SHIFT - 10);
+</span><span class='line'>tmp = (u64)pages_min * zone-&gt;managed_pages;
+</span><span class='line'>do_div(tmp, lowmem_pages);
+</span><span class='line'>zone-&gt;watermark[WMARK_MIN] = tmp;
+</span><span class='line'>zone-&gt;watermark[WMARK_LOW] = min_wmark_pages(zone) + (tmp &gt;&gt; 2);
+</span><span class='line'>zone-&gt;watermark[WMARK_HIGH] = min_wmark_pages(zone) + (tmp &gt;&gt; 1);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即根据min_free_kbytes的值按照每个zone管理页面的比例算出zone的min_watermark，然后再加min的1/4就是low，加1/2就是high了</p>
+
+<h4>总结：</h4>
+
+<p>swappiness的值是个参考值，是否会发生swap跟当前是哪种page reclaim及系统当前状态都有关系，所以设置了swappiness=0并不代表一定没有swap发生，同时设为0也确实会可能发生OOM。</p>
+
+<p>个人仍然认为线上环境设置swappiness=0是没有任何问题的。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-swap/">Linux swap实现</a></h2>
     
     
@@ -2462,839 +2659,6 @@ policy:和NUMA相关</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/09/kernel-mm-find-page/">查看某进程内存</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-09T17:54:00+08:00'><span class='date'>2015-09-09</span> <span class='time'>17:54:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>test.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;sys/mman.h&gt;
-</span><span class='line'>#include&lt;sys/types.h&gt;
-</span><span class='line'>#include&lt;fcntl.h&gt;
-</span><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>#include&lt;unistd.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;time.h&gt;
-</span><span class='line'>#include &lt;string.h&gt;
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{   
-</span><span class='line'>&#9;int i,j,k,l;
-</span><span class='line'>&#9;char *mp;
-</span><span class='line'>&#9;mp = (char*)mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); 
-</span><span class='line'>&#9;strcpy(mp, "ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK");
-</span><span class='line'>&#9;strcpy(mp+4096, "AAAAAAAAAAAAAAAAAAABBBBBBBBBBBBCCCCCCCCCCC");
-</span><span class='line'>&#9;sleep(10000000);
-</span><span class='line'>&#9;munmap(mp, 8192);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># strace ./test
-</span><span class='line'>execve("./test", ["./test"], [/* 23 vars */]) = 0
-</span><span class='line'>brk(0)                                  = 0x1bdf000
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f166000
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f165000
-</span><span class='line'>access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
-</span><span class='line'>open("/etc/ld.so.cache", O_RDONLY)      = 3
-</span><span class='line'>fstat(3, {st_mode=S_IFREG|0644, st_size=72203, ...}) = 0
-</span><span class='line'>mmap(NULL, 72203, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f133f153000
-</span><span class='line'>close(3)                                = 0
-</span><span class='line'>open("/lib64/libc.so.6", O_RDONLY)      = 3
-</span><span class='line'>read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0&gt;\0\1\0\0\0\360\332a\2217\0\0\0"..., 832) = 832
-</span><span class='line'>fstat(3, {st_mode=S_IFREG|0755, st_size=1726296, ...}) = 0
-</span><span class='line'>mmap(0x3791600000, 3506520, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x3791600000
-</span><span class='line'>mprotect(0x379174f000, 2097152, PROT_NONE) = 0
-</span><span class='line'>mmap(0x379194f000, 20480, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x14f000) = 0x379194f000
-</span><span class='line'>mmap(0x3791954000, 16728, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x3791954000
-</span><span class='line'>close(3)                                = 0
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f152000
-</span><span class='line'>mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f151000
-</span><span class='line'>arch_prctl(ARCH_SET_FS, 0x7f133f1516e0) = 0
-</span><span class='line'>mprotect(0x379194f000, 16384, PROT_READ) = 0
-</span><span class='line'>mprotect(0x379141c000, 4096, PROT_READ) = 0
-</span><span class='line'>munmap(0x7f133f153000, 72203)           = 0
-</span><span class='line'>mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f133f163000
-</span><span class='line'>rt_sigprocmask(SIG_BLOCK, [CHLD], [], 8) = 0
-</span><span class='line'>rt_sigaction(SIGCHLD, NULL, {SIG_DFL, [], 0}, 8) = 0
-</span><span class='line'>rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
-</span><span class='line'>nanosleep({10000000, 0},</span></code></pre></td></tr></table></div></figure>
-
-
-<p>基本确定最后一个mmap就是我们申请的，它的起始虚拟地址是0x7f133f163000，所以要在对应tast的mm中找到相应的vma。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash&gt; ps
-</span><span class='line'>...
-</span><span class='line'>  58674  58673   0  ffff88003d388ae0  IN   0.0    3672    316  test
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_7.0.8&gt; task_struct ffff88003d388ae0
-</span><span class='line'>struct task_struct {
-</span><span class='line'>...
-</span><span class='line'>mm = 0xffff88003d80ba00,
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_7.0.8&gt; mm_struct 0xffff88003d80ba00
-</span><span class='line'>struct mm_struct {
-</span><span class='line'>  mmap = 0xffff88002a4d5ed0,
-</span><span class='line'>  mm_rb = {
-</span><span class='line'>&#9;rb_node = 0xffff88003c2fad38
-</span><span class='line'>  },
-</span><span class='line'>  mmap_cache = 0xffff880029332788,
-</span><span class='line'>  get_unmapped_area = 0xffffffff81010410 &lt;arch_get_unmapped_area_topdown&gt;,
-</span><span class='line'>  get_unmapped_exec_area = 0x0,
-</span><span class='line'>  unmap_area = 0xffffffff8113aed0 &lt;arch_unmap_area_topdown&gt;,
-</span><span class='line'>  mmap_base = 139720639541248,
-</span><span class='line'>  task_size = 140737488351232,
-</span><span class='line'>  cached_hole_size = 0,   
-</span><span class='line'>  free_area_cache = 139720639524864,
-</span><span class='line'>  pgd = 0xffff88000c952000,
-</span><span class='line'>  ...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>先看mmap，mmap_cache是不是，不是的话从mm_rb.rb_node开始找，这个是平衡二叉树的根。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define rb_entry(ptr, type, member) container_of(ptr, type, member)
-</span><span class='line'>
-</span><span class='line'>vma_tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以rb_node的地址减去vm_rb在struct vm_area_struct的偏移就是对应struct vm_area_struct的地址（2.6.32-358是0x38）</p>
-
-<p>所以rb_node = 0xffff88003c2fad38 => struct vm_area_struct = 0xffff88003c2fad00</p>
-
-<p>根据find_vma函数方法，直到找到</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Look up the first VMA which satisfies  addr &lt; vm_end,  NULL if none. */
-</span><span class='line'>struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct vm_area_struct *vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;if (mm) {
-</span><span class='line'>&#9;&#9;/* Check the cache first. */
-</span><span class='line'>&#9;&#9;/* (Cache hit rate is typically around 35%.) */
-</span><span class='line'>&#9;&#9;vma = mm-&gt;mmap_cache;
-</span><span class='line'>&#9;&#9;if (!(vma && vma-&gt;vm_end &gt; addr && vma-&gt;vm_start &lt;= addr)) {
-</span><span class='line'>&#9;&#9;&#9;struct rb_node * rb_node;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;rb_node = mm-&gt;mm_rb.rb_node;
-</span><span class='line'>&#9;&#9;&#9;vma = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;while (rb_node) {
-</span><span class='line'>&#9;&#9;&#9;&#9;struct vm_area_struct * vma_tmp;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;vma_tmp = rb_entry(rb_node,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct vm_area_struct, vm_rb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_end &gt; addr) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;vma = vma_tmp;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (vma_tmp-&gt;vm_start &lt;= addr)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_left;
-</span><span class='line'>&#9;&#9;&#9;&#9;} else 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;rb_node = rb_node-&gt;rb_right;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;if (vma)
-</span><span class='line'>&#9;&#9;&#9;&#9;mm-&gt;mmap_cache = vma; 
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return vma; 
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>crash_7.0.8&gt; vm_area_struct 0xffff88002d29c5f8
-</span><span class='line'>struct vm_area_struct {
-</span><span class='line'>  vm_mm = 0xffff88003d80ba00,
-</span><span class='line'>  vm_start = 139720639524864,
-</span><span class='line'>  vm_end = 139720639541248,
-</span><span class='line'>  vm_next = 0xffff880029332788,
-</span><span class='line'>  vm_prev = 0xffff88003c2fa918,
-</span><span class='line'>  vm_page_prot = {
-</span><span class='line'>&#9;pgprot = 9223372036854775845
-</span><span class='line'>  },
-</span><span class='line'>  vm_flags = 1048691,
-</span><span class='line'>  vm_rb = {
-</span><span class='line'>&#9;rb_parent_color = 18446612133323974193,
-</span><span class='line'>&#9;rb_right = 0xffff8800293327c0,
-</span><span class='line'>&#9;rb_left = 0xffff88003c2fa950
-</span><span class='line'>  },
-</span><span class='line'>  ...
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>crash_7.0.8&gt; p/x 139720639524864
-</span><span class='line'>$4 = 0x7f133f163000</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以对应的vma就是0xffff88002d29c5f8，用内核函数follow_page找到对应page</p>
-
-<p>follow_page.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt;
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/sysctl.h&gt;
-</span><span class='line'>#include &lt;linux/timer.h&gt;
-</span><span class='line'>#include &lt;linux/hardirq.h&gt;
-</span><span class='line'>#include &lt;linux/bottom_half.h&gt;
-</span><span class='line'>#include &lt;linux/preempt.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;linux/file.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/kprobes.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/mm.h&gt;
-</span><span class='line'>#include &lt;linux/mm_types.h&gt;
-</span><span class='line'>
-</span><span class='line'>static int __init test_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;int i;
-</span><span class='line'>&#9;struct page *(*follow_page_p)(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-</span><span class='line'>&#9;&#9;= (struct page *(*)(struct vm_area_struct *vma, unsigned long address, unsigned int flags))0xffffffff81133ab0;
-</span><span class='line'>&#9;struct vm_area_struct *vma = (struct vm_area_struct *)0xffff88002d29c5f8;
-</span><span class='line'>&#9;unsigned long address = 139720639524864UL;
-</span><span class='line'>&#9;struct page *pa;  
-</span><span class='line'>&#9;char ch[4096+10]; 
-</span><span class='line'>&#9;pa = follow_page_p(vma, address, 0);
-</span><span class='line'>&#9;memcpy(ch, page_address(pa), 4096); 
-</span><span class='line'>&#9;printk("page = %p\n", pa);
-</span><span class='line'>&#9;printk("%s\n", ch);   
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __exit test_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;printk("test exit\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_init);
-</span><span class='line'>module_exit(test_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>obj-m := follow_page.o
-</span><span class='line'>KDIR:=/lib/modules/$(shell uname -r)/build/
-</span><span class='line'>PWD=$(shell pwd)
-</span><span class='line'>
-</span><span class='line'>all:
-</span><span class='line'>&#9;make -C $(KDIR) M=$(PWD) modules
-</span><span class='line'>clean:
-</span><span class='line'>&#9;make -C $(KDIR) M=$(PWD) clean</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># insmod ./follow_page.ko
-</span><span class='line'># rmmod follow_page
-</span><span class='line'># dmesg
-</span><span class='line'>page = ffffea000077a1a8
-</span><span class='line'>ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK
-</span><span class='line'>test exit</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt; 
-</span><span class='line'>#include &lt;linux/kernel.h&gt; 
-</span><span class='line'>#include &lt;linux/init.h&gt;   
-</span><span class='line'>#include &lt;linux/types.h&gt;  
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/sysctl.h&gt; 
-</span><span class='line'>#include &lt;linux/timer.h&gt;  
-</span><span class='line'>#include &lt;linux/hardirq.h&gt;
-</span><span class='line'>#include &lt;linux/bottom_half.h&gt;
-</span><span class='line'>#include &lt;linux/preempt.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/types.h&gt;  
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;linux/file.h&gt;   
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/kprobes.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/mm.h&gt;
-</span><span class='line'>#include &lt;linux/mm_types.h&gt;
-</span><span class='line'>
-</span><span class='line'>static int __init test_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct page *(*follow_page_p)(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-</span><span class='line'>&#9;&#9;= (struct page *(*)(struct vm_area_struct *vma, unsigned long address, unsigned int flags))0xffffffff81133ab0;
-</span><span class='line'>&#9;struct vm_area_struct *vma = (struct vm_area_struct *)0xffff88002d29c5f8;
-</span><span class='line'>&#9;unsigned long address = 139720639524864UL;
-</span><span class='line'>&#9;struct page *pa;  
-</span><span class='line'>&#9;char ch[4096+10]; 
-</span><span class='line'>&#9;pa = follow_page_p(vma, address, 0);
-</span><span class='line'>&#9;memcpy(ch, page_address(pa), 4096);
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;pgd_t *pgd;
-</span><span class='line'>&#9;&#9;pud_t *pud;
-</span><span class='line'>&#9;&#9;pmd_t *pmd;
-</span><span class='line'>&#9;&#9;pte_t *pte;
-</span><span class='line'>&#9;&#9;unsigned long pfn;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;pgd = pgd_offset(vma-&gt;vm_mm, address);
-</span><span class='line'>&#9;&#9;pud = pud_offset(pgd, address);
-</span><span class='line'>&#9;&#9;pmd = pmd_offset(pud, address);
-</span><span class='line'>&#9;&#9;pte = pte_offset_map(pmd, address);
-</span><span class='line'>&#9;&#9;pfn = pte_pfn(*pte);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("follow_page=%p\n\n", pa);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("PTE_PFN_MASK=0x%lx PAGE_OFFSET=%lx __va(x)=x+PAGE_OFFSET\n\n", PTE_PFN_MASK, PAGE_OFFSET);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("mm-&gt;pgd=%p\n", vma-&gt;vm_mm-&gt;pgd);
-</span><span class='line'>&#9;&#9;printk("PGDIR_SHIFT=%u PTRS_PER_PGD=%u pgd_index*8=0x%lx mm-&gt;pgd+index==pgd=%p\n\n", PGDIR_SHIFT, PTRS_PER_PGD, pgd_index(address)*8, pgd);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pgd=0x%lx *pgd&MASK=0x%lx __va=%p\n", (*pgd).pgd, ((*pgd).pgd)&PTE_PFN_MASK, __va(((*pgd).pgd)&PTE_PFN_MASK));
-</span><span class='line'>&#9;&#9;printk("PUD_SHIFT=%u PTRS_PER_PUD=%u pud_index*8=0x%lx __va+index==pud=%p\n\n", PUD_SHIFT, PTRS_PER_PUD, pud_index(address)*8, pud);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pud=0x%lx *pud&MASK=0x%lx __va=%p\n", (*pud).pud, ((*pud).pud)&PTE_PFN_MASK, __va(((*pud).pud)&PTE_PFN_MASK));
-</span><span class='line'>&#9;&#9;printk("PMD_SHIFT=%d PTRS_PER_PMD=%d pmd_index*8=0x%lx __va+index==pmd=%p\n\n", PMD_SHIFT, PTRS_PER_PMD, pmd_index(address)*8, pmd);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pmd=0x%lx *pmd&MASK=0x%lx __va=%p\n", (*pmd).pmd, ((*pmd).pmd)&PTE_PFN_MASK, __va(((*pmd).pmd)&PTE_PFN_MASK));
-</span><span class='line'>&#9;&#9;printk("PAGE_SHIFT=%d PTRS_PER_PTE=%d pte_index*8=0x%lx __va+index==pte=%p\n\n", PAGE_SHIFT, PTRS_PER_PTE, pte_index(address)*8, pte);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;printk("*pte=0x%lx *pte&MASK=0x%lx pte_pfn=%lx pfn=%lx\n", (*pte).pte, ((*pte).pte)&PTE_PFN_MASK, (((*pte).pte)&PTE_PFN_MASK)&gt;&gt;PAGE_SHIFT, pfn);
-</span><span class='line'>&#9;&#9;printk("vmemmap=%p pfn*sizeof(page)=0x%lx cal_page=%p==follow_page\n\n", vmemmap, pfn*sizeof(struct page), vmemmap+pfn);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;printk("%s\n", ch);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __exit test_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;printk("test exit\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_init);   
-</span><span class='line'>module_exit(test_exit);   
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># dmesg
-</span><span class='line'>follow_page=ffffea000077a1a8
-</span><span class='line'>
-</span><span class='line'>PTE_PFN_MASK=0x3ffffffff000 PAGE_OFFSET=ffff880000000000 __va(x)=x+PAGE_OFFSET
-</span><span class='line'>
-</span><span class='line'>mm-&gt;pgd=ffff88000c952000
-</span><span class='line'>PGDIR_SHIFT=39 PTRS_PER_PGD=512 pgd_index*8=0x7f0 mm-&gt;pgd+index==pgd=ffff88000c9527f0
-</span><span class='line'>
-</span><span class='line'>*pgd=0x30bee067 *pgd&MASK=0x30bee000 __va=ffff880030bee000
-</span><span class='line'>PUD_SHIFT=30 PTRS_PER_PUD=512 pud_index*8=0x260 __va+index==pud=ffff880030bee260
-</span><span class='line'>
-</span><span class='line'>*pud=0x323b1067 *pud&MASK=0x323b1000 __va=ffff8800323b1000
-</span><span class='line'>PMD_SHIFT=21 PTRS_PER_PMD=512 pmd_index*8=0xfc0 __va+index==pmd=ffff8800323b1fc0
-</span><span class='line'>
-</span><span class='line'>*pmd=0xc934067 *pmd&MASK=0xc934000 __va=ffff88000c934000
-</span><span class='line'>PAGE_SHIFT=12 PTRS_PER_PTE=512 pte_index*8=0xb18 __va+index==pte=ffff88000c934b18
-</span><span class='line'>
-</span><span class='line'>*pte=0x80000000222e3047 *pte&MASK=0x222e3000 pte_pfn=222e3 pfn=222e3
-</span><span class='line'>vmemmap=ffffea0000000000 pfn*sizeof(page)=0x77a1a8 cal_page=ffffea000077a1a8==follow_page
-</span><span class='line'>
-</span><span class='line'>ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK
-</span><span class='line'>test exit</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>dfs all vma, 虚拟地址连续，物理地址不连续</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>...
-</span><span class='line'>mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f90fd1e3000
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt; 
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/sysctl.h&gt;
-</span><span class='line'>#include &lt;linux/timer.h&gt;
-</span><span class='line'>#include &lt;linux/hardirq.h&gt;
-</span><span class='line'>#include &lt;linux/bottom_half.h&gt;
-</span><span class='line'>#include &lt;linux/preempt.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>#include &lt;linux/proc_fs.h&gt;
-</span><span class='line'>#include &lt;linux/file.h&gt; 
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/kprobes.h&gt;
-</span><span class='line'>
-</span><span class='line'>#include &lt;linux/mm.h&gt;   
-</span><span class='line'>#include &lt;linux/mm_types.h&gt;
-</span><span class='line'>
-</span><span class='line'>#define N 10000000
-</span><span class='line'>char ch[N];
-</span><span class='line'>
-</span><span class='line'>void dfs(struct rb_node *rb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct page *(*follow_page_p)(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-</span><span class='line'>&#9;&#9;= (struct page *(*)(struct vm_area_struct *vma, unsigned long address, unsigned int flags))0xffffffff81133ab0;
-</span><span class='line'>&#9;struct vm_area_struct *vma;
-</span><span class='line'>&#9;unsigned long start, end, addr = 0x7f90fd1e3000;
-</span><span class='line'>&#9;struct page *pa;
-</span><span class='line'>&#9;if (!rb)
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;vma = rb_entry(rb, struct vm_area_struct, vm_rb);
-</span><span class='line'>&#9;start = vma-&gt;vm_start;
-</span><span class='line'>&#9;end = vma-&gt;vm_end;
-</span><span class='line'>&#9;if (addr &gt;= start && addr &lt; end && end-start &lt;= N) {
-</span><span class='line'>&#9;&#9;pa = follow_page_p(vma, addr, 0);
-</span><span class='line'>&#9;&#9;if (pa) {
-</span><span class='line'>&#9;&#9;&#9;memcpy(ch, page_address(pa), 4096);
-</span><span class='line'>&#9;&#9;&#9;printk("page=%p ch=%s\n", pa, ch);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;pa = follow_page_p(vma, addr+4096, 0);
-</span><span class='line'>&#9;&#9;if (pa) {
-</span><span class='line'>&#9;&#9;&#9;memcpy(ch, page_address(pa), 4096);
-</span><span class='line'>&#9;&#9;&#9;printk("page=%p ch=%s\n", pa, ch);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;dfs(rb-&gt;rb_left);
-</span><span class='line'>&#9;dfs(rb-&gt;rb_right);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static int __init test_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct mm_struct *mm = (struct mm_struct*)0xffff8800303a3880;
-</span><span class='line'>&#9;printk("test start task-&gt;mm=%p\n", mm-&gt;mm_rb.rb_node);
-</span><span class='line'>&#9;dfs(mm-&gt;mm_rb.rb_node);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>static void __exit test_exit(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;printk("test exit\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_init);
-</span><span class='line'>module_exit(test_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>test start task-&gt;mm=ffff88002cc05e40
-</span><span class='line'>page=ffffea000066e618 ch=ABCDEFGHIJKL1234567890!@#$%^&*()KKKKKKKKKKKKKKKKKKK
-</span><span class='line'>page=ffffea000062bec0 ch=AAAAAAAAAAAAAAAAAAABBBBBBBBBBBBCCCCCCCCCCC
-</span><span class='line'>test exit</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/11">&larr; Older</a>
@@ -3348,7 +2712,7 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(55)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(56)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
@@ -3357,7 +2721,7 @@ if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>13</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -3557,8 +2921,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(20)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(21)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~08/?opendiv=2016'>2016-08</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
@@ -3652,6 +3017,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/08/31/command-pssh_pscp/">pssh、pscp命令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a>
       </li>
     
@@ -3665,10 +3034,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-base/">内核热补丁技术揭秘</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a>
       </li>
     
   </ul>

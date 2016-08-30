@@ -62,6 +62,779 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/07/29/kvm-src3/">KVM源代码分析3:CPU虚拟化</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-07-29T14:48:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>14:48:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.oenhan.com/kvm-src-3-cpu">http://www.oenhan.com/kvm-src-3-cpu</a></p>
+
+<p>在虚拟机的创建与运行章节里面笼统的介绍了KVM在qemu中的创建和运行，基本的qemu代码流程已经梳理清楚，后续主要写一些硬件虚拟化的原理和代码流程，主要写原理和qemu控制KVM运行的的ioctl接口，后续对内核代码的梳理也从这些接口下手。</p>
+
+<h4>1.VT-x 技术</h4>
+
+<p>Intel处理器支持的虚拟化技术即是VT-x，之所以CPU支持硬件虚拟化是因为软件虚拟化的效率太低。</p>
+
+<p>处理器虚拟化的本质是分时共享，主要体现在状态恢复和资源隔离，实际上每个VM对于VMM看就是一个task么，之前Intel处理器在虚拟化上没有提供默认的硬件支持，传统 x86 处理器有4个特权级，Linux使用了0,3级别，0即内核，3即用户态，（更多参考CPU的运行环、特权级与保护）而在虚拟化架构上，虚拟机监控器的运行级别需要内核态特权级，而CPU特权级被传统OS占用，所以Intel设计了VT-x，提出了VMX模式，即VMX root operation 和 VMX non-root operation，虚拟机监控器运行在VMX root operation，虚拟机运行在VMX non-root operation。每个模式下都有相对应的0~3特权级。</p>
+
+<p>为什么引入这两种特殊模式，在传统x86的系统中，CPU有不同的特权级，是为了划分不同的权限指令，某些指令只能由系统软件操作，称为特权指令，这些指令只能在最高特权级上才能正确执行，反之则会触发异常，处理器会陷入到最高特权级，由系统软件处理。还有一种需要操作特权资源（如访问中断寄存器）的指令，称为敏感指令。OS运行在特权级上，屏蔽掉用户态直接执行的特权指令，达到控制所有的硬件资源目的；而在虚拟化环境中，VMM控制所有所有硬件资源，VM中的OS只能占用一部分资源，OS执行的很多特权指令是不能真正对硬件生效的，所以原特权级下有了root模式，OS指令不需要修改就可以正常执行在特权级上，但这个特权级的所有敏感指令都会传递到root模式处理，这样达到了VMM的目的。</p>
+
+<p>在KVM源代码分析1:基本工作原理章节中也说了kvm分3个模式，对应到VT-x 中即是客户模式对应vmx非root模式，内核模式对应VMX root模式下的0特权级，用户模式对应vmx root模式下的3特权级。</p>
+
+<p>如下图<br/>
+<img src="/images/system/kvm/2015-07-29-6.jpg" alt="" /></p>
+
+<p>在非根模式下敏感指令引发的陷入称为VM-Exit，VM-Exit发生后，CPU从非根模式切换到根模式；对应的，VM-Entry则是从根模式到非根模式，通常意味着调用VM进入运行态。VMLAUCH/VMRESUME命令则是用来发起VM-Entry。</p>
+
+<h4>2.VMCS</h4>
+
+<p>VMCS保存虚拟机的相关CPU状态，每个VCPU都有一个VMCS（内存的），每个物理CPU都有VMCS对应的寄存器（物理的），当CPU发生VM-Entry时，CPU则从VCPU指定的内存中读取VMCS加载到物理CPU上执行，当发生VM-Exit时，CPU则将当前的CPU状态保存到VCPU指定的内存中，即VMCS，以备下次VMRESUME。</p>
+
+<p>VMLAUCH指VM的第一次VM-Entry，VMRESUME则是VMLAUCH之后后续的VM-Entry。VMCS下有一些控制域：</p>
+
+<table>
+<tr>
+    <td>
+        VM-execution controls
+    </td>
+    <td>
+        Determines what operations cause VM exits
+    </td>
+    <td>
+        CR0, CR3, CR4, Exceptions, IO Ports, Interrupts, Pin Events, etc
+    </td>
+</tr>
+<tr>
+    <td>
+        Guest-state area
+    </td>
+    <td>
+        Saved on VM exits，Reloaded on VM entry
+    </td>
+    <td>
+        EIP, ESP, EFLAGS, IDTR, Segment Regs, Exit info, etc
+    </td>
+</tr>
+<tr>
+    <td>
+        Host-state area
+    </td>
+    <td>
+        Loaded on VM exits
+    </td>
+    <td>
+        CR3, EIP set to monitor entry point, EFLAGS hardcoded, etc
+    </td>
+</tr>
+<tr>
+    <td>
+        VM-exit controls
+    </td>
+    <td>
+        Determines which state to save, load, how to transition
+    </td>
+    <td>
+        Example: MSR save-load list  
+    </td>
+</tr>
+<tr>
+    <td>
+        VM-entry controls
+    </td>
+    <td>
+        Determines which state to load, how to transition
+    </td>
+    <td>
+        Including injecting events (interrupts, exceptions) on entry
+    </td>
+</tr>
+</table>
+
+
+<p>关于具体控制域的细节，还是翻Intel手册吧。</p>
+
+<h4>3.VM-Entry/VM-Exit</h4>
+
+<p>VM-Entry是从根模式切换到非根模式，即VMM切换到guest上，这个状态由VMM发起，发起之前先保存VMM中的关键寄存器内容到VMCS中，然后进入到VM-Entry，VM-Entry附带参数主要有3个：1.guest是否处于64bit模式，2.MSR VM-Entry控制，3.注入事件。1应该只在VMLAUCH有意义，3更多是在VMRESUME，而VMM发起VM-Entry更多是因为3，2主要用来每次更新MSR。</p>
+
+<p>VM-Exit是CPU从非根模式切换到根模式，从guest切换到VMM的操作，VM-Exit触发的原因就很多了，执行敏感指令，发生中断，模拟特权资源等。</p>
+
+<p>运行在非根模式下的敏感指令一般分为3个方面：</p>
+
+<p>1.行为没有变化的，也就是说该指令能够正确执行。</p>
+
+<p>2.行为有变化的，直接产生VM-Exit。</p>
+
+<p>3.行为有变化的，但是是否产生VM-Exit受到VM-Execution控制域控制。</p>
+
+<p>主要说一下”受到VM-Execution控制域控制”的敏感指令，这个就是针对性的硬件优化了，一般是1.产生VM-Exit；2.不产生VM-Exit，同时调用优化函数完成功能。典型的有“RDTSC指令”。除了大部分是优化性能的，还有一小部分是直接VM-Exit执行指令结果是异常的，或者说在虚拟化场景下是不适用的，典型的就是TSC offset了。</p>
+
+<p>VM-Exit发生时退出的相关信息，如退出原因、触发中断等，这些内容保存在VM-Exit信息域中。</p>
+
+<h4>4.KVM_CREATE_VM</h4>
+
+<p>创建VM就写这里吧，kvm_dev_ioctl_create_vm函数是主干，在kvm_create_vm中，主要有两个函数，kvm_arch_init_vm和hardware_enable_all，需要注意，但是更先一步的是KVM结构体，下面的struct是精简后的版本。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kvm {
+</span><span class='line'>&#9;struct mm_struct *mm; /* userspace tied to this vm */
+</span><span class='line'>&#9;struct kvm_memslots *memslots;  /*qemu模拟的内存条模型*/
+</span><span class='line'>&#9;struct kvm_vcpu *vcpus[KVM_MAX_VCPUS]; /* 模拟的CPU */
+</span><span class='line'>&#9;atomic_t online_vcpus;
+</span><span class='line'>&#9;int last_boosted_vcpu;
+</span><span class='line'>&#9;struct list_head vm_list;  //HOST上VM管理链表，
+</span><span class='line'>&#9;struct kvm_io_bus *buses[KVM_NR_BUSES];
+</span><span class='line'>&#9;struct kvm_vm_stat stat;
+</span><span class='line'>&#9;struct kvm_arch arch; //这个是host的arch的一些参数
+</span><span class='line'>&#9;atomic_t users_count;
+</span><span class='line'> 
+</span><span class='line'>&#9;long tlbs_dirty;
+</span><span class='line'>&#9;struct list_head devices;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>kvm_arch_init_vm基本没有特别动作，初始化了KVM->arch，以及更新了kvmclock函数，这个另外再说。</p>
+
+<p>而hardware_enable_all，针对于每个CPU执行“on_each_cpu(hardware_enable_nolock, NULL, 1）”，在hardware_enable_nolock中先把cpus_hardware_enabled置位，进入到kvm_arch_hardware_enable中，有hardware_enable和TSC初始化规则，主要看hardware_enable，crash_enable_local_vmclear清理位图，判断MSR_IA32_FEATURE_CONTROL寄存器是否满足虚拟环境，不满足则将条件写入到寄存器内，CR4将X86_CR4_VMXE置位，另外还有kvm_cpu_vmxon打开VMX操作模式，外层包了vmm_exclusive的判断，它是kvm_intel.ko的外置参数，默认唯一，可以让用户强制不使用VMM硬件支持。</p>
+
+<h4>5.KVM_CREATE_VCPU</h4>
+
+<p>kvm_vm_ioctl_create_vcpu主要有三部分，kvm_arch_vcpu_create，kvm_arch_vcpu_setup和kvm_arch_vcpu_postcreate，重点自然是kvm_arch_vcpu_create。老样子，在这之前先看一下VCPU的结构体。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kvm_vcpu {
+</span><span class='line'>&#9;struct kvm *kvm;  //归属的KVM
+</span><span class='line'>#ifdef CONFIG_PREEMPT_NOTIFIERS
+</span><span class='line'>&#9;struct preempt_notifier preempt_notifier;
+</span><span class='line'>#endif
+</span><span class='line'>&#9;int cpu;
+</span><span class='line'>&#9;int vcpu_id;
+</span><span class='line'>&#9;int srcu_idx;
+</span><span class='line'>&#9;int mode;
+</span><span class='line'>&#9;unsigned long requests;
+</span><span class='line'>&#9;unsigned long guest_debug;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct mutex mutex;
+</span><span class='line'>&#9;struct kvm_run *run;  //运行时的状态
+</span><span class='line'> 
+</span><span class='line'>&#9;int fpu_active;
+</span><span class='line'>&#9;int guest_fpu_loaded, guest_xcr0_loaded;
+</span><span class='line'>&#9;wait_queue_head_t wq; //队列
+</span><span class='line'>&#9;struct pid *pid;
+</span><span class='line'>&#9;int sigset_active;
+</span><span class='line'>&#9;sigset_t sigset;
+</span><span class='line'>&#9;struct kvm_vcpu_stat stat; //一些数据
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_HAS_IOMEM
+</span><span class='line'>&#9;int mmio_needed;
+</span><span class='line'>&#9;int mmio_read_completed;
+</span><span class='line'>&#9;int mmio_is_write;
+</span><span class='line'>&#9;int mmio_cur_fragment;
+</span><span class='line'>&#9;int mmio_nr_fragments;
+</span><span class='line'>&#9;struct kvm_mmio_fragment mmio_fragments[KVM_MAX_MMIO_FRAGMENTS];
+</span><span class='line'>#endif
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_KVM_ASYNC_PF
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;u32 queued;
+</span><span class='line'>&#9;&#9;struct list_head queue;
+</span><span class='line'>&#9;&#9;struct list_head done;
+</span><span class='line'>&#9;&#9;spinlock_t lock;
+</span><span class='line'>&#9;} async_pf;
+</span><span class='line'>#endif
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_HAVE_KVM_CPU_RELAX_INTERCEPT
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Cpu relax intercept or pause loop exit optimization
+</span><span class='line'>&#9; * in_spin_loop: set when a vcpu does a pause loop exit
+</span><span class='line'>&#9; *  or cpu relax intercepted.
+</span><span class='line'>&#9; * dy_eligible: indicates whether vcpu is eligible for directed yield.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;bool in_spin_loop;
+</span><span class='line'>&#9;&#9;bool dy_eligible;
+</span><span class='line'>&#9;} spin_loop;
+</span><span class='line'>#endif
+</span><span class='line'>&#9;bool preempted;
+</span><span class='line'>&#9;struct kvm_vcpu_arch arch;  //当前VCPU虚拟的架构，默认介绍X86
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>借着看kvm_arch_vcpu_create，它借助kvm_x86_ops->vcpu_create即vmx_create_vcpu完成任务，vmx是X86硬件虚拟化层，从代码看，qemu用户态是一层，kernel 中KVM通用代码是一层，类似kvm_x86_ops是一层，针对各个不同硬件架构，而vcpu_vmx则是具体架构的虚拟化方案一层。首先是kvm_vcpu_init初始化，主要是填充结构体，可以注意的是vcpu->run分派了一页内存，下面有kvm_arch_vcpu_init负责填充x86 CPU结构体，下面就是kvm_vcpu_arch：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kvm_vcpu_arch {
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * rip and regs accesses must go through
+</span><span class='line'>&#9; * kvm_{register,rip}_{read,write} functions.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;unsigned long regs[NR_VCPU_REGS];
+</span><span class='line'>&#9;u32 regs_avail;
+</span><span class='line'>&#9;u32 regs_dirty;
+</span><span class='line'>&#9;//类似这些寄存器就是就是用来缓存真正的CPU值的
+</span><span class='line'>&#9;unsigned long cr0;
+</span><span class='line'>&#9;unsigned long cr0_guest_owned_bits;
+</span><span class='line'>&#9;unsigned long cr2;
+</span><span class='line'>&#9;unsigned long cr3;
+</span><span class='line'>&#9;unsigned long cr4;
+</span><span class='line'>&#9;unsigned long cr4_guest_owned_bits;
+</span><span class='line'>&#9;unsigned long cr8;
+</span><span class='line'>&#9;u32 hflags;
+</span><span class='line'>&#9;u64 efer;
+</span><span class='line'>&#9;u64 apic_base;
+</span><span class='line'>&#9;struct kvm_lapic *apic;    /* kernel irqchip context */
+</span><span class='line'>&#9;unsigned long apic_attention;
+</span><span class='line'>&#9;int32_t apic_arb_prio;
+</span><span class='line'>&#9;int mp_state;
+</span><span class='line'>&#9;u64 ia32_misc_enable_msr;
+</span><span class='line'>&#9;bool tpr_access_reporting;
+</span><span class='line'>&#9;u64 ia32_xss;
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Paging state of the vcpu
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * If the vcpu runs in guest mode with two level paging this still saves
+</span><span class='line'>&#9; * the paging mode of the l1 guest. This context is always used to
+</span><span class='line'>&#9; * handle faults.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct kvm_mmu mmu; //内存管理，更多的是附带了直接操作函数
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Paging state of an L2 guest (used for nested npt)
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * This context will save all necessary information to walk page tables
+</span><span class='line'>&#9; * of the an L2 guest. This context is only initialized for page table
+</span><span class='line'>&#9; * walking and not for faulting since we never handle l2 page faults on
+</span><span class='line'>&#9; * the host.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct kvm_mmu nested_mmu;
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Pointer to the mmu context currently used for
+</span><span class='line'>&#9; * gva_to_gpa translations.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct kvm_mmu *walk_mmu;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct kvm_mmu_memory_cache mmu_pte_list_desc_cache;
+</span><span class='line'>&#9;struct kvm_mmu_memory_cache mmu_page_cache;
+</span><span class='line'>&#9;struct kvm_mmu_memory_cache mmu_page_header_cache;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct fpu guest_fpu;
+</span><span class='line'>&#9;u64 xcr0;
+</span><span class='line'>&#9;u64 guest_supported_xcr0;
+</span><span class='line'>&#9;u32 guest_xstate_size;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct kvm_pio_request pio;
+</span><span class='line'>&#9;void *pio_data;
+</span><span class='line'> 
+</span><span class='line'>&#9;u8 event_exit_inst_len;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct kvm_queued_exception {
+</span><span class='line'>&#9;&#9;bool pending;
+</span><span class='line'>&#9;&#9;bool has_error_code;
+</span><span class='line'>&#9;&#9;bool reinject;
+</span><span class='line'>&#9;&#9;u8 nr;
+</span><span class='line'>&#9;&#9;u32 error_code;
+</span><span class='line'>&#9;} exception;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct kvm_queued_interrupt {
+</span><span class='line'>&#9;&#9;bool pending;
+</span><span class='line'>&#9;&#9;bool soft;
+</span><span class='line'>&#9;&#9;u8 nr;
+</span><span class='line'>&#9;} interrupt;
+</span><span class='line'> 
+</span><span class='line'>&#9;int halt_request; /* real mode on Intel only */
+</span><span class='line'> 
+</span><span class='line'>&#9;int cpuid_nent;
+</span><span class='line'>&#9;struct kvm_cpuid_entry2 cpuid_entries[KVM_MAX_CPUID_ENTRIES];
+</span><span class='line'> 
+</span><span class='line'>&#9;int maxphyaddr;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* emulate context */
+</span><span class='line'>&#9;//下面是KVM的软件模拟模式，也就是没有vmx的情况，估计也没人用这一套
+</span><span class='line'>&#9;struct x86_emulate_ctxt emulate_ctxt;
+</span><span class='line'>&#9;bool emulate_regs_need_sync_to_vcpu;
+</span><span class='line'>&#9;bool emulate_regs_need_sync_from_vcpu;
+</span><span class='line'>&#9;int (*complete_userspace_io)(struct kvm_vcpu *vcpu);
+</span><span class='line'> 
+</span><span class='line'>&#9;gpa_t time;
+</span><span class='line'>&#9;struct pvclock_vcpu_time_info hv_clock;
+</span><span class='line'>&#9;unsigned int hw_tsc_khz;
+</span><span class='line'>&#9;struct gfn_to_hva_cache pv_time;
+</span><span class='line'>&#9;bool pv_time_enabled;
+</span><span class='line'>&#9;/* set guest stopped flag in pvclock flags field */
+</span><span class='line'>&#9;bool pvclock_set_guest_stopped_request;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;u64 msr_val;
+</span><span class='line'>&#9;&#9;u64 last_steal;
+</span><span class='line'>&#9;&#9;u64 accum_steal;
+</span><span class='line'>&#9;&#9;struct gfn_to_hva_cache stime;
+</span><span class='line'>&#9;&#9;struct kvm_steal_time steal;
+</span><span class='line'>&#9;} st;
+</span><span class='line'> 
+</span><span class='line'>&#9;u64 last_guest_tsc;
+</span><span class='line'>&#9;u64 last_host_tsc;
+</span><span class='line'>&#9;u64 tsc_offset_adjustment;
+</span><span class='line'>&#9;u64 this_tsc_nsec;
+</span><span class='line'>&#9;u64 this_tsc_write;
+</span><span class='line'>&#9;u64 this_tsc_generation;
+</span><span class='line'>&#9;bool tsc_catchup;
+</span><span class='line'>&#9;bool tsc_always_catchup;
+</span><span class='line'>&#9;s8 virtual_tsc_shift;
+</span><span class='line'>&#9;u32 virtual_tsc_mult;
+</span><span class='line'>&#9;u32 virtual_tsc_khz;
+</span><span class='line'>&#9;s64 ia32_tsc_adjust_msr;
+</span><span class='line'> 
+</span><span class='line'>&#9;atomic_t nmi_queued;  /* unprocessed asynchronous NMIs */
+</span><span class='line'>&#9;unsigned nmi_pending; /* NMI queued after currently running handler */
+</span><span class='line'>&#9;bool nmi_injected;    /* Trying to inject an NMI this entry */
+</span><span class='line'> 
+</span><span class='line'>&#9;struct mtrr_state_type mtrr_state;
+</span><span class='line'>&#9;u64 pat;
+</span><span class='line'> 
+</span><span class='line'>&#9;unsigned switch_db_regs;
+</span><span class='line'>&#9;unsigned long db[KVM_NR_DB_REGS];
+</span><span class='line'>&#9;unsigned long dr6;
+</span><span class='line'>&#9;unsigned long dr7;
+</span><span class='line'>&#9;unsigned long eff_db[KVM_NR_DB_REGS];
+</span><span class='line'>&#9;unsigned long guest_debug_dr7;
+</span><span class='line'> 
+</span><span class='line'>&#9;u64 mcg_cap;
+</span><span class='line'>&#9;u64 mcg_status;
+</span><span class='line'>&#9;u64 mcg_ctl;
+</span><span class='line'>&#9;u64 *mce_banks;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* Cache MMIO info */
+</span><span class='line'>&#9;u64 mmio_gva;
+</span><span class='line'>&#9;unsigned access;
+</span><span class='line'>&#9;gfn_t mmio_gfn;
+</span><span class='line'>&#9;u64 mmio_gen;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct kvm_pmu pmu;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* used for guest single stepping over the given code position */
+</span><span class='line'>&#9;unsigned long singlestep_rip;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* fields used by HYPER-V emulation */
+</span><span class='line'>&#9;u64 hv_vapic;
+</span><span class='line'> 
+</span><span class='line'>&#9;cpumask_var_t wbinvd_dirty_mask;
+</span><span class='line'> 
+</span><span class='line'>&#9;unsigned long last_retry_eip;
+</span><span class='line'>&#9;unsigned long last_retry_addr;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;bool halted;
+</span><span class='line'>&#9;&#9;gfn_t gfns[roundup_pow_of_two(ASYNC_PF_PER_VCPU)];
+</span><span class='line'>&#9;&#9;struct gfn_to_hva_cache data;
+</span><span class='line'>&#9;&#9;u64 msr_val;
+</span><span class='line'>&#9;&#9;u32 id;
+</span><span class='line'>&#9;&#9;bool send_user_only;
+</span><span class='line'>&#9;} apf;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* OSVW MSRs (AMD only) */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;u64 length;
+</span><span class='line'>&#9;&#9;u64 status;
+</span><span class='line'>&#9;} osvw;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;u64 msr_val;
+</span><span class='line'>&#9;&#9;struct gfn_to_hva_cache data;
+</span><span class='line'>&#9;} pv_eoi;
+</span><span class='line'> 
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Indicate whether the access faults on its page table in guest
+</span><span class='line'>&#9; * which is set when fix page fault and used to detect unhandeable
+</span><span class='line'>&#9; * instruction.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;bool write_fault_to_shadow_pgtable;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* set at EPT violation at this point */
+</span><span class='line'>&#9;unsigned long exit_qualification;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* pv related host specific info */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;bool pv_unhalted;
+</span><span class='line'>&#9;} pv;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>整个arch结构真是长，很适合凑篇幅，很多结构其他过程涉及到的再提吧，反正我也不知道。</p>
+
+<p>kvm_arch_vcpu_init初始化了x86在虚拟化底层的实现函数，首先是pv和emulate_ctxt，这些不支持VMX下的模拟虚拟化，尤其是vcpu->arch.emulate_ctxt.ops = &amp;emulate_ops，emulate_ops初始化虚拟化模拟的对象函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct x86_emulate_ops emulate_ops = {
+</span><span class='line'>&#9;.read_std            = kvm_read_guest_virt_system,
+</span><span class='line'>&#9;.write_std           = kvm_write_guest_virt_system,
+</span><span class='line'>&#9;.fetch               = kvm_fetch_guest_virt,
+</span><span class='line'>&#9;.read_emulated       = emulator_read_emulated,
+</span><span class='line'>&#9;.write_emulated      = emulator_write_emulated,
+</span><span class='line'>&#9;.cmpxchg_emulated    = emulator_cmpxchg_emulated,
+</span><span class='line'>&#9;.invlpg              = emulator_invlpg,
+</span><span class='line'>&#9;.pio_in_emulated     = emulator_pio_in_emulated,
+</span><span class='line'>&#9;.pio_out_emulated    = emulator_pio_out_emulated,
+</span><span class='line'>&#9;.get_segment         = emulator_get_segment,
+</span><span class='line'>&#9;.set_segment         = emulator_set_segment,
+</span><span class='line'>&#9;.get_cached_segment_base = emulator_get_cached_segment_base,
+</span><span class='line'>&#9;.get_gdt             = emulator_get_gdt,
+</span><span class='line'>&#9;.get_idt         = emulator_get_idt,
+</span><span class='line'>&#9;.set_gdt             = emulator_set_gdt,
+</span><span class='line'>&#9;.set_idt         = emulator_set_idt,
+</span><span class='line'>&#9;.get_cr              = emulator_get_cr,
+</span><span class='line'>&#9;.set_cr              = emulator_set_cr,
+</span><span class='line'>&#9;.cpl                 = emulator_get_cpl,
+</span><span class='line'>&#9;.get_dr              = emulator_get_dr,
+</span><span class='line'>&#9;.set_dr              = emulator_set_dr,
+</span><span class='line'>&#9;.set_msr             = emulator_set_msr,
+</span><span class='line'>&#9;.get_msr             = emulator_get_msr,
+</span><span class='line'>&#9;.halt                = emulator_halt,
+</span><span class='line'>&#9;.wbinvd              = emulator_wbinvd,
+</span><span class='line'>&#9;.fix_hypercall       = emulator_fix_hypercall,
+</span><span class='line'>&#9;.get_fpu             = emulator_get_fpu,
+</span><span class='line'>&#9;.put_fpu             = emulator_put_fpu,
+</span><span class='line'>&#9;.intercept           = emulator_intercept,
+</span><span class='line'>&#9;.get_cpuid           = emulator_get_cpuid,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>x86_emulate_ops函数看看就好，实际上也很少有人放弃vmx直接软件模拟。后面又有mp_state，给pio_data分配了一个page，kvm_set_tsc_khz设置TSC，kvm_mmu_create则是初始化MMU的函数，里面的函数都是地址转换的重点，在内存虚拟化重点提到。kvm_create_lapic初始化lapic，初始化mce_banks结构，还有pv_time,xcr0,xstat,pmu等，类似x86硬件结构上需要存在的，OS底层需要看到的硬件名称都要有对应的软件结构。</p>
+
+<p>回到vmx_create_vcpu，vmx的guest_msrs分配得到一个page，后面是vmcs的分配，vmx->loaded_vmcs->vmcs = alloc_vmcs()，alloc_vmcs为当前cpu执行alloc_vmcs_cpu，alloc_vmcs_cpu中alloc_pages_exact_node分配给vmcs，alloc_pages_exact_node调用<code>__alloc_pages</code>实现，原来以为vmcs占用了一个page，但此处从伙伴系统申请了2<sup>vmcs</sup>_config.order页，此处vmcs_config在setup_vmcs_config中初始化，vmcs_conf->order = get_order(vmcs_config.size)，而vmcs_conf->size = vmx_msr_high &amp; 0x1fff，又rdmsr(MSR_IA32_VMX_BASIC, vmx_msr_low, vmx_msr_high)，此处size由于与0x1fff与运算，大小必然小于4k，order则为0，然来绕去还是一个page大小。这么做估计是为了兼容vmcs_config中的size计算。</p>
+
+<p>下面根据vmm_exclusive进行kvm_cpu_vmxon，进入vmx模式，初始化loaded_vmcs，然后用kvm_cpu_vmxoff退出vmx模式。</p>
+
+<p>vmx_vcpu_load加载VCPU的信息，切换到指定cpu，进入到vmx模式，将loaded_vmcs的vmcs和当前cpu的vmcs绑定到一起。vmx_vcpu_setup则是初始化vmcs内容，主要是赋值计算，下面的vmx_vcpu_put则是vmx_vcpu_load的反运算。下面还有一些apic，nested，pml就不说了。</p>
+
+<p>vmx_create_vcpu结束就直接回到kvm_vm_ioctl_create_vcpu函数，下面是kvm_arch_vcpu_setup，整个就一条线到kvm_arch_vcpu_load函数，主要有kvm_x86_ops->vcpu_load(vcpu, cpu)和tsc处理，vcpu_load就是vmx_vcpu_load，刚说了，就是进入vcpu模式下准备工作。</p>
+
+<p>kvm_arch_vcpu_setup后面是create_vcpu_fd为proc创建控制fd，让qemu使用。kvm_arch_vcpu_postcreate则是马后炮般，重新vcpu_load，写msr，tsc。</p>
+
+<p>如此整个vcpu就创建完成了。</p>
+
+<h4>6.KVM_RUN</h4>
+
+<p>KVM run涉及内容也不少，先写完内存虚拟化之后再开篇专门写RUN流程。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/07/29/kvm-src2/">KVM源代码分析2:虚拟机的创建与运行</a></h2>
     
     
@@ -1334,67 +2107,6 @@ Maximum delay at：最大调度延迟发生的时刻。</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/24/tools-haproxy-splice/">haproxy splice</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-24T16:45:00+08:00'><span class='date'>2015-07-24</span> <span class='time'>16:45:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>www.haproxy.org/download/1.5/doc/configuration.txt 或 <a href="/download/tools/haproxy-1.5-configuration.txt">configuration.txt</a></p>
-
-<p>旧版编译加</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>USE_TCPSPLICE=1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>比较新的加</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>USE_LINUX_SPLICE=1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>默认编译会加入</p>
-
-<p>编译加入了也要在配置文件中开启才有效</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>option splice-auto
-</span><span class='line'>option splice-request
-</span><span class='line'>option splice-response</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在global中关闭splice功能</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>nosplice</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/20">&larr; Older</a>
@@ -1448,7 +2160,7 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(55)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(56)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
@@ -1457,7 +2169,7 @@ if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>13</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -1657,8 +2369,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(20)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(21)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~08/?opendiv=2016'>2016-08</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
@@ -1752,6 +2465,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/08/31/command-pssh_pscp/">pssh、pscp命令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a>
       </li>
     
@@ -1765,10 +2482,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-base/">内核热补丁技术揭秘</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a>
       </li>
     
   </ul>

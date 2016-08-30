@@ -62,6 +62,325 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2016/01/21/kernel-net-udp-sum/">udp checksum</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2016-01-21T16:43:00+08:00'><span class='date'>2016-01-21</span> <span class='time'>16:43:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://wenx05124561.blog.163.com/blog/static/124000805201242032041268/">http://wenx05124561.blog.163.com/blog/static/124000805201242032041268/</a></p>
+
+<h4>a. 网卡设备属性</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define NETIF_F_IP_CSUM     2   /* 基于IPv4的L4层checksum. */  
+</span><span class='line'>#define NETIF_F_NO_CSUM     4   /* 设备可靠不需要L4层checksum. loopack. */  
+</span><span class='line'>#define NETIF_F_HW_CSUM     8   /* 基于所有协议的L4层checksum*/  
+</span><span class='line'>#define NETIF_F_IPV6_CSUM   16  /* 基于IPv6的L4层checksum*/  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过ethtool -k eth0可以查看网卡是否支持硬件checksum，tx-checksumming: on  表明支持发送hardware checksum。</p>
+
+<h4>b. linux UDP checksum数据结构</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>union {
+</span><span class='line'>&#9;__wsum    csum;
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;__u16 csum_start;
+</span><span class='line'>&#9;&#9;__u16 csum_offset;
+</span><span class='line'>&#9;};
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>1） skb->csum和skb->ip_summed这两个域也是与4层校验相关的，这两个域的含义依赖于skb表示的是一个输入包还是一个输出包。</p>
+
+<p>2） 当网卡设备能提供硬件checksum并且作为输出包的时候，表示为skb->csum_start和skb->csum_offset</p>
+
+<p>csum_start: Offset from skb->head where checksumming should start</p>
+
+<p>csum_offset: Offset from csum_start where checksum should be stored</p>
+
+<p>当数据包是一个输入包时</p>
+
+<p>skb->ip_summed表示的是四层校验的状态，下面的几个宏定义表示了设备驱动传递给4层的一些信息。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define CHECKSUM_NONE 0
+</span><span class='line'>#define CHECKSUM_UNNECESSARY 1
+</span><span class='line'>#define CHECKSUM_COMPLETE 2</span></code></pre></td></tr></table></div></figure>
+
+
+<p></p>
+
+<p>skb->csum:存放硬件或者软件计算的payload的checksum不包括伪头，但是是否有意义由skb->ip_summed的值决定。</p>
+
+<p>CHECKSUM_NONE表示csum域中的校验值是无意义的，需要L4层自己校验payload和伪头。有可能是硬件检验出错或者硬件没有校验功能，协议栈软件更改如pskb_trim_rcsum函数。</p>
+
+<p>CHECKSUM_UNNECESSARY表示网卡或者协议栈已经计算和验证了L4层的头和校验值。也就是计算了tcp udp的伪头。还有一种情况就是回环，因为在回环中错误发生的概率太低了，因此就不需要计算校验来节省cpu事件。</p>
+
+<p>CHECKSUM_COMPLETE表示网卡已经计算了L4层payload的校验，并且csum已经被赋值，此时L4层的接收者只需要加伪头并验证校验结果。</p>
+
+<p>1) 在L4层发现如果udp->check位段被设为0，那么skb->ip_summed直接设为CHECKSUM_UNNECESSARY，放行该报文。</p>
+
+<p>2) 如果skb->ip_summed为CHECKSUM_COMPLETE，则把skb->csum加上伪头进行校验，成功则将skb->ip_summed设为CHECKSUM_UNNECESSARY， 放行该数据包。</p>
+
+<p>3) 通过上述后skb->ip_summed还不是CHECKSUM_UNNECESSARY，那么重新计算伪头赋给skb->csum。</p>
+
+<p>4) 将还不是CHECKSUM_UNNECESSARY的数据报文的payload加上skb->csum进行checksum计算，成功将设为CHECKSUM_UNNECESSARY并放行，失败则丢弃。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh, 
+</span><span class='line'>&#9;&#9;&#9;&#9;int proto)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct iphdr *iph;
+</span><span class='line'>&#9;int err; 
+</span><span class='line'>
+</span><span class='line'>&#9;UDP_SKB_CB(skb)-&gt;partial_cov = 0; 
+</span><span class='line'>&#9;UDP_SKB_CB(skb)-&gt;cscov = skb-&gt;len;
+</span><span class='line'>
+</span><span class='line'>&#9;if (proto == IPPROTO_UDPLITE) {
+</span><span class='line'>&#9;&#9;err = udplite_checksum_init(skb, uh); 
+</span><span class='line'>&#9;&#9;if (err)
+</span><span class='line'>&#9;&#9;&#9;return err; 
+</span><span class='line'>&#9;}    
+</span><span class='line'>
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;if (uh-&gt;check == 0) { 
+</span><span class='line'>&#9;&#9;skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+</span><span class='line'>&#9;} else if (skb-&gt;ip_summed == CHECKSUM_COMPLETE) {
+</span><span class='line'>&#9;&#9;if (!csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len,
+</span><span class='line'>&#9;&#9;&#9;&#9;proto, skb-&gt;csum))
+</span><span class='line'>&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+</span><span class='line'>&#9;}    
+</span><span class='line'>&#9;if (!skb_csum_unnecessary(skb))
+</span><span class='line'>&#9;&#9;skb-&gt;csum = csum_tcpudp_nofold(iph-&gt;saddr, iph-&gt;daddr,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;skb-&gt;len, proto, 0);
+</span><span class='line'>&#9;/* Probably, we should checksum udp header (it should be in cache
+</span><span class='line'>&#9; * in any case) and data in tiny packets (&lt; rx copybreak).
+</span><span class='line'>&#9; */
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (udp_lib_checksum_complete(skb))
+</span><span class='line'>&#9;goto csum_error;</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int udp_lib_checksum_complete(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;return !skb_csum_unnecessary(skb) &&
+</span><span class='line'>&#9;&#9;__udp_lib_checksum_complete(skb);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline __sum16 __udp_lib_checksum_complete(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;return __skb_checksum_complete_head(skb, UDP_SKB_CB(skb)-&gt;cscov);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>__sum16 __skb_checksum_complete_head(struct sk_buff *skb, int len)
+</span><span class='line'>{
+</span><span class='line'>&#9;__sum16 sum;
+</span><span class='line'>
+</span><span class='line'>&#9;sum = csum_fold(skb_checksum(skb, 0, len, skb-&gt;csum));
+</span><span class='line'>&#9;if (likely(!sum)) {
+</span><span class='line'>&#9;&#9;if (unlikely(skb-&gt;ip_summed == CHECKSUM_COMPLETE))
+</span><span class='line'>&#9;&#9;&#9;netdev_rx_csum_fault(skb-&gt;dev);
+</span><span class='line'>&#9;&#9;skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return sum;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>当数据包是输出包时</h4>
+
+<p>skb->csum表示为csum_start和csum_offset，它表示硬件网卡存放将要计算的校验值的地址，和最后填充的便宜。这个域在输出包时使用，只在校验值在硬件计算的情况下才对于网卡真正有意义。硬件checksum功能只能用于非分片报文。
+而此时ip_summed可以被设置的值有下面两种：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define CHECKSUM_NONE        0
+</span><span class='line'>#define CHECKSUM_PARTIAL  3</span></code></pre></td></tr></table></div></figure>
+
+
+<p>CHECKSUM_NONE 表示协议栈计算好了校验值，设备不需要做任何事。CHECKSUM_PARTIAL表示协议栈算好了伪头需要硬件计算payload checksum。</p>
+
+<p>1）对于UDP socket开启了UDP_CSUM_NOXMIT /<em> UDP csum disabled </em>/</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>uh-&gt;check = 0；
+</span><span class='line'>skb-&gt;ip_summed = CHECKSUM_NONE;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>2）软件udp checksum</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct iphdr *iph = ip_hdr(skb);
+</span><span class='line'>struct udphdr *uh = udp_hdr(skb);
+</span><span class='line'>uh-&gt;check = 0;
+</span><span class='line'>skb-&gt;csum = csum_partial(skb_transport_header (skb), skb-&gt;len, 0);//skb-&gt;data指向传输层头
+</span><span class='line'>uh-&gt;check = csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len, iph-&gt;protocol, skb-&gt;csum);
+</span><span class='line'>skb-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>//Todo: scatter and gather</span></code></pre></td></tr></table></div></figure>
+
+
+<p>3)  硬件checksum: 只能是ip报文长度小于mtu的数据报(没有分片的报文)。</p>
+
+<p>CHECKSUM_PARTIAL表示使用硬件checksum ，L4层的伪头的校验已经完毕，并且已经加入uh->check字段中，此时只需要设备计算整个头4层头的校验值。</p>
+
+<p>（对于支持scatter and gather的报文必须要传输层头在线性空间才能使用硬件checksum功能）</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>uh-&gt;check = ~csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr, skb-&gt;len, IPPROTO_UDP, 0);
+</span><span class='line'>skb-&gt;csum_start = skb_transport_header (skb) - skb-&gt;head;
+</span><span class='line'>skb-&gt;csum_offset = offsetof(struct udphdr, check);
+</span><span class='line'>skb-&gt;ip_summed = CHECKSUM_PARTIAL;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后在dev_queue_xmit发送的时候发现设备不支持硬件checksum就会进行软件计算</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct netdev_queue *txq)
+</span><span class='line'>
+</span><span class='line'>{
+</span><span class='line'>&#9;.......
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* If packet is not checksummed and device does not
+</span><span class='line'>&#9;&#9;&#9; * support checksumming for this protocol, complete
+</span><span class='line'>&#9;&#9;&#9; * checksumming here.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_set_transport_header(skb, skb-&gt;csum_start -
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;skb_headroom(skb));
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!dev_can_checksum(dev, skb) &&
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;skb_checksum_help(skb))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto out_kfree_skb;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;........
+</span></code></pre></td></tr></table></div></figure>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2016/01/21/system-base-init/">Linux系统启动过程分析</a></h2>
     
     
@@ -265,7 +584,7 @@ if (query != null) {
 
 <h3>linux 实时时钟（RTC）驱动</h3>
 
-<p>翻译：窗外云天<a href="&#x6d;&#97;&#105;&#108;&#x74;&#x6f;&#58;&#121;&#x61;&#x6f;&#x7a;&#x68;&#x65;&#x6e;&#103;&#x75;&#x6f;&#50;&#x30;&#x30;&#x36;&#x40;&#x31;&#50;&#54;&#x2e;&#99;&#111;&#x6d;">&#121;&#x61;&#111;&#122;&#x68;&#101;&#x6e;&#x67;&#x75;&#x6f;&#50;&#48;&#x30;&#x36;&#x40;&#49;&#50;&#54;&#x2e;&#99;&#x6f;&#109;</a>  最后矫正时间：2011.9.25</p>
+<p>翻译：窗外云天<a href="&#x6d;&#97;&#105;&#108;&#x74;&#x6f;&#x3a;&#x79;&#x61;&#x6f;&#x7a;&#104;&#101;&#110;&#x67;&#x75;&#111;&#x32;&#48;&#x30;&#x36;&#64;&#49;&#x32;&#54;&#x2e;&#x63;&#x6f;&#x6d;">&#x79;&#x61;&#x6f;&#122;&#x68;&#x65;&#x6e;&#103;&#117;&#111;&#x32;&#x30;&#48;&#x36;&#64;&#49;&#50;&#x36;&#46;&#x63;&#x6f;&#x6d;</a>  最后矫正时间：2011.9.25</p>
 
 <p>当linux开发者提到“实时时钟”的时候，他们通常所指的就是墙钟时间，这个时间是电池供电的，所以在系统掉电的情况下还能正常工作。除非在MS-Windows启动的时候设置，否则这个时钟不会同步于本地时区和夏令时间。事实上，他被设置成格林威治时间。</p>
 
@@ -1173,181 +1492,6 @@ if (query != null) {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2016/01/06/system-base-time/">linux系统时间和硬件时钟问题(date和hwclock)</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2016-01-06T10:48:00+08:00'><span class='date'>2016-01-06</span> <span class='time'>10:48:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://rpf413.blog.163.com/blog/static/4556376020122831444674/">http://rpf413.blog.163.com/blog/static/4556376020122831444674/</a></p>
-
-<h4>总结一下hwclock，这个容易晕：</h4>
-
-<p>1）/etc/sysconfig/clock 文件，只对 hwclock 命令有效，且只在系统启动和关闭的时候才有用（修改了其中的 UTC=true 到 UTC=false 的前后，执行 hwclock (<code>--utc</code>, 或 <code>--localtime</code>) 都没有变化，要重启系统后才生效）；</p>
-
-<p>2）/etc/rc.d/rc.sysinit 文件，run once at boot time，其中有从硬件时钟同步时间到系统时间的操作；</p>
-
-<p>3）<code>hwclock --localtime</code> 的输出，才是硬件时钟真正的时间。如果输出结果带时区（比如CST），还要看/etc/sysconfig/clock里的UTC参数，如果 UTC=false，那时区有意义；如果 UTC=true，那时区没意义，实际上是UTC时间。</p>
-
-<p>4）在 /etc/sysconfig/clock 中 UTC=false 时，date、hwclock、<code>hwclcok --localtime</code> 输出的时间应该都一致，且此时 <code>hwclock --utc</code>是没有意义的；</p>
-
-<p>5）在 /etc/sysconfig/clock 中 UTC=ture 时，date、hwclock 的输出是一致的，<code>hwclock --localtime</code> 的输出则是UTC时间；</p>
-
-<p>6）如果不想在输出中带时区，则 export LANG=C ，然后再运行 hwclock 就没有什么CST了，免得时区误导你；</p>
-
-<p>7）<code>hwclock --utc</code> 很闹腾，还是别看了，你会晕的。。。</p>
-
-<p>8）系统关闭时会同步系统时间到硬件时钟，系统启动时会从硬件时钟读取时间更新到系统，这2个步骤都要根据 /etc/sysconfig/clock 文件中UTC的参数来设置时区转换。</p>
-
-<h4>实际案例分析</h4>
-
-<p>修改了 /etc/sysconfig/clock 中UTC参数但系统未正常关闭的情况</p>
-
-<p>修改 /etc/sysconfig/clock 文件后，如果系统内核突然崩溃，然后直接按电源重启，则系统没有进行 系统时间到硬件时钟的 同步；但是 系统启动时，又根据 /etc/sysconfig/clock 中UTC的参数，来同步硬件时钟到系统，这时就会出现时间问题：</p>
-
-<p>0）假设系统的时区为CST（UTC+8）；<br/>
-1）假设原 /etc/sysconfig/clock 中 UTC=true，修改成 UTC=false；<br/>
-2）如果此时系统未正常关机，系统时间未按参数 UTC=false 同步时间到硬件时钟（没有+8小时）；<br/>
-3）但系统被按电源重启后，系统读取到 UTC=false，认为硬件时钟为CST时间，直接用于系统时间；<br/>
-4）那么此时，系统时间将少了8小时。</p>
-
-<hr />
-
-<p><a href="http://hi.baidu.com/lujunqianglw/blog/item/bc2d9144d24fc48fb3b7dc1d.html">http://hi.baidu.com/lujunqianglw/blog/item/bc2d9144d24fc48fb3b7dc1d.html</a></p>
-
-<h4>一、首先要弄清几个概念：</h4>
-
-<h5>1. “系统时间”与“硬件时间”</h5>
-
-<p>系统时间: 一般说来就是我们执行 date 命令看到的时间，linux系统下所有的时间调用（除了直接访问硬件时间的命令）都是使用的这个时间。</p>
-
-<p>硬件时间: 主板上BIOS中的时间，由主板电池供电来维持运行，系统开机时要读取这个时间，并根据它来设定系统时间（注意：系统启动时根据硬件时间设定系统时间的过程可能存在时区换算，这要视具体的系统及相关设置而定）。</p>
-
-<h5>2. “UTC时间”与“本地时间”</h5>
-
-<p>UTC时间：Coordinated Universal 8 e2 i( H7 t0 ^/ ^Time 世界协调时间（又称世界标准时间、世界统一时间），在一般精度要求下，它与GMT（Greenwich Mean Time，格林威治标准时间）是一样的，其实也就是说 GMT≈UTC，但 UTC 是以原子钟校准的，更精确。</p>
-
-<p>本地时间：由于处在不同的时区，本地时间一般与UTC是不同的，换算方法就是</p>
-
-<p>本地时间 = UTC + 时区 或 UTC = 本地时间 - 时区</p>
-
-<p>时区东为正，西为负，例如在中国，本地时间都使用北京时间，在linux上显示就是 CST（China Standard Time，中国标准时，注意美国的中部标准时Central Standard Time也缩写为CST，与这里的CST不是一回事！），时区为东八区，也就是 +8 区，所以 CST=UTC+(+8小时) 或 UTC=CST-(+8小时)。</p>
-
-<h4>二、时间命令</h4>
-
-<h5>1. 系统时间 date</h5>
-
-<p>直接调用 date，得到的是本地时间。如果想得到UTC时间的话，使用 date -u。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[12-01 19:07&gt; ~]$ date
-</span><span class='line'>2009年 12月 07日 星期一 14:22:20 CST
-</span><span class='line'>[12-01 19:07&gt; ~]$ date -u
-</span><span class='line'>2009年 12月 07日 星期一 06:22:22 UTC</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2. 硬件时间 /sbin/hwclock</h5>
-
-<p>直接调用 /sbin/hwclock 显示的时间就是 BIOS 中的时间吗？未必！这要看 /etc/sysconfig/clock 中是否启用了UTC，如果启用了UTC（UTC=true），显示的其实是经过时区换算的时间而不是BIOS中真正的时间，如果加上 &ndash;localtime 选项，则得到的总是 BIOS 中实际的时间.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[12-01 19:07&gt; ~]# hwclock
-</span><span class='line'>2009年12月07日 星期一 14时28分43秒 -0.611463 seconds
-</span><span class='line'>[12-01 19:07&gt; ~]# hwclock --utc
-</span><span class='line'>2009年12月07日 星期一 14时28分46秒 -0.594189 seconds
-</span><span class='line'>[12-01 19:07&gt; ~]# hwclock --localtime
-</span><span class='line'>2009年12月07日 星期一 06时28分50秒 -0.063875 seconds</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>3. /etc/localtime</h5>
-
-<p>这个文件用来设置系统的时区，将 /usr/share/zoneinfo/ 中相应文件拷贝到/etc下并重命名为 localtime 即可修改时区设置，而且这种修改对 date 命令是及时生效的。不论是 date 还是 hwclock 都会用到这个文件，会根据这个文件的时区设置来进行UTC和本地之间之间的换算。</p>
-
-<h5>4. /etc/sysconfig/clock</h5>
-
-<p>这个文件只对 hwclock 有效，而且似乎是只在系统启动和关闭的时候才有用，比如修改了其中的 UTC=true 到 UTC=false 的前后，执行 hwclock (<code>--utc</code>, 或 <code>--localtime</code>) 都没有变化，要重启系统后才生效。注：如果设置 UTC=false 并重启系统后,执行一些命令结果如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>date 2009年 12月 07日 星期一 19:26:29 CST
-</span><span class='line'>date -u 2009年 12月 07日 星期一 11:26:29 UTC
-</span><span class='line'>hwclock 2009年12月07日 星期一 19时26分30秒 -0.442668 seconds
-</span><span class='line'>hwclock --utc 2009年12月08日 星期二 03时26分31秒 -0.999091 seconds
-</span><span class='line'>hwclock --localtime 2009年12月07日 星期一 19时26分32秒 -0.999217 seconds</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可见，如果不使用UTC，BIOS时间（红色部分）就是系统本地时间，而且注意这时执行 <code>hwclock --utc</code> 得到的结果没有任何意义，因为这里我们已经禁用了UTC，而且也明显不符合“本地时间=UTC+时区”的关系。</p>
-
-<h4>三、linux与windows双系统间的时间同步</h4>
-
-<p>系统启动和关闭时，硬件时间与系统时间之间的同步有两种方式(假设在中国，用CST代表本地时间)：</p>
-
-<p>方式A: 使用UTC（对linux就是 /etc/sysconfig/clock 中 UTC=true）</p>
-
-<p>开机: BIOS&mdash;&mdash;->UTC（将BIOS中的时间看成是UTC）&mdash;&mdash;(时区变化)&mdash;&ndash;>CST<br/>
-关机: CST &mdash;&mdash;-(时区变化)&mdash;&ndash;>UTC&mdash;&mdash;-存储到&mdash;&mdash;>BIOS</p>
-
-<p>方式B: 不使用UTC（对linux就是 /etc/sysconfig/clock 中 UTC=false）</p>
-
-<p>开机: BIOS&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;>CST（将BIOS中的时间看成是CST）<br/>
-关机: CST &mdash;&mdash;&mdash;存储到&mdash;&mdash;>BIOS</p>
-
-<hr />
-
-<p>FIX:</p>
-
-<p>方式A: 使用UTC（对linux就是 /etc/sysconfig/clock 中 UTC=true）</p>
-
-<p>关机: CST &mdash;&mdash;-操作系统根据时区算出UTC时间&mdash;&mdash;-存储到&mdash;&mdash;>BIOS<br/>
-开机: BIOS&mdash;&mdash;->BIOS中的时间是UTC&mdash;&mdash;&mdash;&ndash;操作系统根据时区计算出localtime&mdash;&mdash;&mdash;-CST</p>
-
-<p>方式B: 不使用UTC（对linux就是 /etc/sysconfig/clock 中 UTC=false）</p>
-
-<p>关机: CST &mdash;&mdash;&ndash;操作系统中UTC=false，直接将localtime存储到&mdash;&mdash;>BIOS<br/>
-开机: BIOS&mdash;&mdash;&ndash;BIOS中的时间是localtime&mdash;&ndash;操作系统中UTC=false，BIOS时间当成localtime&mdash;&mdash;&ndash;>CST（将BIOS中的时间看成是CST）</p>
-
-<hr />
-
-<p>通过设定 /etc/sysconfig/clock，linux可以支持这两种方式，然而windows只支持方式B（至少是默认支持B，而我不知道怎么能让它支 持A），那么在双系统情况下，如果linux设成A方式，那么在linux与windows系统切换时一定会造成时间混乱的，解决办法就是将linux中 的UTC禁用，也设成B方式就可以了。</p>
-
-<p>注：可以通过 <code>hwclock --hctosys</code> 来利用硬件时间来设置系统时间（注意不是简单的复制BIOS中的时间为系统时间，要看是否使用UTC，如果使用的话则要做时区换算），通过 <code>hwclock --systohc</code> 来根据系统时间设置硬件时间（也要看是否启用UTC来决定是否做时区换算）。</p>
-
-<p>总之，不论使用 <code>--systohc</code> 还是 <code>--hctosys</code>，同步后直接运行不带参数的 hwclock 得到的时间与直接运行 date 得到的时间应该一致，这个时间是否就是BIOS中的时间（<code>hwclock --localtime</code>)那就不一定了，如果启用了UTC就不是，没启用UTC就是。</p>
-
-<p>而且还要注意：在系统中手动使用 <code>hwclock hwclock --set --date='yyyy-mm-dd'</code> 来设置BIOS时间只在系统运行时有效，因为当系统关闭时，还会按设定好的方式根据系统时间来重设BIOS时间的，于是手动的设置便被覆盖掉了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/5">&larr; Older</a>
@@ -1401,7 +1545,7 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(55)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(56)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
@@ -1410,7 +1554,7 @@ if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>13</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -1610,8 +1754,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(20)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(21)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~08/?opendiv=2016'>2016-08</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
@@ -1705,6 +1850,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/08/31/command-pssh_pscp/">pssh、pscp命令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a>
       </li>
     
@@ -1718,10 +1867,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-base/">内核热补丁技术揭秘</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a>
       </li>
     
   </ul>

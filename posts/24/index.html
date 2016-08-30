@@ -62,6 +62,563 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-12T17:13:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>17:13:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/45932775">http://blog.csdn.net/zhangskd/article/details/45932775</a></p>
+
+<p>主要内容：Socket的异步通知机制。</p>
+
+<p>内核版本：3.15.2</p>
+
+<h4>概述</h4>
+
+<p>socket上定义了几个IO事件：状态改变事件、有数据可读事件、有发送缓存可写事件、有IO错误事件。对于这些事件，socket中分别定义了相应的事件处理函数，也称回调函数。</p>
+
+<p>Socket I/O事件的处理过程中，要使用到sock上的两个队列：等待队列和异步通知队列，这两个队列中都保存着等待该Socket I/O事件的进程。</p>
+
+<p>Q：为什么要使用两个队列，等待队列和异步通知队列有什么区别呢？<br/>
+A：等待队列上的进程会睡眠，直到Socket I/O事件的发生，然后在事件处理函数中被唤醒。异步通知队列上的进程则不需要睡眠，Socket I/O事件发时，事件处理函数会给它们发送到信号，这些进程事先注册的信号处理函数就能够被执行。</p>
+
+<h4>异步通知队列</h4>
+
+<p>Socket层使用异步通知队列来实现异步等待，此时等待Socket I/O事件的进程不用睡眠。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;struct socket_wq __rcu *sk_wq; /* socket的等待队列和异步通知队列 */
+</span><span class='line'>&#9;...
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>struct socket_wq {
+</span><span class='line'>&#9;/* Note: wait MUST be first field of socket_wq */
+</span><span class='line'>&#9;wait_queue_head_t wait; /* 等待队列头 */
+</span><span class='line'>&#9;struct fasync_struct *fasync_list; /* 异步通知队列 */
+</span><span class='line'>&#9;struct rcu_head *rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct fasync_struct {
+</span><span class='line'>&#9;spinlock_t fa_lock;
+</span><span class='line'>&#9;int magic;
+</span><span class='line'>&#9;int fa_fd; /* 文件描述符 */
+</span><span class='line'>&#9;struct fasync_struct *fa_next; /* 用于链入单向链表 */
+</span><span class='line'>&#9;struct file *fa_file; /* fa_file-&gt;f_owner记录接收信号的进程 */
+</span><span class='line'>&#9;struct rcu_head fa_rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过之前的blog《linux的异步通知机制》，我们知道为了能处理协议栈发出的SIGIO信号，</p>
+
+<p>用户程序需要做的事情有：<br/>
+1. 通过signal()指定SIGIO的处理函数。<br/>
+2. 设置sockfd的拥有者为本进程，如此一来本进程才能收到协议栈发出的SIGIO信号。<br/>
+3. 设置sockfd支持异步通知，即设置O_ASYNC标志。</p>
+
+<p>对应的用户程序函数调用大概如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>signal(SIGIO, my_handler); /* set new SIGIO handler */
+</span><span class='line'>fcntl(sockfd, F_SETOWN, getpid()); /* set sockfd's owner process */
+</span><span class='line'>oflags = fcntl(sockfd, F_GETFL); /* get old sockfd flags */
+</span><span class='line'>fcntl(sockfd, F_SETFL, oflags | O_ASYNC); /* set new sockfd flags */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下文关注的是内核层面的一些工作：<br/>
+1. 如何把进程加入Socket的异步通知队列，或者把进程从Socket的异步通知队列中删除。<br/>
+2. 协议栈何时发送信号给Socket异步通知队列上的进程。</p>
+
+<h4>插入和删除</h4>
+
+<p>首先来看下fcntl()的系统调用。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct fd f = fdget_raw(fd);
+</span><span class='line'>&#9;long err = -EBADF; /* Bad file number */
+</span><span class='line'>
+</span><span class='line'>&#9;if (! f.file)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;/* File is opened with O_PATH, almost nothing can be done with it */
+</span><span class='line'>&#9;if (unlikely(f.file-&gt;f_mode & FMODE_PATH)) {
+</span><span class='line'>&#9;&#9;if (! check_fcntl_cmd(cmd))
+</span><span class='line'>&#9;&#9;&#9;goto out1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;err = security_file_fcntl(f.file, cmd, arg);
+</span><span class='line'>&#9;if (! err)
+</span><span class='line'>&#9;&#9;err = do_fcntl(fd, cmd, arg, f.file); /* 实际的处理函数 */
+</span><span class='line'>
+</span><span class='line'>out1:
+</span><span class='line'>&#9;fdput(f);
+</span><span class='line'>out:
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static long do_fcntl(int fd, unsigned int cmd, unsigned long arg, struct fil *filp)
+</span><span class='line'>{
+</span><span class='line'>&#9;long err = -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;switch(cmd) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case F_SETFL: /* 在这里设置O_ASYNC标志 */
+</span><span class='line'>&#9;&#9;err = setfl(fd, filp, arg);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case F_SETOWN: /* 在这里设置所有者进程 */
+</span><span class='line'>&#9;&#9;err = f_setown(filp, arg, 1);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;....
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int setfl(int fd, struct file *filp, unsigned long arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* -&gt;fasync() is responsible for setting the FASYNC bit. */
+</span><span class='line'>&#9;if (((arg ^ filp-&gt;f_flags) & FASYNC) && filp-&gt;f_op-&gt;fasync) {
+</span><span class='line'>&#9;&#9;error = filp-&gt;f_op-&gt;fasync(fd, filp, (arg & FASYNC) != 0);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (error &lt; 0)
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;if (error &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;error = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Socket文件的操作函数集为socket_file_ops。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations socket_file_ops = {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;.fasync = sock_fasync,
+</span><span class='line'>&#9;...
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Update the socket async list. */
+</span><span class='line'>static int sock_fasync(int fd, struct file *filp, int on)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct socket *sock = filp-&gt;private_data;
+</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;
+</span><span class='line'>&#9;struct socket_wq *wq; /* Socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (sk == NULL)
+</span><span class='line'>&#9;&#9;return -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;lock_sock(sk);
+</span><span class='line'>&#9;wq = rcu_dereference_protected(sock-&gt;wq, sock_owned_by_user(sk));
+</span><span class='line'>
+</span><span class='line'>&#9;fasync_helper(fd, filp, on, &wq-&gt;fasync_list); /* 使用此函数来插入或删除 */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 设置或取消SOCK_FASYNC标志 */
+</span><span class='line'>&#9;if (! wq-&gt;fasync_list)
+</span><span class='line'>&#9;&#9;sock_reset_flag(sk, SOCK_FASYNC);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;sock_set_flag(sk, SOCK_FASYNC);
+</span><span class='line'>
+</span><span class='line'>&#9;release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和设备驱动一样，最终调用fasync_helper()来把进程插入异步通知队列，或者把进程从异步通知队列中删除。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * fasync_helper() is used by almost all character device drivers to set up the fasync
+</span><span class='line'> * queue, and for regular files by the file lease code. It returns negative on error, 0 if
+</span><span class='line'> * it did no changes and positive if it added / deleted the entry.
+</span><span class='line'> */
+</span><span class='line'>
+</span><span class='line'>int fasync_helper(int fd, struct file *filp, int on, struct fasync_struct **fapp)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (! on)
+</span><span class='line'>&#9;&#9;return fasync_remove_entry(filp, fapp); /* 插入 */
+</span><span class='line'>
+</span><span class='line'>&#9;return fasync_add_entry(fd, filp, fapp); /* 删除 */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>发送信号</h4>
+
+<p>当Socket I/O事件触发时，协议栈会调用sk_wake_async()来进行异步通知。</p>
+
+<p>函数的处理方式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum {
+</span><span class='line'>&#9;SOCK_WAKE_IO, /* 直接发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_WAITD, /* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_SPACE, /* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_URG, /* 直接发送SIGURG信号 */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通告的IO类型，常用的有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define __SI_POLL 0
+</span><span class='line'>#define POLL_IN (__SI_POLL | 1) /* data input available, 有接收数据可读 */
+</span><span class='line'>#define POLL_OUT (__SI_POLL | 2) /* output buffers available, 有输出缓存可写 */
+</span><span class='line'>#define POLL_MSG (__SI_POLL | 3) /* input message available, 有输入消息可读 */
+</span><span class='line'>#define POLL_ERR (__SI_POLL | 4) /* i/0 error, I/O错误 */
+</span><span class='line'>#define POLL_PRI (__SI_POLL | 5) /* high priority input available, 有紧急数据可读 */
+</span><span class='line'>#define POLL_HUP (__SI_POLL | 6) /* device disconnected, 设备关闭或文件关闭，无法继续读写 */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>how为函数的处理方式，band为通告的IO类型。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_wake_async(struct sock *sk, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sock_flag(sk, SOCK_FASYNC)) /* sock需要支持异步通知 */
+</span><span class='line'>&#9;&#9;sock_wake_async(sk-&gt;sk_socket, how, band);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int sock_wake_async(struct socket *sock, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct socket_wq *wq;
+</span><span class='line'>
+</span><span class='line'>&#9;if (! sock)
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'>&#9;wq = rcu_dereference(sock-&gt;wq); /* socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (! wq || !wq-&gt;fasync_list) { /* 如果有队列没有实例 */
+</span><span class='line'>&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;switch(how) {
+</span><span class='line'>&#9;/* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>&#9;case SOCK_WAKE_WAITD:
+</span><span class='line'>&#9;&#9;if (test_bit(SOCK_ASYNC_WAITDATA, &sock-&gt;flags))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;goto call_kill;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>&#9;case SOCK_WAKE_SPACE:
+</span><span class='line'>&#9;&#9;if (! test_and_clear_bit(SOCK_ASYNC_NOSPACE, &sock-&gt;flags))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;/* fall_through */
+</span><span class='line'>
+</span><span class='line'>&#9;case SOCK_WAKE_IO: /* 直接发送SIGIO信号 */
+</span><span class='line'>call_kill:
+</span><span class='line'>&#9;&#9;&#9;/* 发送SIGIO信号给异步通知队列上的进程，告知IO消息 */
+</span><span class='line'>&#9;&#9;&#9;kill_fasync(&wq-&gt;fasync_list, SIGIO, band);
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;case SOCK_WAKE_URG:
+</span><span class='line'>&#9;&#9;&#9;/* 发送SIGURG信号给异步通知队列上的进程 */
+</span><span class='line'>&#9;&#9;&#9;kill_fasync(&wq-&gt;fasync_list, SIGURG, band);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和设备驱动一样，最终调用kill_fasync()来发送信号给用户进程。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kill_fasync(struct fasync_struct **fp, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;/* First a quick test without locking: usually the list is empty. */
+</span><span class='line'>&#9;if (*f) {
+</span><span class='line'>&#9;&#9;rcu_read_lock();
+</span><span class='line'>&#9;&#9;kill_fasync_rcu(rcu_dereference(*fp), sig, band);
+</span><span class='line'>&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void kill_fasync_rcu(struct fasync_struct *fa, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;while (fa) {
+</span><span class='line'>&#9;&#9;struct fown_struct *fown;
+</span><span class='line'>&#9;&#9;unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (fa-&gt;magic != FASYNC_MAGIC) {
+</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "kill_fasync: bad magic number in fasync_struct!\n");
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_lock_irqsave(&fa-&gt;fa_lock, flags);
+</span><span class='line'>&#9;&#9;if (fa-&gt;fa_file) {
+</span><span class='line'>&#9;&#9;&#9;fown = &fa-&gt;file-&gt;f_owner; /* 持有文件的进程 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Don't send SIGURG to processes which have not set a queued signum:
+</span><span class='line'>&#9;&#9;&#9; * SIGURG has its own default signalling mechanism. */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (! (sig == SIGURG && fown-&gt;signum == 0))
+</span><span class='line'>&#9;&#9;&#9;&#9;send_sigio(fown, fa-&gt;fa_fd, band); /* 发送信号给持有文件的进程 */
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;spin_unlock_irqrestore(&fa-&gt;fa_lock, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;fa = rcu_dereference(fa-&gt;fa_next); /* 指向下一个异步通知结构体 */
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a></h2>
     
     
@@ -3226,767 +3783,6 @@ Web server is available in the Apache documentation.
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/09/kernel-net-accept/">socket接收连接 sys_accept</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-09T17:10:00+08:00'><span class='date'>2015-06-09</span> <span class='time'>17:10:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://linux.chinaunix.net/techdoc/net/">http://linux.chinaunix.net/techdoc/net/</a></p>
-
-<p><a href="http://linux.chinaunix.net/techdoc/net/2008/12/30/1055672.shtml">http://linux.chinaunix.net/techdoc/net/2008/12/30/1055672.shtml</a></p>
-
-<p>这一节我们开始分析如何接收TCP的socket的连接请求，象以前的分析章节一样我们先看练习中的用户界面</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>accept(server_sockfd, （struct sockaddr *)&client_address, client_len);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>还是以前的分析方法，这里要注意第二个参数，client_address，它是在我们的测试程序中另外声明用于保存客户端socket地址的数据结构变量。其他二个参数无需多说。还是按照以前的方式我们直接看sys_socketcall()函数的代码部分</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>case SYS_ACCEPT:
-</span><span class='line'>&#9;err = sys_accept(a0, (struct sockaddr __user *)a1,
-</span><span class='line'>&#9;&#9; (int __user *)a[2]);
-</span><span class='line'>&#9;break;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>显然是进入sys_accept()这个函数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()
-</span><span class='line'>asmlinkage long sys_accept(int fd, struct sockaddr __user *upeer_sockaddr,
-</span><span class='line'>&#9;&#9;&#9; int __user *upeer_addrlen)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct socket *sock, *newsock;
-</span><span class='line'>&#9;struct file *newfile;
-</span><span class='line'>&#9;int err, len, newfd, fput_needed;
-</span><span class='line'>&#9;char address[MAX_SOCK_ADDR];
-</span><span class='line'>&#9;sock = sockfd_lookup_light(fd, &err, &fput_needed);
-</span><span class='line'>&#9;if (!sock)
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>&#9;err = -ENFILE;
-</span><span class='line'>&#9;if (!(newsock = sock_alloc()))
-</span><span class='line'>&#9;&#9;goto out_put;
-</span><span class='line'>&#9;newsock-&gt;type = sock-&gt;type;
-</span><span class='line'>&#9;newsock-&gt;ops = sock-&gt;ops;
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * We don't need try_module_get here, as the listening socket (sock)
-</span><span class='line'>&#9; * has the protocol module (sock-&gt;ops-&gt;owner) held.qinjian
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;__module_get(newsock-&gt;ops-&gt;owner);
-</span><span class='line'>&#9;newfd = sock_alloc_fd(&newfile);
-</span><span class='line'>&#9;if (unlikely(newfd  0)) {
-</span><span class='line'>&#9;&#9;err = newfd;
-</span><span class='line'>&#9;&#9;sock_release(newsock);
-</span><span class='line'>&#9;&#9;goto out_put;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;err = sock_attach_fd(newsock, newfile);
-</span><span class='line'>&#9;if (err  0)
-</span><span class='line'>&#9;&#9;goto out_fd_simple;
-</span><span class='line'>&#9;err = security_socket_accept(sock, newsock);
-</span><span class='line'>&#9;if (err)
-</span><span class='line'>&#9;&#9;goto out_fd;
-</span><span class='line'>&#9;err = sock-&gt;ops-&gt;accept(sock, newsock, sock-&gt;file-&gt;f_flags);
-</span><span class='line'>&#9;if (err  0)
-</span><span class='line'>&#9;&#9;goto out_fd;
-</span><span class='line'>&#9;if (upeer_sockaddr) {
-</span><span class='line'>&#9;&#9;if (newsock-&gt;ops-&gt;getname(newsock, (struct sockaddr *)address,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; &len, 2)  0) {
-</span><span class='line'>&#9;&#9;&#9;err = -ECONNABORTED;
-</span><span class='line'>&#9;&#9;&#9;goto out_fd;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;err = move_addr_to_user(address, len, upeer_sockaddr,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;upeer_addrlen);
-</span><span class='line'>&#9;&#9;if (err  0)
-</span><span class='line'>&#9;&#9;&#9;goto out_fd;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;/* File flags are not inherited via accept() unlike another OSes.QJ */
-</span><span class='line'>&#9;fd_install(newfd, newfile);
-</span><span class='line'>&#9;err = newfd;
-</span><span class='line'>&#9;security_socket_post_accept(sock, newsock);
-</span><span class='line'>out_put:
-</span><span class='line'>&#9;fput_light(sock-&gt;file, fput_needed);
-</span><span class='line'>out:
-</span><span class='line'>&#9;return err;
-</span><span class='line'>out_fd_simple:
-</span><span class='line'>&#9;sock_release(newsock);
-</span><span class='line'>&#9;put_filp(newfile);
-</span><span class='line'>&#9;put_unused_fd(newfd);
-</span><span class='line'>&#9;goto out_put;
-</span><span class='line'>out_fd:
-</span><span class='line'>&#9;fput(newfile);
-</span><span class='line'>&#9;put_unused_fd(newfd);
-</span><span class='line'>&#9;goto out_put;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个函数总的作用就是使服务端的socket能够创建与客户端连接的“子连接”，也就是会利用服务器端的socket创建一个新的能与客户端建立连接的socket，而且会把新连接的socket的id号，返回到我们测试程序中的client_sockfd，同时也把客户端的socket地址保存在client_address中，函数中首先会进入sockfd_lookup_light（）中找到我们服务器端的socket，这个函数前面章节中用到多次了不再进入细细分析了，接着函数中调用sock_alloc（）函数创建一个新的socket,此后为这个新创建的socket分配一个可用的文件号，然后能过sock_attach_fd使其与文件号挂钩。最重要的当属这句代码</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = sock-&gt;ops-&gt;accept(sock, newsock, sock-&gt;file-&gt;f_flags);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这部分开始入手分析TCP的socket是如何执行的，这里会进入inet_stream_ops中执行，可能有些朋友是直接阅读本文的，最好是看一下前面的章节理清是如何进入这个函数的，我们这里不再重复了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>const struct proto_ops inet_stream_ops = {
-</span><span class='line'>&#9;。。。。。。
-</span><span class='line'>&#9;.accept         = inet_accept,
-</span><span class='line'>&#9;。。。。。。
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们再次看一下af_inet.c中的这个数据结构，很显然进入了inet_accept()函数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()
-</span><span class='line'>int inet_accept(struct socket *sock, struct socket *newsock, int flags)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct sock *sk1 = sock-&gt;sk;
-</span><span class='line'>&#9;int err = -EINVAL;
-</span><span class='line'>&#9;struct sock *sk2 = sk1-&gt;sk_prot-&gt;accept(sk1, flags, &err);
-</span><span class='line'>&#9;if (!sk2)
-</span><span class='line'>&#9;&#9;goto do_err;
-</span><span class='line'>&#9;lock_sock(sk2);
-</span><span class='line'>&#9;BUG_TRAP((1  sk2-&gt;sk_state) &
-</span><span class='line'>&#9;&#9; (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT | TCPF_CLOSE));
-</span><span class='line'>&#9;sock_graft(sk2, newsock);
-</span><span class='line'>&#9;newsock-&gt;state = SS_CONNECTED;
-</span><span class='line'>&#9;err = 0;
-</span><span class='line'>&#9;release_sock(sk2);
-</span><span class='line'>do_err:
-</span><span class='line'>&#9;return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进入这个函数的时候已经找到了我们前面建立的socket结构，而newsock是我们新分配建立的socket结构，我们看到上面函数中执行了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock *sk2 = sk1-&gt;sk_prot-&gt;accept(sk1, flags, &err);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进而进入了钩子函数中执行，那里的struct proto tcp_prot结构变量可以看到</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct proto tcp_prot = {
-</span><span class='line'>&#9;。。。。。。
-</span><span class='line'>&#9;.accept            = inet_csk_accept,
-</span><span class='line'>&#9;。。。。。。
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>很显然是执行的inet_csk_accept（）函数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()--&gt;inet_csk_accept()
-</span><span class='line'>struct sock *inet_csk_accept(struct sock *sk, int flags, int *err)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>&#9;struct sock *newsk;
-</span><span class='line'>&#9;int error;
-</span><span class='line'>&#9;lock_sock(sk);
-</span><span class='line'>&#9;/* We need to make sure that this socket is listening,
-</span><span class='line'>&#9; * and that it has something pending.qinjian
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;error = -EINVAL;
-</span><span class='line'>&#9;if (sk-&gt;sk_state != TCP_LISTEN)
-</span><span class='line'>&#9;&#9;goto out_err;
-</span><span class='line'>&#9;/* Find already established connection */
-</span><span class='line'>&#9;if (reqsk_queue_empty(&icsk-&gt;icsk_accept_queue)) {
-</span><span class='line'>&#9;&#9;long timeo = sock_rcvtimeo(sk, flags & O_NONBLOCK);
-</span><span class='line'>&#9;&#9;/* If this is a non blocking socket don't sleep */
-</span><span class='line'>&#9;&#9;error = -EAGAIN;
-</span><span class='line'>&#9;&#9;if (!timeo)
-</span><span class='line'>&#9;&#9;&#9;goto out_err;
-</span><span class='line'>&#9;&#9;error = inet_csk_wait_for_connect(sk, timeo);
-</span><span class='line'>&#9;&#9;if (error)
-</span><span class='line'>&#9;&#9;&#9;goto out_err;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;newsk = reqsk_queue_get_child(&icsk-&gt;icsk_accept_queue, sk);
-</span><span class='line'>&#9;BUG_TRAP(newsk-&gt;sk_state != TCP_SYN_RECV);
-</span><span class='line'>out:
-</span><span class='line'>&#9;release_sock(sk);
-</span><span class='line'>&#9;return newsk;
-</span><span class='line'>out_err:
-</span><span class='line'>&#9;newsk = NULL;
-</span><span class='line'>&#9;*err = error;
-</span><span class='line'>&#9;goto out;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>象往常叙述的一样首先是在sock中取得struct inet_connection_sock结构,然后判断一下sock的状态是否已经处于监听状态，如果没有处于监听状态的话就不能接收了，只好出错返回了。接着是检查icsk中的icsk_accept_queue请求队列是否为空，因为我们练习中还未启动客户端程序，所以此时还没有连接请求到来，这个队列现在是空的，所以进入if语句，sock_rcvtimeo（）是根据是否允许“阻塞”即等待，而取得sock结构中的sk_rcvtimeo时间值，然后根据这个值进入inet_csk_wait_for_connect（）函数中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()--&gt;inet_csk_accept()--&gt;inet_csk_wait_for_connect()
-</span><span class='line'>static int inet_csk_wait_for_connect(struct sock *sk, long timeo)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>&#9;DEFINE_WAIT(wait);
-</span><span class='line'>&#9;int err;
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * True wake-one mechanism for incoming connections: only
-</span><span class='line'>&#9; * one process gets woken up, not the 'whole herd'.
-</span><span class='line'>&#9; * Since we do not 'race & poll' for established sockets
-</span><span class='line'>&#9; * anymore, the common case will execute the loop only once.
-</span><span class='line'>&#9; *
-</span><span class='line'>&#9; * Subtle issue: "add_wait_queue_exclusive()" will be added
-</span><span class='line'>&#9; * after any current non-exclusive waiters, and we know that
-</span><span class='line'>&#9; * it will always _stay_ after any new non-exclusive waiters
-</span><span class='line'>&#9; * because all non-exclusive waiters are added at the
-</span><span class='line'>&#9; * beginning of the wait-queue. As such, it's ok to "drop"
-</span><span class='line'>&#9; * our exclusiveness temporarily when we get woken up without
-</span><span class='line'>&#9; * having to remove and re-insert us on the wait queue.wumingxiaozu
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;for (;;) {
-</span><span class='line'>&#9;&#9;prepare_to_wait_exclusive(sk-&gt;sk_sleep, &wait,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; TASK_INTERRUPTIBLE);
-</span><span class='line'>&#9;&#9;release_sock(sk);
-</span><span class='line'>&#9;&#9;if (reqsk_queue_empty(&icsk-&gt;icsk_accept_queue))
-</span><span class='line'>&#9;&#9;&#9;timeo = schedule_timeout(timeo);
-</span><span class='line'>&#9;&#9;lock_sock(sk);
-</span><span class='line'>&#9;&#9;err = 0;
-</span><span class='line'>&#9;&#9;if (!reqsk_queue_empty(&icsk-&gt;icsk_accept_queue))
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;err = -EINVAL;
-</span><span class='line'>&#9;&#9;if (sk-&gt;sk_state != TCP_LISTEN)
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;err = sock_intr_errno(timeo);
-</span><span class='line'>&#9;&#9;if (signal_pending(current))
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;err = -EAGAIN;
-</span><span class='line'>&#9;&#9;if (!timeo)
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;finish_wait(sk-&gt;sk_sleep, &wait);
-</span><span class='line'>&#9;return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>函数首先是调用了宏来声明一个等待队列</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFINE_WAIT(name)                                \
-</span><span class='line'>wait_queue_t name = {                                    \
-</span><span class='line'>&#9;.private      = current,                             \
-</span><span class='line'>&#9;.func         = autoremove_wake_function,            \
-</span><span class='line'>&#9;.task_list    = LIST_HEAD_INIT((name).task_list),    \
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>关于等待队列的具体概念我们留在以后专门的章节中论述，这里可以看出是根据当前进程而建立的名为wait的等待队列，接着函数中调用了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()--&gt;inet_csk_accept()--&gt;inet_csk_wait_for_connect()--&gt;prepare_to_wait_exclusive()
-</span><span class='line'>void
-</span><span class='line'>prepare_to_wait_exclusive(wait_queue_head_t *q, wait_queue_t *wait, int state)
-</span><span class='line'>{
-</span><span class='line'>&#9;unsigned long flags;
-</span><span class='line'>&#9;wait-&gt;flags |= WQ_FLAG_EXCLUSIVE;
-</span><span class='line'>&#9;spin_lock_irqsave(&q-&gt;lock, flags);
-</span><span class='line'>&#9;if (list_empty(&wait-&gt;task_list))
-</span><span class='line'>&#9;&#9;__add_wait_queue_tail(q, wait);
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * don't alter the task state if this is just going to
-</span><span class='line'>&#9;  * queue an async wait queue callback wumingxiaozu
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (is_sync_wait(wait))
-</span><span class='line'>&#9;&#9;set_current_state(state);
-</span><span class='line'>&#9;spin_unlock_irqrestore(&q-&gt;lock, flags);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接着要把这里创建的wait，即当前进程的这里的等待队列挂入sk中的sk_sleep队列，这样我们可以理解到多个进程都可以对一个socket并发的连接，这个函数与我们所说的等待队列部分内容是密切相关的，我们只简单的叙述一下，函数中主要是将我们上面建立的等待队列插入到这里的sock结构中的sk_sleep所指定的等待队列头中，此后再次调用reqsk_queue_empty（）函数检查一下icsk_accept_queue是否为空，如果还为空就说明没有连接请求到来，开始睡眠等待了，schedule_timeout（）这个函数与时钟密切相关，所以请朋友们参考其他资料，这里是根据我们上面得到的定时时间来进入睡眠的。</p>
-
-<p>当从这个函数返回时，再次锁住sock防止其他进程打扰，然后这里还是判断一下icsk_accept_queue是否为空，如果还为空的话就要跳出for循环了，醒来后还要检查一下是否是因为信号而醒来的，如果有信号就要处理信号signal_pending（），最后如果睡眠的时间已经用完了也会跳出循环，跳出循环后就要将这里的等待队列从sock中的sk_sleep中摘链。</p>
-
-<p>我们回到inet_csk_accept（）函数中继续往下看，如果这时队列icsk_accept_queue不为空，即有连接请求到来怎么办呢，继续看下面的代码</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>newsk = reqsk_queue_get_child(&icsk-&gt;icsk_accept_queue, sk);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里看到是进入了reqsk_queue_get_child函数中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()--&gt;inet_csk_accept()--&gt;reqsk_queue_get_child()
-</span><span class='line'>static inline struct sock *reqsk_queue_get_child(struct request_sock_queue *queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; struct sock *parent)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct request_sock *req = reqsk_queue_remove(queue);
-</span><span class='line'>&#9;struct sock *child = req-&gt;sk;
-</span><span class='line'>&#9;BUG_TRAP(child != NULL);
-</span><span class='line'>&#9;sk_acceptq_removed(parent);
-</span><span class='line'>&#9;__reqsk_free(req);
-</span><span class='line'>&#9;return child;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>函数中首先是调用了reqsk_queue_remove（）从队列中摘下一个已经到来的request_sock结构</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()--&gt;inet_csk_accept()--&gt;reqsk_queue_get_child()--&gt;reqsk_queue_remove()
-</span><span class='line'>static inline struct request_sock *reqsk_queue_remove(struct request_sock_queue *queue)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct request_sock *req = queue-&gt;rskq_accept_head;
-</span><span class='line'>&#9;BUG_TRAP(req != NULL);
-</span><span class='line'>&#9;queue-&gt;rskq_accept_head = req-&gt;dl_next;
-</span><span class='line'>&#9;if (queue-&gt;rskq_accept_head == NULL)
-</span><span class='line'>&#9;&#9;queue-&gt;rskq_accept_tail = NULL;
-</span><span class='line'>&#9;return req;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>很明显上面函数中是从队列的rskq_accept_head摘下一个已经到来的request_sock这个结构是从客户端请求连接时挂入的，reqsk_queue_get_child（）函数在这里把request_sock中载运的sock结构返回到inet_csk_accept中的局部变量newsk使用。而sk_acceptq_removed是递减我们服务器端sock中的sk_ack_backlog。</p>
-
-<p>然后__reqsk_free释放掉request_sock结构。回到inet_csk_accept函数中，然后返回我们间接从icsk->icsk_accept_queue队列中获得了与客户端密切相关的sock结构。这个与客户端密切相关的结构是由我们服务器端在响应底层驱动的数据包过程中建立的，我们将在后边讲解完客户端的连接请求把这一过程补上，这里假设我们已经接收到了客户端的数据包并且服务器端为此专门建了这个与客户端数据包相联系的sock结构，接着返回到inet_accept()函数中，接着调用sock_graft（）函数，注意参数sock_graft(sk2, newsock);sk2是我们上边叙述的与客户端密切相关的sock结构，是从接收队列中获得的。</p>
-
-<p>而newsock，则是我们服务器端为了这个代表客户端的sock结构而准备的新的socket。我们以前说过，socket结构在具体应用上分为二部分，另一部分是这里的sock结构，因为sock是与具体的协议即以前所说的规程的相关，所以变化比较大，而socket比较通用，所以我们上面通过socket_alloc()只是分配了通用部分的socket结构，并没有建立对应协议的sock结构，那么我们分配的新的socket的所需要的sock是从哪里来的呢，我们可以在代码中看到他是取的代表客户端的sock结构，与我们新建的socket挂入的，看一下这个关键的函数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_socketcall()--&gt;sys_accept()--&gt;inet_accept()--&gt;sock_graft()
-</span><span class='line'>static inline void sock_graft(struct sock *sk, struct socket *parent)
-</span><span class='line'>{
-</span><span class='line'>&#9;write_lock_bh(&sk-&gt;sk_callback_lock);
-</span><span class='line'>&#9;sk-&gt;sk_sleep = &parent-&gt;wait;
-</span><span class='line'>&#9;parent-&gt;sk = sk;
-</span><span class='line'>&#9;sk-&gt;sk_socket = parent;
-</span><span class='line'>&#9;security_sock_graft(sk, parent);
-</span><span class='line'>&#9;write_unlock_bh(&sk-&gt;sk_callback_lock);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面传递的参数是</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sock_graft(sk2, newsock);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>sk2是代表我们客户端的sock，newsock是我们服务器端的新socket，可以看出上面的sock_graft,graft是嫁接的意思，从函数面上就可以理解了，然后其内部就是将服务器端新建的socket与客户端的sock“挂钩了”，从此以后，这个socket就是服务器端与客户端通讯的桥梁了。这样回到上面的inet_accept函数时，我们看到将newsock->state = SS_CONNECTED;也就是状态改变成了连接状态，而以前的服务器的socket并没有任何的状态改变，那个socket继续覆行他的使命“孵化”新的socket。回到我们的sys_accept()函数中下面接着看，我们在练习中看到需要获得客户端的地址，在那个章节中我们又走到了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>newsock-&gt;ops-&gt;getname(newsock, (struct sockaddr )address, &len, 2)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这要看我们在sys_accpet()函数中新创建的newsock的ops钩子结构了，很明显我们在sys_accept()函数中看到了newsock->ops = sock->ops;所以newsock是使用的已经建立的服务器端的inet_stream_ops结构变量，我们可以在这个结构中看到</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>const struct proto_ops inet_stream_ops = {
-</span><span class='line'>&#9;。。。。。。
-</span><span class='line'>&#9;.getname     = inet_getname,
-</span><span class='line'>&#9;。。。。。。
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因此进入了inet_getname()函数，这个函数在/net/ipv4/af_inet.c中的683行处。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_accept()--&gt;inet_getname()
-</span><span class='line'>int inet_getname(struct socket *sock, struct sockaddr *uaddr,
-</span><span class='line'>&#9;&#9;&#9;int *uaddr_len, int peer)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct sock *sk        = sock-&gt;sk;
-</span><span class='line'>&#9;struct inet_sock *inet    = inet_sk(sk);
-</span><span class='line'>&#9;struct sockaddr_in *sin    = (struct sockaddr_in *)uaddr;
-</span><span class='line'>&#9;sin-&gt;sin_family = AF_INET;
-</span><span class='line'>&#9;if (peer) {
-</span><span class='line'>&#9;&#9;if (!inet-&gt;dport ||
-</span><span class='line'>&#9;&#9; (((1  sk-&gt;sk_state) & (TCPF_CLOSE | TCPF_SYN_SENT)) &&
-</span><span class='line'>&#9;&#9; peer == 1))
-</span><span class='line'>&#9;&#9;&#9;return -ENOTCONN;
-</span><span class='line'>&#9;&#9;sin-&gt;sin_port = inet-&gt;dport;
-</span><span class='line'>&#9;&#9;sin-&gt;sin_addr.s_addr = inet-&gt;daddr;
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;__be32 addr = inet-&gt;rcv_saddr;
-</span><span class='line'>&#9;&#9;if (!addr)
-</span><span class='line'>&#9;&#9;&#9;addr = inet-&gt;saddr;
-</span><span class='line'>&#9;&#9;sin-&gt;sin_port = inet-&gt;sport;
-</span><span class='line'>&#9;&#9;sin-&gt;sin_addr.s_addr = addr;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;memset(sin-&gt;sin_zero, 0, sizeof(sin-&gt;sin_zero));
-</span><span class='line'>&#9;*uaddr_len = sizeof(*sin);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在上面的代码中，关键的是这二句</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sin-&gt;sin_port = inet-&gt;dport;
-</span><span class='line'>sin-&gt;sin_addr.s_addr = inet-&gt;daddr;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里直接将我们练习中的准备接收的数组address转换成tcp的地址结构struct sockaddr_in指针，然后直接用上面二句赋值了，我们看到他是使用的我们刚刚提到的从icsk->icsk_accept_queue接收队列中得到的sock进而得到了inet_sock专用于INET的sock结构</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_sock {
-</span><span class='line'>&#9;/* sk and pinet6 has to be the first two members of inet_sock */
-</span><span class='line'>&#9;struct sock        sk;
-</span><span class='line'>#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
-</span><span class='line'>&#9;struct ipv6_pinfo    *pinet6;
-</span><span class='line'>#endif
-</span><span class='line'>&#9;/* Socket demultiplex comparisons on incoming packets.wumingxiaozu */
-</span><span class='line'>&#9;__be32               daddr;
-</span><span class='line'>&#9;__be32               rcv_saddr;
-</span><span class='line'>&#9;__be16               dport;
-</span><span class='line'>&#9;__u16                num;
-</span><span class='line'>&#9;__be32               saddr;
-</span><span class='line'>&#9;__s16                uc_ttl;
-</span><span class='line'>&#9;__u16                cmsg_flags;
-</span><span class='line'>&#9;struct ip_options    *opt;
-</span><span class='line'>&#9;__be16               sport;
-</span><span class='line'>&#9;__u16                id;
-</span><span class='line'>&#9;__u8                 tos;
-</span><span class='line'>&#9;__u8                 mc_ttl;
-</span><span class='line'>&#9;__u8                 pmtudisc;
-</span><span class='line'>&#9;__u8                 recverr:1,
-</span><span class='line'>&#9;                     is_icsk:1,
-</span><span class='line'>&#9;                     freebind:1,
-</span><span class='line'>&#9;                     hdrincl:1,
-</span><span class='line'>&#9;                     mc_loop:1;
-</span><span class='line'>&#9;int                  mc_index;
-</span><span class='line'>&#9;__be32               mc_addr;
-</span><span class='line'>&#9;struct ip_mc_socklist    *mc_list;
-</span><span class='line'>&#9;struct {
-</span><span class='line'>&#9;&#9;unsigned int        flags;
-</span><span class='line'>&#9;&#9;unsigned int        fragsize;
-</span><span class='line'>&#9;&#9;struct ip_options   *opt;
-</span><span class='line'>&#9;&#9;struct dst_entry    *dst;
-</span><span class='line'>&#9;&#9;int                 length; /* Total length of all frames */
-</span><span class='line'>&#9;&#9;__be32              addr;
-</span><span class='line'>&#9;&#9;struct flowi        fl;
-</span><span class='line'>&#9;} cork;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个结构中的头一个变量就是sock结构，所以这里直接将sock的地址做为inet_sock结构的开始是完全可以的，这也就是inet_sk()这个函数的主要作用</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sys_accept()--&gt;inet_getname()--&gt;inet_sk()
-</span><span class='line'>static inline struct inet_sock *inet_sk(const struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;return (struct inet_sock *)sk;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>那么可能会有朋友问我们只是从icsk->icsk_accept_queue接收队列中间接得到了sock结构指针并没有看到inet_sock结构指针啊？请朋友们相信我们在后边叙述完了客户端的连接请求过程后会把这部分给补上的，所以这里的inet_sock肯定是在服务器的底层驱动相关的部分完成的，我们将在完成客户端的连接后分析这部分的关键内容。所以我们看到这里将inet_sock结构中的请求方即客户端的端口和地址间接设置进了应用程序的地址结构变量client_address就取得了客户端的地址，这个过程是在sys_accept()中使用</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = move_addr_to_user(address, len, upeer_sockaddr,
-</span><span class='line'>&#9;&#9;&#9;&#9;upeer_addrlen);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>将客户端的socket地址复制给我们的应用程序界面。我们上边已经通过inet_getname（）函数复制客户端的地址到address数组中了，这样通过move_addr_to_user()函数后，我们程序界面上client_address就得到了客户端的socket地址。接着我们看到函数执行了fd_install（）函数，即为新创建的socket分配一个文件号和file结构，有关没有详述的函数请朋友们参考深入理解LINUX内核第三版中的介绍，自己阅读暂且做为一种练习吧。 朋友们看到这里可以结合一下我们的地图，因为截止到现在我们都是围绕着地图中的服务器角度来分析的，接下来的章节我们将转换到客户端的角度来分析。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/25">&larr; Older</a>
@@ -4040,7 +3836,7 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(55)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(56)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
@@ -4049,7 +3845,7 @@ if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>13</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -4249,8 +4045,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(20)</span></li>
-<div id='2016' class='catsub'><li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2016/'>2016</a><a href='##' onmousedown=showDiv('2016')><span class='exp_style' id='exp_2016'>[+]</span></a><span class='right_span'>(21)</span></li>
+<div id='2016' class='catsub'><li><a href='/blog/cats/2016~08/?opendiv=2016'>2016-08</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2016~05/?opendiv=2016'>2016-05</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2016~03/?opendiv=2016'>2016-03</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2016~02/?opendiv=2016'>2016-02</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2016~01/?opendiv=2016'>2016-01</a><span class='right_span'>6</span></li>
@@ -4344,6 +4141,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2016/08/31/command-pssh_pscp/">pssh、pscp命令</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a>
       </li>
     
@@ -4357,10 +4158,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2016/03/29/debug-ksplice-base/">内核热补丁技术揭秘</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a>
       </li>
     
   </ul>
